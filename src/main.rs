@@ -42,7 +42,11 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match rt.block_on(rpc::serve()) {
+            let served = rt.block_on(rpc::serve());
+            // drops the tasks (the upstream with them: kill on drop) without
+            // waiting on the thread still blocked reading an open stdin
+            rt.shutdown_timeout(std::time::Duration::from_millis(500));
+            match served {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("rox-gws: stdio: {e}");

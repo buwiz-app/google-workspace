@@ -1,0 +1,15 @@
+[package]
+name = "rox-gws"
+version = "1.1.0"
+edition = "2021"
+description = "The first-party Google Workspace plugin (dev.goldcoders.google-workspace): read-only Gmail tools over the user's workspace-mcp, as a stdio MCP server"
+publish = false
+
+[dependencies]
+# workspace-mcp's text answers are parsed with JS regex semantics (lookbehind
+# for `^` in multiline mode), as server.mjs parsed them
+fancy-regex = "0.16"
+rox-mcp = { path = "../rox-mcp" }
+rox-v1 = { path = "../rox-v1" }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt", "signal", "sync", "time"] }

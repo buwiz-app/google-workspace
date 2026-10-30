@@ -1,0 +1,9 @@
+{
+  "protocol": "1.0.0",
+  "id": "dev.goldcoders.google-workspace",
+  "short": "gws",
+  "version": "1.1.0",
+  "title": "Google Workspace",
+  "description": "Read-only Gmail search and reading for routines and the agent, through the user's Google Workspace MCP server.",
+  "publisher": { "id": "dev.goldcoders", "key_id": "gc-2026-01", "name": "Goldcoders" }
+}

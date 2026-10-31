@@ -137,7 +137,7 @@ async fn handle(plugin: &Plugin, method: &str, params: Option<&Value>) -> Result
         "ping" => Ok(json!({})),
         "tools/list" => {
             optional_cursor(params)?;
-            let mut list: Vec<Value> = reserved::NAMES.iter().map(|n| json!({"name": n, "description": "Reserved for Rox.", "inputSchema": {"type": "object"}})).collect();
+            let mut list: Vec<Value> = reserved::NAMES.iter().map(|n| json!({"name": n, "description": "Reserved for Buwiz Bot.", "inputSchema": {"type": "object"}})).collect();
             list.extend(tools::list());
             Ok(json!({"tools": list}))
         }

@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use crate::tools::{fail, ok};
 use crate::{config, js};
 
-pub const NAMES: [&str; 5] = ["rox.provision", "rox.session.open", "rox.session.close", "rox.ticket.resolve", "rox.uninstall"];
+pub const NAMES: [&str; 5] = ["buwiz.provision", "buwiz.session.open", "buwiz.session.close", "buwiz.ticket.resolve", "buwiz.uninstall"];
 
 /// The provisioned key: memory only (4.3), never logged, written or echoed.
 #[derive(Default)]
@@ -25,9 +25,9 @@ impl Key {
 /// -32603 (a bad seed, an unreadable manifest).
 pub fn call(key: &Key, name: &str, args: &Value) -> Result<Value, String> {
     Ok(match name {
-        "rox.provision" => return provision(key, args),
-        "rox.session.open" => fail("invalid_args", &format!("no app {}: this plugin has no apps", js::slice_utf16(&js::string(args.get("app")), 60))),
-        "rox.ticket.resolve" => ok(json!({"valid": false})),
+        "buwiz.provision" => return provision(key, args),
+        "buwiz.session.open" => fail("invalid_args", &format!("no app {}: this plugin has no apps", js::slice_utf16(&js::string(args.get("app")), 60))),
+        "buwiz.ticket.resolve" => ok(json!({"valid": false})),
         _ => ok(json!({"ok": true})),
     })
 }

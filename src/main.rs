@@ -1,5 +1,5 @@
 //! `rox-gws [mcp]`: the first-party Google Workspace plugin, id
-//! dev.goldcoders.google-workspace, short `gws`, as a stdio MCP server
+//! app.buwiz.google-workspace, short `gws`, as a stdio MCP server
 //! (what Rox's broker spawns). `rox-gws manifest`: print the unsigned
 //! manifest, for the signing step (`rox-broker sign-manifest`).
 //!

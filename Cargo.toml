@@ -2,7 +2,7 @@
 name = "rox-gws"
 version = "1.1.0"
 edition = "2021"
-description = "The first-party Google Workspace plugin (dev.goldcoders.google-workspace): read-only Gmail tools over the user's workspace-mcp, as a stdio MCP server"
+description = "The first-party Google Workspace plugin (app.buwiz.google-workspace): read-only Gmail tools over the user's workspace-mcp, as a stdio MCP server"
 publish = false
 
 [dependencies]

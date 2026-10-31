@@ -23,7 +23,7 @@ use crate::{config, tools};
 const LATEST: &str = "2025-11-25";
 const SUPPORTED: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
 const INSTRUCTIONS: &str = "Gmail is read-only here: gws_search_mail finds messages, gws_read_mail reads one. Neither sends, labels or deletes mail.";
-const MANIFEST_URI: &str = "rox://manifest";
+const MANIFEST_URI: &str = "buwiz://manifest";
 
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_REQUEST: i64 = -32600;
@@ -175,7 +175,7 @@ async fn call_tool(plugin: &Plugin, name: &str, args: &Value) -> Result<Value, E
     }
     // P7: nothing before a successful provision
     if !plugin.key.is_set() {
-        return Err(Error::mcp(INVALID_REQUEST, "rox.provision must come first"));
+        return Err(Error::mcp(INVALID_REQUEST, "buwiz.provision must come first"));
     }
     if !tools::has(name) {
         return Err(Error::mcp(INVALID_PARAMS, &format!("no tool {name}")));
@@ -183,9 +183,9 @@ async fn call_tool(plugin: &Plugin, name: &str, args: &Value) -> Result<Value, E
     Ok(tools::run(&plugin.upstream, name, args).await)
 }
 
-/// `^rox\.[a-z.]+$` (grammar.mjs `reservedTool`).
+/// `^buwiz\.[a-z.]+$` (grammar.mjs `reservedTool`).
 fn is_reserved_name(name: &str) -> bool {
-    name.strip_prefix("rox.").is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_lowercase() || b == b'.'))
+    name.strip_prefix("buwiz.").is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_lowercase() || b == b'.'))
 }
 
 /// zod's name for a value's type.
@@ -255,8 +255,8 @@ mod tests {
 
     #[test]
     fn reserved_names_follow_the_grammar() {
-        assert!(is_reserved_name("rox.frobnicate") && is_reserved_name("rox.a.b"));
-        assert!(!is_reserved_name("rox.") && !is_reserved_name("rox.X") && !is_reserved_name("gws_read_mail") && !is_reserved_name("rox.a1"));
+        assert!(is_reserved_name("buwiz.frobnicate") && is_reserved_name("buwiz.a.b") && !is_reserved_name("rox.provision"), "the 1.x names are no longer reserved: plain unknown tools");
+        assert!(!is_reserved_name("buwiz.") && !is_reserved_name("buwiz.X") && !is_reserved_name("gws_read_mail") && !is_reserved_name("buwiz.a1"));
     }
 
     #[test]

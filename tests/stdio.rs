@@ -49,11 +49,11 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
 
     let served = ask("resources/read", json!({"uri": "buwiz://manifest"}));
     let m: Value = serde_json::from_str(served["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!((m["protocol"].as_str(), m["version"].as_str(), m["id"].as_str(), m["short"].as_str()), (Some("2.1.0"), Some("1.2.0"), Some("app.buwiz.google-workspace"), Some("gws")));
+    assert_eq!((m["protocol"].as_str(), m["version"].as_str(), m["id"].as_str(), m["short"].as_str()), (Some("1.0.0"), Some("1.3.0"), Some("app.buwiz.google-workspace"), Some("gws")));
 
     let seed = [7u8; 32];
     let public = b64(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().as_bytes());
-    let p = call(&mut ask, "buwiz.provision", json!({"protocol": "2.1.0", "key": {"alg": "ed25519", "seed": b64(&seed)}, "pub": public}));
+    let p = call(&mut ask, "buwiz.provision", json!({"protocol": "1.0.0", "key": {"alg": "ed25519", "seed": b64(&seed)}, "pub": public}));
     assert_eq!(p["structuredContent"]["ok"], true, "{p}");
 
     let account = |token: &str, expires_at: Value| json!({"account": "google", "label": "default", "provider": "google", "subject": "owner@example.com", "scopes": ["https://www.googleapis.com/auth/gmail.readonly"], "access_token": token, "token_type": "Bearer", "expires_at": expires_at});
@@ -86,6 +86,6 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
 fn the_manifest_command_prints_1_2_0_for_protocol_2_1_0() {
     let out = Command::new(env!("CARGO_BIN_EXE_buwiz-gws")).arg("manifest").output().unwrap();
     let m: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!((m["version"].as_str(), m["protocol"].as_str()), (Some("1.2.0"), Some("2.1.0")));
+    assert_eq!((m["version"].as_str(), m["protocol"].as_str()), (Some("1.3.0"), Some("1.0.0")));
     assert_eq!(m["version"].as_str(), Some(env!("CARGO_PKG_VERSION")), "Cargo.toml and the manifest agree");
 }

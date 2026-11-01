@@ -1,6 +1,6 @@
 {
   "name": "google-workspace",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Read-only Gmail search and reading for Buwiz routines and the agent, with the Google account you sign in to in Buwiz Bot.",
   "author": { "name": "Buwiz" },
   "homepage": "https://github.com/buwiz-app/google-workspace",
@@ -12,10 +12,10 @@
     }
   },
   "buwiz": {
-    "protocol": "2.1.0",
+    "protocol": "1.0.0",
     "id": "app.buwiz.google-workspace",
     "short": "gws",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "server": "gws",
     "accounts": [
       {

@@ -132,7 +132,7 @@ async fn handle(plugin: &Plugin, method: &str, params: Option<&Value>) -> Result
             Ok(json!({
                 "protocolVersion": version,
                 "capabilities": {"tools": {}, "resources": {}},
-                "serverInfo": {"name": "rox-google-workspace", "version": "1.0.0"},
+                "serverInfo": {"name": "buwiz-google-workspace", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": INSTRUCTIONS,
             }))
         }

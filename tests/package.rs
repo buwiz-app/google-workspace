@@ -1,7 +1,7 @@
 //! package/plugin.json, the 1.0 package's source: it agrees with the
-//! served manifest, and (with `BUWIZ_BROKER_BIN` set to a rox-broker build)
+//! served manifest, and (with `BUWIZ_BROKER_BIN` set to a buwiz-broker build)
 //! what the release script makes of it is signed with a throwaway key and
-//! passes `rox-broker manifest package` and `manifest verify` as Buwiz Bot
+//! passes `buwiz-broker manifest package` and `manifest verify` as Buwiz Bot
 //! checks them at install.
 
 use std::path::{Path, PathBuf};
@@ -42,7 +42,7 @@ fn broker(bin: &str, args: &[&str], stdin: Option<&Value>) -> Value {
     }
     drop(c.stdin.take());
     let out = c.wait_with_output().unwrap();
-    assert!(out.status.success() || stdin.is_some(), "rox-broker {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() || stdin.is_some(), "buwiz-broker {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     serde_json::from_slice(&out.stdout).unwrap_or(Value::Null)
 }
 
@@ -59,7 +59,7 @@ fn plugin_json(dir: &Path, platform: &str, asset: &str, published: Option<&Path>
 #[test]
 fn the_signed_package_passes_the_bots_checks() {
     let Ok(bin) = std::env::var("BUWIZ_BROKER_BIN") else {
-        eprintln!("skipped: set BUWIZ_BROKER_BIN to a rox-broker build to check the signed package");
+        eprintln!("skipped: set BUWIZ_BROKER_BIN to a buwiz-broker build to check the signed package");
         return;
     };
     let dir = std::env::temp_dir().join(format!("buwiz-gws-package-{}", std::process::id()));

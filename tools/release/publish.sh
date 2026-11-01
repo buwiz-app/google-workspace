@@ -19,10 +19,10 @@
 #                      which skips pre-releases (for a coordinated switch)
 #   --key-file <path>  sign with a seed file instead (a throwaway key for
 #                      local checks; never with --publish)
-#   --trust <file>     check the result as Buwiz Bot does (`rox-broker
+#   --trust <file>     check the result as Buwiz Bot does (`buwiz-broker
 #                      manifest verify` and `manifest package`) against
 #                      this trust store
-#   BUWIZ_BROKER_BIN   rox-broker from buwiz-bot/buwiz-bot (its
+#   BUWIZ_BROKER_BIN   buwiz-broker from buwiz-bot/buwiz-bot (its
 #                      sign-manifest and manifest checks)
 #   KEY_ID             default: the manifest's publisher.key_id
 set -euo pipefail
@@ -43,7 +43,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-: "${BUWIZ_BROKER_BIN:?set BUWIZ_BROKER_BIN to a rox-broker build (buwiz-bot/buwiz-bot broker/)}"
+: "${BUWIZ_BROKER_BIN:?set BUWIZ_BROKER_BIN to a buwiz-broker build (buwiz-bot/buwiz-bot broker/)}"
 if [ "$PUBLISH" = 1 ] && [ -n "$KEY_FILE" ]; then echo "--publish signs with the Keychain key only" >&2; exit 2; fi
 
 case "$(uname -s)" in Darwin) OS=macos ;; Linux) OS=linux ;; *) echo "unsupported OS $(uname -s)" >&2; exit 1 ;; esac
@@ -94,7 +94,7 @@ def op(name, req):
     r = subprocess.run([broker, "manifest", name], input=json.dumps(req), capture_output=True, text=True)
     a = json.loads(r.stdout or "{}")
     if not a.get("ok"):
-        sys.exit(f"rox-broker manifest {name}: {r.stdout.strip() or r.stderr.strip()}")
+        sys.exit(f"buwiz-broker manifest {name}: {r.stdout.strip() or r.stderr.strip()}")
     return a["value"]
 served = op("verify", {"text": open(f"{out}/manifest.signed.json").read(), "trust": trust})["manifest"]
 p = op("package", {"text": open(f"{out}/plugin.json").read(), "trust": trust, "platform": platform})

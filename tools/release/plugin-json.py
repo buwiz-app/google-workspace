@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fills package/plugin.json for a release: buwiz.files (the signed manifest)
 and buwiz.binaries (this platform's binary), each with its sha256, and
-writes <out>/plugin.unsigned.json for `rox-broker sign-manifest --block buwiz`.
+writes <out>/plugin.unsigned.json for `buwiz-broker sign-manifest --block buwiz`.
 
 usage: plugin-json.py <template> <out dir> <platform> <binary asset> [<published plugin.json>]
 

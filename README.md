@@ -73,15 +73,15 @@ binary per platform. `tools/release/publish.sh` makes one on the owner's
 Mac, from a clean tree:
 
 ```sh
-BUWIZ_BROKER_BIN=<buwiz-bot>/broker/target/release/rox-broker tools/release/publish.sh            # dist/release/ only
-BUWIZ_BROKER_BIN=<buwiz-bot>/broker/target/release/rox-broker tools/release/publish.sh --publish  # and the GitHub release
+BUWIZ_BROKER_BIN=<buwiz-bot>/broker/target/release/buwiz-broker tools/release/publish.sh            # dist/release/ only
+BUWIZ_BROKER_BIN=<buwiz-bot>/broker/target/release/buwiz-broker tools/release/publish.sh --publish  # and the GitHub release
 ```
 
 It builds this machine's binary, signs the served manifest with
-`rox-broker sign-manifest`, writes `plugin.json` and signs its `buwiz`
+`buwiz-broker sign-manifest`, writes `plugin.json` and signs its `buwiz`
 block (`sign-manifest --block buwiz`), both with `gc-2026-01` from the
 login Keychain: two Keychain prompts. `--trust <trust.json>` also checks
-the result as the Bot does (`rox-broker manifest verify` and
+the result as the Bot does (`buwiz-broker manifest verify` and
 `manifest package`). For a local check without the real key, sign with a
 throwaway seed file and a trust store that names its public key:
 
@@ -98,7 +98,7 @@ to the same release: it takes the release's `plugin.json`, adds the
 binary, signs it again and uploads both.
 
 `cargo test` with `BUWIZ_BROKER_BIN` set also signs the package with a
-throwaway key and checks it with `rox-broker manifest package`.
+throwaway key and checks it with `buwiz-broker manifest package`.
 
 ## Parity with the Node plugin ends
 
@@ -109,5 +109,5 @@ Gmail's API with the Bot's Google account instead, so GWS-06 parity ends:
 the Node plugin stays on workspace-mcp. The tools' input schemas and
 result shapes are unchanged.
 
-`src/v1` (JCS and keys) is a copy of the Bot's `rox-v1` crate. Keep it in
+`src/v1` (JCS and keys) is a copy of the Bot's `buwiz-protocol` crate (formerly `rox-v1`). Keep it in
 step with the Bot's, so the signed bytes match.

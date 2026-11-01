@@ -16,8 +16,9 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinSet;
 
+use crate::accounts::Accounts;
+use crate::gmail::Gmail;
 use crate::reserved::{self, Key};
-use crate::upstream::Upstream;
 use crate::{config, tools};
 
 const LATEST: &str = "2025-11-25";
@@ -51,7 +52,8 @@ impl Error {
 #[derive(Default)]
 struct Plugin {
     key: Key,
-    upstream: Upstream,
+    accounts: Accounts,
+    gmail: Gmail,
 }
 
 /// Serves until stdin ends (after the requests in flight) or a SIGTERM.
@@ -113,7 +115,7 @@ pub async fn serve() -> std::io::Result<()> {
         });
         while tasks.try_join_next().is_some() {}
     }
-    // stdin is done: answer what is in flight, then go (the upstream with us)
+    // stdin is done: answer what is in flight, then go
     tokio::select! {
         _ = async { while tasks.join_next().await.is_some() {} } => {}
         _ = term.recv() => {}
@@ -168,7 +170,7 @@ async fn handle(plugin: &Plugin, method: &str, params: Option<&Value>) -> Result
 
 async fn call_tool(plugin: &Plugin, name: &str, args: &Value) -> Result<Value, Error> {
     if reserved::NAMES.contains(&name) {
-        return reserved::call(&plugin.key, name, args).map_err(Error::internal);
+        return reserved::call(&plugin.key, &plugin.accounts, name, args).map_err(Error::internal);
     }
     if is_reserved_name(name) {
         return Err(Error::mcp(METHOD_NOT_FOUND, &format!("{name} is not a tool of this plugin")));
@@ -180,7 +182,7 @@ async fn call_tool(plugin: &Plugin, name: &str, args: &Value) -> Result<Value, E
     if !tools::has(name) {
         return Err(Error::mcp(INVALID_PARAMS, &format!("no tool {name}")));
     }
-    Ok(tools::run(&plugin.upstream, name, args).await)
+    Ok(tools::run(&plugin.gmail, &plugin.accounts, name, args).await)
 }
 
 /// `^buwiz\.[a-z.]+$` (grammar.mjs `reservedTool`).

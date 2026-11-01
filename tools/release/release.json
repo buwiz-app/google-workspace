@@ -1,7 +1,0 @@
-{
-  "run": { "args": ["mcp"], "env": { "GWS_MANIFEST": "{manifest}" } },
-  "needs_env": [
-    { "key": "GWS_UPSTREAM", "label": "workspace-mcp settings (compact JSON)", "secret": true },
-    { "key": "GWS_USER_EMAIL", "label": "Google address to read", "secret": false }
-  ]
-}

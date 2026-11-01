@@ -1,0 +1,33 @@
+{
+  "name": "google-workspace",
+  "version": "1.2.0",
+  "description": "Read-only Gmail search and reading for Buwiz routines and the agent, with the Google account you sign in to in Buwiz Bot.",
+  "author": { "name": "Buwiz" },
+  "homepage": "https://github.com/buwiz-app/google-workspace",
+  "mcpServers": {
+    "gws": {
+      "command": "${PLUGIN_ROOT}/bin/buwiz-gws",
+      "args": ["mcp"],
+      "env": { "GWS_MANIFEST": "${PLUGIN_ROOT}/manifest.signed.json" }
+    }
+  },
+  "buwiz": {
+    "protocol": "2.1.0",
+    "id": "app.buwiz.google-workspace",
+    "short": "gws",
+    "version": "1.2.0",
+    "server": "gws",
+    "accounts": [
+      {
+        "id": "google",
+        "provider": "google",
+        "label": "Google account",
+        "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+        "required": true
+      }
+    ],
+    "files": {},
+    "binaries": {},
+    "publisher": { "id": "app.buwiz", "key_id": "gc-2026-01" }
+  }
+}

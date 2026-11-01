@@ -1,15 +1,18 @@
-//! The reserved tools (spec 7.8), as the fixture has them: the key in
-//! memory only, provision first. The plugin has no apps, so session opens
-//! are refused, and no tickets, so every ticket is invalid.
+//! The reserved tools (spec 7.8, and 2.1 §5's account pair), as the
+//! fixture has them: the key in memory only, provision first; the pushed
+//! Google token in memory only (`crate::accounts`). The plugin has no apps,
+//! so session opens are refused, and no tickets, so every ticket is
+//! invalid.
 
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
+use crate::accounts::Accounts;
 use crate::tools::{fail, ok};
 use crate::{config, js};
 
-pub const NAMES: [&str; 5] = ["buwiz.provision", "buwiz.session.open", "buwiz.session.close", "buwiz.ticket.resolve", "buwiz.uninstall"];
+pub const NAMES: [&str; 7] = ["buwiz.provision", "buwiz.session.open", "buwiz.session.close", "buwiz.ticket.resolve", "buwiz.uninstall", "buwiz.account.set", "buwiz.account.clear"];
 
 /// The provisioned key: memory only (4.3), never logged, written or echoed.
 #[derive(Default)]
@@ -23,9 +26,11 @@ impl Key {
 
 /// A reserved tool's result, or an error thrown to the caller as JSON-RPC
 /// -32603 (a bad seed, an unreadable manifest).
-pub fn call(key: &Key, name: &str, args: &Value) -> Result<Value, String> {
+pub fn call(key: &Key, accounts: &Accounts, name: &str, args: &Value) -> Result<Value, String> {
     Ok(match name {
         "buwiz.provision" => return provision(key, args),
+        "buwiz.account.set" => accounts.set(args),
+        "buwiz.account.clear" => accounts.clear(args),
         "buwiz.session.open" => fail("invalid_args", &format!("no app {}: this plugin has no apps", js::slice_utf16(&js::string(args.get("app")), 60))),
         "buwiz.ticket.resolve" => ok(json!({"valid": false})),
         _ => ok(json!({"ok": true})),

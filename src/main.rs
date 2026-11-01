@@ -5,31 +5,24 @@
 //!
 //! v1 routines read mail only through `reads`, from read-only tools of an
 //! approved plugin (spec 5.9, Q1); this plugin is that source. It holds no
-//! Google credentials of its own: it proxies to the user's own Google
-//! Workspace MCP server (workspace-mcp), started from `GWS_UPSTREAM` with
-//! the account from `GWS_USER_EMAIL` (both from the install record's env,
-//! see `config`). The upstream answers in text ("Message ID: …" lines,
-//! "--- BODY ---" sections); gws_search_mail and gws_read_mail turn that
-//! into structured items. A missing or failing upstream is a plain isError
-//! result, never a crash.
-//!
-//! It answers byte for byte as the Bot's Node plugin
-//! (buwiz-bot/buwiz-bot `server/src/v1/plugins/google-workspace/
-//! server.mjs`), which it replaces; the Bot's
-//! `server/test/v1-gws.test.mjs` runs against either (`GWS_CMD`).
+//! Google credentials of its own: Buwiz Bot signs the user in to Google
+//! (the `google` account its plugin.json declares, extension format 2.1
+//! §4) and pushes the access token with `buwiz.account.set`; the mail tools
+//! call Gmail's REST API with it. Without a token they answer
+//! `account_required`, and the Bot asks the user to sign in.
 
 use std::io::Write as _;
 use std::process::ExitCode;
 
+mod accounts;
 mod config;
+#[cfg(test)]
+mod fake_gmail;
 mod gmail;
 mod js;
-#[allow(dead_code, reason = "a verbatim copy of the Bot's rox-mcp client, kept diffable: the broker uses the rest")]
-mod mcp;
 mod reserved;
 mod rpc;
 mod tools;
-mod upstream;
 mod v1;
 
 const USAGE: &str = "usage: buwiz-gws [mcp]\n       buwiz-gws manifest";
@@ -47,8 +40,8 @@ fn main() -> ExitCode {
                 }
             };
             let served = rt.block_on(rpc::serve());
-            // drops the tasks (the upstream with them: kill on drop) without
-            // waiting on the thread still blocked reading an open stdin
+            // drops the tasks without waiting on the thread still blocked
+            // reading an open stdin
             rt.shutdown_timeout(std::time::Duration::from_millis(500));
             match served {
                 Ok(()) => ExitCode::SUCCESS,

@@ -1,19 +1,37 @@
 # Google Workspace for Buwiz Bot
 
 `buwiz-gws` is Buwiz Bot's first-party Google Workspace plugin,
-`app.buwiz.google-workspace` (mini app protocol 2.0.0). It is a stdio MCP
-server with two read-only tools, `gws_search_mail` and `gws_read_mail`.
-They are the mail source v1 routines read through.
+`app.buwiz.google-workspace`: a Buwiz extension format 2.1 package (mini
+app protocol 2.1.0). It is a stdio MCP server with two read-only tools,
+`gws_search_mail` and `gws_read_mail`. They are the mail source v1
+routines read through.
 
-It holds no Google credentials of its own. It proxies to the user's own
-Google Workspace MCP server (workspace-mcp),
-which it starts on the first mail call. Two values from the install
-record's environment configure it:
-- `GWS_UPSTREAM`: the upstream's command, as compact JSON;
-- `GWS_USER_EMAIL`: the account.
-
-A missing or failing upstream gives a plain `isError` result, never a
+It holds no Google credentials of its own. Its `plugin.json` declares one
+account, `google` (scope `gmail.readonly`); Buwiz Bot signs you in to it
+and pushes the access token with `buwiz.account.set` (after provision,
+after sign-in and after each refresh) and takes it back with
+`buwiz.account.clear`. The plugin keeps the token in memory only and calls
+Gmail's REST API with it. Without a token (none pushed, expired, or Gmail
+answering 401) a mail tool answers `isError` with
+`{code: "account_required", account: "google"}`, and the Bot asks you in
+the chat to sign in. Other failures are a plain `isError` result, never a
 crash.
+
+## Install and sign in
+
+1. Ask Buwiz Bot's agent to install `https://github.com/buwiz-app/google-workspace`.
+   A card in the chat lists the package (its Google account among it);
+   review and install it.
+2. Add your Google OAuth client once in Buwiz Bot's Setup (the shared
+   Google client that Google connectors use) if you have not.
+3. Open the plugin's page in Buwiz Bot, and under Accounts, sign in to
+   Google. If a routine or the agent reads mail before you sign in, a
+   "Sign in to Google" card shows up in the chat.
+
+Buwiz Bot 2.1 is needed: a 2.0 Bot cannot install 1.2.0 (its served
+manifest is protocol 2.1.0, and a 2.0 Bot never pushes an account). On a
+2.0 Bot, install 1.1.0 by its release URL,
+`https://github.com/buwiz-app/google-workspace/releases/tag/v1.1.0`.
 
 ## Commands
 
@@ -22,8 +40,9 @@ buwiz-gws mcp        # serve MCP on stdio (what the Bot's broker spawns); also t
 buwiz-gws manifest   # print the unsigned manifest
 ```
 
-The plugin reads its signed manifest from `GWS_MANIFEST`. Without it, it
-reads `buwiz-gws.manifest.json` next to the binary.
+The plugin reads its signed manifest from `GWS_MANIFEST` (plugin.json sets
+it to `${PLUGIN_ROOT}/manifest.signed.json`). Without it, it reads
+`buwiz-gws.manifest.json` next to the binary.
 
 ## Build and test
 
@@ -35,39 +54,55 @@ cargo build --release --locked
 The Bot builds it from a pinned commit of this repo
 (`plugins/google-workspace/rev` in buwiz-bot/buwiz-bot).
 
-## Signing the manifest
+## The package
 
-The Bot's broker refuses an unsigned manifest. The publisher key
-`gc-2026-01` lives in the owner's login Keychain. The Bot's
-`scripts/gws-install-wizard` signs `buwiz-gws manifest` with
-`rox-broker sign-manifest`. A release takes the signed manifest from the
-`GWS_MANIFEST_JSON` secret.
+`package/plugin.json` is the package's source: `mcpServers.gws` runs
+`${PLUGIN_ROOT}/bin/buwiz-gws mcp`, and its `buwiz` block names the mini
+app (id, short, version, protocol 2.1.0), its `google` account and the
+publisher key `gc-2026-01`. The release script fills in `buwiz.files` (the
+signed served manifest) and `buwiz.binaries` (one per platform), each with
+its sha256, and signs the block. Keep its versions equal to `manifest.json`
+and `Cargo.toml` (`cargo test` checks).
 
 ## Releasing
 
-A GitHub release is what Buwiz Bot's agent installs from: ask it to
-install `https://github.com/buwiz-app/google-workspace`, and a card in the
-chat asks you to review and install it. `tools/release/publish.sh` makes
-one on the owner's Mac:
+A GitHub release is what Buwiz Bot installs from. Its assets are
+`plugin.json`, `manifest.signed.json` and one `buwiz-gws-<os>-<arch>`
+binary per platform. `tools/release/publish.sh` makes one on the owner's
+Mac, from a clean tree:
 
 ```sh
 BUWIZ_BROKER_BIN=<buwiz-bot>/broker/target/release/rox-broker tools/release/publish.sh            # dist/release/ only
 BUWIZ_BROKER_BIN=<buwiz-bot>/broker/target/release/rox-broker tools/release/publish.sh --publish  # and the GitHub release
 ```
 
-It builds this machine's binary, then signs the manifest and the release
-index `buwiz-release.json` with `gc-2026-01` (two Keychain prompts). The
-index lists each asset's sha256, how the Bot runs the plugin and the
-environment it asks you for at install (`tools/release/release.json`). Run
-it on another platform to add that platform's binary to the same release.
+It builds this machine's binary, signs the served manifest with
+`rox-broker sign-manifest`, writes `plugin.json` and signs its `buwiz`
+block (`sign-manifest --block buwiz`), both with `gc-2026-01` from the
+login Keychain: two Keychain prompts. `--trust <trust.json>` also checks
+the result as the Bot does (`rox-broker manifest verify` and
+`manifest package`). For a local check without the real key, sign with a
+throwaway seed file and a trust store that names its public key:
 
-## Parity with the Node plugin
+```sh
+BUWIZ_BROKER_BIN=… tools/release/publish.sh --key-file <seed file> --trust <trust.json>
+```
 
-`buwiz-gws` answers byte for byte as the Bot's Node plugin
-(`server/src/v1/plugins/google-workspace/server.mjs`), which it replaces.
-To check it, run the Bot's `server/test/v1-gws.test.mjs` with `GWS_CMD`
-set to this binary. GWS-06 compares the two.
+Run it with `--publish` on another platform to add that platform's binary
+to the same release: it takes the release's `plugin.json`, adds the
+binary, signs it again and uploads both.
 
-`src/v1` (JCS and keys) and `src/mcp.rs` (the stdio MCP client) are copies
-of the Bot's `rox-v1` and `rox-mcp` crates. Keep them in step with the
-Bot's, so the signed bytes match.
+`cargo test` with `BUWIZ_BROKER_BIN` set also signs the package with a
+throwaway key and checks it with `rox-broker manifest package`.
+
+## Parity with the Node plugin ends
+
+Up to 1.1.0, `buwiz-gws` answered byte for byte as the Bot's Node plugin
+(`server/src/v1/plugins/google-workspace/server.mjs`) over the user's
+workspace-mcp, and the Bot's GWS-06 test compared the two. 1.2.0 reads
+Gmail's API with the Bot's Google account instead, so GWS-06 parity ends:
+the Node plugin stays on workspace-mcp. The tools' input schemas and
+result shapes are unchanged.
+
+`src/v1` (JCS and keys) is a copy of the Bot's `rox-v1` crate. Keep it in
+step with the Bot's, so the signed bytes match.

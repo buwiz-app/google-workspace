@@ -6,7 +6,7 @@
 //! v1 routines read mail only through `reads`, from read-only tools of an
 //! approved plugin (spec 5.9, Q1); this plugin is that source. It holds no
 //! Google credentials of its own: Buwiz Bot signs the user in to Google
-//! (the `google` account its plugin.json declares, extension format 2.1
+//! (the `google` account its plugin.json declares, mini app protocol 1.0
 //! §4) and pushes the access token with `buwiz.account.set`; the mail tools
 //! call Gmail's REST API with it. Without a token they answer
 //! `account_required`, and the Bot asks the user to sign in.

@@ -1,4 +1,4 @@
-//! package/plugin.json, the 2.1 package's source: it agrees with the
+//! package/plugin.json, the 1.0 package's source: it agrees with the
 //! served manifest, and (with `BUWIZ_BROKER_BIN` set to a rox-broker build)
 //! what the release script makes of it is signed with a throwaway key and
 //! passes `rox-broker manifest package` and `manifest verify` as Buwiz Bot
@@ -91,7 +91,7 @@ fn the_signed_package_passes_the_bots_checks() {
 
     let served = broker(&bin, &["manifest", "verify"], Some(&json!({"text": std::fs::read_to_string(dir.join("manifest.signed.json")).unwrap(), "trust": trust})));
     assert_eq!(served["ok"], true, "{served}");
-    assert_eq!((served["value"]["manifest"]["protocol"].as_str(), served["value"]["manifest"]["version"].as_str()), (Some("2.1.0"), Some("1.2.0")));
+    assert_eq!((served["value"]["manifest"]["protocol"].as_str(), served["value"]["manifest"]["version"].as_str()), (Some("1.0.0"), Some("1.3.0")));
 
     let text = std::fs::read_to_string(&signed).unwrap();
     let p = broker(&bin, &["manifest", "package"], Some(&json!({"text": text, "trust": trust, "platform": "macos-aarch64"})));
@@ -103,7 +103,7 @@ fn the_signed_package_passes_the_bots_checks() {
     assert_eq!(
         p["value"],
         json!({
-            "id": "app.buwiz.google-workspace", "short": "gws", "version": "1.2.0", "server": "gws",
+            "id": "app.buwiz.google-workspace", "short": "gws", "version": "1.3.0", "server": "gws",
             "accounts": [{"id": "google", "provider": "google", "label": "Google account", "scopes": ["https://www.googleapis.com/auth/gmail.readonly"], "required": true}],
             "files": [{"path": "manifest.signed.json", "asset": "manifest.signed.json", "sha256": sha("manifest.signed.json")}],
             "binary": {"path": "bin/buwiz-gws", "asset": "buwiz-gws-macos-aarch64", "sha256": sha("buwiz-gws-macos-aarch64")},

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds buwiz-gws for this machine and writes a Buwiz extension format 2.1
+# Builds buwiz-gws for this machine and writes a Buwiz mini app protocol 1.0
 # GitHub release's assets to dist/release/ (flat names, as GitHub's are):
 #   buwiz-gws-<os>-<arch>    the binary (os, arch as Rust names them);
 #                            installed at bin/buwiz-gws
@@ -106,7 +106,7 @@ if [ "$EXISTS" = 1 ]; then
   gh release upload "$TAG" -R "$GH_REPO" --clobber "$OUT/$BIN_ASSET" "$OUT/plugin.json"
 else
   gh release create "$TAG" -R "$GH_REPO" --target "$COMMIT" --title "buwiz-gws $VERSION" \
-    --notes "Google Workspace plugin $VERSION (app.buwiz.google-workspace), Buwiz extension format 2.1: Gmail with the Google account you sign in to in Buwiz Bot. Install it by asking Buwiz Bot's agent to install https://github.com/$GH_REPO" \
+    --notes "Google Workspace plugin $VERSION (app.buwiz.google-workspace), Buwiz mini app protocol 1.0: Gmail with the Google account you sign in to in Buwiz Bot. Install it by asking Buwiz Bot's agent to install https://github.com/$GH_REPO" \
     "$OUT/$BIN_ASSET" "$OUT/manifest.signed.json" "$OUT/plugin.json"
 fi
 echo "published $TAG" >&2

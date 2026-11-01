@@ -1,4 +1,4 @@
-//! The Google account Buwiz Bot signs the user in to (extension format 2.1
+//! The Google account Buwiz Bot signs the user in to (mini app protocol 1.0
 //! §4). The Bot pushes its access token with `buwiz.account.set` after
 //! provision, after sign-in and after each refresh, and takes it back with
 //! `buwiz.account.clear` after sign-out, removal or a failed refresh. The

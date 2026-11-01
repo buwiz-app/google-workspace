@@ -1,8 +1,8 @@
 # Google Workspace for Buwiz Bot
 
 `buwiz-gws` is Buwiz Bot's first-party Google Workspace plugin,
-`app.buwiz.google-workspace`: a Buwiz extension format 2.1 package (mini
-app protocol 2.1.0). It is a stdio MCP server with two read-only tools,
+`app.buwiz.google-workspace`: a Buwiz mini app protocol 1.0 package (protocol
+1.0.0). It is a stdio MCP server with two read-only tools,
 `gws_search_mail` and `gws_read_mail`. They are the mail source v1
 routines read through.
 
@@ -28,10 +28,11 @@ crash.
    Google. If a routine or the agent reads mail before you sign in, a
    "Sign in to Google" card shows up in the chat.
 
-Buwiz Bot 2.1 is needed: a 2.0 Bot cannot install 1.2.0 (its served
-manifest is protocol 2.1.0, and a 2.0 Bot never pushes an account). On a
-2.0 Bot, install 1.1.0 by its release URL,
-`https://github.com/buwiz-app/google-workspace/releases/tag/v1.1.0`.
+A Buwiz Bot on protocol 1.0 is needed. Earlier Bots ran pre-release
+numbers of the protocol: on a 2.1 Bot install 1.2.0
+(`https://github.com/buwiz-app/google-workspace/releases/tag/v1.2.0`), on a
+2.0 Bot 1.1.0
+(`https://github.com/buwiz-app/google-workspace/releases/tag/v1.1.0`).
 
 ## Commands
 
@@ -58,7 +59,7 @@ The Bot builds it from a pinned commit of this repo
 
 `package/plugin.json` is the package's source: `mcpServers.gws` runs
 `${PLUGIN_ROOT}/bin/buwiz-gws mcp`, and its `buwiz` block names the mini
-app (id, short, version, protocol 2.1.0), its `google` account and the
+app (id, short, version, protocol 1.0.0), its `google` account and the
 publisher key `gc-2026-01`. The release script fills in `buwiz.files` (the
 signed served manifest) and `buwiz.binaries` (one per platform), each with
 its sha256, and signs the block. Keep its versions equal to `manifest.json`

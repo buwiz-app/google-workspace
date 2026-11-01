@@ -1,4 +1,4 @@
-//! The reserved tools (spec 7.8, and 2.1 §5's account pair), as the
+//! The reserved tools (protocol 1.0: the lifecycle tools and the account pair), as the
 //! fixture has them: the key in memory only, provision first; the pushed
 //! Google token in memory only (`crate::accounts`). The plugin has no apps,
 //! so session opens are refused, and no tickets, so every ticket is

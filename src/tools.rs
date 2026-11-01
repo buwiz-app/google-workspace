@@ -52,7 +52,7 @@ pub fn has(name: &str) -> bool {
     name == "gws_search_mail" || name == "gws_read_mail"
 }
 
-/// A tool that needs the Google account the Bot has not pushed (2.1 §4):
+/// A tool that needs the Google account the Bot has not pushed (protocol 1.0, accounts):
 /// the host turns it into a "Sign in to Google" card.
 pub fn account_required() -> Value {
     json!({"content": [{"type": "text", "text": SIGN_IN}], "structuredContent": {"code": "account_required", "account": GOOGLE, "message": SIGN_IN}, "isError": true})

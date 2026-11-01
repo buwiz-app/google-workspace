@@ -172,17 +172,6 @@ pub fn round(x: f64) -> f64 {
     }
 }
 
-/// JavaScript truthiness.
-pub fn truthy(v: Option<&Value>) -> bool {
-    match v {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().is_some_and(|f| f != 0.0 && !f.is_nan()),
-        Some(Value::String(s)) => !s.is_empty(),
-        _ => true,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

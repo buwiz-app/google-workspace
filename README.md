@@ -89,6 +89,10 @@ throwaway seed file and a trust store that names its public key:
 BUWIZ_BROKER_BIN=… tools/release/publish.sh --key-file <seed file> --trust <trust.json>
 ```
 
+Add `--prerelease` to publish a release that Buwiz Bot does not install
+from the repo URL yet (a coordinated switch); mark it latest on GitHub
+later.
+
 Run it with `--publish` on another platform to add that platform's binary
 to the same release: it takes the release's `plugin.json`, adds the
 binary, signs it again and uploads both.

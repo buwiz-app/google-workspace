@@ -14,6 +14,9 @@
 # when it exists (another platform's run), adds this platform's binary to
 # its plugin.json, re-signs that and uploads both.
 #
+#   --prerelease       mark a new release as a pre-release: Buwiz Bot's
+#                      install from the repo URL reads the latest release,
+#                      which skips pre-releases (for a coordinated switch)
 #   --key-file <path>  sign with a seed file instead (a throwaway key for
 #                      local checks; never with --publish)
 #   --trust <file>     check the result as Buwiz Bot does (`rox-broker
@@ -27,14 +30,16 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="$REPO_DIR/dist/release"
 GH_REPO=buwiz-app/google-workspace
 PUBLISH=0
+PRERELEASE=()
 KEY_FILE=
 TRUST=
 while [ $# -gt 0 ]; do
   case "$1" in
     --publish) PUBLISH=1 ;;
+    --prerelease) PRERELEASE=(--prerelease) ;;
     --key-file) KEY_FILE="${2:?--key-file needs a path}"; shift ;;
     --trust) TRUST="${2:?--trust needs a file}"; shift ;;
-    *) echo "usage: publish.sh [--publish] [--key-file <seed file>] [--trust <trust.json>]" >&2; exit 2 ;;
+    *) echo "usage: publish.sh [--publish [--prerelease]] [--key-file <seed file>] [--trust <trust.json>]" >&2; exit 2 ;;
   esac
   shift
 done
@@ -105,7 +110,7 @@ echo "dist/release: $TAG for $PLATFORM at $COMMIT" >&2
 if [ "$EXISTS" = 1 ]; then
   gh release upload "$TAG" -R "$GH_REPO" --clobber "$OUT/$BIN_ASSET" "$OUT/plugin.json"
 else
-  gh release create "$TAG" -R "$GH_REPO" --target "$COMMIT" --title "buwiz-gws $VERSION" \
+  gh release create "$TAG" -R "$GH_REPO" --target "$COMMIT" ${PRERELEASE[@]+"${PRERELEASE[@]}"} --title "buwiz-gws $VERSION" \
     --notes "Google Workspace plugin $VERSION (app.buwiz.google-workspace), Buwiz mini app protocol 1.0: Gmail with the Google account you sign in to in Buwiz Bot. Install it by asking Buwiz Bot's agent to install https://github.com/$GH_REPO" \
     "$OUT/$BIN_ASSET" "$OUT/manifest.signed.json" "$OUT/plugin.json"
 fi

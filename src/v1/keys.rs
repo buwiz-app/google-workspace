@@ -1,7 +1,7 @@
 //! The key pieces of the mini app protocol this plugin needs (spec 4):
 //! base64url without padding, sha256 as lowercase hex, and the public half
-//! of the key the Bot provisions. Copied from the Bot's `rox-v1` crate
-//! (`broker/rox-v1/src/keys.rs`), with the parts the plugin never calls
+//! of the key the Bot provisions. Copied from the Bot's `buwiz-protocol` crate (formerly `rox-v1`)
+//! (`broker/buwiz-protocol/src/keys.rs`), with the parts the plugin never calls
 //! left out.
 
 use base64::Engine as _;

@@ -1,7 +1,7 @@
 //! `buwiz-gws [mcp]`: the first-party Google Workspace plugin, id
 //! app.buwiz.google-workspace, short `gws`, as a stdio MCP server
 //! (what Buwiz Bot's broker spawns). `buwiz-gws manifest`: print the
-//! unsigned manifest, for the signing step (`rox-broker sign-manifest`).
+//! unsigned manifest, for the signing step (`buwiz-broker sign-manifest`).
 //!
 //! v1 routines read mail only through `reads`, from read-only tools of an
 //! approved plugin (spec 5.9, Q1); this plugin is that source. It holds no

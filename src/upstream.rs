@@ -1,11 +1,11 @@
 //! The user's Google Workspace MCP server (workspace-mcp), started on the
 //! first mail call from `GWS_UPSTREAM` and kept while it lives, over the
-//! stdio client rox-broker uses (`rox-mcp`). Its stderr is ours.
+//! stdio client the Bot's broker uses (`crate::mcp`). Its stderr is ours.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use rox_mcp::{Conn, Hooks, Spec, REQUEST_TIMEOUT};
+use crate::mcp::{Conn, Hooks, Spec, REQUEST_TIMEOUT};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
@@ -45,7 +45,7 @@ impl Upstream {
         let up = config::upstream()?;
         let spec = Spec { command: up.command, args: up.args, env: up.env, inherit_all: false, client: "rox-gws" };
         let could_not = |e: String| format!("the Google Workspace server could not start: {}", js::slice_utf16(&e, 200));
-        let timed = |e: rox_mcp::RpcError| if e.code == REQUEST_TIMEOUT { DID_NOT_ANSWER.to_owned() } else { e.message };
+        let timed = |e: crate::mcp::RpcError| if e.code == REQUEST_TIMEOUT { DID_NOT_ANSWER.to_owned() } else { e.message };
         let conn = Conn::connect_within(&spec, Arc::new(Stderr), START_TIMEOUT).await.map_err(|e| could_not(timed(e)))?;
         let tools = match conn.request("tools/list", json!({}), START_TIMEOUT).await {
             Ok(r) => r.get("tools").and_then(Value::as_array).cloned().unwrap_or_default(),

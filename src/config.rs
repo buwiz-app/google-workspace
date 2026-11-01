@@ -16,12 +16,12 @@ use serde_json::{Map, Value};
 
 use crate::js;
 
-/// The signed manifest: `GWS_MANIFEST`, else `rox-gws.manifest.json`
+/// The signed manifest: `GWS_MANIFEST`, else `buwiz-gws.manifest.json`
 /// beside this binary (where the app bundle puts the signed copy).
 pub fn manifest_path() -> PathBuf {
     match std::env::var("GWS_MANIFEST") {
         Ok(p) if !p.is_empty() => PathBuf::from(p),
-        _ => std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("rox-gws.manifest.json"))).unwrap_or_else(|| PathBuf::from("rox-gws.manifest.json")),
+        _ => std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("buwiz-gws.manifest.json"))).unwrap_or_else(|| PathBuf::from("buwiz-gws.manifest.json")),
     }
 }
 

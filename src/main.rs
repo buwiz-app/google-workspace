@@ -1,7 +1,7 @@
-//! `rox-gws [mcp]`: the first-party Google Workspace plugin, id
+//! `buwiz-gws [mcp]`: the first-party Google Workspace plugin, id
 //! app.buwiz.google-workspace, short `gws`, as a stdio MCP server
-//! (what Rox's broker spawns). `rox-gws manifest`: print the unsigned
-//! manifest, for the signing step (`rox-broker sign-manifest`).
+//! (what Buwiz Bot's broker spawns). `buwiz-gws manifest`: print the
+//! unsigned manifest, for the signing step (`rox-broker sign-manifest`).
 //!
 //! v1 routines read mail only through `reads`, from read-only tools of an
 //! approved plugin (spec 5.9, Q1); this plugin is that source. It holds no
@@ -13,9 +13,10 @@
 //! into structured items. A missing or failing upstream is a plain isError
 //! result, never a crash.
 //!
-//! It answers byte for byte as `server/src/v1/plugins/google-workspace/
-//! server.mjs`, which it replaces; `server/test/v1-gws.test.mjs` runs
-//! against either (`GWS_CMD`).
+//! It answers byte for byte as the Bot's Node plugin
+//! (buwiz-bot/buwiz-bot `server/src/v1/plugins/google-workspace/
+//! server.mjs`), which it replaces; the Bot's
+//! `server/test/v1-gws.test.mjs` runs against either (`GWS_CMD`).
 
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -23,12 +24,15 @@ use std::process::ExitCode;
 mod config;
 mod gmail;
 mod js;
+#[allow(dead_code, reason = "a verbatim copy of the Bot's rox-mcp client, kept diffable: the broker uses the rest")]
+mod mcp;
 mod reserved;
 mod rpc;
 mod tools;
 mod upstream;
+mod v1;
 
-const USAGE: &str = "usage: rox-gws [mcp]\n       rox-gws manifest";
+const USAGE: &str = "usage: buwiz-gws [mcp]\n       buwiz-gws manifest";
 const MANIFEST: &str = include_str!("../manifest.json");
 
 fn main() -> ExitCode {
@@ -38,7 +42,7 @@ fn main() -> ExitCode {
             let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(rt) => rt,
                 Err(e) => {
-                    eprintln!("rox-gws: {e}");
+                    eprintln!("buwiz-gws: {e}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -49,7 +53,7 @@ fn main() -> ExitCode {
             match served {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
-                    eprintln!("rox-gws: stdio: {e}");
+                    eprintln!("buwiz-gws: stdio: {e}");
                     ExitCode::FAILURE
                 }
             }

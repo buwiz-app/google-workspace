@@ -1,0 +1,116 @@
+{
+  "about": "RFC 8785 vectors shared by grok-shell (server/v1/jcs.mjs) and Rox. input: JSON text; jcs: canonical text; signable: whether a signed object may carry it (safe integers only); error: input is not I-JSON.",
+  "vectors": [
+    {
+      "name": "empty object",
+      "input": "{}",
+      "jcs": "{}",
+      "signable": true
+    },
+    {
+      "name": "empty array",
+      "input": "[]",
+      "jcs": "[]",
+      "signable": true
+    },
+    {
+      "name": "literals",
+      "input": "[null, true, false]",
+      "jcs": "[null,true,false]",
+      "signable": true
+    },
+    {
+      "name": "key order by UTF-16 code units (RFC 8785 3.2.3)",
+      "input": "{\"\\u20ac\": \"Euro Sign\", \"\\r\": \"Carriage Return\", \"\\ufb33\": \"Hebrew Letter Dalet With Dagesh\", \"1\": \"One\", \"\\ud83d\\ude00\": \"Emoji: Grinning Face\", \"\\u0080\": \"Control\", \"\\u00f6\": \"Latin Small Letter O With Diaeresis\"}",
+      "jcs": "{\"\\r\":\"Carriage Return\",\"1\":\"One\",\"\":\"Control\",\"ö\":\"Latin Small Letter O With Diaeresis\",\"€\":\"Euro Sign\",\"😀\":\"Emoji: Grinning Face\",\"דּ\":\"Hebrew Letter Dalet With Dagesh\"}",
+      "signable": true
+    },
+    {
+      "name": "RFC 8785 3.2.2 sample (non-integers: not signable)",
+      "input": "{\"numbers\":[333333333.33333329,1E30,4.50,2e-3,0.000000000000000000000000001],\"string\":\"\\u20ac$\\u000F\\u000aA'\\u0042\\u0022\\u005c\\\\\\\"\\/\",\"literals\":[null,true,false]}",
+      "jcs": "{\"literals\":[null,true,false],\"numbers\":[333333333.3333333,1e+30,4.5,0.002,1e-27],\"string\":\"€$\\u000f\\nA'B\\\"\\\\\\\\\\\"/\"}",
+      "signable": false
+    },
+    {
+      "name": "string escapes",
+      "input": "[\"\\b\\f\\n\\r\\t\", \"\\u0001\\u001f\", \"\\\"\\\\\", \"\\/\", \"\\u007f\"]",
+      "jcs": "[\"\\b\\f\\n\\r\\t\",\"\\u0001\\u001f\",\"\\\"\\\\\",\"/\",\"\"]",
+      "signable": true
+    },
+    {
+      "name": "unicode passes through unescaped",
+      "input": "{\"name\":\"Dela Cruz Jañe — 日本語 😀\"}",
+      "jcs": "{\"name\":\"Dela Cruz Jañe — 日本語 😀\"}",
+      "signable": true
+    },
+    {
+      "name": "nested objects sort at every level",
+      "input": "{\"b\":{\"z\":1,\"a\":[{\"y\":2,\"x\":3}]},\"a\":{\"d\":4,\"c\":5}}",
+      "jcs": "{\"a\":{\"c\":5,\"d\":4},\"b\":{\"a\":[{\"x\":3,\"y\":2}],\"z\":1}}",
+      "signable": true
+    },
+    {
+      "name": "whitespace removed",
+      "input": " { \"a\" : [ 1 , 2 ] ,\n\t\"b\" : { } } ",
+      "jcs": "{\"a\":[1,2],\"b\":{}}",
+      "signable": true
+    },
+    {
+      "name": "integers",
+      "input": "[0, -0, 1, -1, 9007199254740991, -9007199254740991]",
+      "jcs": "[0,0,1,-1,9007199254740991,-9007199254740991]",
+      "signable": true
+    },
+    {
+      "name": "integer written with exponent and fraction",
+      "input": "[1e3, 1.0, 100E-2, -5e0]",
+      "jcs": "[1000,1,1,-5]",
+      "signable": true
+    },
+    {
+      "name": "unsafe integer (not signable)",
+      "input": "[9007199254740992]",
+      "jcs": "[9007199254740992]",
+      "signable": false
+    },
+    {
+      "name": "fraction (not signable)",
+      "input": "{\"a\":0.5}",
+      "jcs": "{\"a\":0.5}",
+      "signable": false
+    },
+    {
+      "name": "large exponents (not signable)",
+      "input": "[1e21, 1e-7, 123e-20]",
+      "jcs": "[1e+21,1e-7,1.23e-18]",
+      "signable": false
+    },
+    {
+      "name": "a signed envelope",
+      "input": "{\"v\":1,\"typ\":\"buwiz-call\",\"plugin\":\"app.buwiz.ebirforms\",\"app\":\"forms\",\"open_id\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"tool\":\"bir_form_validate\",\"args\":{\"period\":\"2026-09\",\"code\":\"1601C\"},\"ts\":1793000000000,\"nonce\":\"BBBBBBBBBBBBBBBBBBBBBB\"}",
+      "jcs": "{\"app\":\"forms\",\"args\":{\"code\":\"1601C\",\"period\":\"2026-09\"},\"nonce\":\"BBBBBBBBBBBBBBBBBBBBBB\",\"open_id\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"plugin\":\"app.buwiz.ebirforms\",\"tool\":\"bir_form_validate\",\"ts\":1793000000000,\"typ\":\"buwiz-call\",\"v\":1}",
+      "signable": true
+    },
+    {
+      "name": "keys that differ only in case",
+      "input": "{\"a\":1,\"B\":2,\"A\":3,\"b\":4,\"_\":5}",
+      "jcs": "{\"A\":3,\"B\":2,\"_\":5,\"a\":1,\"b\":4}",
+      "signable": true
+    },
+    {
+      "name": "duplicate key",
+      "input": "{\"a\":1,\"a\":2}",
+      "error": true
+    },
+    {
+      "name": "duplicate key, nested",
+      "input": "{\"x\":{\"k\":1,\"k\":1}}",
+      "error": true
+    },
+    {
+      "name": "lone surrogate",
+      "input": "[\"\\ud800\"]",
+      "error": true
+    }
+  ]
+}

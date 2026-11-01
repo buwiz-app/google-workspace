@@ -38,7 +38,7 @@ fn provision(key: &Key, args: &Value) -> Result<Value, String> {
         return Ok(fail("invalid_args", "the key and pub do not match"));
     }
     let seed = k.and_then(|k| k.get("seed")).and_then(Value::as_str).unwrap_or_default();
-    let public = rox_v1::keys::SessionKey::from_seed(seed).map_err(|_| "a seed is 32 bytes of base64url".to_owned())?.public();
+    let public = crate::v1::keys::SessionKey::from_seed(seed).map_err(|_| "a seed is 32 bytes of base64url".to_owned())?.public();
     if args.get("pub").and_then(Value::as_str) != Some(public.as_str()) {
         return Ok(fail("invalid_args", "the key and pub do not match"));
     }
@@ -49,7 +49,7 @@ fn provision(key: &Key, args: &Value) -> Result<Value, String> {
         }
         *held = Some(seed.to_owned());
     }
-    let m = rox_v1::jcs::parse_ijson(&config::manifest_text()?)?;
-    let sha = rox_v1::keys::sha256_hex(&rox_v1::jcs::signed_bytes(&m)?);
+    let m = crate::v1::jcs::parse_ijson(&config::manifest_text()?)?;
+    let sha = crate::v1::keys::sha256_hex(&crate::v1::jcs::signed_bytes(&m)?);
     Ok(ok(json!({"ok": true, "manifest_sha256": sha})))
 }

@@ -43,6 +43,24 @@ The Bot's broker refuses an unsigned manifest. The publisher key
 `rox-broker sign-manifest`. A release takes the signed manifest from the
 `GWS_MANIFEST_JSON` secret.
 
+## Releasing
+
+A GitHub release is what Buwiz Bot's agent installs from: ask it to
+install `https://github.com/buwiz-app/google-workspace`, and a card in the
+chat asks you to review and install it. `tools/release/publish.sh` makes
+one on the owner's Mac:
+
+```sh
+BUWIZ_BROKER_BIN=<buwiz-bot>/broker/target/release/rox-broker tools/release/publish.sh            # dist/release/ only
+BUWIZ_BROKER_BIN=<buwiz-bot>/broker/target/release/rox-broker tools/release/publish.sh --publish  # and the GitHub release
+```
+
+It builds this machine's binary, then signs the manifest and the release
+index `buwiz-release.json` with `gc-2026-01` (two Keychain prompts). The
+index lists each asset's sha256, how the Bot runs the plugin and the
+environment it asks you for at install (`tools/release/release.json`). Run
+it on another platform to add that platform's binary to the same release.
+
 ## Parity with the Node plugin
 
 `buwiz-gws` answers byte for byte as the Bot's Node plugin

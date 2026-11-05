@@ -32,6 +32,10 @@ const FULL_MAX: u64 = 32 * 1024 * 1024;
 pub enum Failure {
     /// No usable token: none pushed, expired, or Gmail answered 401.
     AccountRequired,
+    /// The sign-in doesn't cover this: Gmail answered 403 for its scopes.
+    NeedsAccess,
+    /// Gmail couldn't be reached.
+    Offline(String),
     /// Anything else, as a plain message.
     Plain(String),
 }
@@ -52,43 +56,104 @@ impl Default for Gmail {
 /// A Gmail message id: what the API hands out (hex), so it is safe in a
 /// path as it is.
 pub fn id_ok(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 impl Gmail {
     /// `base` is [`GMAIL_API`] in production; tests pass a local server.
     pub fn new(base: &str) -> Self {
-        let config = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).timeout_global(Some(TIMEOUT)).user_agent("buwiz-gws").build();
-        Self { agent: config.new_agent(), base: base.trim_end_matches('/').to_owned() }
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .timeout_global(Some(TIMEOUT))
+            .user_agent("buwiz-gws")
+            .build();
+        Self {
+            agent: config.new_agent(),
+            base: base.trim_end_matches('/').to_owned(),
+        }
     }
 
     /// A GET of `path` under the base: its JSON, or `None` for a 404.
-    fn get(&self, auth: &Bearer, path: String, query: Vec<(&'static str, String)>, cap: u64) -> Result<Option<Value>, Failure> {
+    fn get(
+        &self,
+        auth: &Bearer,
+        path: String,
+        query: Vec<(&'static str, String)>,
+        cap: u64,
+    ) -> Result<Option<Value>, Failure> {
         let url = format!("{}/{path}", self.base);
-        let mut req = self.agent.get(&url).header("authorization", auth.header()).header("accept", "application/json");
+        let mut req = self
+            .agent
+            .get(&url)
+            .header("authorization", auth.header())
+            .header("accept", "application/json");
         for (k, v) in &query {
             req = req.query(*k, v);
         }
-        let mut res = req.call().map_err(|e| Failure::Plain(format!("could not reach Gmail: {}", js::slice_utf16(&e.to_string(), 200))))?;
+        let mut res = req.call().map_err(|e| {
+            Failure::Offline(format!(
+                "could not reach Gmail: {}",
+                js::slice_utf16(&e.to_string(), 200)
+            ))
+        })?;
         let status = res.status().as_u16();
-        let body = res.body_mut().with_config().limit(cap).read_to_vec().map_err(|e| Failure::Plain(format!("Gmail's answer could not be read: {}", js::slice_utf16(&e.to_string(), 200))))?;
+        let body = res
+            .body_mut()
+            .with_config()
+            .limit(cap)
+            .read_to_vec()
+            .map_err(|e| {
+                Failure::Plain(format!(
+                    "Gmail's answer could not be read: {}",
+                    js::slice_utf16(&e.to_string(), 200)
+                ))
+            })?;
         match status {
-            200 => serde_json::from_slice(&body).map(Some).map_err(|_| Failure::Plain("Gmail's answer is not JSON".to_owned())),
+            200 => serde_json::from_slice(&body)
+                .map(Some)
+                .map_err(|_| Failure::Plain("Gmail's answer is not JSON".to_owned())),
             401 => Err(Failure::AccountRequired),
             404 => Ok(None),
             _ => {
                 let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                let why = v.pointer("/error/message").and_then(Value::as_str).unwrap_or("no reason given");
-                Err(Failure::Plain(format!("Gmail answered {status}: {}", js::slice_utf16(why, 300))))
+                let why = v
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("no reason given");
+                if status == 403 && why.contains("insufficient") {
+                    return Err(Failure::NeedsAccess);
+                }
+                Err(Failure::Plain(format!(
+                    "Gmail answered {status}: {}",
+                    js::slice_utf16(why, 300)
+                )))
             }
         }
     }
 
     /// The ids of the first `max` messages `q` finds.
     pub fn search(&self, auth: &Bearer, q: &str, max: usize) -> Result<Vec<String>, Failure> {
-        let found = self.get(auth, "messages".to_owned(), vec![("q", q.to_owned()), ("maxResults", max.to_string())], SMALL_MAX)?;
-        let list = found.as_ref().and_then(|v| v.get("messages")).and_then(Value::as_array);
-        Ok(list.into_iter().flatten().filter_map(|m| m.get("id").and_then(Value::as_str)).map(str::to_owned).collect())
+        let found = self.get(
+            auth,
+            "messages".to_owned(),
+            vec![("q", q.to_owned()), ("maxResults", max.to_string())],
+            SMALL_MAX,
+        )?;
+        let list = found
+            .as_ref()
+            .and_then(|v| v.get("messages"))
+            .and_then(Value::as_array);
+        Ok(list
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m.get("id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect())
     }
 
     /// Each message's From, Subject, Date and snippet (`format=metadata`),
@@ -103,13 +168,19 @@ impl Gmail {
                     .map(|id| {
                         let mut query = vec![("format", "metadata".to_owned())];
                         query.extend(headers.iter().cloned());
-                        id_ok(id).then(|| scope.spawn(move || self.get(auth, format!("messages/{id}"), query, SMALL_MAX)))
+                        id_ok(id).then(|| {
+                            scope.spawn(move || {
+                                self.get(auth, format!("messages/{id}"), query, SMALL_MAX)
+                            })
+                        })
                     })
                     .collect();
                 let mut got = Vec::with_capacity(gets.len());
                 for g in gets {
                     got.push(match g {
-                        Some(g) => g.join().unwrap_or_else(|_| Err(Failure::Plain("the Gmail request failed".to_owned())))?,
+                        Some(g) => g.join().unwrap_or_else(|_| {
+                            Err(Failure::Plain("the Gmail request failed".to_owned()))
+                        })?,
                         None => None,
                     });
                 }
@@ -120,26 +191,232 @@ impl Gmail {
         Ok(out)
     }
 
+    /// The labels, each with its counts.
+    pub fn labels(&self, auth: &Bearer) -> Result<Vec<Value>, Failure> {
+        let list = self.get(auth, "labels".to_owned(), Vec::new(), SMALL_MAX)?;
+        let ids: Vec<String> = list
+            .iter()
+            .flat_map(|v| {
+                v.get("labels")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|l| l.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        let mut out = Vec::with_capacity(ids.len());
+        for batch in ids.chunks(METADATA_AT_ONCE) {
+            let done: Result<Vec<_>, Failure> = std::thread::scope(|scope| {
+                let gets: Vec<_> = batch
+                    .iter()
+                    .filter(|id| id_ok(id))
+                    .map(|id| {
+                        scope.spawn(move || {
+                            self.get(auth, format!("labels/{id}"), Vec::new(), SMALL_MAX)
+                        })
+                    })
+                    .collect();
+                gets.into_iter()
+                    .map(|g| {
+                        g.join().unwrap_or_else(|_| {
+                            Err(Failure::Plain("the Gmail request failed".to_owned()))
+                        })
+                    })
+                    .collect()
+            });
+            out.extend(done?.into_iter().flatten());
+        }
+        Ok(out)
+    }
+
+    /// The account's latest history id.
+    pub fn history_now(&self, auth: &Bearer) -> Result<Option<String>, Failure> {
+        let profile = self.get(auth, "profile".to_owned(), Vec::new(), SMALL_MAX)?;
+        Ok(profile.and_then(|p| {
+            p.get("historyId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }))
+    }
+
+    /// A page of threads: their ids, and the next page's token.
+    pub fn thread_ids(
+        &self,
+        auth: &Bearer,
+        label: Option<&str>,
+        q: Option<&str>,
+        page: Option<&str>,
+        max: usize,
+    ) -> Result<(Vec<String>, Option<String>), Failure> {
+        let mut query = vec![("maxResults", max.to_string())];
+        query.extend(label.map(|l| ("labelIds", l.to_owned())));
+        query.extend(q.map(|q| ("q", q.to_owned())));
+        query.extend(page.map(|p| ("pageToken", p.to_owned())));
+        let found = self.get(auth, "threads".to_owned(), query, SMALL_MAX)?;
+        let ids = found
+            .iter()
+            .flat_map(|v| {
+                v.get("threads")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|t| t.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        Ok((
+            ids,
+            found
+                .as_ref()
+                .and_then(|v| v.get("nextPageToken"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        ))
+    }
+
+    /// Threads by id, as headers only; `None` for one that's gone.
+    pub fn threads_metadata(
+        &self,
+        auth: &Bearer,
+        ids: &[String],
+    ) -> Result<Vec<Option<Value>>, Failure> {
+        let headers = ["From", "Subject", "Date"].map(|h| ("metadataHeaders", h.to_owned()));
+        let mut out = Vec::with_capacity(ids.len());
+        for batch in ids.chunks(METADATA_AT_ONCE) {
+            let done: Result<Vec<_>, Failure> = std::thread::scope(|scope| {
+                let gets: Vec<_> = batch
+                    .iter()
+                    .map(|id| {
+                        let mut query = vec![("format", "metadata".to_owned())];
+                        query.extend(headers.iter().cloned());
+                        id_ok(id).then(|| {
+                            scope.spawn(move || {
+                                self.get(auth, format!("threads/{id}"), query, SMALL_MAX)
+                            })
+                        })
+                    })
+                    .collect();
+                gets.into_iter()
+                    .map(|g| {
+                        g.map_or(Ok(None), |g| {
+                            g.join().unwrap_or_else(|_| {
+                                Err(Failure::Plain("the Gmail request failed".to_owned()))
+                            })
+                        })
+                    })
+                    .collect()
+            });
+            out.extend(done?);
+        }
+        Ok(out)
+    }
+
+    /// A whole thread, `format=full`.
+    pub fn thread_full(&self, auth: &Bearer, id: &str) -> Result<Option<Value>, Failure> {
+        if !id_ok(id) {
+            return Ok(None);
+        }
+        self.get(
+            auth,
+            format!("threads/{id}"),
+            vec![("format", "full".to_owned())],
+            FULL_MAX,
+        )
+    }
+
+    /// What changed since `start`: the threads touched and the newest history
+    /// id. `None`: `start` is too old, so a full sync is needed.
+    pub fn history(
+        &self,
+        auth: &Bearer,
+        start: &str,
+    ) -> Result<Option<(Vec<String>, String)>, Failure> {
+        let (mut touched, mut newest, mut page) = (Vec::new(), start.to_owned(), None::<String>);
+        loop {
+            let mut query = vec![
+                ("startHistoryId", start.to_owned()),
+                ("maxResults", "500".to_owned()),
+            ];
+            query.extend(page.take().map(|p| ("pageToken", p)));
+            let Some(v) = self.get(auth, "history".to_owned(), query, FULL_MAX)? else {
+                return Ok(None);
+            };
+            for h in v
+                .get("history")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                for kind in [
+                    "messages",
+                    "messagesAdded",
+                    "messagesDeleted",
+                    "labelsAdded",
+                    "labelsRemoved",
+                ] {
+                    for m in h.get(kind).and_then(Value::as_array).into_iter().flatten() {
+                        let thread = m
+                            .pointer("/message/threadId")
+                            .or_else(|| m.get("threadId"))
+                            .and_then(Value::as_str);
+                        if let Some(t) = thread.filter(|t| !touched.iter().any(|x: &String| x == t))
+                        {
+                            touched.push(t.to_owned());
+                        }
+                    }
+                }
+            }
+            if let Some(id) = v.get("historyId").and_then(Value::as_str) {
+                newest = id.to_owned();
+            }
+            match v.get("nextPageToken").and_then(Value::as_str) {
+                Some(next) => page = Some(next.to_owned()),
+                None => return Ok(Some((touched, newest))),
+            }
+        }
+    }
+
     /// One message, `format=full`; `None` when Gmail has no such message.
     pub fn full(&self, auth: &Bearer, id: &str) -> Result<Option<Value>, Failure> {
         if !id_ok(id) {
             return Ok(None);
         }
-        self.get(auth, format!("messages/{id}"), vec![("format", "full".to_owned())], FULL_MAX)
+        self.get(
+            auth,
+            format!("messages/{id}"),
+            vec![("format", "full".to_owned())],
+            FULL_MAX,
+        )
     }
 }
 
 /// A header of a message's `payload` (names are case-insensitive), trimmed;
 /// empty when missing.
 pub fn header(message: &Value, name: &str) -> String {
-    let headers = message.pointer("/payload/headers").and_then(Value::as_array);
-    let found = headers.into_iter().flatten().find(|h| h.get("name").and_then(Value::as_str).is_some_and(|n| n.eq_ignore_ascii_case(name)));
-    js::trim(found.and_then(|h| h.get("value")).and_then(Value::as_str).unwrap_or_default()).to_owned()
+    let headers = message
+        .pointer("/payload/headers")
+        .and_then(Value::as_array);
+    let found = headers.into_iter().flatten().find(|h| {
+        h.get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+    });
+    js::trim(
+        found
+            .and_then(|h| h.get("value"))
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )
+    .to_owned()
 }
 
 /// Gmail's `snippet` (HTML-escaped) as plain text on one line.
 pub fn snippet(message: &Value) -> String {
-    snippet_of(&decode_entities(message.get("snippet").and_then(Value::as_str).unwrap_or_default()))
+    snippet_of(&decode_entities(
+        message
+            .get("snippet")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    ))
 }
 
 /// The message's body as plain text: its first text/plain part, else its
@@ -149,7 +426,12 @@ pub fn body(message: &Value) -> String {
     if let Some(p) = message.get("payload") {
         collect_leaves(p, &mut leaves);
     }
-    let mime = |p: &Value| p.get("mimeType").and_then(Value::as_str).unwrap_or_default().to_ascii_lowercase();
+    let mime = |p: &Value| {
+        p.get("mimeType")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    };
     let text = if let Some(p) = leaves.iter().find(|p| mime(p) == "text/plain") {
         decode_part(p)
     } else if let Some(p) = leaves.iter().find(|p| mime(p) == "text/html") {
@@ -157,15 +439,64 @@ pub fn body(message: &Value) -> String {
     } else {
         String::new()
     };
-    text.replace("\r\n", "\n").trim_end_matches(['\n', '\r', ' ', '\t']).to_owned()
+    text.replace("\r\n", "\n")
+        .trim_end_matches(['\n', '\r', ' ', '\t'])
+        .to_owned()
+}
+
+/// The message's HTML part, as text; `None` when it has none.
+pub fn html_body(message: &Value) -> Option<String> {
+    let mut leaves = Vec::new();
+    if let Some(p) = message.get("payload") {
+        collect_leaves(p, &mut leaves);
+    }
+    let is_html = |p: &&&Value| {
+        p.get("mimeType")
+            .and_then(Value::as_str)
+            .is_some_and(|m| m.eq_ignore_ascii_case("text/html"))
+    };
+    leaves.iter().find(is_html).map(|p| decode_part(p))
+}
+
+/// Attachments: `{name, mime, size, id}`.
+pub fn attachments(message: &Value) -> Vec<Value> {
+    fn walk(part: &Value, out: &mut Vec<Value>) {
+        let name = part
+            .get("filename")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !name.is_empty() {
+            out.push(serde_json::json!({"name": name, "mime": part.get("mimeType"), "size": part.pointer("/body/size"), "id": part.pointer("/body/attachmentId")}));
+        }
+        for p in part
+            .get("parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            walk(p, out);
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(p) = message.get("payload") {
+        walk(p, &mut out);
+    }
+    out
 }
 
 fn collect_leaves<'a>(part: &'a Value, out: &mut Vec<&'a Value>) {
     match part.get("parts").and_then(Value::as_array) {
         Some(parts) if !parts.is_empty() => parts.iter().for_each(|p| collect_leaves(p, out)),
         _ => {
-            let named = part.get("filename").and_then(Value::as_str).is_some_and(|f| !f.is_empty());
-            let attached = part_header(part, "content-disposition").is_some_and(|d| d.trim_start().to_ascii_lowercase().starts_with("attachment"));
+            let named = part
+                .get("filename")
+                .and_then(Value::as_str)
+                .is_some_and(|f| !f.is_empty());
+            let attached = part_header(part, "content-disposition").is_some_and(|d| {
+                d.trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("attachment")
+            });
             if !named && !attached {
                 out.push(part);
             }
@@ -175,22 +506,48 @@ fn collect_leaves<'a>(part: &'a Value, out: &mut Vec<&'a Value>) {
 
 fn part_header<'a>(part: &'a Value, name: &str) -> Option<&'a str> {
     let headers = part.get("headers").and_then(Value::as_array)?;
-    headers.iter().find(|h| h.get("name").and_then(Value::as_str).is_some_and(|n| n.eq_ignore_ascii_case(name))).and_then(|h| h.get("value")).and_then(Value::as_str)
+    headers
+        .iter()
+        .find(|h| {
+            h.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+        .and_then(|h| h.get("value"))
+        .and_then(Value::as_str)
 }
 
 /// A part's `body.data` (base64url, padded or not) as text in its
 /// charset: UTF-8 (invalid bytes replaced), or Latin-1 when it says so.
 fn decode_part(part: &Value) -> String {
-    let data = part.pointer("/body/data").and_then(Value::as_str).unwrap_or_default();
-    let clean: String = data.chars().filter(|c| !c.is_whitespace() && *c != '=').map(|c| match c {
-        '+' => '-',
-        '/' => '_',
-        c => c,
-    }).collect();
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(clean).unwrap_or_default();
-    let ctype = part_header(part, "content-type").unwrap_or_default().to_ascii_lowercase();
-    let charset = ctype.split(';').find_map(|p| p.trim().strip_prefix("charset=")).map(|c| c.trim_matches('"').to_owned()).unwrap_or_default();
-    if matches!(charset.as_str(), "iso-8859-1" | "latin1" | "latin-1" | "windows-1252" | "cp1252") {
+    let data = part
+        .pointer("/body/data")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let clean: String = data
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '=')
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            c => c,
+        })
+        .collect();
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(clean)
+        .unwrap_or_default();
+    let ctype = part_header(part, "content-type")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let charset = ctype
+        .split(';')
+        .find_map(|p| p.trim().strip_prefix("charset="))
+        .map(|c| c.trim_matches('"').to_owned())
+        .unwrap_or_default();
+    if matches!(
+        charset.as_str(),
+        "iso-8859-1" | "latin1" | "latin-1" | "windows-1252" | "cp1252"
+    ) {
         bytes.iter().map(|&b| char::from(b)).collect()
     } else {
         String::from_utf8_lossy(&bytes).into_owned()
@@ -205,7 +562,10 @@ pub fn decode_entities(s: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        let end = rest[1..].find(|c: char| !(c.is_ascii_alphanumeric() || c == '#')).map(|i| i + 1).filter(|&i| rest[i..].starts_with(';'));
+        let end = rest[1..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '#'))
+            .map(|i| i + 1)
+            .filter(|&i| rest[i..].starts_with(';'));
         let decoded = end.and_then(|e| {
             let name = &rest[1..e];
             let c = match name {
@@ -216,7 +576,11 @@ pub fn decode_entities(s: &str) -> String {
                 "apos" => Some('\''),
                 "nbsp" => Some('\u{a0}'),
                 _ => {
-                    let n = name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")).map(|h| u32::from_str_radix(h, 16)).or_else(|| name.strip_prefix('#').map(str::parse::<u32>));
+                    let n = name
+                        .strip_prefix("#x")
+                        .or_else(|| name.strip_prefix("#X"))
+                        .map(|h| u32::from_str_radix(h, 16))
+                        .or_else(|| name.strip_prefix('#').map(str::parse::<u32>));
                     n.and_then(Result::ok).and_then(char::from_u32)
                 }
             };
@@ -237,7 +601,26 @@ pub fn decode_entities(s: &str) -> String {
     out
 }
 
-const BLOCKS: [&str; 18] = ["br", "p", "div", "tr", "li", "ul", "ol", "table", "blockquote", "hr", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article"];
+const BLOCKS: [&str; 18] = [
+    "br",
+    "p",
+    "div",
+    "tr",
+    "li",
+    "ul",
+    "ol",
+    "table",
+    "blockquote",
+    "hr",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "section",
+    "article",
+];
 const SKIPPED: [&str; 4] = ["script", "style", "head", "title"];
 
 /// HTML as plain text: tags gone (a block tag ends its line), script,
@@ -260,11 +643,18 @@ pub fn strip_html(html: &str) -> String {
         }
         let gt = html[lt..].find('>').map_or(html.len(), |n| lt + n + 1);
         let tag = lower[lt + 1..gt].trim_start_matches('/');
-        let name: String = tag.chars().take_while(char::is_ascii_alphanumeric).collect();
+        let name: String = tag
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect();
         i = gt;
         if SKIPPED.contains(&name.as_str()) && !lower[lt + 1..].starts_with('/') {
             let close = format!("</{name}");
-            i = lower[gt..].find(&close).map_or(html.len(), |n| lower[gt + n..].find('>').map_or(html.len(), |m| gt + n + m + 1));
+            i = lower[gt..].find(&close).map_or(html.len(), |n| {
+                lower[gt + n..]
+                    .find('>')
+                    .map_or(html.len(), |m| gt + n + m + 1)
+            });
         } else if BLOCKS.contains(&name.as_str()) {
             text.push('\n');
         } else if name == "td" || name == "th" {
@@ -369,20 +759,32 @@ mod tests {
         assert_eq!(body(&latin), "café");
         let bad_utf8 = json!({"payload": {"mimeType": "text/plain", "body": {"data": "Y2Fm6Q"}}});
         assert_eq!(body(&bad_utf8), "caf\u{fffd}");
-        assert_eq!(body(&json!({"payload": {"mimeType": "image/png", "body": {"data": "AAAA"}}})), "");
+        assert_eq!(
+            body(&json!({"payload": {"mimeType": "image/png", "body": {"data": "AAAA"}}})),
+            ""
+        );
         let attached = json!({"payload": {"mimeType": "multipart/mixed", "parts": [{"mimeType": "text/plain", "headers": [{"name": "Content-Disposition", "value": "attachment"}], "body": {"data": b64("no")}}]}});
         assert_eq!(body(&attached), "");
     }
 
     #[test]
     fn entities_decode_and_unknown_ones_stay() {
-        assert_eq!(decode_entities("It&#39;s &quot;ok&quot; &lt;b&gt; &amp;amp; &copy; AT&T &#xZZ; &"), "It's \"ok\" <b> &amp; &copy; AT&T &#xZZ; &");
+        assert_eq!(
+            decode_entities("It&#39;s &quot;ok&quot; &lt;b&gt; &amp;amp; &copy; AT&T &#xZZ; &"),
+            "It's \"ok\" <b> &amp; &copy; AT&T &#xZZ; &"
+        );
     }
 
     #[test]
     fn html_keeps_one_blank_line_and_drops_skipped_blocks() {
-        assert_eq!(strip_html("<div>a</div><p></p><p></p><div>b</div>"), "a\n\nb");
-        assert_eq!(strip_html("<table><tr><td>x</td><td>y</td></tr></table>"), "x y");
+        assert_eq!(
+            strip_html("<div>a</div><p></p><p></p><div>b</div>"),
+            "a\n\nb"
+        );
+        assert_eq!(
+            strip_html("<table><tr><td>x</td><td>y</td></tr></table>"),
+            "x y"
+        );
         assert_eq!(strip_html("plain < text"), "plain");
         assert_eq!(strip_html("one\ntwo<br>\nthree"), "one two\nthree");
         assert_eq!(strip_html("<SCRIPT>a</SCRIPT>ok<style"), "ok");
@@ -390,11 +792,17 @@ mod tests {
 
     #[test]
     fn snippets_are_one_line_and_capped() {
-        assert_eq!(snippet_of("  See you \u{a0} at\tnoon.\r\n\n"), "See you at noon.");
+        assert_eq!(
+            snippet_of("  See you \u{a0} at\tnoon.\r\n\n"),
+            "See you at noon."
+        );
         let long = format!("{}abcd😀tail", "word ".repeat(39));
         assert_eq!(snippet_of(&long), format!("{}abcd…", "word ".repeat(39)));
         assert_eq!(js::len_utf16(&snippet_of(&"x".repeat(500))), 200);
-        assert_eq!(snippet(&json!({"snippet": "Don&#39;t  forget"})), "Don't forget");
+        assert_eq!(
+            snippet(&json!({"snippet": "Don&#39;t  forget"})),
+            "Don't forget"
+        );
         assert_eq!(snippet(&json!({})), "");
     }
 
@@ -405,7 +813,10 @@ mod tests {
         assert_eq!(big.len(), 65_522 + "…[truncated]".len());
         let three = cap_bytes(&format!("a{}", "€".repeat(30_000)), BODY_MAX);
         assert_eq!(three.len(), 1 + 3 * 21_840 + "…[truncated]".len());
-        let fffd = cap_bytes(&format!("{}\u{fffd}{}", "a".repeat(65_519), "b".repeat(100)), BODY_MAX);
+        let fffd = cap_bytes(
+            &format!("{}\u{fffd}{}", "a".repeat(65_519), "b".repeat(100)),
+            BODY_MAX,
+        );
         assert_eq!(fffd, format!("{}…[truncated]", "a".repeat(65_519)));
         assert_eq!(cap_bytes("short", BODY_MAX), "short");
     }

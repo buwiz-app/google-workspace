@@ -36,12 +36,14 @@ impl Accounts {
 
     /// `buwiz.account.set`'s arguments.
     pub fn set(&self, args: &Value) -> Value {
-        self.held().set(args.as_object().unwrap_or(&serde_json::Map::new()))
+        self.held()
+            .set(args.as_object().unwrap_or(&serde_json::Map::new()))
     }
 
     /// `buwiz.account.clear`'s arguments.
     pub fn clear(&self, args: &Value) -> Value {
-        self.held().clear(args.as_object().unwrap_or(&serde_json::Map::new()))
+        self.held()
+            .clear(args.as_object().unwrap_or(&serde_json::Map::new()))
     }
 
     /// Forgets every token (`buwiz.uninstall`).
@@ -56,7 +58,9 @@ impl Accounts {
 
     /// Who is signed in and what the sign-in covers.
     pub fn signed_in(&self) -> Option<(String, Vec<String>)> {
-        self.held().get(GOOGLE).map(|a| (a.subject.clone(), a.scopes.clone()))
+        self.held()
+            .get(GOOGLE)
+            .map(|a| (a.subject.clone(), a.scopes.clone()))
     }
 }
 
@@ -73,7 +77,13 @@ mod tests {
     }
 
     fn in_an_hour() -> Value {
-        json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3600)
+        json!(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600
+        )
     }
 
     #[test]
@@ -81,9 +91,16 @@ mod tests {
         let a = Accounts::default();
         assert!(a.google().is_none());
         let r = set(&a, "default", TOKEN, in_an_hour());
-        assert!(!r.to_string().contains(TOKEN), "the answer never echoes the token");
+        assert!(
+            !r.to_string().contains(TOKEN),
+            "the answer never echoes the token"
+        );
         assert_eq!(a.google().unwrap().header(), format!("Bearer {TOKEN}"));
-        assert_eq!(format!("{:?}", a.google().unwrap()), "Bearer(…)", "Debug never shows it");
+        assert_eq!(
+            format!("{:?}", a.google().unwrap()),
+            "Bearer(…)",
+            "Debug never shows it"
+        );
         a.clear(&json!({"account": "google", "label": "default"}));
         assert!(a.google().is_none());
         // clearing what is not there is fine
@@ -103,7 +120,10 @@ mod tests {
     fn another_label_serves_when_default_is_missing_and_another_accounts_token_never_does() {
         let a = Accounts::default();
         a.set(&json!({"account": "github", "label": "default", "access_token": "x"}));
-        assert!(a.google().is_none(), "another account's token is not Google's");
+        assert!(
+            a.google().is_none(),
+            "another account's token is not Google's"
+        );
         set(&a, "work", "w", in_an_hour());
         assert_eq!(a.google().unwrap().header(), "Bearer w");
     }
@@ -111,7 +131,12 @@ mod tests {
     #[test]
     fn a_set_without_its_fields_is_refused_without_echoing() {
         let a = Accounts::default();
-        for args in [json!({}), json!({"account": "google", "label": "default"}), json!({"account": "google", "access_token": TOKEN}), json!({"label": "x", "access_token": TOKEN})] {
+        for args in [
+            json!({}),
+            json!({"account": "google", "label": "default"}),
+            json!({"account": "google", "access_token": TOKEN}),
+            json!({"label": "x", "access_token": TOKEN}),
+        ] {
             let r = a.set(&args);
             assert_eq!(r["isError"], true);
             assert!(!r.to_string().contains(TOKEN));

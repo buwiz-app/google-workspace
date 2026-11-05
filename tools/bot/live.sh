@@ -13,6 +13,11 @@
 #      GWS_PORT       the test broker's port (default 8821; never 8787)
 #      GWS_STUB_PORT  the stub's (default 8822); GWS_AGENT_PORT gpui-agent's (default 17481)
 #      GWS_MAILS      how many fake mails (default 200)
+#      GWS_HOSTILE=1  add the stub's hostile mail
+#      GWS_GRANT      the one scope the stub grants, as for an older sign-in
+#      GWS_NO_SIGN_IN=1  stop before sign-in, to see the setup guide
+#      GWS_MODEL_PORT  run tools/bot/standin-model.py there instead of the mock:
+#                     still no real model, and results land in <inst>/model/
 # Everything is fake: a throwaway key, never gc-2026-01; a file keystore, never
 # the Keychain; the stub Google, never a real account.
 set -euo pipefail
@@ -69,21 +74,31 @@ PY
 
 up() {
   keys; package
+  # the stub seeds afresh each start, so the last run's store would hold ids it no longer serves
+  rm -rf "$INST/gws-data"
   local broker app stub
   broker="$(target "$BOT/broker")/debug/buwiz-broker"; app="$(target "$BOT/app")/debug/buwiz-bot"; stub="$(target "$REPO")/debug/gws-fake-google"
-  nohup "$stub" --port "$STUB_PORT" --mails "${GWS_MAILS:-200}" > "$INST/stub.log" 2>&1 & echo $! > "$INST/stub.pid"
+  local hostile=(); [ -z "${GWS_HOSTILE:-}" ] || hostile=(--hostile)
+  [ -z "${GWS_GRANT:-}" ] || hostile+=(--grant "$GWS_GRANT")
+  nohup "$stub" --port "$STUB_PORT" --mails "${GWS_MAILS:-200}" ${hostile[@]+"${hostile[@]}"} > "$INST/stub.log" 2>&1 & echo $! > "$INST/stub.pid"
+  local model=(MOCK=1 ANTHROPIC_BASE_URL=http://127.0.0.1:1)
+  if [ -n "${GWS_MODEL_PORT:-}" ]; then
+    mkdir -p "$INST/model"
+    nohup python3 "$REPO/tools/bot/standin-model.py" "$GWS_MODEL_PORT" "$INST/model" > "$INST/model.log" 2>&1 & echo $! > "$INST/model.pid"
+    model=("ANTHROPIC_BASE_URL=http://127.0.0.1:$GWS_MODEL_PORT" ANTHROPIC_API_KEY=standin)
+  fi
   mkdir -p "$INST/broker" "$INST/gws-data"
   # no real model: the mock answers, every model URL is a dead loopback port,
   # and no key rides in from this shell. Unset, the broker reaches the local
   # opencodex proxy on 8080, which holds the owner's credentials.
   env -u GPUI_AGENT -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u OPENROUTER_API_KEY -u OPENAI_API_KEY -u XAI_API_KEY \
-    MOCK=1 OPENCODEX_URL=http://127.0.0.1:1 ANTHROPIC_BASE_URL=http://127.0.0.1:1 GEN_BASE_URL=http://127.0.0.1:1 \
+    "${model[@]}" OPENCODEX_URL=http://127.0.0.1:1 GEN_BASE_URL=http://127.0.0.1:1 \
     BUWIZ_BROKER_HUB=1 BUWIZ_BROKER_V1_HOST=1 BUWIZ_BROKER_MCP_HOST=1 BUWIZ_BROKER_DATA_DIR="$INST/broker" \
     BUWIZ_TRUST_FILE="$INST/trust.json" BUWIZ_KEYSTORE="file:$INST/keys" BUWIZ_TEST_GOOGLE="http://127.0.0.1:$STUB_PORT" \
     nohup "$broker" --port "$PORT" --data "$INST/broker" --no-node > "$INST/broker.log" 2>&1 & echo $! > "$INST/broker.pid"
   for _ in $(seq 1 100); do [ -s "$INST/broker/host-token" ] && curl -s "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 0.1; done
   install
-  signin
+  [ -n "${GWS_NO_SIGN_IN:-}" ] || signin
   "$BOT/scripts/buwiz-test" --name gws "$app" "$INST" "$AGENT_PORT" "BUWIZ_BACKEND=http://127.0.0.1:$PORT" "BUWIZ_HOST_TOKEN_FILE=$INST/broker/host-token"
 }
 
@@ -121,7 +136,7 @@ agent() {
 }
 
 down() {
-  for f in pid broker.pid stub.pid; do [ -f "$INST/$f" ] && kill "$(cat "$INST/$f")" 2>/dev/null || true; rm -f "$INST/$f"; done
+  for f in pid broker.pid stub.pid model.pid; do [ -f "$INST/$f" ] && kill "$(cat "$INST/$f")" 2>/dev/null || true; rm -f "$INST/$f"; done
 }
 
 case "${1:-}" in

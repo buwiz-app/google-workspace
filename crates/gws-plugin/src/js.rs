@@ -62,14 +62,14 @@ pub fn number(f: f64) -> String {
     } else {
         let e = n - 1;
         let sign = if e < 0 { '-' } else { '+' };
-        let head = if k == 1 { digits.clone() } else { format!("{}.{}", &digits[..1], &digits[1..]) };
+        let head = if k == 1 {
+            digits.clone()
+        } else {
+            format!("{}.{}", &digits[..1], &digits[1..])
+        };
         format!("{head}e{sign}{}", e.abs())
     };
-    if f < 0.0 {
-        format!("-{s}")
-    } else {
-        s
-    }
+    if f < 0.0 { format!("-{s}") } else { s }
 }
 
 /// `String(v)`; `None` is `undefined`.
@@ -80,7 +80,17 @@ pub fn string(v: Option<&Value>) -> String {
         Some(Value::Bool(b)) => b.to_string(),
         Some(Value::Number(n)) => number(n.as_f64().unwrap_or(f64::NAN)),
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(items)) => items.iter().map(|i| if i.is_null() { String::new() } else { string(Some(i)) }).collect::<Vec<_>>().join(","),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|i| {
+                if i.is_null() {
+                    String::new()
+                } else {
+                    string(Some(i))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(","),
         Some(Value::Object(_)) => "[object Object]".to_owned(),
     }
 }
@@ -113,12 +123,21 @@ pub fn string_to_number(s: &str) -> f64 {
     if t.is_empty() {
         return 0.0;
     }
-    for (prefix, radix) in [("0x", 16), ("0X", 16), ("0o", 8), ("0O", 8), ("0b", 2), ("0B", 2)] {
+    for (prefix, radix) in [
+        ("0x", 16),
+        ("0X", 16),
+        ("0o", 8),
+        ("0O", 8),
+        ("0b", 2),
+        ("0B", 2),
+    ] {
         if let Some(rest) = t.strip_prefix(prefix) {
             if rest.is_empty() || !rest.chars().all(|c| c.is_digit(radix)) {
                 return f64::NAN;
             }
-            return rest.chars().fold(0.0, |n, c| n * f64::from(radix) + f64::from(c.to_digit(radix).unwrap_or(0)));
+            return rest.chars().fold(0.0, |n, c| {
+                n * f64::from(radix) + f64::from(c.to_digit(radix).unwrap_or(0))
+            });
         }
     }
     let (sign, body) = match t.as_bytes()[0] {
@@ -165,11 +184,7 @@ pub fn string_to_number(s: &str) -> f64 {
 /// `Math.round(x)`: to the nearest integer, halves up.
 pub fn round(x: f64) -> f64 {
     let f = x.floor();
-    if x - f >= 0.5 {
-        f + 1.0
-    } else {
-        f
-    }
+    if x - f >= 0.5 { f + 1.0 } else { f }
 }
 
 #[cfg(test)]
@@ -194,7 +209,17 @@ mod tests {
         ] {
             assert_eq!(to_number(Some(&v)), n, "{v}");
         }
-        for v in [json!("abc"), json!("1,2"), json!([1, 2]), json!({}), json!("inf"), json!("NaN"), json!("1e"), json!("."), json!("-0x1")] {
+        for v in [
+            json!("abc"),
+            json!("1,2"),
+            json!([1, 2]),
+            json!({}),
+            json!("inf"),
+            json!("NaN"),
+            json!("1e"),
+            json!("."),
+            json!("-0x1"),
+        ] {
             assert!(to_number(Some(&v)).is_nan(), "{v}");
         }
         assert!(to_number(None).is_nan());
@@ -202,7 +227,10 @@ mod tests {
         assert_eq!(string(Some(&json!(12.5))), "12.5");
         assert_eq!(string(Some(&json!(1e21))), "1e+21");
         assert_eq!(string(None), "undefined");
-        assert_eq!((round(2.5), round(-2.5), round(0.49999999999999994)), (3.0, -2.0, 0.0));
+        assert_eq!(
+            (round(2.5), round(-2.5), round(0.49999999999999994)),
+            (3.0, -2.0, 0.0)
+        );
     }
 
     #[test]

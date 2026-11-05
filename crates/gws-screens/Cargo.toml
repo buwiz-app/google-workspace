@@ -11,3 +11,4 @@ publish.workspace = true
 buwiz-app = { git = "https://github.com/buwiz-app/buwiz-sdk", rev = "79883a820597c623c9259cc0fac0c4166bdde093" }
 nsh-core = { git = "https://github.com/hexuria/nsh", rev = "f1461478d3768fb5da872cb697f0b0a48564ee91" }
 serde_json.workspace = true
+tokio = { version = "1", features = ["sync"] }

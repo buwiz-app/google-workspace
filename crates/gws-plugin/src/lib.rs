@@ -10,8 +10,10 @@
 
 pub mod accounts;
 pub mod apis;
+pub mod clean;
 pub mod gmail;
 pub mod js;
+pub mod mail;
 pub mod manifest;
 pub mod serve;
 pub mod tools;
@@ -39,26 +41,50 @@ pub struct Core {
     store_key: Mutex<Option<String>>,
     /// Opened at first use: a store that won't open must not stop mail search.
     store: Mutex<Option<Store>>,
+    /// Wakes the background sync.
+    pub sync: mail::Waker,
+    /// What a card's tickets stand for: a search, or a thread.
+    pub tickets: Mutex<buwiz_plugin::Tickets<mail::Subject>>,
 }
 
 impl Core {
     pub fn new(apis: &Apis, paths: Result<Paths, gws_store::Error>) -> Self {
-        Self { accounts: Accounts::default(), gmail: Gmail::new(&apis.gmail), paths, store_key: Mutex::new(None), store: Mutex::new(None) }
+        Self {
+            accounts: Accounts::default(),
+            gmail: Gmail::new(&apis.gmail),
+            paths,
+            store_key: Mutex::new(None),
+            store: Mutex::new(None),
+            sync: mail::Waker::default(),
+            tickets: Mutex::default(),
+        }
     }
 
     /// `buwiz.provision`'s seed, accepted: the store can open from here on.
     pub fn unlock(&self, seed: &str) {
-        *self.store_key.lock().unwrap_or_else(|e| e.into_inner()) = Some(gws_store::key_from_seed(seed));
+        *self.store_key.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(gws_store::key_from_seed(seed));
     }
 
     /// Whether the Bot has provisioned this process.
     pub fn provisioned(&self) -> bool {
-        self.store_key.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        self.store_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// Runs one of the plugin's tools. `args` were checked as an object.
     pub fn run(&self, tool: &str, args: &Value) -> Value {
-        tools::run(&self.gmail, &self.accounts, tool, args)
+        mail::run(self, tool, args)
+            .unwrap_or_else(|| tools::run(&self.gmail, &self.accounts, tool, args))
+    }
+
+    /// [`Self::run`] for the model in a chat: a mail search also offers a card.
+    pub fn run_for_chat(&self, tool: &str, args: &Value) -> Value {
+        let mut result = self.run(tool, args);
+        mail::offer_card(self, tool, args, &mut result);
+        result
     }
 
     /// The store, opened if it isn't yet. One that won't open is an error for
@@ -66,7 +92,15 @@ impl Core {
     pub fn store(&self) -> Result<MutexGuard<'_, Option<Store>>, gws_store::Error> {
         let mut held = self.store.lock().unwrap_or_else(|e| e.into_inner());
         if held.is_none() {
-            let key = self.store_key.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or(gws_store::Error { code: "locked", message: "The store opens after the Bot provisions the plugin.".to_owned() })?;
+            let key = self
+                .store_key
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .ok_or(gws_store::Error {
+                    code: "locked",
+                    message: "The store opens after the Bot provisions the plugin.".to_owned(),
+                })?;
             let paths = self.paths.as_ref().map_err(Clone::clone)?;
             *held = Some(Store::open(paths, &key)?);
         }
@@ -74,14 +108,19 @@ impl Core {
     }
 
     /// `buwiz.uninstall`, which the person confirmed: every token, and this
-    /// install's files.
-    pub fn uninstall(&self) {
+    /// install's files. An error says what stayed on disk.
+    pub fn uninstall(&self) -> Result<(), gws_store::Error> {
         self.accounts.forget();
         *self.store.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        let key = self.store_key.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let paths = self.paths.as_ref().ok();
-        if let Some(Err(e)) = key.zip(paths).map(|(key, paths)| gws_store::wipe(paths, &key)) {
-            eprintln!("buwiz-gws: uninstall: {}", e.code);
+        let paths = self.paths.as_ref().map_err(Clone::clone)?;
+        match self
+            .store_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            Some(key) => gws_store::wipe(paths, &key),
+            None => Ok(()),
         }
     }
 }
@@ -93,7 +132,9 @@ pub struct Gws {
 
 impl Gws {
     pub fn from_env() -> Self {
-        Self { core: Arc::new(Core::new(&Apis::from_env(), Paths::from_env())) }
+        Self {
+            core: Arc::new(Core::new(&Apis::from_env(), Paths::from_env())),
+        }
     }
 }
 
@@ -116,11 +157,22 @@ impl Plugin for Gws {
         self.core.run(tool, &Value::Object(args.clone()))
     }
 
-    fn ticket_title(&mut self, _ticket: &str) -> Option<String> {
-        None
+    fn ticket_title(&mut self, ticket: &str) -> Option<String> {
+        // a title says what it is, never what it stands for
+        self.core
+            .tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .subject(ticket)
+            .map(|_| manifest::APPS[0].title.to_owned())
     }
 
     fn uninstall(&mut self) {
-        self.core.uninstall();
+        if let Err(e) = self.core.uninstall() {
+            eprintln!(
+                "buwiz-gws: uninstall left the plugin's files in place: {}",
+                e.code
+            );
+        }
     }
 }

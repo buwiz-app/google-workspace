@@ -22,7 +22,7 @@
         "id": "google",
         "provider": "google",
         "label": "Google account",
-        "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+        "scopes": ["https://www.googleapis.com/auth/gmail.modify"],
         "required": true
       }
     ],

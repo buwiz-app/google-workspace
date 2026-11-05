@@ -23,8 +23,16 @@ use crate::{Gws, tools};
 /// the SDK's `Tool` carries `readOnlyHint` alone.
 fn with_audience(mut reply: Value) -> Value {
     let defs = tools::defs();
-    for tool in reply.pointer_mut("/result/tools").and_then(Value::as_array_mut).into_iter().flatten() {
-        let def = tool.get("name").and_then(Value::as_str).and_then(|name| defs.iter().find(|d| d.name == name));
+    for tool in reply
+        .pointer_mut("/result/tools")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        let def = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|name| defs.iter().find(|d| d.name == name));
         if let Some(def) = def {
             tool["_meta"] = json!({"buwiz/audience": def.audience});
             tool["annotations"] = json!({"readOnlyHint": def.read_only, "destructiveHint": false, "idempotentHint": def.read_only, "openWorldHint": def.open_world});
@@ -61,11 +69,19 @@ fn route(message: &Value) -> Route {
     }
     let params = message.get("params");
     match params.and_then(|p| p.get("name")).and_then(Value::as_str) {
-        Some(name @ ("buwiz.account.set" | "buwiz.account.clear")) => Route::Account(name.to_owned()),
+        Some(name @ ("buwiz.account.set" | "buwiz.account.clear")) => {
+            Route::Account(name.to_owned())
+        }
         Some("buwiz.provision") => Route::Provision,
         Some(name) if tools::has(name) => match params.and_then(|p| p.get("arguments")) {
-            None | Some(Value::Null) => Route::Tool { name: name.to_owned(), args: json!({}) },
-            Some(args) if args.is_object() => Route::Tool { name: name.to_owned(), args: args.clone() },
+            None | Some(Value::Null) => Route::Tool {
+                name: name.to_owned(),
+                args: json!({}),
+            },
+            Some(args) if args.is_object() => Route::Tool {
+                name: name.to_owned(),
+                args: args.clone(),
+            },
             // the SDK's refusal of arguments that aren't an object
             Some(_) => Route::Server,
         },
@@ -74,13 +90,19 @@ fn route(message: &Value) -> Route {
 }
 
 fn is_error(reply: Option<&Value>) -> bool {
-    reply.is_none_or(|r| r.get("error").is_some() || r.pointer("/result/isError") == Some(&Value::Bool(true)))
+    reply.is_none_or(|r| {
+        r.get("error").is_some() || r.pointer("/result/isError") == Some(&Value::Bool(true))
+    })
 }
 
 /// The plugin's own check of a tool's audience, beside the Hub's, and closed
 /// by default: only a caller it can name reaches anything.
 fn audience_allows(name: &str, origin: Origin) -> bool {
-    let names = |who: &str| tools::defs().iter().any(|d| d.name == name && d.audience.contains(&who));
+    let names = |who: &str| {
+        tools::defs()
+            .iter()
+            .any(|d| d.name == name && d.audience.contains(&who))
+    };
     match origin {
         Origin::App => names("app"),
         // a routine's turn is the model's
@@ -91,23 +113,45 @@ fn audience_allows(name: &str, origin: Origin) -> bool {
 }
 
 /// The MCP revisions this server speaks, newest first; the broker takes any.
-const MCP_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
+const MCP_VERSIONS: &[&str] = &[
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+    "2024-10-07",
+];
 
 /// `initialize`'s answer, on the revision the client asked for when it's one
 /// of ours, else on the newest.
 fn negotiated(mut reply: Value, message: &Value) -> Value {
-    let asked = message.pointer("/params/protocolVersion").and_then(Value::as_str);
-    let version = asked.filter(|v| MCP_VERSIONS.contains(v)).unwrap_or(MCP_VERSIONS[0]);
+    let asked = message
+        .pointer("/params/protocolVersion")
+        .and_then(Value::as_str);
+    let version = asked
+        .filter(|v| MCP_VERSIONS.contains(v))
+        .unwrap_or(MCP_VERSIONS[0]);
     if let Some(result) = reply.get_mut("result") {
         result["protocolVersion"] = json!(version);
     }
     reply
 }
 
-/// Whether a parsed line is a JSON-RPC message at all. One that isn't gets no
-/// answer: a reply would have no request to pair with.
+/// Whether a parsed line is a JSON-RPC message at all.
 fn is_message(message: &Value) -> bool {
-    message.get("jsonrpc") == Some(&json!("2.0")) && message.get("method").is_some_and(Value::is_string) && message.get("params").is_none_or(Value::is_object)
+    message.get("jsonrpc") == Some(&json!("2.0"))
+        && message.get("method").is_some_and(Value::is_string)
+        && message.get("params").is_none_or(Value::is_object)
+}
+
+/// The error for a line that isn't a request but names an id, so its sender
+/// isn't left waiting. With no id there's nobody to answer.
+fn invalid(line: &Value) -> Option<Value> {
+    let id = line
+        .get("id")
+        .filter(|id| id.is_string() || id.is_number())?;
+    Some(
+        json!({"jsonrpc": "2.0", "id": id, "error": {"code": buwiz_plugin::INVALID_REQUEST, "message": "invalid request"}}),
+    )
 }
 
 /// Tools running at once, past which a call is refused: a Bot's screens hold
@@ -129,14 +173,22 @@ fn write(out: &Out, reply: &Value) {
 /// runs, whatever happens to the file. Without one the plugin doesn't start:
 /// the SDK would serve the unsigned manifest and check callers against that.
 fn pinned_manifest() -> Result<Served, String> {
-    let path = std::env::var_os(MANIFEST_ENV).filter(|p| !p.is_empty()).ok_or(format!("{MANIFEST_ENV} is not set, so there is no signed manifest to serve"))?;
+    let path = std::env::var_os(MANIFEST_ENV)
+        .filter(|p| !p.is_empty())
+        .ok_or(format!(
+            "{MANIFEST_ENV} is not set, so there is no signed manifest to serve"
+        ))?;
     let unsigned = std::fs::read_to_string(&path).map_err(|e| format!("{MANIFEST_ENV}: {e}"))?;
-    Ok(Served { signed: None, unsigned })
+    Ok(Served {
+        signed: None,
+        unsigned,
+    })
 }
 
 /// A tool's answer. A panic is an error for this call, not a silent caller.
 fn answer(run: impl FnOnce() -> Value) -> Value {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|_| buwiz_plugin::fail("internal", "That didn't work. Try again."))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+        .unwrap_or_else(|_| buwiz_plugin::fail("internal", "That didn't work. Try again."))
 }
 
 /// Runs in-flight requests can be cancelled by id.
@@ -149,6 +201,7 @@ pub fn serve(plugin: Gws) -> Result<(), String> {
 
 fn run(plugin: Gws, manifest: Served) -> std::io::Result<()> {
     let core = plugin.core.clone();
+    crate::mail::start(core.clone());
     let mut server = Server::with_manifest(plugin, manifest);
     let out: Out = Arc::new(Mutex::new(std::io::stdout()));
     let mut running: Vec<JoinHandle<()>> = Vec::new();
@@ -160,13 +213,22 @@ fn run(plugin: Gws, manifest: Served) -> std::io::Result<()> {
         if input.read_until(b'\n', &mut raw)? == 0 {
             break;
         }
-        // a bad byte is one bad line, not the end of the plugin
-        let line = String::from_utf8_lossy(&raw);
-        let line = line.trim_end_matches(['\n', '\r']);
+        // a bad byte is one bad line, not the end of the plugin. It's refused,
+        // not repaired: a repaired search is a different search.
+        let lossy = String::from_utf8_lossy(&raw);
+        let line = lossy.trim_end_matches(['\n', '\r']);
         if line.is_empty() {
             continue;
         }
-        let Some(message) = serde_json::from_str::<Value>(line).ok().filter(is_message) else {
+        let parsed = serde_json::from_str::<Value>(line).ok();
+        let Some(message) = parsed
+            .as_ref()
+            .filter(|m| is_message(m) && matches!(lossy, std::borrow::Cow::Borrowed(_)))
+            .cloned()
+        else {
+            if let Some(reply) = parsed.as_ref().and_then(invalid) {
+                write(&out, &reply);
+            }
             continue;
         };
         running.retain(|t| !t.is_finished());
@@ -174,27 +236,64 @@ fn run(plugin: Gws, manifest: Served) -> std::io::Result<()> {
         match route(&message) {
             Route::Tool { name, args } if core.provisioned() => {
                 let params = message.get("params").cloned().unwrap_or(Value::Null);
-                let tool = server.plugin().tools().into_iter().find(|t| t.name == name).expect("routed tools exist");
+                let tool = server
+                    .plugin()
+                    .tools()
+                    .into_iter()
+                    .find(|t| t.name == name)
+                    .expect("routed tools exist");
                 let caller = Caller::of(&params);
                 if let Err(why) = server.authorize(&tool, &caller) {
-                    write(&out, &json!({"jsonrpc": "2.0", "id": id, "result": buwiz_plugin::fail("permission_denied", &why)}));
+                    write(
+                        &out,
+                        &json!({"jsonrpc": "2.0", "id": id, "result": buwiz_plugin::fail("permission_denied", &why)}),
+                    );
                     continue;
                 }
                 if !audience_allows(&name, caller.origin) {
-                    write(&out, &json!({"jsonrpc": "2.0", "id": id, "result": buwiz_plugin::fail("permission_denied", "Only a person can do this.")}));
+                    write(
+                        &out,
+                        &json!({"jsonrpc": "2.0", "id": id, "result": buwiz_plugin::fail("permission_denied", "Only a person can do this.")}),
+                    );
+                    continue;
+                }
+                // what never leaves this Mac answers here, whatever is running:
+                // a full cap can't stop a screen knowing where it stands
+                if tools::is_local(&name) {
+                    write(
+                        &out,
+                        &json!({"jsonrpc": "2.0", "id": id, "result": answer(|| core.run(&name, &args))}),
+                    );
                     continue;
                 }
                 if running.len() >= MAX_RUNNING {
-                    write(&out, &json!({"jsonrpc": "2.0", "id": id, "result": buwiz_plugin::fail("rate_limited", "Busy with other requests. Try again in a moment.")}));
+                    write(
+                        &out,
+                        &json!({"jsonrpc": "2.0", "id": id, "result": buwiz_plugin::fail("rate_limited", "Busy with other requests. Try again in a moment.")}),
+                    );
                     continue;
                 }
                 let cancelled = Arc::new(AtomicBool::new(false));
                 let key = id.to_string();
-                cancels.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), cancelled.clone());
+                cancels
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key.clone(), cancelled.clone());
                 let (core, out, cancels) = (core.clone(), out.clone(), cancels.clone());
+                // a routine's turn has no one to show a card to
+                let chat = caller.origin == Origin::Agent && caller.routine.is_none();
                 running.push(std::thread::spawn(move || {
-                    let result = answer(|| core.run(&name, &args));
-                    cancels.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+                    let result = answer(|| {
+                        if chat {
+                            core.run_for_chat(&name, &args)
+                        } else {
+                            core.run(&name, &args)
+                        }
+                    });
+                    cancels
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&key);
                     if !cancelled.load(Ordering::SeqCst) {
                         write(&out, &json!({"jsonrpc": "2.0", "id": id, "result": result}));
                     }
@@ -206,8 +305,15 @@ fn run(plugin: Gws, manifest: Served) -> std::io::Result<()> {
                 }
             }
             Route::Cancelled => {
-                let request = message.pointer("/params/requestId").map(Value::to_string).unwrap_or_default();
-                if let Some(flag) = cancels.lock().unwrap_or_else(|e| e.into_inner()).get(&request) {
+                let request = message
+                    .pointer("/params/requestId")
+                    .map(Value::to_string)
+                    .unwrap_or_default();
+                if let Some(flag) = cancels
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&request)
+                {
                     flag.store(true, Ordering::SeqCst);
                 }
             }
@@ -219,13 +325,20 @@ fn run(plugin: Gws, manifest: Served) -> std::io::Result<()> {
             Route::Account(name) if core.provisioned() => {
                 let empty = json!({});
                 let args = message.pointer("/params/arguments").unwrap_or(&empty);
-                let result = if name == "buwiz.account.set" { core.accounts.set(args) } else { core.accounts.clear(args) };
+                let result = if name == "buwiz.account.set" {
+                    core.accounts.set(args)
+                } else {
+                    core.accounts.clear(args)
+                };
+                core.sync.wake();
                 write(&out, &json!({"jsonrpc": "2.0", "id": id, "result": result}));
             }
             Route::Provision => {
                 let reply = server.handle(&message);
                 if !is_error(reply.as_ref())
-                    && let Some(seed) = message.pointer("/params/arguments/key/seed").and_then(Value::as_str)
+                    && let Some(seed) = message
+                        .pointer("/params/arguments/key/seed")
+                        .and_then(Value::as_str)
                 {
                     core.unlock(seed);
                 }
@@ -254,11 +367,17 @@ mod tests {
     fn the_model_reaches_only_a_tool_that_names_it() {
         assert!(audience_allows(tools::READ_MAIL, Origin::Agent));
         assert!(audience_allows(tools::READ_MAIL, Origin::Routine));
-        assert!(!audience_allows(tools::STATUS, Origin::Agent), "the address on it is the screen's");
+        assert!(
+            !audience_allows(tools::STATUS, Origin::Agent),
+            "the address on it is the screen's"
+        );
         assert!(!audience_allows(tools::STATUS, Origin::Routine));
         assert!(audience_allows(tools::STATUS, Origin::App));
         assert!(audience_allows(tools::RESOLVE, Origin::Resolve));
-        assert!(!audience_allows(tools::STATUS, Origin::Resolve), "a resolve reaches the resolve tool");
+        assert!(
+            !audience_allows(tools::STATUS, Origin::Resolve),
+            "a resolve reaches the resolve tool"
+        );
     }
 
     #[test]
@@ -272,16 +391,51 @@ mod tests {
     fn initialize_answers_the_revision_asked_for_if_it_is_ours() {
         let reply = || json!({"result": {"protocolVersion": "2025-11-25", "capabilities": {}}});
         let asked = |v: &str| json!({"params": {"protocolVersion": v}});
-        assert_eq!(negotiated(reply(), &asked("2024-11-05"))["result"]["protocolVersion"], "2024-11-05");
-        assert_eq!(negotiated(reply(), &asked("1999-01-01"))["result"]["protocolVersion"], "2025-11-25", "else the newest");
-        assert_eq!(negotiated(reply(), &json!({}))["result"]["protocolVersion"], "2025-11-25");
+        assert_eq!(
+            negotiated(reply(), &asked("2024-11-05"))["result"]["protocolVersion"],
+            "2024-11-05"
+        );
+        assert_eq!(
+            negotiated(reply(), &asked("1999-01-01"))["result"]["protocolVersion"],
+            "2025-11-25",
+            "else the newest"
+        );
+        assert_eq!(
+            negotiated(reply(), &json!({}))["result"]["protocolVersion"],
+            "2025-11-25"
+        );
+    }
+
+    #[test]
+    fn only_a_line_with_an_id_gets_an_error() {
+        assert_eq!(
+            invalid(&json!({"jsonrpc": "1.0", "id": 7, "method": "ping"})).unwrap()["id"],
+            7
+        );
+        assert_eq!(
+            invalid(&json!({"id": "a"})).unwrap()["error"]["code"],
+            buwiz_plugin::INVALID_REQUEST
+        );
+        assert_eq!(invalid(&json!({"method": "ping"})), None);
+        assert_eq!(invalid(&json!([1])), None);
+        assert_eq!(invalid(&json!({"id": null})), None);
     }
 
     #[test]
     fn only_a_json_rpc_message_counts() {
-        assert!(is_message(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"})));
-        assert!(is_message(&json!({"jsonrpc": "2.0", "method": "x", "params": {}})));
-        for bad in [json!([1]), json!({"id": 1, "method": "ping"}), json!({"jsonrpc": "1.0", "id": 1, "method": "ping"}), json!({"jsonrpc": "2.0", "id": 1}), json!({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": [1]})] {
+        assert!(is_message(
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        ));
+        assert!(is_message(
+            &json!({"jsonrpc": "2.0", "method": "x", "params": {}})
+        ));
+        for bad in [
+            json!([1]),
+            json!({"id": 1, "method": "ping"}),
+            json!({"jsonrpc": "1.0", "id": 1, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": 1}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": [1]}),
+        ] {
             assert!(!is_message(&bad), "{bad}");
         }
     }
@@ -289,8 +443,14 @@ mod tests {
     #[test]
     fn a_panic_is_an_answer() {
         let r = answer(|| panic!("a bug"));
-        assert_eq!((r["isError"].clone(), r["structuredContent"]["code"].clone()), (json!(true), json!("internal")));
-        assert!(!r.to_string().contains("a bug"), "what panicked stays out of the answer");
+        assert_eq!(
+            (r["isError"].clone(), r["structuredContent"]["code"].clone()),
+            (json!(true), json!("internal"))
+        );
+        assert!(
+            !r.to_string().contains("a bug"),
+            "what panicked stays out of the answer"
+        );
         assert_eq!(answer(|| json!({"ok": true})), json!({"ok": true}));
     }
 
@@ -299,13 +459,29 @@ mod tests {
         let call = |extra: Value| {
             let mut m = json!({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": tools::STATUS}});
             for (k, v) in extra.as_object().unwrap() {
-                if k == "id" { m["id"] = v.clone() } else { m["params"][k] = v.clone() }
+                if k == "id" {
+                    m["id"] = v.clone()
+                } else {
+                    m["params"][k] = v.clone()
+                }
             }
             m
         };
-        assert!(matches!(route(&call(json!({}))), Route::Server), "no id: a notification");
-        assert!(matches!(route(&call(json!({"id": 1, "arguments": [1]}))), Route::Server), "not an object");
-        assert!(matches!(route(&call(json!({"id": 1, "arguments": null}))), Route::Tool { .. }));
+        assert!(
+            matches!(route(&call(json!({}))), Route::Server),
+            "no id: a notification"
+        );
+        assert!(
+            matches!(
+                route(&call(json!({"id": 1, "arguments": [1]}))),
+                Route::Server
+            ),
+            "not an object"
+        );
+        assert!(matches!(
+            route(&call(json!({"id": 1, "arguments": null}))),
+            Route::Tool { .. }
+        ));
         assert!(matches!(route(&call(json!({"id": 1}))), Route::Tool { .. }));
     }
 }

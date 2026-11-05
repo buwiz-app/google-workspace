@@ -23,7 +23,7 @@ person's own press.
 |---|---|
 | `crates/gws-plugin` | Package `buwiz-gws`: the binary, the tools, the manifest. `serve.rs` is a concurrent loop around `buwiz_plugin::Server`, which keeps doing provision, certificates, tickets and the caller checks |
 | `crates/gws-screens` | The native screens. The Bot pins this crate |
-| `crates/gws-store` | SQLCipher with a 0600 key file, in `GWS_DATA_DIR` |
+| `crates/gws-store` | SQLCipher in `GWS_DATA_DIR`. Its key comes from the plugin key the Bot provisions, so none is on disk |
 | `crates/gws-fake-google` | A stub Google on 127.0.0.1 with fake data, for tests and test Bots. Never in a release |
 
 ## Install and sign in

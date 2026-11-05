@@ -73,7 +73,12 @@ up() {
   broker="$(target "$BOT/broker")/debug/buwiz-broker"; app="$(target "$BOT/app")/debug/buwiz-bot"; stub="$(target "$REPO")/debug/gws-fake-google"
   nohup "$stub" --port "$STUB_PORT" --mails "${GWS_MAILS:-200}" > "$INST/stub.log" 2>&1 & echo $! > "$INST/stub.pid"
   mkdir -p "$INST/broker" "$INST/gws-data"
-  env -u GPUI_AGENT BUWIZ_BROKER_HUB=1 BUWIZ_BROKER_V1_HOST=1 BUWIZ_BROKER_MCP_HOST=1 BUWIZ_BROKER_DATA_DIR="$INST/broker" \
+  # no real model: the mock answers, every model URL is a dead loopback port,
+  # and no key rides in from this shell. Unset, the broker reaches the local
+  # opencodex proxy on 8080, which holds the owner's credentials.
+  env -u GPUI_AGENT -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u OPENROUTER_API_KEY -u OPENAI_API_KEY -u XAI_API_KEY \
+    MOCK=1 OPENCODEX_URL=http://127.0.0.1:1 ANTHROPIC_BASE_URL=http://127.0.0.1:1 GEN_BASE_URL=http://127.0.0.1:1 \
+    BUWIZ_BROKER_HUB=1 BUWIZ_BROKER_V1_HOST=1 BUWIZ_BROKER_MCP_HOST=1 BUWIZ_BROKER_DATA_DIR="$INST/broker" \
     BUWIZ_TRUST_FILE="$INST/trust.json" BUWIZ_KEYSTORE="file:$INST/keys" BUWIZ_TEST_GOOGLE="http://127.0.0.1:$STUB_PORT" \
     nohup "$broker" --port "$PORT" --data "$INST/broker" --no-node > "$INST/broker.log" 2>&1 & echo $! > "$INST/broker.pid"
   for _ in $(seq 1 100); do [ -s "$INST/broker/host-token" ] && curl -s "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 0.1; done

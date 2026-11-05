@@ -27,7 +27,7 @@ buwiz-plugin = { git = "https://github.com/buwiz-app/buwiz-sdk", rev = "79883a82
 gws-store = { path = "../gws-store" }
 # Gmail's base64url bodies
 base64 = "0.22"
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
 # Google's REST APIs: blocking, on the tool's own thread; rustls with ring and
 # Mozilla's roots (webpki-roots), no OpenSSL, no gzip
 ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }

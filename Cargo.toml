@@ -9,7 +9,9 @@ publish = false
 repository = "https://github.com/buwiz-app/google-workspace"
 
 [workspace.dependencies]
-serde_json = { version = "1", features = ["preserve_order"] }
+# plain: gws-screens is compiled into the Bot, and a feature here would change
+# serde_json for the whole app. The plugin turns on preserve_order for itself.
+serde_json = "1"
 
 [profile.release]
 codegen-units = 1

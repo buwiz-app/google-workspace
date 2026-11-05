@@ -75,10 +75,9 @@ impl Core {
     pub fn uninstall(&self) {
         self.accounts.forget();
         *self.store.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        if let Some(key) = self.store_key.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-            if let Err(e) = gws_store::wipe(&self.paths, &key) {
-                eprintln!("buwiz-gws: uninstall: {}", e.code);
-            }
+        let key = self.store_key.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(Err(e)) = key.map(|key| gws_store::wipe(&self.paths, &key)) {
+            eprintln!("buwiz-gws: uninstall: {}", e.code);
         }
     }
 }

@@ -46,9 +46,9 @@ fn broker(bin: &str, args: &[&str], stdin: Option<&Value>) -> Value {
     serde_json::from_slice(&out.stdout).unwrap_or(Value::Null)
 }
 
-fn plugin_json(dir: &Path, platform: &str, asset: &str, published: Option<&Path>) {
+fn plugin_json(template: &Path, dir: &Path, platform: &str, asset: &str, published: Option<&Path>) {
     let mut c = Command::new("python3");
-    c.arg(repo("tools/release/plugin-json.py")).arg(repo("package/plugin.json")).arg(dir).arg(platform).arg(asset);
+    c.arg(repo("tools/release/plugin-json.py")).arg(template).arg(dir).arg(platform).arg(asset);
     if let Some(p) = published {
         c.arg(p);
     }
@@ -66,7 +66,8 @@ fn the_signed_package_passes_the_bots_checks() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let s = |p: &Path| p.display().to_string();
-    // a throwaway publisher key, trusted under the real key id
+    // a throwaway publisher key under a test key id: never the release one
+    const TEST_KEY_ID: &str = "gws-test-01";
     let seed = [42u8; 32];
     let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
     let key = dir.join("test.key");
@@ -77,17 +78,21 @@ fn the_signed_package_passes_the_bots_checks() {
     }
     let public = b64(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().as_bytes());
     let trust = json!({
-        "publishers": {"gc-2026-01": {"alg": "ed25519", "publisher": "app.buwiz", "public_key": public}},
-        "approved_plugins": [{"id": "app.buwiz.google-workspace", "publisher_key_id": "gc-2026-01"}],
+        "publishers": {TEST_KEY_ID: {"alg": "ed25519", "publisher": "app.buwiz", "public_key": public, "first_party": true}},
+        "approved_plugins": [{"id": "app.buwiz.google-workspace", "publisher_key_id": TEST_KEY_ID}],
     });
 
     // the release script's steps: the served manifest signed, the binary
     // beside it, plugin.json filled in and its block signed
     let unsigned = dir.join("manifest.json");
-    std::fs::write(&unsigned, gws::manifest::unsigned(gws::manifest::RELEASE_KEY_ID).to_string()).unwrap();
+    std::fs::write(&unsigned, gws::manifest::unsigned(TEST_KEY_ID).to_string()).unwrap();
+    let mut template = read_json(&repo("package/plugin.json"));
+    template["buwiz"]["publisher"]["key_id"] = json!(TEST_KEY_ID);
+    let template_file = dir.join("plugin.template.json");
+    std::fs::write(&template_file, template.to_string()).unwrap();
     broker(&bin, &["sign-manifest", &s(&unsigned), "--key-file", &s(&key), "--out", &s(&dir.join("manifest.signed.json"))], None);
     std::fs::write(dir.join("buwiz-gws-macos-aarch64"), b"a binary").unwrap();
-    plugin_json(&dir, "macos-aarch64", "buwiz-gws-macos-aarch64", None);
+    plugin_json(&template_file, &dir, "macos-aarch64", "buwiz-gws-macos-aarch64", None);
     let signed = dir.join("plugin.json");
     broker(&bin, &["sign-manifest", &s(&dir.join("plugin.unsigned.json")), "--block", "buwiz", "--key-file", &s(&key), "--out", &s(&signed)], None);
 
@@ -112,13 +117,13 @@ fn the_signed_package_passes_the_bots_checks() {
         })
     );
     // the block's signature is the throwaway key's: another trust refuses it
-    let other = json!({"publishers": {"gc-2026-01": {"alg": "ed25519", "publisher": "app.buwiz", "public_key": b64(ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key().as_bytes())}}, "approved_plugins": trust["approved_plugins"]});
+    let other = json!({"publishers": {TEST_KEY_ID: {"alg": "ed25519", "publisher": "app.buwiz", "public_key": b64(ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key().as_bytes()), "first_party": true}}, "approved_plugins": trust["approved_plugins"]});
     let refused = broker(&bin, &["manifest", "package"], Some(&json!({"text": text, "trust": other, "platform": "macos-aarch64"})));
     assert_ne!(refused["ok"], true, "{refused}");
 
     // a second platform's run keeps the first platform's binary
     std::fs::write(dir.join("buwiz-gws-linux-x86_64"), b"another binary").unwrap();
-    plugin_json(&dir, "linux-x86_64", "buwiz-gws-linux-x86_64", Some(&signed));
+    plugin_json(&template_file, &dir, "linux-x86_64", "buwiz-gws-linux-x86_64", Some(&signed));
     let both = read_json(&dir.join("plugin.unsigned.json"));
     let platforms: Vec<&String> = both["buwiz"]["binaries"].as_object().unwrap().keys().collect();
     assert_eq!(platforms, ["linux-x86_64", "macos-aarch64"]);

@@ -40,6 +40,8 @@ pub struct Def {
     pub input_schema: Value,
     pub read_only: bool,
     pub audience: &'static [&'static str],
+    /// Reaches past this Mac, to Google.
+    pub open_world: bool,
 }
 
 pub const SEARCH_MAIL: &str = "gws_search_mail";
@@ -60,6 +62,7 @@ pub fn defs() -> Vec<Def> {
             }),
             read_only: true,
             audience: AGENT_AND_APP,
+            open_world: true,
         },
         Def {
             name: READ_MAIL,
@@ -67,6 +70,7 @@ pub fn defs() -> Vec<Def> {
             input_schema: json!({"type": "object", "properties": {"id": {"type": "string", "description": "the message id"}}, "required": ["id"]}),
             read_only: true,
             audience: AGENT_AND_APP,
+            open_world: true,
         },
         Def {
             name: STATUS,
@@ -74,6 +78,7 @@ pub fn defs() -> Vec<Def> {
             input_schema: json!({"type": "object", "properties": {}}),
             read_only: true,
             audience: APP_ONLY,
+            open_world: false,
         },
         Def {
             name: RESOLVE,
@@ -81,6 +86,7 @@ pub fn defs() -> Vec<Def> {
             input_schema: json!({"type": "object"}),
             read_only: true,
             audience: APP_ONLY,
+            open_world: false,
         },
     ]
 }

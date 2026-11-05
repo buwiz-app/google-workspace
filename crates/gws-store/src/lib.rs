@@ -1,19 +1,21 @@
-//! The plugin's local store: SQLCipher in `<data dir>/workspace.db`, keyed by
-//! a 256-bit raw key in a 0600 file beside it, migrated forward on open.
-//! Everything here is the person's Google data, so the store refuses to open
-//! without encryption. It holds no tokens: those stay in the Bot's keystore
-//! and in the plugin's memory.
+//! The plugin's local store: SQLCipher in `<data dir>/workspace.db`, migrated
+//! forward on open. Everything here is the person's Google data, so the store
+//! refuses to open without encryption. It holds no tokens: those stay in the
+//! Bot's keystore and in the plugin's memory.
+//!
+//! The key is on no disk of ours. [`key_from_seed`] derives it from the plugin
+//! key the Bot's keystore holds and provisions at every start, so a backup or
+//! a copy of the data folder carries the lock without the key.
 
 use std::fs;
-use std::io::Write as _;
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::DirBuilderExt as _;
+use std::path::PathBuf;
 
 use rusqlite::{Connection, OptionalExtension as _, params};
+use sha2::{Digest as _, Sha256};
 
 pub const DATA_DIR_ENV: &str = "GWS_DATA_DIR";
 const DB_FILE: &str = "workspace.db";
-const KEY_FILE: &str = "workspace.key";
 /// Where open Drive files and attachments are kept while the person works on them.
 const OPEN_DIR: &str = "open";
 
@@ -64,20 +66,22 @@ impl Paths {
     }
 
     /// `GWS_DATA_DIR`, else `~/Library/Application Support/app.buwiz.google-workspace`.
-    pub fn from_env() -> Self {
-        let dir = std::env::var_os(DATA_DIR_ENV).filter(|d| !d.is_empty()).map(PathBuf::from).unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-            home.join("Library/Application Support/app.buwiz.google-workspace")
-        });
-        Self { dir }
+    /// A folder that isn't absolute is refused: the working folder is nobody's store.
+    pub fn from_env() -> Result<Self> {
+        Self::from_vars(std::env::var_os(DATA_DIR_ENV), std::env::var_os("HOME"))
+    }
+
+    fn from_vars(data: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> Result<Self> {
+        let dir = match (data.filter(|d| !d.is_empty()), home.filter(|h| !h.is_empty())) {
+            (Some(data), _) => PathBuf::from(data),
+            (None, Some(home)) => PathBuf::from(home).join("Library/Application Support/app.buwiz.google-workspace"),
+            (None, None) => return Err(error("no_home", "HOME is not set, so the plugin has no folder for its store.")),
+        };
+        if dir.is_absolute() { Ok(Self { dir }) } else { Err(error("data_dir", "The data folder must be an absolute path.")) }
     }
 
     pub fn db(&self) -> PathBuf {
         self.dir.join(DB_FILE)
-    }
-
-    pub fn key_file(&self) -> PathBuf {
-        self.dir.join(KEY_FILE)
     }
 
     pub fn open_dir(&self) -> PathBuf {
@@ -85,34 +89,11 @@ impl Paths {
     }
 }
 
-/// The key file's 64 hex digits, making it (0600) when absent. A store without
-/// its key stays as it is: a new key would only hide why it no longer opens.
-fn key(path: &Path, store_exists: bool) -> Result<String> {
-    match fs::read_to_string(path) {
-        Ok(text) => {
-            let text = text.trim().to_owned();
-            if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(error("bad_key", "The store's key file is damaged."));
-            }
-            if fs::metadata(path).map(|m| m.permissions().mode() & 0o077 != 0).unwrap_or(true) {
-                return Err(error("key_open", "The store's key file is readable by others, so it was not used."));
-            }
-            Ok(text)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && store_exists => {
-            let _ = e;
-            Err(error("key_lost", "The store's key file is gone, so the saved mail can't be read."))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut bytes = [0u8; 32];
-            getrandom::fill(&mut bytes).map_err(|_| error("no_random", "The system gave no random bytes."))?;
-            let text: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).map_err(|_| error("key_write", "The store's key file cannot be made."))?;
-            file.write_all(text.as_bytes()).map_err(|_| error("key_write", "The store's key file cannot be written."))?;
-            Ok(text)
-        }
-        Err(_) => Err(error("key_read", "The store's key file cannot be read.")),
-    }
+/// The store's key: 64 hex digits from the provisioned plugin key, under a
+/// label of its own so it is never the signing key itself.
+pub fn key_from_seed(seed: &str) -> String {
+    let digest = Sha256::new().chain_update(b"app.buwiz.google-workspace store key v1\0").chain_update(seed.as_bytes()).finalize();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub struct Store {
@@ -121,9 +102,11 @@ pub struct Store {
 
 impl Store {
     /// Open (creating when absent) the store at `paths`, migrated to the latest schema.
-    pub fn open(paths: &Paths) -> Result<Self> {
+    pub fn open(paths: &Paths, key: &str) -> Result<Self> {
+        if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(error("bad_key", "That is not a store key."));
+        }
         fs::DirBuilder::new().recursive(true).mode(0o700).create(&paths.dir).map_err(|_| error("data_dir", "The data folder cannot be made."))?;
-        let key = key(&paths.key_file(), paths.db().exists())?;
         let conn = Connection::open(paths.db())?;
         // SQLCipher reads a raw key as x'<64 hex>' (no key derivation)
         conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))?;
@@ -179,7 +162,6 @@ pub fn wipe(paths: &Paths) -> Result<()> {
         Err(_) => Err(error("wipe", "The plugin's files could not be removed.")),
     };
     gone(fs::remove_file(paths.db()))?;
-    gone(fs::remove_file(paths.key_file()))?;
     gone(fs::remove_dir_all(paths.open_dir()))?;
     let _ = fs::remove_dir(&paths.dir);
     Ok(())
@@ -205,71 +187,82 @@ mod tests {
         }
     }
 
+    fn key() -> String {
+        key_from_seed("a-fake-provisioned-seed")
+    }
+
     #[test]
     fn what_it_keeps_survives_a_reopen_and_is_encrypted_on_disk() {
         let dir = Dir::new("enc");
         let paths = Paths::in_dir(&dir.0);
         let secret = "fake-subject-line-to-find-on-disk";
-        Store::open(&paths).unwrap().set_state("me@example.com", "cursor", secret).unwrap();
-        assert_eq!(Store::open(&paths).unwrap().state("me@example.com", "cursor").unwrap().as_deref(), Some(secret));
+        Store::open(&paths, &key()).unwrap().set_state("me@example.com", "cursor", secret).unwrap();
+        assert_eq!(Store::open(&paths, &key()).unwrap().state("me@example.com", "cursor").unwrap().as_deref(), Some(secret));
         let bytes = fs::read(paths.db()).unwrap();
         assert!(!bytes.starts_with(b"SQLite format 3"), "an encrypted file has no SQLite header");
         assert!(!bytes.windows(secret.len()).any(|w| w == secret.as_bytes()), "the value is not in the file");
     }
 
+    /// A backup or a copy of the folder holds the lock, never the key.
     #[test]
-    fn the_key_file_is_private_and_a_loose_one_is_refused() {
-        let dir = Dir::new("key");
+    fn nothing_in_the_data_folder_opens_the_store() {
+        let dir = Dir::new("copy");
         let paths = Paths::in_dir(&dir.0);
-        drop(Store::open(&paths).unwrap());
-        let key_file = paths.key_file();
-        assert_eq!(fs::metadata(&key_file).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(fs::metadata(&paths.dir).unwrap().permissions().mode() & 0o777, 0o700);
-        fs::set_permissions(&key_file, fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(Store::open(&paths).err().unwrap().code, "key_open");
+        let key = key();
+        drop(Store::open(&paths, &key).unwrap());
+        let files: Vec<String> = fs::read_dir(&paths.dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(files, ["workspace.db"], "no key file beside it");
+        let bytes = fs::read(paths.db()).unwrap();
+        assert!(!bytes.windows(key.len()).any(|w| w == key.as_bytes()));
     }
 
     #[test]
-    fn another_key_does_not_open_it() {
+    fn the_key_is_the_seeds_and_not_the_seed() {
+        assert_eq!(key_from_seed("s"), key_from_seed("s"));
+        assert_ne!(key_from_seed("s"), key_from_seed("t"));
+        assert_eq!(key_from_seed("s").len(), 64);
+        assert!(!key_from_seed("seed-text").contains("seed-text"));
+    }
+
+    #[test]
+    fn another_key_does_not_open_it_and_a_malformed_one_is_refused() {
         let dir = Dir::new("wrong");
         let paths = Paths::in_dir(&dir.0);
-        drop(Store::open(&paths).unwrap());
-        fs::write(paths.key_file(), "ab".repeat(32)).unwrap();
-        assert_eq!(Store::open(&paths).err().unwrap().code, "wrong_key");
+        drop(Store::open(&paths, &key()).unwrap());
+        assert_eq!(Store::open(&paths, &key_from_seed("another")).err().unwrap().code, "wrong_key");
+        assert_eq!(Store::open(&paths, "short").err().unwrap().code, "bad_key");
     }
 
     #[test]
-    fn a_store_that_lost_its_key_says_so_and_keeps_saying_so() {
-        let dir = Dir::new("lost");
-        let paths = Paths::in_dir(&dir.0);
-        drop(Store::open(&paths).unwrap());
-        fs::remove_file(paths.key_file()).unwrap();
-        assert_eq!(Store::open(&paths).err().unwrap().code, "key_lost");
-        assert_eq!(Store::open(&paths).err().unwrap().code, "key_lost");
-        assert!(!paths.key_file().exists(), "no new key over the old store");
+    fn with_no_home_or_a_relative_folder_there_is_no_store() {
+        assert_eq!(Paths::from_vars(None, None).err().unwrap().code, "no_home");
+        assert_eq!(Paths::from_vars(None, Some("".into())).err().unwrap().code, "no_home");
+        assert_eq!(Paths::from_vars(Some("relative/dir".into()), Some("/Users/u".into())).err().unwrap().code, "data_dir");
+        assert_eq!(Paths::from_vars(Some("/d".into()), None).unwrap().dir, PathBuf::from("/d"));
+        assert!(Paths::from_vars(None, Some("/Users/u".into())).unwrap().dir.ends_with("app.buwiz.google-workspace"));
     }
 
     #[test]
     fn wipe_leaves_what_isnt_the_plugins() {
         let dir = Dir::new("shared");
         let paths = Paths::in_dir(&dir.0);
-        drop(Store::open(&paths).unwrap());
+        drop(Store::open(&paths, &key()).unwrap());
         fs::create_dir_all(paths.open_dir()).unwrap();
         fs::write(paths.open_dir().join("a.docx"), b"x").unwrap();
         let other = paths.dir.join("someone-elses.txt");
         fs::write(&other, b"keep me").unwrap();
         wipe(&paths).unwrap();
-        assert!(other.exists() && !paths.db().exists() && !paths.key_file().exists() && !paths.open_dir().exists());
+        assert!(other.exists() && !paths.db().exists() && !paths.open_dir().exists());
     }
 
     #[test]
     fn a_newer_store_is_refused_and_wipe_removes_everything() {
         let dir = Dir::new("newer");
         let paths = Paths::in_dir(&dir.0);
-        let store = Store::open(&paths).unwrap();
+        let store = Store::open(&paths, &key()).unwrap();
         store.conn().execute_batch("PRAGMA user_version = 9999;").unwrap();
         drop(store);
-        assert_eq!(Store::open(&paths).err().unwrap().code, "schema_newer");
+        assert_eq!(Store::open(&paths, &key()).err().unwrap().code, "schema_newer");
         wipe(&paths).unwrap();
         assert!(!paths.dir.exists());
         wipe(&paths).unwrap();

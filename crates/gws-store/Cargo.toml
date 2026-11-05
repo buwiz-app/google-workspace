@@ -7,6 +7,5 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-getrandom = "0.3"
+sha2 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
-serde_json.workspace = true

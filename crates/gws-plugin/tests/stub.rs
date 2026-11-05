@@ -53,9 +53,22 @@ fn each_command_opens_its_own_screen() {
 }
 
 #[test]
+fn a_store_from_another_plugin_key_starts_afresh() {
+    let google = FakeGoogle::start(Seed::default());
+    let core = signed_in(&google, "rekey");
+    core.unlock("first-seed");
+    core.store().unwrap().as_ref().unwrap().set_state("a", "k", "v").unwrap();
+    let again = Core::new(&Apis::at(&google.base()), core.paths.clone());
+    again.unlock("second-seed");
+    assert_eq!(again.store().unwrap().as_ref().unwrap().state("a", "k").unwrap(), None);
+}
+
+#[test]
 fn uninstall_takes_every_token_and_every_file() {
     let google = FakeGoogle::start(Seed::default());
     let core = signed_in(&google, "uninstall");
+    assert!(core.store().is_err(), "the store stays shut until the Bot provisions");
+    core.unlock("a-fake-seed");
     drop(core.store().unwrap());
     assert!(core.paths.db().exists());
     core.uninstall();

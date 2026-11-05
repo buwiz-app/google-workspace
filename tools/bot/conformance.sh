@@ -38,6 +38,7 @@ for id in $(node -e 'for (const a of JSON.parse(require("fs").readFileSync(proce
   APP_ARGS+=(--app "$id=$TMP/app-$id.tsx")
 done
 "${SIGN[@]}" "$TMP/manifest.json" --key-file "$TMP/test.key" ${APP_ARGS[@]+"${APP_ARGS[@]}"} --out "$TMP/signed.json"
-exec node --disable-warning=ExperimentalWarning "$RUNNER" --command "$BIN" --args mcp \
+# not `exec`: the trap has to run, or the throwaway key stays on disk
+node --disable-warning=ExperimentalWarning "$RUNNER" --command "$BIN" --args mcp \
   --manifest "$TMP/signed.json" --key-file "$TMP/test.key" --manifest-env BUWIZ_PLUGIN_MANIFEST \
   --env "GWS_DATA_DIR=$TMP/data" "$@"

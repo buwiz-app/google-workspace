@@ -1,0 +1,19 @@
+[package]
+name = "gws-fake-google"
+version = "0.1.0"
+description = "A stub Google for tests and test Bots: sign-in, Gmail, Calendar and Drive on 127.0.0.1, with fake data. Never part of a release."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "gws-fake-google"
+path = "src/main.rs"
+
+[lib]
+name = "gws_fake_google"
+path = "src/lib.rs"
+
+[dependencies]
+base64 = "0.22"
+serde_json.workspace = true

@@ -1,21 +1,21 @@
 {
   "name": "google-workspace",
-  "version": "1.3.0",
-  "description": "Read-only Gmail search and reading for Buwiz routines and the agent, with the Google account you sign in to in Buwiz Bot.",
+  "version": "1.4.0",
+  "description": "Mail, Calendar and Drive in Buwiz Bot, with the Google account you sign in to.",
   "author": { "name": "Buwiz" },
   "homepage": "https://github.com/buwiz-app/google-workspace",
   "mcpServers": {
     "gws": {
       "command": "${PLUGIN_ROOT}/bin/buwiz-gws",
       "args": ["mcp"],
-      "env": { "GWS_MANIFEST": "${PLUGIN_ROOT}/manifest.signed.json" }
+      "env": { "BUWIZ_PLUGIN_MANIFEST": "${PLUGIN_ROOT}/manifest.signed.json" }
     }
   },
   "buwiz": {
     "protocol": "1.0.0",
     "id": "app.buwiz.google-workspace",
     "short": "gws",
-    "version": "1.3.0",
+    "version": "1.4.0",
     "server": "gws",
     "accounts": [
       {

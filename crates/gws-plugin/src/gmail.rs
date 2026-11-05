@@ -3,9 +3,9 @@
 //! headers, a message's plain-text body (text/plain, else text/html with
 //! the tags stripped), one-line snippets, the 64 KiB cap.
 //!
-//! The HTTP client is ureq (rustls with Mozilla's roots, no OpenSSL),
-//! blocking, so each request runs on tokio's blocking pool. It follows no
-//! redirects, so the token only ever goes to the API base.
+//! The HTTP client is ureq (rustls with Mozilla's roots, so no OpenSSL in it),
+//! blocking, on the tool's own thread. It follows no redirects, so the token
+//! only ever goes to the API base.
 
 use std::time::Duration;
 
@@ -20,6 +20,8 @@ pub const GMAIL_API: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 pub const BODY_MAX: usize = 64 * 1024;
 pub const SNIPPET_MAX: usize = 200;
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// Requests in flight for one search.
+const METADATA_AT_ONCE: usize = 8;
 /// A list or metadata answer.
 const SMALL_MAX: u64 = 1024 * 1024;
 /// A `format=full` message (attachments are not in it, only their ids).
@@ -61,73 +63,70 @@ impl Gmail {
     }
 
     /// A GET of `path` under the base: its JSON, or `None` for a 404.
-    fn spawn_get(&self, auth: &Bearer, path: String, query: Vec<(&'static str, String)>, cap: u64) -> tokio::task::JoinHandle<Result<Option<Value>, Failure>> {
-        let (agent, url, auth) = (self.agent.clone(), format!("{}/{path}", self.base), auth.header().to_owned());
-        tokio::task::spawn_blocking(move || {
-            let mut req = agent.get(&url).header("authorization", &auth).header("accept", "application/json");
-            for (k, v) in &query {
-                req = req.query(*k, v);
+    fn get(&self, auth: &Bearer, path: String, query: Vec<(&'static str, String)>, cap: u64) -> Result<Option<Value>, Failure> {
+        let url = format!("{}/{path}", self.base);
+        let mut req = self.agent.get(&url).header("authorization", auth.header()).header("accept", "application/json");
+        for (k, v) in &query {
+            req = req.query(*k, v);
+        }
+        let mut res = req.call().map_err(|e| Failure::Plain(format!("could not reach Gmail: {}", js::slice_utf16(&e.to_string(), 200))))?;
+        let status = res.status().as_u16();
+        let body = res.body_mut().with_config().limit(cap).read_to_vec().map_err(|e| Failure::Plain(format!("Gmail's answer could not be read: {}", js::slice_utf16(&e.to_string(), 200))))?;
+        match status {
+            200 => serde_json::from_slice(&body).map(Some).map_err(|_| Failure::Plain("Gmail's answer is not JSON".to_owned())),
+            401 => Err(Failure::AccountRequired),
+            404 => Ok(None),
+            _ => {
+                let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let why = v.pointer("/error/message").and_then(Value::as_str).unwrap_or("no reason given");
+                Err(Failure::Plain(format!("Gmail answered {status}: {}", js::slice_utf16(why, 300))))
             }
-            let mut res = req.call().map_err(|e| Failure::Plain(format!("could not reach Gmail: {}", js::slice_utf16(&e.to_string(), 200))))?;
-            let status = res.status().as_u16();
-            let body = res.body_mut().with_config().limit(cap).read_to_vec().map_err(|e| Failure::Plain(format!("Gmail's answer could not be read: {}", js::slice_utf16(&e.to_string(), 200))))?;
-            match status {
-                200 => serde_json::from_slice(&body).map(Some).map_err(|_| Failure::Plain("Gmail's answer is not JSON".to_owned())),
-                401 => Err(Failure::AccountRequired),
-                404 => Ok(None),
-                _ => {
-                    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                    let why = v.pointer("/error/message").and_then(Value::as_str).unwrap_or("no reason given");
-                    Err(Failure::Plain(format!("Gmail answered {status}: {}", js::slice_utf16(why, 300))))
-                }
-            }
-        })
-    }
-
-    async fn get(&self, auth: &Bearer, path: String, query: Vec<(&'static str, String)>, cap: u64) -> Result<Option<Value>, Failure> {
-        joined(self.spawn_get(auth, path, query, cap).await)
+        }
     }
 
     /// The ids of the first `max` messages `q` finds.
-    pub async fn search(&self, auth: &Bearer, q: &str, max: usize) -> Result<Vec<String>, Failure> {
-        let found = self.get(auth, "messages".to_owned(), vec![("q", q.to_owned()), ("maxResults", max.to_string())], SMALL_MAX).await?;
+    pub fn search(&self, auth: &Bearer, q: &str, max: usize) -> Result<Vec<String>, Failure> {
+        let found = self.get(auth, "messages".to_owned(), vec![("q", q.to_owned()), ("maxResults", max.to_string())], SMALL_MAX)?;
         let list = found.as_ref().and_then(|v| v.get("messages")).and_then(Value::as_array);
         Ok(list.into_iter().flatten().filter_map(|m| m.get("id").and_then(Value::as_str)).map(str::to_owned).collect())
     }
 
     /// Each message's From, Subject, Date and snippet (`format=metadata`),
     /// fetched together; `None` for one Gmail no longer has.
-    pub async fn metadata(&self, auth: &Bearer, ids: &[String]) -> Result<Vec<Option<Value>>, Failure> {
+    pub fn metadata(&self, auth: &Bearer, ids: &[String]) -> Result<Vec<Option<Value>>, Failure> {
         let headers = ["From", "Subject", "Date"].map(|h| ("metadataHeaders", h.to_owned()));
-        let gets: Vec<_> = ids
-            .iter()
-            .map(|id| {
-                let mut query = vec![("format", "metadata".to_owned())];
-                query.extend(headers.iter().cloned());
-                id_ok(id).then(|| self.spawn_get(auth, format!("messages/{id}"), query, SMALL_MAX))
-            })
-            .collect();
-        let mut out = Vec::with_capacity(gets.len());
-        for g in gets {
-            out.push(match g {
-                Some(g) => joined(g.await)?,
-                None => None,
+        let mut out = Vec::with_capacity(ids.len());
+        for batch in ids.chunks(METADATA_AT_ONCE) {
+            let done: Result<Vec<_>, Failure> = std::thread::scope(|scope| {
+                let gets: Vec<_> = batch
+                    .iter()
+                    .map(|id| {
+                        let mut query = vec![("format", "metadata".to_owned())];
+                        query.extend(headers.iter().cloned());
+                        id_ok(id).then(|| scope.spawn(move || self.get(auth, format!("messages/{id}"), query, SMALL_MAX)))
+                    })
+                    .collect();
+                let mut got = Vec::with_capacity(gets.len());
+                for g in gets {
+                    got.push(match g {
+                        Some(g) => g.join().unwrap_or_else(|_| Err(Failure::Plain("the Gmail request failed".to_owned())))?,
+                        None => None,
+                    });
+                }
+                Ok(got)
             });
+            out.extend(done?);
         }
         Ok(out)
     }
 
     /// One message, `format=full`; `None` when Gmail has no such message.
-    pub async fn full(&self, auth: &Bearer, id: &str) -> Result<Option<Value>, Failure> {
+    pub fn full(&self, auth: &Bearer, id: &str) -> Result<Option<Value>, Failure> {
         if !id_ok(id) {
             return Ok(None);
         }
-        self.get(auth, format!("messages/{id}"), vec![("format", "full".to_owned())], FULL_MAX).await
+        self.get(auth, format!("messages/{id}"), vec![("format", "full".to_owned())], FULL_MAX)
     }
-}
-
-fn joined(r: Result<Result<Option<Value>, Failure>, tokio::task::JoinError>) -> Result<Option<Value>, Failure> {
-    r.unwrap_or_else(|e| Err(Failure::Plain(format!("the Gmail request failed: {e}"))))
 }
 
 /// A header of a message's `payload` (names are case-insensitive), trimmed;

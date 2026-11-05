@@ -1,19 +1,18 @@
-[package]
-name = "buwiz-gws"
-version = "1.3.0"
-edition = "2021"
-description = "The first-party Google Workspace plugin (app.buwiz.google-workspace): read-only Gmail tools over Gmail's API with the Google account Buwiz Bot signs in to, as a stdio MCP server"
-repository = "https://github.com/buwiz-app/google-workspace"
-publish = false
+[workspace]
+resolver = "2"
+members = ["crates/gws-plugin", "crates/gws-store", "crates/gws-fake-google", "crates/gws-screens"]
 
-[dependencies]
-# the provisioned key and the manifest digest (src/v1); Gmail's base64url bodies
-base64 = "0.22"
-ed25519-dalek = "2.2"
-serde = "1"
-serde_json = { version = "1", features = ["preserve_order"] }
-sha2 = "0.10"
-tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt", "signal", "sync"] }
-# Gmail's REST API: blocking (run on tokio's blocking pool), rustls with ring
-# and Mozilla's roots (webpki-roots), no OpenSSL, no gzip
-ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+repository = "https://github.com/buwiz-app/google-workspace"
+
+[workspace.dependencies]
+# plain: gws-screens is compiled into the Bot, and a feature here would change
+# serde_json for the whole app. The plugin turns on preserve_order for itself.
+serde_json = "1"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

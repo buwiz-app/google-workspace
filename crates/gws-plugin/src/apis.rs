@@ -25,10 +25,10 @@ impl Apis {
     /// Google, unless this is a `stub` build and [`STUB_ENV`] names a loopback server.
     pub fn from_env() -> Self {
         #[cfg(feature = "stub")]
-        if let Ok(base) = std::env::var(STUB_ENV) {
-            if is_loopback(&base) {
-                return Self::at(&base);
-            }
+        if let Ok(base) = std::env::var(STUB_ENV)
+            && is_loopback(&base)
+        {
+            return Self::at(&base);
         }
         Self::google()
     }

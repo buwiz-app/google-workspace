@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use buwiz_plugin::manifest::MANIFEST_ENV;
+use buwiz_plugin::manifest::{MANIFEST_ENV, Served};
 use buwiz_plugin::{Caller, Origin, Plugin as _, Server};
 use serde_json::{Value, json};
 
@@ -73,11 +73,17 @@ fn is_error(reply: Option<&Value>) -> bool {
     reply.is_none_or(|r| r.get("error").is_some() || r.pointer("/result/isError") == Some(&Value::Bool(true)))
 }
 
-/// The plugin's own check of a tool's audience, beside the Hub's: a screen, a
-/// resolve or a routine may reach what they're granted, but the model reaches
-/// only a tool that names `agent`. The SDK doesn't know the audience.
+/// The plugin's own check of a tool's audience, beside the Hub's, and closed
+/// by default: only a caller it can name reaches anything.
 fn audience_allows(name: &str, origin: Origin) -> bool {
-    origin != Origin::Agent || tools::defs().iter().any(|d| d.name == name && d.audience.contains(&"agent"))
+    let names = |who: &str| tools::defs().iter().any(|d| d.name == name && d.audience.contains(&who));
+    match origin {
+        Origin::App => names("app"),
+        // a routine's turn is the model's
+        Origin::Agent | Origin::Routine => names("agent"),
+        Origin::Resolve => name == tools::RESOLVE,
+        Origin::Unknown => false,
+    }
 }
 
 type Out = Arc<Mutex<std::io::Stdout>>;
@@ -90,11 +96,19 @@ fn write(out: &Out, reply: &Value) {
     let _ = out.flush();
 }
 
-/// The manifest must be the signed one the Bot verified. Without this the
-/// SDK would serve the unsigned one and check callers against it.
-fn require_manifest() -> Result<(), String> {
+/// The signed manifest, read once. Served from memory, so the bytes the Bot
+/// verified are the ones the caller checks use for as long as this process
+/// runs, whatever happens to the file. Without one the plugin doesn't start:
+/// the SDK would serve the unsigned manifest and check callers against that.
+fn pinned_manifest() -> Result<Served, String> {
     let path = std::env::var_os(MANIFEST_ENV).filter(|p| !p.is_empty()).ok_or(format!("{MANIFEST_ENV} is not set, so there is no signed manifest to serve"))?;
-    std::fs::read(&path).map(drop).map_err(|e| format!("{MANIFEST_ENV}: {e}"))
+    let unsigned = std::fs::read_to_string(&path).map_err(|e| format!("{MANIFEST_ENV}: {e}"))?;
+    Ok(Served { signed: None, unsigned })
+}
+
+/// A tool's answer. A panic is an error for this call, not a silent caller.
+fn answer(run: impl FnOnce() -> Value) -> Value {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|_| buwiz_plugin::fail("internal", "That didn't work. Try again."))
 }
 
 /// Runs in-flight requests can be cancelled by id.
@@ -102,13 +116,12 @@ type Running = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 
 /// Serves stdin to stdout until stdin closes, then waits for what's running.
 pub fn serve(plugin: Gws) -> Result<(), String> {
-    require_manifest()?;
-    run(plugin).map_err(|e| e.to_string())
+    run(plugin, pinned_manifest()?).map_err(|e| e.to_string())
 }
 
-fn run(plugin: Gws) -> std::io::Result<()> {
+fn run(plugin: Gws, manifest: Served) -> std::io::Result<()> {
     let core = plugin.core.clone();
-    let mut server = Server::new(plugin);
+    let mut server = Server::with_manifest(plugin, manifest);
     let out: Out = Arc::new(Mutex::new(std::io::stdout()));
     let mut running: Vec<JoinHandle<()>> = Vec::new();
     let cancels: Running = Arc::default();
@@ -155,7 +168,7 @@ fn run(plugin: Gws) -> std::io::Result<()> {
                 cancels.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), cancelled.clone());
                 let (core, out, cancels) = (core.clone(), out.clone(), cancels.clone());
                 running.push(std::thread::spawn(move || {
-                    let result = core.run(&name, &args);
+                    let result = answer(|| core.run(&name, &args));
                     cancels.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
                     if !cancelled.load(Ordering::SeqCst) {
                         write(&out, &json!({"jsonrpc": "2.0", "id": id, "result": result}));
@@ -210,9 +223,27 @@ mod tests {
     #[test]
     fn the_model_reaches_only_a_tool_that_names_it() {
         assert!(audience_allows(tools::READ_MAIL, Origin::Agent));
+        assert!(audience_allows(tools::READ_MAIL, Origin::Routine));
         assert!(!audience_allows(tools::STATUS, Origin::Agent), "the address on it is the screen's");
+        assert!(!audience_allows(tools::STATUS, Origin::Routine));
         assert!(audience_allows(tools::STATUS, Origin::App));
         assert!(audience_allows(tools::RESOLVE, Origin::Resolve));
+        assert!(!audience_allows(tools::STATUS, Origin::Resolve), "a resolve reaches the resolve tool");
+    }
+
+    #[test]
+    fn a_caller_it_cant_name_reaches_nothing() {
+        for def in tools::defs() {
+            assert!(!audience_allows(def.name, Origin::Unknown), "{}", def.name);
+        }
+    }
+
+    #[test]
+    fn a_panic_is_an_answer() {
+        let r = answer(|| panic!("a bug"));
+        assert_eq!((r["isError"].clone(), r["structuredContent"]["code"].clone()), (json!(true), json!("internal")));
+        assert!(!r.to_string().contains("a bug"), "what panicked stays out of the answer");
+        assert_eq!(answer(|| json!({"ok": true})), json!({"ok": true}));
     }
 
     #[test]

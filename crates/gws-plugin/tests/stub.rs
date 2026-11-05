@@ -53,7 +53,7 @@ fn each_command_opens_its_own_screen() {
 }
 
 #[test]
-fn a_store_from_another_plugin_key_starts_afresh() {
+fn a_new_plugin_key_finds_a_new_store_and_the_old_one_stays() {
     let google = FakeGoogle::start(Seed::default());
     let core = signed_in(&google, "rekey");
     core.unlock("first-seed");
@@ -61,6 +61,8 @@ fn a_store_from_another_plugin_key_starts_afresh() {
     let again = Core::new(&Apis::at(&google.base()), core.paths.clone());
     again.unlock("second-seed");
     assert_eq!(again.store().unwrap().as_ref().unwrap().state("a", "k").unwrap(), None);
+    drop(again);
+    assert_eq!(core.store().unwrap().as_ref().unwrap().state("a", "k").unwrap().as_deref(), Some("v"), "nothing was wiped");
 }
 
 #[test]
@@ -70,8 +72,9 @@ fn uninstall_takes_every_token_and_every_file() {
     assert!(core.store().is_err(), "the store stays shut until the Bot provisions");
     core.unlock("a-fake-seed");
     drop(core.store().unwrap());
-    assert!(core.paths.db().exists());
+    let db = core.paths.db(&gws_store::key_from_seed("a-fake-seed"));
+    assert!(db.exists());
     core.uninstall();
     assert!(core.accounts.google().is_none());
-    assert!(!core.paths.dir.exists());
+    assert!(!db.exists() && !core.paths.dir.exists());
 }

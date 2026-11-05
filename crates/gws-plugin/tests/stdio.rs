@@ -54,6 +54,37 @@ fn without_a_readable_signed_manifest_it_does_not_start() {
     assert!(!status.success() && err.contains("BUWIZ_PLUGIN_MANIFEST"), "{err}");
 }
 
+/// What the Bot verified is what's served, whatever becomes of the file.
+#[test]
+fn the_manifest_is_read_once() {
+    let manifest = manifest_file("pinned");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws")).arg("mcp").env("BUWIZ_PLUGIN_MANIFEST", &manifest).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut next = || {
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+    writeln!(stdin, "{}", provision()).unwrap();
+    next();
+    std::fs::write(&manifest, r#"{"swapped": true}"#).unwrap();
+    writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": "buwiz://manifest"}})).unwrap();
+    assert_eq!(next()["result"]["contents"][0]["text"], text);
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn a_caller_it_cant_name_gets_nothing() {
+    let manifest = manifest_file("nameless");
+    let call = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "gws_status", "arguments": {}}});
+    let (_, out, _) = run(Some(&manifest), &[provision(), call]);
+    let reply: Value = serde_json::from_str(out.lines().last().unwrap()).unwrap();
+    assert_eq!(reply["result"]["structuredContent"]["code"], "permission_denied", "{out}");
+}
+
 #[test]
 fn a_call_with_no_id_is_not_answered_and_a_bad_byte_is_one_bad_line() {
     let manifest = manifest_file("noid");
@@ -98,7 +129,7 @@ fn a_cancelled_request_gets_no_answer() {
     assert!(next().contains("manifest_sha256"));
     writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "buwiz.account.set", "arguments": {"account": "google", "label": "default", "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}}})).unwrap();
     next();
-    writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "gws_search_mail", "arguments": {"query": "x"}}})).unwrap();
+    writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "gws_search_mail", "arguments": {"query": "x"}, "_meta": {"buwiz/caller": {"origin": "agent"}}}})).unwrap();
     writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 3}})).unwrap();
     writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 4, "method": "ping"})).unwrap();
     assert!(next().contains("\"id\":4"), "the ping answers while the search waits");
@@ -135,7 +166,7 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
         assert_eq!(v["id"], id, "{line}");
         v
     };
-    let call = |ask: &mut dyn FnMut(&str, Value) -> Value, name: &str, args: Value| ask("tools/call", json!({"name": name, "arguments": args}))["result"].clone();
+    let call = |ask: &mut dyn FnMut(&str, Value) -> Value, name: &str, args: Value| ask("tools/call", json!({"name": name, "arguments": args, "_meta": {"buwiz/caller": {"origin": "agent"}}}))["result"].clone();
 
     ask("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}));
     let tools = ask("tools/list", json!({}));

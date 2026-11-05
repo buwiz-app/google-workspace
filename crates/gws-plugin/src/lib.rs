@@ -59,29 +59,26 @@ impl Core {
         tools::run(&self.gmail, &self.accounts, tool, args)
     }
 
-    /// The store, opened if it isn't yet. What it holds can be fetched again,
-    /// so a store made under another plugin key is started afresh.
+    /// The store, opened if it isn't yet. One that won't open is an error for
+    /// the caller: nothing here deletes it.
     pub fn store(&self) -> Result<MutexGuard<'_, Option<Store>>, gws_store::Error> {
         let mut held = self.store.lock().unwrap_or_else(|e| e.into_inner());
         if held.is_none() {
             let key = self.store_key.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or(gws_store::Error { code: "locked", message: "The store opens after the Bot provisions the plugin.".to_owned() })?;
-            *held = Some(match Store::open(&self.paths, &key) {
-                Err(e) if e.code == "wrong_key" => {
-                    gws_store::wipe(&self.paths)?;
-                    Store::open(&self.paths, &key)?
-                }
-                other => other?,
-            });
+            *held = Some(Store::open(&self.paths, &key)?);
         }
         Ok(held)
     }
 
-    /// `buwiz.uninstall`: every token and every file goes.
+    /// `buwiz.uninstall`, which the person confirmed: every token, and this
+    /// install's files.
     pub fn uninstall(&self) {
         self.accounts.forget();
         *self.store.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        if let Err(e) = gws_store::wipe(&self.paths) {
-            eprintln!("buwiz-gws: uninstall: {}", e.code);
+        if let Some(key) = self.store_key.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            if let Err(e) = gws_store::wipe(&self.paths, &key) {
+                eprintln!("buwiz-gws: uninstall: {}", e.code);
+            }
         }
     }
 }

@@ -1,23 +1,25 @@
-//! The plugin's local store: SQLCipher in `<data dir>/workspace.db`, migrated
-//! forward on open. Everything here is the person's Google data, so the store
+//! The plugin's local store: SQLCipher in `<data dir>/workspace-<id>.db`,
+//! migrated forward on open. Everything here is the person's Google data, so the store
 //! refuses to open without encryption. It holds no tokens: those stay in the
 //! Bot's keystore and in the plugin's memory.
 //!
 //! The key is on no disk of ours. [`key_from_seed`] derives it from the plugin
 //! key the Bot's keystore holds and provisions at every start, so a backup or
-//! a copy of the data folder carries the lock without the key.
+//! a copy of the data folder carries the lock without the key. The file's name
+//! comes from the key too, so each install has a store of its own and a new
+//! plugin key finds a new file: nothing ever has to delete a store to go on.
 
 use std::fs;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension as _, params};
 use sha2::{Digest as _, Sha256};
 
 pub const DATA_DIR_ENV: &str = "GWS_DATA_DIR";
-const DB_FILE: &str = "workspace.db";
-/// Where open Drive files and attachments are kept while the person works on them.
-const OPEN_DIR: &str = "open";
+/// How long a locked store is waited for.
+const BUSY_WAIT: Duration = Duration::from_secs(5);
 
 /// The schema, oldest first. A released migration never changes.
 const MIGRATIONS: &[(i64, &str)] = &[(
@@ -80,13 +82,22 @@ impl Paths {
         if dir.is_absolute() { Ok(Self { dir }) } else { Err(error("data_dir", "The data folder must be an absolute path.")) }
     }
 
-    pub fn db(&self) -> PathBuf {
-        self.dir.join(DB_FILE)
+    /// The store of the install holding `key`.
+    pub fn db(&self, key: &str) -> PathBuf {
+        self.dir.join(format!("workspace-{}.db", install_id(key)))
     }
 
-    pub fn open_dir(&self) -> PathBuf {
-        self.dir.join(OPEN_DIR)
+    /// Where this install keeps open Drive files and attachments. Their edits
+    /// can't be fetched again, so only an uninstall ever removes them.
+    pub fn open_dir(&self, key: &str) -> PathBuf {
+        self.dir.join(format!("open-{}", install_id(key)))
     }
+}
+
+/// What names an install's files: says nothing about the key.
+fn install_id(key: &str) -> String {
+    let digest = Sha256::new().chain_update(b"app.buwiz.google-workspace install id v1\0").chain_update(key.as_bytes()).finalize();
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 /// The store's key: 64 hex digits from the provisioned plugin key, under a
@@ -101,23 +112,35 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open (creating when absent) the store at `paths`, migrated to the latest schema.
+    /// Open (creating when absent) this install's store, migrated to the
+    /// latest schema. Nothing here deletes anything: a store that won't open
+    /// stays as it is and the error says why.
     pub fn open(paths: &Paths, key: &str) -> Result<Self> {
+        Self::open_waiting(paths, key, BUSY_WAIT)
+    }
+
+    fn open_waiting(paths: &Paths, key: &str, wait: Duration) -> Result<Self> {
         if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(error("bad_key", "That is not a store key."));
         }
         fs::DirBuilder::new().recursive(true).mode(0o700).create(&paths.dir).map_err(|_| error("data_dir", "The data folder cannot be made."))?;
-        let conn = Connection::open(paths.db())?;
+        let conn = Connection::open(paths.db(key))?;
+        conn.busy_timeout(wait)?;
         // SQLCipher reads a raw key as x'<64 hex>' (no key derivation)
         conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))?;
         let cipher: Option<String> = conn.query_row("PRAGMA cipher_version", [], |r| r.get(0)).optional()?;
         if cipher.filter(|c| !c.is_empty()).is_none() {
             return Err(error("no_cipher", "This build has no SQLCipher, so it will not keep mail it can't encrypt."));
         }
-        if conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).is_err() {
-            return Err(error("wrong_key", "The store does not open with this key file."));
+        match conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)) {
+            Ok(_) => {}
+            // the one answer that means this key doesn't fit; a busy or full
+            // disk is only that, whatever it might look like
+            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::NotADatabase => return Err(error("wrong_key", "The store does not open with this key.")),
+            Err(e) => return Err(e.into()),
         }
-        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = DELETE;")?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        conn.query_row("PRAGMA journal_mode = DELETE", [], |_| Ok(()))?;
         let mut store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -153,16 +176,23 @@ impl Store {
     }
 }
 
-/// Deletes what the plugin keeps (`buwiz.uninstall`): its own files by name,
-/// never the folder's other contents, and the folder only once it's empty.
-pub fn wipe(paths: &Paths) -> Result<()> {
+/// Deletes this install's files (`buwiz.uninstall`, which the person
+/// confirmed), the store's side files with it, and the folder once it's empty.
+/// Nothing else calls this, and another install's files stay.
+pub fn wipe(paths: &Paths, key: &str) -> Result<()> {
     let gone = |r: std::io::Result<()>| match r {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(error("wipe", "The plugin's files could not be removed.")),
     };
-    gone(fs::remove_file(paths.db()))?;
-    gone(fs::remove_dir_all(paths.open_dir()))?;
+    let db = paths.db(key);
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut side = db.clone().into_os_string();
+        side.push(suffix);
+        gone(fs::remove_file(side))?;
+    }
+    gone(fs::remove_file(&db))?;
+    gone(fs::remove_dir_all(paths.open_dir(key)))?;
     let _ = fs::remove_dir(&paths.dir);
     Ok(())
 }
@@ -198,7 +228,7 @@ mod tests {
         let secret = "fake-subject-line-to-find-on-disk";
         Store::open(&paths, &key()).unwrap().set_state("me@example.com", "cursor", secret).unwrap();
         assert_eq!(Store::open(&paths, &key()).unwrap().state("me@example.com", "cursor").unwrap().as_deref(), Some(secret));
-        let bytes = fs::read(paths.db()).unwrap();
+        let bytes = fs::read(paths.db(&key())).unwrap();
         assert!(!bytes.starts_with(b"SQLite format 3"), "an encrypted file has no SQLite header");
         assert!(!bytes.windows(secret.len()).any(|w| w == secret.as_bytes()), "the value is not in the file");
     }
@@ -211,9 +241,24 @@ mod tests {
         let key = key();
         drop(Store::open(&paths, &key).unwrap());
         let files: Vec<String> = fs::read_dir(&paths.dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
-        assert_eq!(files, ["workspace.db"], "no key file beside it");
-        let bytes = fs::read(paths.db()).unwrap();
+        assert_eq!(files.len(), 1, "no key file beside it: {files:?}");
+        assert!(files[0].starts_with("workspace-") && !files[0].contains(&key[..16]), "{files:?}");
+        let bytes = fs::read(paths.db(&key)).unwrap();
         assert!(!bytes.windows(key.len()).any(|w| w == key.as_bytes()));
+    }
+
+    /// Two installs on one folder, or a new plugin key: neither touches the other.
+    #[test]
+    fn each_install_has_its_own_store() {
+        let dir = Dir::new("two");
+        let paths = Paths::in_dir(&dir.0);
+        let (one, two) = (key_from_seed("one"), key_from_seed("two"));
+        Store::open(&paths, &one).unwrap().set_state("a", "k", "first").unwrap();
+        Store::open(&paths, &two).unwrap().set_state("a", "k", "second").unwrap();
+        assert_eq!(Store::open(&paths, &one).unwrap().state("a", "k").unwrap().as_deref(), Some("first"));
+        assert_eq!(Store::open(&paths, &two).unwrap().state("a", "k").unwrap().as_deref(), Some("second"));
+        wipe(&paths, &one).unwrap();
+        assert!(!paths.db(&one).exists() && paths.db(&two).exists(), "an uninstall takes its own files only");
     }
 
     #[test]
@@ -225,12 +270,39 @@ mod tests {
     }
 
     #[test]
-    fn another_key_does_not_open_it_and_a_malformed_one_is_refused() {
+    fn a_damaged_store_is_wrong_key_and_stays_on_disk_and_a_malformed_key_is_refused() {
         let dir = Dir::new("wrong");
         let paths = Paths::in_dir(&dir.0);
-        drop(Store::open(&paths, &key()).unwrap());
-        assert_eq!(Store::open(&paths, &key_from_seed("another")).err().unwrap().code, "wrong_key");
+        let key = key();
+        drop(Store::open(&paths, &key).unwrap());
+        let bytes = vec![7u8; 8192];
+        fs::write(paths.db(&key), &bytes).unwrap();
+        assert_eq!(Store::open(&paths, &key).err().unwrap().code, "wrong_key");
+        assert_eq!(fs::read(paths.db(&key)).unwrap(), bytes, "left as it was");
         assert_eq!(Store::open(&paths, "short").err().unwrap().code, "bad_key");
+    }
+
+    /// A store another connection holds is busy, not the wrong key.
+    #[test]
+    fn a_busy_store_is_not_a_wrong_key() {
+        let dir = Dir::new("busy");
+        let paths = Paths::in_dir(&dir.0);
+        let key = key();
+        let holder = Store::open(&paths, &key).unwrap();
+        holder.conn().execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let err = Store::open_waiting(&paths, &key, Duration::from_millis(50)).err().unwrap();
+        assert_eq!(err.code, "store");
+        holder.conn().execute_batch("COMMIT;").unwrap();
+        assert!(Store::open(&paths, &key).is_ok(), "and nothing was lost");
+    }
+
+    #[test]
+    fn a_store_it_cant_reach_is_not_a_wrong_key() {
+        let dir = Dir::new("io");
+        let paths = Paths::in_dir(&dir.0);
+        let key = key();
+        fs::create_dir_all(paths.db(&key)).unwrap();
+        assert_eq!(Store::open(&paths, &key).err().unwrap().code, "store");
     }
 
     #[test]
@@ -243,16 +315,22 @@ mod tests {
     }
 
     #[test]
-    fn wipe_leaves_what_isnt_the_plugins() {
+    fn wipe_takes_this_installs_files_and_leaves_the_rest() {
         let dir = Dir::new("shared");
         let paths = Paths::in_dir(&dir.0);
-        drop(Store::open(&paths, &key()).unwrap());
-        fs::create_dir_all(paths.open_dir()).unwrap();
-        fs::write(paths.open_dir().join("a.docx"), b"x").unwrap();
+        let key = key();
+        drop(Store::open(&paths, &key).unwrap());
+        fs::create_dir_all(paths.open_dir(&key)).unwrap();
+        fs::write(paths.open_dir(&key).join("a.docx"), b"x").unwrap();
+        let sides: Vec<String> = ["-journal", "-wal", "-shm"].iter().map(|s| format!("{}{s}", paths.db(&key).display())).collect();
+        for side in &sides {
+            fs::write(side, b"stale").unwrap();
+        }
         let other = paths.dir.join("someone-elses.txt");
         fs::write(&other, b"keep me").unwrap();
-        wipe(&paths).unwrap();
-        assert!(other.exists() && !paths.db().exists() && !paths.open_dir().exists());
+        wipe(&paths, &key).unwrap();
+        assert!(other.exists() && !paths.db(&key).exists() && !paths.open_dir(&key).exists());
+        assert!(sides.iter().all(|s| !std::path::Path::new(s).exists()), "no stale journal for a later store");
     }
 
     #[test]
@@ -263,8 +341,8 @@ mod tests {
         store.conn().execute_batch("PRAGMA user_version = 9999;").unwrap();
         drop(store);
         assert_eq!(Store::open(&paths, &key()).err().unwrap().code, "schema_newer");
-        wipe(&paths).unwrap();
+        wipe(&paths, &key()).unwrap();
         assert!(!paths.dir.exists());
-        wipe(&paths).unwrap();
+        wipe(&paths, &key()).unwrap();
     }
 }

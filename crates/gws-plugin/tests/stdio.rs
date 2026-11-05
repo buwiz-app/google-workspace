@@ -86,13 +86,84 @@ fn a_caller_it_cant_name_gets_nothing() {
 }
 
 #[test]
-fn a_call_with_no_id_is_not_answered_and_a_bad_byte_is_one_bad_line() {
+fn a_call_with_no_id_is_not_answered() {
     let manifest = manifest_file("noid");
     let call = json!({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "gws_status", "arguments": {}}});
     let ping = json!({"jsonrpc": "2.0", "id": 2, "method": "ping"});
     let (_, out, _) = run(Some(&manifest), &[provision(), call, ping]);
     let replies: Vec<Value> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(replies.iter().map(|r| r["id"].clone()).collect::<Vec<_>>(), [json!(1), json!(2)], "{out}");
+}
+
+#[test]
+fn a_bad_byte_is_one_bad_line() {
+    let manifest = manifest_file("byte");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws")).arg("mcp").env("BUWIZ_PLUGIN_MANIFEST", &manifest).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"x\":\"\xff\xfe\"}\n\xc3\x28\n").unwrap();
+    writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 2, "method": "ping"})).unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("\"id\":2"), "it read on: {text}");
+}
+
+#[test]
+fn what_isnt_a_json_rpc_message_gets_no_answer() {
+    let manifest = manifest_file("junk");
+    let lines = [json!({"jsonrpc": "1.0", "id": 1, "method": "ping"}), json!({"id": 2, "method": "ping"}), json!({"jsonrpc": "2.0", "id": 3}), json!({"jsonrpc": "2.0", "id": 4, "method": "ping", "params": [1]}), json!([5]), json!({"jsonrpc": "2.0", "id": 6, "method": "ping"})];
+    let (_, out, _) = run(Some(&manifest), &lines);
+    let ids: Vec<Value> = out.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["id"].clone()).collect();
+    assert_eq!(ids, [json!(6)], "{out}");
+}
+
+/// With no HOME there's no store, and mail search works all the same.
+#[test]
+fn no_home_means_no_store_not_no_plugin() {
+    let manifest = manifest_file("nohome");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws")).arg("mcp").env_remove("HOME").env_remove("GWS_DATA_DIR").env("BUWIZ_PLUGIN_MANIFEST", &manifest).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{}", provision()).unwrap();
+    writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "gws_search_mail", "arguments": {"query": "x"}, "_meta": {"buwiz/caller": {"origin": "agent"}}}})).unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && text.contains("account_required"), "{text}");
+}
+
+/// Past the cap a call is refused at once, and the ones running still answer.
+#[cfg(feature = "stub")]
+#[test]
+fn past_the_cap_a_call_is_refused_not_queued_forever() {
+    let (gate, wait) = std::sync::mpsc::channel::<()>();
+    let wait = std::sync::Mutex::new(wait);
+    let fake = gws_fake_google::serve(move |_| {
+        let _ = wait.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10));
+        (200, json!({"messages": []}).to_string())
+    });
+    let base = fake.base.trim_end_matches("/gmail/v1/users/me").to_owned();
+    let manifest = manifest_file("cap");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws")).arg("mcp").env("BUWIZ_PLUGIN_MANIFEST", &manifest).env("GWS_STUB_BASE", base).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut next = || {
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+    writeln!(stdin, "{}", provision()).unwrap();
+    next();
+    writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "buwiz.account.set", "arguments": {"account": "google", "label": "default", "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}}})).unwrap();
+    next();
+    for id in 10..43 {
+        writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "gws_search_mail", "arguments": {"query": "x"}, "_meta": {"buwiz/caller": {"origin": "agent"}}}})).unwrap();
+    }
+    let refused = next();
+    assert_eq!((refused["id"].clone(), refused["result"]["structuredContent"]["code"].clone()), (json!(42), json!("rate_limited")), "{refused}");
+    drop(gate);
+    drop(stdin);
+    child.wait().unwrap();
 }
 
 #[test]

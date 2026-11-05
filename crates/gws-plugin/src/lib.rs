@@ -30,7 +30,9 @@ use gmail::Gmail;
 pub struct Core {
     pub accounts: Accounts,
     pub gmail: Gmail,
-    pub paths: Paths,
+    /// Where the store lives. An error waits here for whoever needs the store:
+    /// not having one must not stop mail search.
+    pub paths: Result<Paths, gws_store::Error>,
     /// The store's key, from the provisioned plugin key: memory only. Its
     /// being here is also how the loop knows provision happened: the SDK
     /// keeps its own key private.
@@ -40,7 +42,7 @@ pub struct Core {
 }
 
 impl Core {
-    pub fn new(apis: &Apis, paths: Paths) -> Self {
+    pub fn new(apis: &Apis, paths: Result<Paths, gws_store::Error>) -> Self {
         Self { accounts: Accounts::default(), gmail: Gmail::new(&apis.gmail), paths, store_key: Mutex::new(None), store: Mutex::new(None) }
     }
 
@@ -65,7 +67,8 @@ impl Core {
         let mut held = self.store.lock().unwrap_or_else(|e| e.into_inner());
         if held.is_none() {
             let key = self.store_key.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or(gws_store::Error { code: "locked", message: "The store opens after the Bot provisions the plugin.".to_owned() })?;
-            *held = Some(Store::open(&self.paths, &key)?);
+            let paths = self.paths.as_ref().map_err(Clone::clone)?;
+            *held = Some(Store::open(paths, &key)?);
         }
         Ok(held)
     }
@@ -76,7 +79,8 @@ impl Core {
         self.accounts.forget();
         *self.store.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let key = self.store_key.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(Err(e)) = key.map(|key| gws_store::wipe(&self.paths, &key)) {
+        let paths = self.paths.as_ref().ok();
+        if let Some(Err(e)) = key.zip(paths).map(|(key, paths)| gws_store::wipe(paths, &key)) {
             eprintln!("buwiz-gws: uninstall: {}", e.code);
         }
     }
@@ -88,9 +92,8 @@ pub struct Gws {
 }
 
 impl Gws {
-    pub fn from_env() -> Result<Self, String> {
-        let paths = Paths::from_env().map_err(|e| e.message)?;
-        Ok(Self { core: Arc::new(Core::new(&Apis::from_env(), paths)) })
+    pub fn from_env() -> Self {
+        Self { core: Arc::new(Core::new(&Apis::from_env(), Paths::from_env())) }
     }
 }
 

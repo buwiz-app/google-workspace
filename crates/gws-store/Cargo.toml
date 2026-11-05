@@ -8,4 +8,11 @@ publish.workspace = true
 
 [dependencies]
 sha2 = "0.10"
+
+# SQLCipher's crypto: Apple's CommonCrypto on macOS, so no OpenSSL there. Other
+# platforms have no system crypto SQLCipher can count on, so OpenSSL is built in.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }

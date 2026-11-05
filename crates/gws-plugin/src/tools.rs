@@ -126,9 +126,20 @@ pub fn run(gmail: &Gmail, accounts: &Accounts, name: &str, args: &Value) -> Valu
 /// the person, so this tool is never the model's.
 fn status(accounts: &Accounts) -> Value {
     match accounts.signed_in() {
-        Some((subject, scopes)) => ok(json!({"signed_in": true, "subject": subject, "scopes": scopes})),
+        Some((subject, scopes)) => ok(json!({"signed_in": true, "subject": subject, "scopes": scopes, "features": features(&scopes)})),
         None => ok(json!({"signed_in": false})),
     }
+}
+
+/// What a sign-in's scopes actually cover. The screens say this, not just
+/// that someone is signed in.
+fn features(scopes: &[String]) -> Value {
+    let covers = |wanted: &[&str]| scopes.iter().any(|s| wanted.iter().any(|w| s.strip_prefix("https://www.googleapis.com/auth/") == Some(*w) || s == w));
+    json!({
+        "mail": covers(&["gmail.readonly", "gmail.modify", "https://mail.google.com/"]),
+        "calendar": covers(&["calendar", "calendar.events", "calendar.readonly", "calendar.events.readonly"]),
+        "drive": covers(&["drive", "drive.readonly", "drive.file"]),
+    })
 }
 
 /// `/mail`, `/calendar`, `/drive`, and `/gws <one of them>`: opens that screen.

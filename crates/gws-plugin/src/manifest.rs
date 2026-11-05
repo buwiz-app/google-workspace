@@ -16,9 +16,14 @@ pub const APPS: [(&str, &str, &str, &str); 3] = [
     ("drive", "Drive", "gws.drive", "Your files in Google Drive."),
 ];
 
-/// The tools a screen calls.
-fn screen_tools() -> Vec<&'static str> {
-    tools::defs().into_iter().filter(|d| d.name != tools::RESOLVE).map(|d| d.name).collect()
+/// The tools each screen calls. Each gets its own and no other, so approving
+/// Calendar never grants a read of Gmail.
+fn screen_tools(id: &str) -> Vec<&'static str> {
+    let mut own = vec![tools::STATUS];
+    if id == "mail" {
+        own.extend([tools::SEARCH_MAIL, tools::READ_MAIL]);
+    }
+    own
 }
 
 fn app(&(id, title, screen, description): &(&str, &str, &str, &str)) -> Value {
@@ -28,7 +33,7 @@ fn app(&(id, title, screen, description): &(&str, &str, &str, &str)) -> Value {
         "description": description,
         "native": { "screen": screen, "abi": buwiz_plugin::manifest::NATIVE_ABI },
         "placement": ["full"],
-        "permissions": { "tools": screen_tools() },
+        "permissions": { "tools": screen_tools(id) },
     })
 }
 
@@ -74,6 +79,15 @@ mod tests {
         assert_eq!(ids, ["mail", "calendar", "drive"]);
         let screens: Vec<&str> = apps.iter().map(|a| a["native"]["screen"].as_str().unwrap()).collect();
         assert_eq!(screens, ["gws.mail", "gws.calendar", "gws.drive"]);
+    }
+
+    #[test]
+    fn only_mail_is_granted_mail_tools() {
+        let m = unsigned(RELEASE_KEY_ID);
+        let tools_of = |id: &str| m["apps"].as_array().unwrap().iter().find(|a| a["id"] == id).unwrap()["permissions"]["tools"].clone();
+        assert_eq!(tools_of("mail"), json!(["gws_status", "gws_search_mail", "gws_read_mail"]));
+        assert_eq!(tools_of("calendar"), json!(["gws_status"]));
+        assert_eq!(tools_of("drive"), json!(["gws_status"]));
     }
 
     #[test]

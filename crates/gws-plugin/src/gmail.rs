@@ -3,7 +3,7 @@
 //! headers, a message's plain-text body (text/plain, else text/html with
 //! the tags stripped), one-line snippets, the 64 KiB cap.
 //!
-//! The HTTP client is ureq (rustls with Mozilla's roots, no OpenSSL),
+//! The HTTP client is ureq (rustls with Mozilla's roots, so no OpenSSL in it),
 //! blocking, on the tool's own thread. It follows no redirects, so the token
 //! only ever goes to the API base.
 

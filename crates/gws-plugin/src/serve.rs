@@ -36,6 +36,7 @@ fn with_audience(mut reply: Value) -> Value {
 /// A message for [`Server`], or one this loop answers.
 enum Route {
     Server,
+    Initialize,
     List,
     Account(String),
     Provision,
@@ -47,6 +48,9 @@ fn route(message: &Value) -> Route {
     let method = message.get("method").and_then(Value::as_str);
     if method == Some("notifications/cancelled") {
         return Route::Cancelled;
+    }
+    if method == Some("initialize") {
+        return Route::Initialize;
     }
     if method == Some("tools/list") {
         return Route::List;
@@ -85,6 +89,30 @@ fn audience_allows(name: &str, origin: Origin) -> bool {
         Origin::Unknown => false,
     }
 }
+
+/// The MCP revisions this server speaks, newest first; the broker takes any.
+const MCP_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
+
+/// `initialize`'s answer, on the revision the client asked for when it's one
+/// of ours, else on the newest.
+fn negotiated(mut reply: Value, message: &Value) -> Value {
+    let asked = message.pointer("/params/protocolVersion").and_then(Value::as_str);
+    let version = asked.filter(|v| MCP_VERSIONS.contains(v)).unwrap_or(MCP_VERSIONS[0]);
+    if let Some(result) = reply.get_mut("result") {
+        result["protocolVersion"] = json!(version);
+    }
+    reply
+}
+
+/// Whether a parsed line is a JSON-RPC message at all. One that isn't gets no
+/// answer: a reply would have no request to pair with.
+fn is_message(message: &Value) -> bool {
+    message.get("jsonrpc") == Some(&json!("2.0")) && message.get("method").is_some_and(Value::is_string) && message.get("params").is_none_or(Value::is_object)
+}
+
+/// Tools running at once, past which a call is refused: a Bot's screens hold
+/// 8 in flight each, and each call here is a thread.
+const MAX_RUNNING: usize = 32;
 
 type Out = Arc<Mutex<std::io::Stdout>>;
 
@@ -138,14 +166,7 @@ fn run(plugin: Gws, manifest: Served) -> std::io::Result<()> {
         if line.is_empty() {
             continue;
         }
-        let Ok(message) = serde_json::from_str::<Value>(line) else {
-            // the SDK's answer to what isn't JSON
-            if let Some(reply) = server.handle_line(line) {
-                let mut out = out.lock().unwrap_or_else(|e| e.into_inner());
-                out.write_all(reply.as_bytes())?;
-                out.write_all(b"\n")?;
-                out.flush()?;
-            }
+        let Some(message) = serde_json::from_str::<Value>(line).ok().filter(is_message) else {
             continue;
         };
         running.retain(|t| !t.is_finished());
@@ -163,6 +184,10 @@ fn run(plugin: Gws, manifest: Served) -> std::io::Result<()> {
                     write(&out, &json!({"jsonrpc": "2.0", "id": id, "result": buwiz_plugin::fail("permission_denied", "Only a person can do this.")}));
                     continue;
                 }
+                if running.len() >= MAX_RUNNING {
+                    write(&out, &json!({"jsonrpc": "2.0", "id": id, "result": buwiz_plugin::fail("rate_limited", "Busy with other requests. Try again in a moment.")}));
+                    continue;
+                }
                 let cancelled = Arc::new(AtomicBool::new(false));
                 let key = id.to_string();
                 cancels.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), cancelled.clone());
@@ -174,6 +199,11 @@ fn run(plugin: Gws, manifest: Served) -> std::io::Result<()> {
                         write(&out, &json!({"jsonrpc": "2.0", "id": id, "result": result}));
                     }
                 }));
+            }
+            Route::Initialize => {
+                if let Some(reply) = server.handle(&message) {
+                    write(&out, &negotiated(reply, &message));
+                }
             }
             Route::Cancelled => {
                 let request = message.pointer("/params/requestId").map(Value::to_string).unwrap_or_default();
@@ -235,6 +265,24 @@ mod tests {
     fn a_caller_it_cant_name_reaches_nothing() {
         for def in tools::defs() {
             assert!(!audience_allows(def.name, Origin::Unknown), "{}", def.name);
+        }
+    }
+
+    #[test]
+    fn initialize_answers_the_revision_asked_for_if_it_is_ours() {
+        let reply = || json!({"result": {"protocolVersion": "2025-11-25", "capabilities": {}}});
+        let asked = |v: &str| json!({"params": {"protocolVersion": v}});
+        assert_eq!(negotiated(reply(), &asked("2024-11-05"))["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(negotiated(reply(), &asked("1999-01-01"))["result"]["protocolVersion"], "2025-11-25", "else the newest");
+        assert_eq!(negotiated(reply(), &json!({}))["result"]["protocolVersion"], "2025-11-25");
+    }
+
+    #[test]
+    fn only_a_json_rpc_message_counts() {
+        assert!(is_message(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"})));
+        assert!(is_message(&json!({"jsonrpc": "2.0", "method": "x", "params": {}})));
+        for bad in [json!([1]), json!({"id": 1, "method": "ping"}), json!({"jsonrpc": "1.0", "id": 1, "method": "ping"}), json!({"jsonrpc": "2.0", "id": 1}), json!({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": [1]})] {
+            assert!(!is_message(&bad), "{bad}");
         }
     }
 

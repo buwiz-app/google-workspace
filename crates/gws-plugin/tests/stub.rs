@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 fn signed_in(google: &FakeGoogle, name: &str) -> Core {
     let dir = std::env::temp_dir().join(format!("gws-stub-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let core = Core::new(&Apis::at(&google.base()), gws_store::Paths::in_dir(dir));
+    let core = Core::new(&Apis::at(&google.base()), Ok(gws_store::Paths::in_dir(dir)));
     core.accounts.set(&json!({"account": "google", "label": "default", "provider": "google", "subject": "owner@example.com", "scopes": ["https://www.googleapis.com/auth/gmail.readonly"], "access_token": "fake-access-1", "token_type": "Bearer", "expires_at": 4_000_000_000u64}));
     core
 }
@@ -33,6 +33,7 @@ fn status_says_who_is_signed_in_and_never_the_token() {
     let core = signed_in(&google, "status");
     let status: Value = core.run("gws_status", &json!({}));
     assert_eq!(status["structuredContent"]["subject"], "owner@example.com");
+    assert_eq!(status["structuredContent"]["features"], json!({"mail": true, "calendar": false, "drive": false}), "a gmail.readonly sign-in covers Mail alone");
     assert!(!status.to_string().contains("fake-access-1"));
     core.accounts.clear(&json!({"account": "google", "label": "default"}));
     assert_eq!(core.run("gws_status", &json!({}))["structuredContent"]["signed_in"], false);
@@ -65,6 +66,23 @@ fn a_new_plugin_key_finds_a_new_store_and_the_old_one_stays() {
     assert_eq!(core.store().unwrap().as_ref().unwrap().state("a", "k").unwrap().as_deref(), Some("v"), "nothing was wiped");
 }
 
+/// As the Bot opens each screen: the SDK's checks against the real manifest.
+#[test]
+fn calendar_and_drive_opens_cant_reach_mail() {
+    let google = FakeGoogle::start(Seed::demo(3));
+    let core = signed_in(&google, "grants");
+    let mut h = buwiz_plugin::testing::Harness::new(gws::Gws { core: std::sync::Arc::new(core) });
+    for app in ["calendar", "drive"] {
+        for tool in ["gws_search_mail", "gws_read_mail"] {
+            let refused = h.app(app, tool, json!({"query": "x", "id": "x"})).unwrap_err();
+            assert_eq!(refused["code"], "permission_denied", "{app} {tool}: {refused}");
+        }
+        assert!(h.app(app, "gws_status", json!({})).is_ok());
+    }
+    assert!(h.app("mail", "gws_search_mail", json!({"query": "fake"})).is_ok());
+    assert_eq!(google.writes(), []);
+}
+
 #[test]
 fn uninstall_takes_every_token_and_every_file() {
     let google = FakeGoogle::start(Seed::default());
@@ -72,9 +90,10 @@ fn uninstall_takes_every_token_and_every_file() {
     assert!(core.store().is_err(), "the store stays shut until the Bot provisions");
     core.unlock("a-fake-seed");
     drop(core.store().unwrap());
-    let db = core.paths.db(&gws_store::key_from_seed("a-fake-seed"));
+    let paths = core.paths.as_ref().unwrap().clone();
+    let db = paths.db(&gws_store::key_from_seed("a-fake-seed"));
     assert!(db.exists());
     core.uninstall();
     assert!(core.accounts.google().is_none());
-    assert!(!db.exists() && !core.paths.dir.exists());
+    assert!(!db.exists() && !paths.dir.exists());
 }

@@ -6,7 +6,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args == ["mcp"] {
-        return match gws::Gws::from_env().and_then(|plugin| gws::serve::serve(plugin).map_err(|e| format!("stdio: {e}"))) {
+        return match gws::serve::serve(gws::Gws::from_env()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("buwiz-gws: {e}");
@@ -14,5 +14,5 @@ fn main() -> ExitCode {
             }
         };
     }
-    buwiz_plugin::cli::main::<gws::Gws>(gws::Gws::from_env)
+    buwiz_plugin::cli::main::<gws::Gws>(|| Ok(gws::Gws::from_env()))
 }

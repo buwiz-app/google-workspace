@@ -29,7 +29,7 @@ gws-store = { path = "../gws-store" }
 base64 = "0.22"
 serde_json = { workspace = true, features = ["preserve_order"] }
 # Google's REST APIs: blocking, on the tool's own thread; rustls with ring and
-# Mozilla's roots (webpki-roots), no OpenSSL, no gzip
+# Mozilla's roots (webpki-roots), no OpenSSL in the HTTP path, no gzip
 ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]

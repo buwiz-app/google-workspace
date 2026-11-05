@@ -1,4 +1,5 @@
-//! The manifest, built in code: one native app, `workspace`, and the `/gws` command.
+//! The manifest, built in code: Mail, Calendar and Drive, each an app of its
+//! own with its own native screen, title and command.
 
 use serde_json::{Value, json};
 
@@ -8,13 +9,27 @@ pub const ID: &str = "app.buwiz.google-workspace";
 pub const SHORT: &str = "gws";
 pub const TITLE: &str = "Google Workspace";
 pub const RELEASE_KEY_ID: &str = "gc-2026-01";
-/// The app, and the native screen it runs (`gws-screens`).
-pub const APP: &str = "workspace";
-pub const SCREEN: &str = "gws.workspace";
+/// `(app id, title, native screen, description)`: one full screen each.
+pub const APPS: [(&str, &str, &str, &str); 3] = [
+    ("mail", "Mail", "gws.mail", "Your Google mail."),
+    ("calendar", "Calendar", "gws.calendar", "Your Google calendar."),
+    ("drive", "Drive", "gws.drive", "Your files in Google Drive."),
+];
 
-/// The tools the screen calls.
+/// The tools a screen calls.
 fn screen_tools() -> Vec<&'static str> {
     tools::defs().into_iter().filter(|d| d.name != tools::RESOLVE).map(|d| d.name).collect()
+}
+
+fn app(&(id, title, screen, description): &(&str, &str, &str, &str)) -> Value {
+    json!({
+        "id": id,
+        "title": title,
+        "description": description,
+        "native": { "screen": screen, "abi": buwiz_plugin::manifest::NATIVE_ABI },
+        "placement": ["full"],
+        "permissions": { "tools": screen_tools() },
+    })
 }
 
 /// The unsigned manifest under publisher key id `key_id`.
@@ -28,20 +43,12 @@ pub fn unsigned(key_id: &str) -> Value {
         "description": "Mail, Calendar and Drive in Buwiz Bot, with the Google account you sign in to.",
         "publisher": { "id": "app.buwiz", "key_id": key_id, "name": "Goldcoders" },
         "commands": [
-            { "name": "gws", "description": "Open Mail, Calendar or Drive", "args": "[mail, calendar or drive]", "resolve": tools::RESOLVE }
+            { "name": "gws", "description": "Open Mail, Calendar or Drive", "args": "[mail, calendar or drive]", "resolve": tools::RESOLVE },
+            { "name": "mail", "description": "Open Mail", "resolve": tools::RESOLVE },
+            { "name": "calendar", "description": "Open Calendar", "resolve": tools::RESOLVE },
+            { "name": "drive", "description": "Open Drive", "resolve": tools::RESOLVE }
         ],
-        "apps": [{
-            "id": APP,
-            "title": TITLE,
-            "description": "Your Google mail, calendar and files.",
-            "native": { "screen": SCREEN, "abi": buwiz_plugin::manifest::NATIVE_ABI },
-            "props": {
-                "type": "object",
-                "properties": { "page": { "type": "string", "enum": ["mail", "calendar", "drive"] } }
-            },
-            "placement": ["full"],
-            "permissions": { "tools": screen_tools() },
-        }],
+        "apps": APPS.iter().map(app).collect::<Vec<_>>(),
     })
 }
 
@@ -57,6 +64,16 @@ mod tests {
             assert!(!d.audience.is_empty(), "{} must say who may call it: the model's list and the Hub read a missing audience in opposite ways", d.name);
             assert!(d.audience.iter().all(|a| ["agent", "app"].contains(a)), "{}", d.name);
         }
+    }
+
+    #[test]
+    fn mail_calendar_and_drive_are_separate_screens() {
+        let m = unsigned(RELEASE_KEY_ID);
+        let apps = m["apps"].as_array().unwrap();
+        let ids: Vec<&str> = apps.iter().map(|a| a["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["mail", "calendar", "drive"]);
+        let screens: Vec<&str> = apps.iter().map(|a| a["native"]["screen"].as_str().unwrap()).collect();
+        assert_eq!(screens, ["gws.mail", "gws.calendar", "gws.drive"]);
     }
 
     #[test]

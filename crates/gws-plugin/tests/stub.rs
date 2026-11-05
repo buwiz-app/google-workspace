@@ -39,14 +39,17 @@ fn status_says_who_is_signed_in_and_never_the_token() {
 }
 
 #[test]
-fn the_command_opens_the_page_it_names() {
+fn each_command_opens_its_own_screen() {
     let google = FakeGoogle::start(Seed::default());
     let core = signed_in(&google, "resolve");
-    let open = |value: &str| core.run("gws_resolve", &json!({"kind": "command", "name": "gws", "value": value}))["structuredContent"].clone();
-    assert_eq!(open("calendar")["props"]["page"], "calendar");
-    assert_eq!(open("DRIVE ")["props"]["page"], "drive");
-    assert_eq!(open("")["props"]["page"], "mail");
-    assert_eq!(open("nonsense")["app"], "workspace");
+    let open = |name: &str, value: &str| core.run("gws_resolve", &json!({"kind": "command", "name": name, "value": value}))["structuredContent"]["app"].clone();
+    assert_eq!(open("mail", ""), "mail");
+    assert_eq!(open("calendar", ""), "calendar");
+    assert_eq!(open("drive", ""), "drive");
+    assert_eq!(open("gws", "calendar"), "calendar");
+    assert_eq!(open("gws", "DRIVE "), "drive");
+    assert_eq!(open("gws", ""), "mail");
+    assert_eq!(open("gws", "nonsense"), "mail");
 }
 
 #[test]

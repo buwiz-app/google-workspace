@@ -124,14 +124,13 @@ fn status(accounts: &Accounts) -> Value {
     }
 }
 
-/// `/gws [mail|calendar|drive]`: opens the screen at that page.
+/// `/mail`, `/calendar`, `/drive`, and `/gws <one of them>`: opens that screen.
 fn resolve(args: &Value) -> Value {
+    let name = js::string_or_empty(args.get("name"));
     let value = js::trim(&js::string_or_empty(args.get("value"))).to_lowercase();
-    let page = match value.as_str() {
-        "calendar" | "drive" => value.as_str(),
-        _ => "mail",
-    };
-    ok(json!({"result": "open", "app": crate::manifest::APP, "props": {"page": page}, "title": crate::manifest::TITLE, "placement": "full"}))
+    let wanted = if name == "gws" { value.as_str() } else { name.as_str() };
+    let (app, title, ..) = crate::manifest::APPS.iter().find(|a| a.0 == wanted).unwrap_or(&crate::manifest::APPS[0]);
+    ok(json!({"result": "open", "app": app, "title": title, "placement": "full"}))
 }
 
 fn search_mail(gmail: &Gmail, accounts: &Accounts, args: &Value) -> Result<Value, Failure> {

@@ -1,10 +1,28 @@
-//! Google Workspace's native screens, compiled into Buwiz Bot. The manifest
-//! names `gws.workspace`; the plugin serves the tools it calls.
+//! Google Workspace's native screens, compiled into Buwiz Bot: Mail, Calendar
+//! and Drive, each a full screen of its own. The manifest names them; the
+//! plugin serves the tools they call.
 
-mod workspace;
+mod shell;
 
-use buwiz_app::{ABI, ScreenDef};
+use buwiz_app::{ABI, Bridge, ScreenDef};
+use nsh_core::element::Root;
 
 pub fn screens() -> &'static [ScreenDef] {
-    &[ScreenDef { id: "gws.workspace", abi: ABI, build: workspace::build }]
+    &[
+        ScreenDef { id: "gws.mail", abi: ABI, build: mail },
+        ScreenDef { id: "gws.calendar", abi: ABI, build: calendar },
+        ScreenDef { id: "gws.drive", abi: ABI, build: drive },
+    ]
+}
+
+fn mail(bridge: Bridge) -> Root {
+    shell::build(bridge, "Mail")
+}
+
+fn calendar(bridge: Bridge) -> Root {
+    shell::build(bridge, "Calendar")
+}
+
+fn drive(bridge: Bridge) -> Root {
+    shell::build(bridge, "Drive")
 }

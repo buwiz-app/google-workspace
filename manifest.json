@@ -1,9 +1,0 @@
-{
-  "protocol": "1.0.0",
-  "id": "app.buwiz.google-workspace",
-  "short": "gws",
-  "version": "1.3.0",
-  "title": "Google Workspace",
-  "description": "Read-only Gmail search and reading for routines and the agent, with the Google account you sign in to in Buwiz Bot.",
-  "publisher": { "id": "app.buwiz", "key_id": "gc-2026-01", "name": "Goldcoders" }
-}

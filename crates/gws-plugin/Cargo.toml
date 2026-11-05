@@ -1,0 +1,38 @@
+[package]
+name = "buwiz-gws"
+version = "1.4.0"
+description = "The first-party Google Workspace plugin (app.buwiz.google-workspace): Gmail, Calendar and Drive with the Google account Buwiz Bot signs in to"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "buwiz-gws"
+path = "src/main.rs"
+
+[lib]
+name = "gws"
+path = "src/lib.rs"
+
+[features]
+# Test Bots and tests only: honour GWS_STUB_BASE, so the plugin talks to the
+# stub Google on loopback. A release is built without it, and then the
+# variable does nothing.
+stub = []
+
+[dependencies]
+# the SDK's server: provision, session certificates, tickets, caller checks
+buwiz-plugin = { git = "https://github.com/buwiz-app/buwiz-sdk", rev = "79883a820597c623c9259cc0fac0c4166bdde093" }
+gws-store = { path = "../gws-store" }
+# Gmail's base64url bodies
+base64 = "0.22"
+serde_json.workspace = true
+# Google's REST APIs: blocking, on the tool's own thread; rustls with ring and
+# Mozilla's roots (webpki-roots), no OpenSSL, no gzip
+ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+gws-fake-google = { path = "../gws-fake-google" }
+ed25519-dalek = "2.2"
+sha2 = "0.10"

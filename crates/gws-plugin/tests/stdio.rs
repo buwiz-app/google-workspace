@@ -17,10 +17,8 @@ fn b64(b: &[u8]) -> String {
 
 #[test]
 fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
-    let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/manifest.json");
     let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
         .arg("mcp")
-        .env("GWS_MANIFEST", manifest)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -45,15 +43,18 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
     ask("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}));
     let tools = ask("tools/list", json!({}));
     let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["buwiz.provision", "buwiz.session.open", "buwiz.session.close", "buwiz.ticket.resolve", "buwiz.uninstall", "buwiz.account.set", "buwiz.account.clear", "gws_search_mail", "gws_read_mail"]);
+    assert_eq!(names, ["buwiz.provision", "buwiz.session.open", "buwiz.session.close", "buwiz.ticket.resolve", "buwiz.uninstall", "buwiz.account.set", "buwiz.account.clear", "gws_search_mail", "gws_read_mail", "gws_status", "gws_resolve"]);
+    let audience = |name: &str| tools["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == name).unwrap()["_meta"]["buwiz/audience"].clone();
+    assert_eq!(audience("gws_read_mail"), json!(["agent", "app"]));
+    assert_eq!(audience("gws_status"), json!(["app"]), "the address on it is the screen's, never the model's");
 
     let served = ask("resources/read", json!({"uri": "buwiz://manifest"}));
     let m: Value = serde_json::from_str(served["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!((m["protocol"].as_str(), m["version"].as_str(), m["id"].as_str(), m["short"].as_str()), (Some("1.0.0"), Some("1.3.0"), Some("app.buwiz.google-workspace"), Some("gws")));
+    assert_eq!((m["protocol"].as_str(), m["version"].as_str(), m["id"].as_str(), m["short"].as_str()), (Some("1.0.0"), Some(env!("CARGO_PKG_VERSION")), Some("app.buwiz.google-workspace"), Some("gws")));
 
     let seed = [7u8; 32];
     let public = b64(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().as_bytes());
-    let p = call(&mut ask, "buwiz.provision", json!({"protocol": "1.0.0", "key": {"alg": "ed25519", "seed": b64(&seed)}, "pub": public}));
+    let p = call(&mut ask, "buwiz.provision", json!({"protocol": "1.0.0", "plugin": "app.buwiz.google-workspace", "key": {"alg": "ed25519", "seed": b64(&seed)}, "pub": public}));
     assert_eq!(p["structuredContent"]["ok"], true, "{p}");
 
     let account = |token: &str, expires_at: Value| json!({"account": "google", "label": "default", "provider": "google", "subject": "owner@example.com", "scopes": ["https://www.googleapis.com/auth/gmail.readonly"], "access_token": token, "token_type": "Bearer", "expires_at": expires_at});
@@ -83,9 +84,9 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
 }
 
 #[test]
-fn the_manifest_command_prints_1_2_0_for_protocol_2_1_0() {
+fn the_manifest_command_prints_this_version_for_protocol_1_0() {
     let out = Command::new(env!("CARGO_BIN_EXE_buwiz-gws")).arg("manifest").output().unwrap();
     let m: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!((m["version"].as_str(), m["protocol"].as_str()), (Some("1.3.0"), Some("1.0.0")));
+    assert_eq!(m["protocol"].as_str(), Some("1.0.0"));
     assert_eq!(m["version"].as_str(), Some(env!("CARGO_PKG_VERSION")), "Cargo.toml and the manifest agree");
 }

@@ -11,7 +11,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 fn repo(p: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(p)
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(p)
 }
 
 fn read_json(p: &Path) -> Value {
@@ -21,7 +21,7 @@ fn read_json(p: &Path) -> Value {
 #[test]
 fn the_template_matches_the_served_manifest() {
     let p = read_json(&repo("package/plugin.json"));
-    let m = read_json(&repo("manifest.json"));
+    let m = gws::manifest::unsigned(gws::manifest::RELEASE_KEY_ID);
     let b = &p["buwiz"];
     for k in ["id", "short", "version", "protocol"] {
         assert_eq!(b[k], m[k], "buwiz.{k}");
@@ -29,7 +29,7 @@ fn the_template_matches_the_served_manifest() {
     assert_eq!((p["version"].as_str(), b["version"].as_str()), (Some(env!("CARGO_PKG_VERSION")), Some(env!("CARGO_PKG_VERSION"))));
     assert_eq!(b["publisher"], json!({"id": m["publisher"]["id"], "key_id": m["publisher"]["key_id"]}));
     assert_eq!(b["server"], "gws");
-    assert_eq!(p["mcpServers"]["gws"], json!({"command": "${PLUGIN_ROOT}/bin/buwiz-gws", "args": ["mcp"], "env": {"GWS_MANIFEST": "${PLUGIN_ROOT}/manifest.signed.json"}}));
+    assert_eq!(p["mcpServers"]["gws"], json!({"command": "${PLUGIN_ROOT}/bin/buwiz-gws", "args": ["mcp"], "env": {"BUWIZ_PLUGIN_MANIFEST": "${PLUGIN_ROOT}/manifest.signed.json"}}));
     assert_eq!(b["accounts"], json!([{"id": "google", "provider": "google", "label": "Google account", "scopes": ["https://www.googleapis.com/auth/gmail.readonly"], "required": true}]));
     assert!(b.get("signature").is_none(), "the release script signs it");
 }
@@ -83,7 +83,9 @@ fn the_signed_package_passes_the_bots_checks() {
 
     // the release script's steps: the served manifest signed, the binary
     // beside it, plugin.json filled in and its block signed
-    broker(&bin, &["sign-manifest", &s(&repo("manifest.json")), "--key-file", &s(&key), "--out", &s(&dir.join("manifest.signed.json"))], None);
+    let unsigned = dir.join("manifest.json");
+    std::fs::write(&unsigned, gws::manifest::unsigned(gws::manifest::RELEASE_KEY_ID).to_string()).unwrap();
+    broker(&bin, &["sign-manifest", &s(&unsigned), "--key-file", &s(&key), "--out", &s(&dir.join("manifest.signed.json"))], None);
     std::fs::write(dir.join("buwiz-gws-macos-aarch64"), b"a binary").unwrap();
     plugin_json(&dir, "macos-aarch64", "buwiz-gws-macos-aarch64", None);
     let signed = dir.join("plugin.json");
@@ -91,7 +93,7 @@ fn the_signed_package_passes_the_bots_checks() {
 
     let served = broker(&bin, &["manifest", "verify"], Some(&json!({"text": std::fs::read_to_string(dir.join("manifest.signed.json")).unwrap(), "trust": trust})));
     assert_eq!(served["ok"], true, "{served}");
-    assert_eq!((served["value"]["manifest"]["protocol"].as_str(), served["value"]["manifest"]["version"].as_str()), (Some("1.0.0"), Some("1.3.0")));
+    assert_eq!((served["value"]["manifest"]["protocol"].as_str(), served["value"]["manifest"]["version"].as_str()), (Some("1.0.0"), Some(env!("CARGO_PKG_VERSION"))));
 
     let text = std::fs::read_to_string(&signed).unwrap();
     let p = broker(&bin, &["manifest", "package"], Some(&json!({"text": text, "trust": trust, "platform": "macos-aarch64"})));
@@ -103,7 +105,7 @@ fn the_signed_package_passes_the_bots_checks() {
     assert_eq!(
         p["value"],
         json!({
-            "id": "app.buwiz.google-workspace", "short": "gws", "version": "1.3.0", "server": "gws",
+            "id": "app.buwiz.google-workspace", "short": "gws", "version": env!("CARGO_PKG_VERSION"), "server": "gws",
             "accounts": [{"id": "google", "provider": "google", "label": "Google account", "scopes": ["https://www.googleapis.com/auth/gmail.readonly"], "required": true}],
             "files": [{"path": "manifest.signed.json", "asset": "manifest.signed.json", "sha256": sha("manifest.signed.json")}],
             "binary": {"path": "bin/buwiz-gws", "asset": "buwiz-gws-macos-aarch64", "sha256": sha("buwiz-gws-macos-aarch64")},

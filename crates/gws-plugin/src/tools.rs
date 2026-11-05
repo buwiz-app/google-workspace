@@ -1,6 +1,7 @@
 //! The plugin's tools, each with who may call it. A tool names its audience
-//! itself ([`Def::audience`]): the model's list treats a missing audience as
-//! open and the Hub treats it as closed, so nothing here leaves it to either.
+//! itself ([`Def::audience`]): protocol 16.4 reads a missing audience as open
+//! to the model while the Hub's press check reads it as closed, so nothing
+//! here leaves it to either. `serve` checks it too.
 
 use serde_json::{json, Value};
 
@@ -29,7 +30,7 @@ pub fn plain_error(message: &str) -> Value {
 
 /// Who may call a tool: `_meta["buwiz/audience"]`.
 pub const AGENT_AND_APP: &[&str] = &["agent", "app"];
-/// The person's screens only: not on the model's list, and the AI's press is refused.
+/// The person's screens only: not on the model's list, and a call from the model is refused.
 pub const APP_ONLY: &[&str] = &["app"];
 
 /// One tool: what `tools/list` shows and who may call it.

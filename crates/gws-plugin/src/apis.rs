@@ -26,12 +26,18 @@ impl Apis {
     pub fn from_env() -> Self {
         #[cfg(feature = "stub")]
         if let Ok(base) = std::env::var(STUB_ENV) {
-            if base.starts_with("http://127.0.0.1:") {
+            if is_loopback(&base) {
                 return Self::at(&base);
             }
         }
         Self::google()
     }
+}
+
+/// `http://127.0.0.1:<port>` and nothing else: `…:9@elsewhere` is another host.
+#[cfg_attr(not(any(feature = "stub", test)), allow(dead_code))]
+fn is_loopback(base: &str) -> bool {
+    base.strip_prefix("http://127.0.0.1:").is_some_and(|port| !port.is_empty() && port.trim_end_matches('/').bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(test)]
@@ -45,6 +51,14 @@ mod tests {
         // the variable is only ever read in a `stub` build: nothing here can name it
         assert_eq!(Apis::from_env(), Apis::google());
         assert!(Apis::google().gmail.starts_with("https://gmail.googleapis.com/"));
+    }
+
+    #[test]
+    fn only_a_loopback_port_counts_as_the_stub() {
+        assert!(is_loopback("http://127.0.0.1:8822") && is_loopback("http://127.0.0.1:8822/"));
+        for base in ["http://127.0.0.1:9@attacker.example/", "http://127.0.0.1:", "https://127.0.0.1:9", "http://127.0.0.1.example:9", "http://127.0.0.1:9/x"] {
+            assert!(!is_loopback(base), "{base}");
+        }
     }
 
     #[test]

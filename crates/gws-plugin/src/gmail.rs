@@ -20,6 +20,8 @@ pub const GMAIL_API: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 pub const BODY_MAX: usize = 64 * 1024;
 pub const SNIPPET_MAX: usize = 200;
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// Requests in flight for one search.
+const METADATA_AT_ONCE: usize = 8;
 /// A list or metadata answer.
 const SMALL_MAX: u64 = 1024 * 1024;
 /// A `format=full` message (attachments are not in it, only their ids).
@@ -93,24 +95,29 @@ impl Gmail {
     /// fetched together; `None` for one Gmail no longer has.
     pub fn metadata(&self, auth: &Bearer, ids: &[String]) -> Result<Vec<Option<Value>>, Failure> {
         let headers = ["From", "Subject", "Date"].map(|h| ("metadataHeaders", h.to_owned()));
-        std::thread::scope(|scope| {
-            let gets: Vec<_> = ids
-                .iter()
-                .map(|id| {
-                    let mut query = vec![("format", "metadata".to_owned())];
-                    query.extend(headers.iter().cloned());
-                    id_ok(id).then(|| scope.spawn(move || self.get(auth, format!("messages/{id}"), query, SMALL_MAX)))
-                })
-                .collect();
-            let mut out = Vec::with_capacity(gets.len());
-            for g in gets {
-                out.push(match g {
-                    Some(g) => g.join().unwrap_or_else(|_| Err(Failure::Plain("the Gmail request failed".to_owned())))?,
-                    None => None,
-                });
-            }
-            Ok(out)
-        })
+        let mut out = Vec::with_capacity(ids.len());
+        for batch in ids.chunks(METADATA_AT_ONCE) {
+            let done: Result<Vec<_>, Failure> = std::thread::scope(|scope| {
+                let gets: Vec<_> = batch
+                    .iter()
+                    .map(|id| {
+                        let mut query = vec![("format", "metadata".to_owned())];
+                        query.extend(headers.iter().cloned());
+                        id_ok(id).then(|| scope.spawn(move || self.get(auth, format!("messages/{id}"), query, SMALL_MAX)))
+                    })
+                    .collect();
+                let mut got = Vec::with_capacity(gets.len());
+                for g in gets {
+                    got.push(match g {
+                        Some(g) => g.join().unwrap_or_else(|_| Err(Failure::Plain("the Gmail request failed".to_owned())))?,
+                        None => None,
+                    });
+                }
+                Ok(got)
+            });
+            out.extend(done?);
+        }
+        Ok(out)
     }
 
     /// One message, `format=full`; `None` when Gmail has no such message.

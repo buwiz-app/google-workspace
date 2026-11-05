@@ -85,8 +85,9 @@ impl Paths {
     }
 }
 
-/// The key file's 64 hex digits, making it (0600) when absent.
-fn key(path: &Path) -> Result<String> {
+/// The key file's 64 hex digits, making it (0600) when absent. A store without
+/// its key stays as it is: a new key would only hide why it no longer opens.
+fn key(path: &Path, store_exists: bool) -> Result<String> {
     match fs::read_to_string(path) {
         Ok(text) => {
             let text = text.trim().to_owned();
@@ -97,6 +98,10 @@ fn key(path: &Path) -> Result<String> {
                 return Err(error("key_open", "The store's key file is readable by others, so it was not used."));
             }
             Ok(text)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && store_exists => {
+            let _ = e;
+            Err(error("key_lost", "The store's key file is gone, so the saved mail can't be read."))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut bytes = [0u8; 32];
@@ -118,7 +123,7 @@ impl Store {
     /// Open (creating when absent) the store at `paths`, migrated to the latest schema.
     pub fn open(paths: &Paths) -> Result<Self> {
         fs::DirBuilder::new().recursive(true).mode(0o700).create(&paths.dir).map_err(|_| error("data_dir", "The data folder cannot be made."))?;
-        let key = key(&paths.key_file())?;
+        let key = key(&paths.key_file(), paths.db().exists())?;
         let conn = Connection::open(paths.db())?;
         // SQLCipher reads a raw key as x'<64 hex>' (no key derivation)
         conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))?;
@@ -165,13 +170,19 @@ impl Store {
     }
 }
 
-/// Deletes every file the plugin keeps (`buwiz.uninstall`).
+/// Deletes what the plugin keeps (`buwiz.uninstall`): its own files by name,
+/// never the folder's other contents, and the folder only once it's empty.
 pub fn wipe(paths: &Paths) -> Result<()> {
-    match fs::remove_dir_all(&paths.dir) {
+    let gone = |r: std::io::Result<()>| match r {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(error("wipe", "The data folder could not be removed.")),
-    }
+        Err(_) => Err(error("wipe", "The plugin's files could not be removed.")),
+    };
+    gone(fs::remove_file(paths.db()))?;
+    gone(fs::remove_file(paths.key_file()))?;
+    gone(fs::remove_dir_all(paths.open_dir()))?;
+    let _ = fs::remove_dir(&paths.dir);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -225,6 +236,30 @@ mod tests {
         drop(Store::open(&paths).unwrap());
         fs::write(paths.key_file(), "ab".repeat(32)).unwrap();
         assert_eq!(Store::open(&paths).err().unwrap().code, "wrong_key");
+    }
+
+    #[test]
+    fn a_store_that_lost_its_key_says_so_and_keeps_saying_so() {
+        let dir = Dir::new("lost");
+        let paths = Paths::in_dir(&dir.0);
+        drop(Store::open(&paths).unwrap());
+        fs::remove_file(paths.key_file()).unwrap();
+        assert_eq!(Store::open(&paths).err().unwrap().code, "key_lost");
+        assert_eq!(Store::open(&paths).err().unwrap().code, "key_lost");
+        assert!(!paths.key_file().exists(), "no new key over the old store");
+    }
+
+    #[test]
+    fn wipe_leaves_what_isnt_the_plugins() {
+        let dir = Dir::new("shared");
+        let paths = Paths::in_dir(&dir.0);
+        drop(Store::open(&paths).unwrap());
+        fs::create_dir_all(paths.open_dir()).unwrap();
+        fs::write(paths.open_dir().join("a.docx"), b"x").unwrap();
+        let other = paths.dir.join("someone-elses.txt");
+        fs::write(&other, b"keep me").unwrap();
+        wipe(&paths).unwrap();
+        assert!(other.exists() && !paths.db().exists() && !paths.key_file().exists() && !paths.open_dir().exists());
     }
 
     #[test]

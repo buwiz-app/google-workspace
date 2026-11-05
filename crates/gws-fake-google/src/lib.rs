@@ -67,15 +67,16 @@ impl Request {
 
 fn decode(s: &str) -> String {
     let bytes = s.as_bytes();
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
     let (mut out, mut i) = (Vec::with_capacity(bytes.len()), 0);
     while i < bytes.len() {
-        match bytes[i] {
-            b'+' => out.push(b' '),
-            b'%' if i + 2 < bytes.len() && u8::from_str_radix(&s[i + 1..(i + 3).min(s.len())], 16).is_ok() => {
-                out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap_or(b'?'));
+        match (bytes[i], bytes.get(i + 1).copied().and_then(hex), bytes.get(i + 2).copied().and_then(hex)) {
+            (b'+', ..) => out.push(b' '),
+            (b'%', Some(high), Some(low)) => {
+                out.push(high * 16 + low);
                 i += 2;
             }
-            b => out.push(b),
+            (b, ..) => out.push(b),
         }
         i += 1;
     }
@@ -535,5 +536,6 @@ mod tests {
     #[test]
     fn percent_decoding_keeps_text() {
         assert_eq!(decode("from%3Aana+x"), "from:ana x");
+        assert_eq!(decode("%aé%"), "%aé%", "a stray percent is kept");
     }
 }

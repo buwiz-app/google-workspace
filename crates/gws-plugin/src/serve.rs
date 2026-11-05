@@ -9,7 +9,7 @@ use std::io::{BufRead as _, Write as _};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use buwiz_plugin::{Caller, Plugin as _, Server};
+use buwiz_plugin::{Caller, Origin, Plugin as _, Server};
 use serde_json::{Value, json};
 
 use crate::{Core, Gws, tools};
@@ -59,6 +59,13 @@ fn is_error(reply: Option<&Value>) -> bool {
     reply.is_none_or(|r| r.get("error").is_some() || r.pointer("/result/isError") == Some(&Value::Bool(true)))
 }
 
+/// The plugin's own check of a tool's audience, beside the Hub's: a screen, a
+/// resolve or a routine may reach what they're granted, but the model reaches
+/// only a tool that names `agent`. The SDK doesn't know the audience.
+fn audience_allows(name: &str, origin: Origin) -> bool {
+    origin != Origin::Agent || tools::defs().iter().any(|d| d.name == name && d.audience.contains(&"agent"))
+}
+
 type Out = Arc<Mutex<std::io::Stdout>>;
 
 fn write(out: &Out, reply: &Value) {
@@ -88,11 +95,22 @@ pub fn serve(plugin: Gws) -> std::io::Result<()> {
     let out: Out = Arc::new(Mutex::new(std::io::stdout()));
     let mut provisioned = false;
     let mut running: Vec<JoinHandle<()>> = Vec::new();
-    for line in std::io::stdin().lock().lines() {
-        let line = line?;
-        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+    let mut input = std::io::stdin().lock();
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        if input.read_until(b'\n', &mut raw)? == 0 {
+            break;
+        }
+        // a bad byte is one bad line, not the end of the plugin
+        let line = String::from_utf8_lossy(&raw);
+        let line = line.trim_end_matches(['\n', '\r']);
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(message) = serde_json::from_str::<Value>(line) else {
             // the SDK's answer to what isn't JSON
-            if let Some(reply) = server.handle_line(&line) {
+            if let Some(reply) = server.handle_line(line) {
                 let mut out = out.lock().unwrap_or_else(|e| e.into_inner());
                 out.write_all(reply.as_bytes())?;
                 out.write_all(b"\n")?;
@@ -106,8 +124,13 @@ pub fn serve(plugin: Gws) -> std::io::Result<()> {
                 let params = message.get("params").cloned().unwrap_or(Value::Null);
                 let id = message.get("id").cloned().unwrap_or(Value::Null);
                 let tool = server.plugin().tools().into_iter().find(|t| t.name == name).expect("routed tools exist");
-                if let Err(why) = server.authorize(&tool, &Caller::of(&params)) {
+                let caller = Caller::of(&params);
+                if let Err(why) = server.authorize(&tool, &caller) {
                     write(&out, &json!({"jsonrpc": "2.0", "id": id, "result": buwiz_plugin::fail("permission_denied", &why)}));
+                    continue;
+                }
+                if !audience_allows(&name, caller.origin) {
+                    write(&out, &json!({"jsonrpc": "2.0", "id": id, "result": buwiz_plugin::fail("permission_denied", "Only a person can do this.")}));
                     continue;
                 }
                 let (core, out) = (core.clone(), out.clone());
@@ -148,4 +171,17 @@ pub fn serve(plugin: Gws) -> std::io::Result<()> {
         let _ = t.join();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_model_reaches_only_a_tool_that_names_it() {
+        assert!(audience_allows(tools::READ_MAIL, Origin::Agent));
+        assert!(!audience_allows(tools::STATUS, Origin::Agent), "the address on it is the screen's");
+        assert!(audience_allows(tools::STATUS, Origin::App));
+        assert!(audience_allows(tools::RESOLVE, Origin::Resolve));
+    }
 }

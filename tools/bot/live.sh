@@ -101,6 +101,20 @@ signin() {
   host POST "/v1/host/plugins/$PLUGIN/accounts/google/signin" '{"label":"default"}' | cut -c1-160; echo
 }
 
+# gpui-agent's gestures activate the app, which takes the keyboard from
+# whatever the owner is typing in, and can move the visible workspace. So each
+# one gives both straight back. A read asks nothing of the app and needs neither.
+agent() {
+  case "${1:-}" in snapshot|hello|wait|assert|events) "$BOT/scripts/test-agent" "$INST" "$@"; return ;; esac
+  local window space status=0
+  window="$(aerospace list-windows --focused --format '%{window-id}' 2>/dev/null || true)"
+  space="$(aerospace list-workspaces --focused 2>/dev/null || true)"
+  "$BOT/scripts/test-agent" "$INST" "$@" || status=$?
+  [ -z "$space" ] || aerospace workspace "$space" 2>/dev/null || true
+  [ -z "$window" ] || aerospace focus --window-id "$window" 2>/dev/null || true
+  return "$status"
+}
+
 down() {
   for f in pid broker.pid stub.pid; do [ -f "$INST/$f" ] && kill "$(cat "$INST/$f")" 2>/dev/null || true; rm -f "$INST/$f"; done
 }
@@ -111,6 +125,6 @@ case "${1:-}" in
   package) keys; package ;;
   signin) signin ;;
   host) shift; host "$@"; echo ;;
-  agent) shift; "$BOT/scripts/test-agent" "$INST" "$@" ;;
+  agent) shift; agent "$@" ;;
   *) sed -n 2,16p "$0"; exit 2 ;;
 esac

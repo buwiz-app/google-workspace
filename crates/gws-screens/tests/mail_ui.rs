@@ -1281,6 +1281,18 @@ fn a_reply_to_someone_new_cant_be_sent_from_the_card() {
 }
 
 #[test]
+fn a_cards_second_press_stays_on_the_card() {
+    let many = "a@x.co, b@x.co, c@x.co, d@x.co, e@x.co, f@x.co";
+    let (mut app, _fake) = start_card(draft(many, Value::Null, json!([])));
+    app.set_viewport(size(px(300.0), px(400.0)))
+        .expect("the viewport sets");
+    app.press("label:Send").expect("Send presses");
+    app.wait_for_within("label:Send it", WAIT).expect("it asks");
+    settle(&mut app);
+    assert!(app.screen().shows("Send it"), "{:?}", app.screen().texts());
+}
+
+#[test]
 fn keep_draft_on_a_card_deletes_nothing() {
     let (mut app, fake) = start_card(draft("ana@example.com", Value::Null, json!([])));
     app.press("label:Keep draft").expect("it presses");

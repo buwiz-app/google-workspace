@@ -1318,6 +1318,17 @@ pub fn card(b: Bridge, ticket: String) -> View {
                         ),
                 );
             }
+            // on a line of its own: beside the buttons it pushes Send it off the card
+            if !stranger && c.asking.get() {
+                card = card.child(
+                    view()
+                        .app_class(Some(format!("px-3 py-1 border-t {LINE}").into()))
+                        .child(
+                            text(ask_line(&letter, &shown))
+                                .app_class(Some(format!("text-[12px] {INK}").into())),
+                        ),
+                );
+            }
             let (sending, opening, name) = (b.clone(), b.clone(), ticket.clone());
             let open = press_text(
                 if stranger {
@@ -1345,10 +1356,6 @@ pub fn card(b: Bridge, ticket: String) -> View {
                 let name = ticket.clone();
                 if c.asking.get() {
                     row = row
-                        .child(
-                            text(ask_line(&letter, &shown))
-                                .app_class(Some(format!("text-[12px] {INK}").into())),
-                        )
                         .child(press_text("Not yet", "Not yet", move || {
                             c.asking.set(false)
                         }))

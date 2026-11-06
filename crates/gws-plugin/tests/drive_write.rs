@@ -1019,6 +1019,25 @@ fn a_share_that_changes_nothing_says_why() {
 }
 
 #[test]
+fn a_press_read_from_one_file_never_lands_on_another_with_the_same_people() {
+    let google = with_people();
+    let people = google.drive_file("drv-a").unwrap().people;
+    google.edit_file("drv-b", |f| {
+        f.shared = true;
+        f.people = people;
+        f.link = Some("reader".to_owned());
+    });
+    let core = signed_in(&google, "share-other");
+    let seen = seen_of(&core, "drv-a");
+    let answer = core.run(
+        "gws_drive_share",
+        &json!({"id": "drv-b", "add": [{"email": "cara@example.com", "role": "reader"}], "seen": seen}),
+    );
+    assert_eq!(refusal(&answer), "changed");
+    assert_eq!(google.drive_writes(), []);
+}
+
+#[test]
 fn a_row_says_it_is_shared_as_soon_as_it_is_and_not_after_the_last_goes() {
     let google = drive();
     let core = signed_in(&google, "share-row");

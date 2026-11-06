@@ -676,8 +676,10 @@ fn person_of(p: &Value, me: &str) -> Value {
     json!({"id": text(p, "id"), "kind": kind, "name": name, "email": email, "role": role, "you": you, "removable": removable})
 }
 
-/// A list of people as a mark: anything about who's on it moves it.
-fn mark_of(people: &[Value]) -> String {
+/// A file's list of people as a mark: anything about who's on it moves it. The
+/// file is in it too, as two files can have the very same people, and a press
+/// read from one must not pass on the other.
+fn mark_of(id: &str, people: &[Value]) -> String {
     let mut lines: Vec<String> = people
         .iter()
         .map(|p| {
@@ -690,7 +692,7 @@ fn mark_of(people: &[Value]) -> String {
         })
         .collect();
     lines.sort();
-    let hash = Sha256::digest(lines.join("\n").as_bytes());
+    let hash = Sha256::digest(format!("{id}\n{}", lines.join("\n")).as_bytes());
     format!("{hash:x}")[..32].to_owned()
 }
 
@@ -734,7 +736,7 @@ fn access(core: &Core, args: &Value) -> Result<Value, Failure> {
         Err(answer) => return Ok(answer),
     };
     match everyone(core, &auth, &account, &id) {
-        Ok(Ok(Some(people))) => Ok(ok(json!({"seen": mark_of(&people), "people": people}))),
+        Ok(Ok(Some(people))) => Ok(ok(json!({"seen": mark_of(&id, &people), "people": people}))),
         Ok(Ok(None)) => Ok(refusal(
             "too_many",
             "Too many people have this file to show them all here, so it can't be shared from here.",
@@ -859,7 +861,7 @@ fn share(core: &Core, args: &Value) -> Result<Value, Failure> {
         Ok(Err(answer)) => return Ok(answer),
         Err(e) => return given_up(e),
     };
-    if mark_of(&people) != js::string_or_empty(args.get("seen")) {
+    if mark_of(&id, &people) != js::string_or_empty(args.get("seen")) {
         return Ok(refusal(
             "changed",
             "Who has this file changed since you looked, so nothing changed. Check the list again.",
@@ -982,17 +984,19 @@ mod tests {
     }
 
     #[test]
-    fn the_mark_moves_with_anyone_on_the_list_and_nothing_else() {
+    fn the_mark_moves_with_the_file_and_anyone_on_its_list_and_nothing_else() {
         let person =
             |id: &str, role: &str| json!({"id": id, "role": role, "email": "a@example.com"});
         let list = [person("1", "reader"), person("2", "writer")];
         let turned = [person("2", "writer"), person("1", "reader")];
-        assert_eq!(mark_of(&list), mark_of(&turned), "order says nothing");
-        assert_ne!(mark_of(&list), mark_of(&list[..1]));
+        let mark = |people: &[Value]| mark_of("a", people);
+        assert_eq!(mark(&list), mark(&turned), "order says nothing");
+        assert_ne!(mark(&list), mark(&list[..1]));
         assert_ne!(
-            mark_of(&list),
-            mark_of(&[person("1", "writer"), person("2", "writer")])
+            mark(&list),
+            mark(&[person("1", "writer"), person("2", "writer")])
         );
+        assert_ne!(mark(&list), mark_of("b", &list), "nor is it another file's");
     }
 
     #[test]

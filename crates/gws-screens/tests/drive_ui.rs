@@ -3376,6 +3376,275 @@ fn a_list_that_moved_comes_back_to_be_read_and_keeps_who_was_added() {
     assert_eq!(last_of(&fake, "gws_drive_share")["seen"], "mark-2");
 }
 
+/// The list Budget.xlsx has, which is nobody Notes has.
+fn budget_people(fake: &Fake) {
+    fake.access.lock().unwrap().insert(
+        "budget".to_owned(),
+        json!({"seen": "mark-budget", "people": [
+            {"id": "p-me", "name": "Owner Fake", "email": "owner@example.com", "role": "owner", "you": true},
+            {"id": "p-eve", "name": "Eve Stone", "email": "eve@example.com", "role": "writer", "removable": true},
+        ]}),
+    );
+}
+
+/// A press on Notes held on its way, ending in `answer`, and the person gone on
+/// to the panel for Budget.xlsx, with Dan added and Eve leaving.
+fn press_notes_then_stage_budget(app: &mut Headless, fake: &Fake, answer: Value) {
+    budget_people(fake);
+    open_share(app);
+    add_person(app, "cara@example.com", "Can view");
+    fake.write_answers
+        .lock()
+        .unwrap()
+        .insert("gws_drive_share".to_owned(), answer);
+    fake.hold("write:gws_drive_share");
+    press(app, "label:Share with these people");
+    press(app, "label:Close sharing");
+    key(app, "down");
+    press(app, "label:Share");
+    add_person(app, "dan@example.com", "Can view");
+    press(app, "label:Take this person off");
+    assert_budget_untouched(app, fake);
+}
+
+/// The panel is still Budget.xlsx's, as the person left it.
+fn assert_budget_untouched(app: &Headless, fake: &Fake) {
+    assert!(app.screen().matches("label:Close sharing").unwrap());
+    assert!(app.screen().shows("Budget.xlsx"), "the panel's name");
+    assert!(app.screen().shows("Eve Stone <eve@example.com>"));
+    assert!(!app.screen().shows("Ana Reyes <ana@example.com>"));
+    assert!(!app.screen().shows("ben@example.com"));
+    assert!(app.screen().shows("dan@example.com"));
+    assert!(app.screen().shows("Share with 1 person and remove 1"));
+    let notes = json!({"id": "notes"});
+    let reads = fake.called("gws_drive_access");
+    assert_eq!(reads.iter().filter(|a| **a == notes).count(), 1);
+}
+
+/// What the next press sends is Budget.xlsx's own.
+fn assert_budget_press_is_its_own(app: &mut Headless, fake: &Fake) {
+    fake.write_answers.lock().unwrap().clear();
+    press(app, "label:Share with these people");
+    assert_eq!(
+        last_of(fake, "gws_drive_share"),
+        json!({
+            "id": "budget",
+            "add": [{"email": "dan@example.com", "role": "reader"}],
+            "remove": ["p-eve"],
+            "seen": "mark-budget",
+        })
+    );
+}
+
+#[test]
+fn a_late_refusal_for_another_file_loads_nobody_under_this_files_name() {
+    let (mut app, fake) = start();
+    let moved = json!({"refused": "changed", "message": "Who has this file changed since you looked, so nothing changed. Check the list again."});
+    press_notes_then_stage_budget(&mut app, &fake, moved);
+    fake.release("write:gws_drive_share");
+    settle(&mut app);
+    assert_budget_untouched(&app, &fake);
+    assert!(!app.screen().shows("Check the list again"));
+    assert_budget_press_is_its_own(&mut app, &fake);
+}
+
+#[test]
+fn a_late_partial_share_for_another_file_clears_nothing_staged_here() {
+    let (mut app, fake) = start();
+    let partial = json!({"added": 1, "removed": 0, "partial": true, "files": []});
+    press_notes_then_stage_budget(&mut app, &fake, partial);
+    fake.release("write:gws_drive_share");
+    settle(&mut app);
+    assert_budget_untouched(&app, &fake);
+    assert!(
+        app.screen()
+            .shows("Only part of your earlier share went through.")
+    );
+    assert_budget_press_is_its_own(&mut app, &fake);
+}
+
+#[test]
+fn a_late_share_for_another_file_leaves_this_panel_open() {
+    let (mut app, fake) = start();
+    let done = json!({"added": 1, "removed": 0, "files": []});
+    press_notes_then_stage_budget(&mut app, &fake, done);
+    let lists = fake.called("gws_drive_list").len();
+    fake.release("write:gws_drive_share");
+    settle(&mut app);
+    assert_budget_untouched(&app, &fake);
+    assert!(app.screen().shows("Your earlier share went through."));
+    assert!(!app.screen().shows("Shared with 1 person."));
+    assert_eq!(
+        fake.called("gws_drive_list").len(),
+        lists + 1,
+        "the rows still take what went through"
+    );
+    assert_budget_press_is_its_own(&mut app, &fake);
+}
+
+#[test]
+fn a_share_that_lands_after_cancel_still_says_so() {
+    let (mut app, fake) = start();
+    open_share(&mut app);
+    add_person(&mut app, "cara@example.com", "Can view");
+    fake.hold("write:gws_drive_share");
+    press(&mut app, "label:Share with these people");
+    press(&mut app, "label:Close sharing");
+    fake.release("write:gws_drive_share");
+    settle(&mut app);
+    assert!(app.screen().shows("Your earlier share went through."));
+    assert!(!app.screen().matches("label:Close sharing").unwrap());
+}
+
+#[test]
+fn a_late_answer_from_an_earlier_opening_of_the_same_file_leaves_this_one_be() {
+    for (answer, said) in [
+        (
+            json!({"refused": "changed", "message": "Who has this file changed since you looked, so nothing changed. Check the list again."}),
+            None,
+        ),
+        (
+            json!({"added": 1, "removed": 0, "partial": true, "files": []}),
+            Some("Only part of your earlier share went through."),
+        ),
+        (
+            json!({"added": 1, "removed": 0, "files": []}),
+            Some("Your earlier share went through."),
+        ),
+    ] {
+        let (mut app, fake) = start();
+        open_share(&mut app);
+        add_person(&mut app, "cara@example.com", "Can view");
+        fake.write_answers
+            .lock()
+            .unwrap()
+            .insert("gws_drive_share".to_owned(), answer);
+        fake.hold("write:gws_drive_share");
+        press(&mut app, "label:Share with these people");
+        press(&mut app, "label:Close sharing");
+        press(&mut app, "label:Share");
+        add_person(&mut app, "dan@example.com", "Can view");
+        fake.release("write:gws_drive_share");
+        settle(&mut app);
+        assert!(app.screen().matches("label:Close sharing").unwrap());
+        assert!(app.screen().shows("dan@example.com"), "{said:?}");
+        assert!(!app.screen().shows("cara@example.com"), "{said:?}");
+        assert_eq!(fake.called("gws_drive_access").len(), 2, "{said:?}");
+        if let Some(said) = said {
+            assert!(app.screen().shows(said));
+        }
+    }
+}
+
+/// Budget.xlsx's share panel, opened after the rows came back, with Dan added.
+fn share_budget_with_dan(app: &mut Headless, fake: &Fake) {
+    budget_people(fake);
+    key(app, "down");
+    press(app, "label:Share");
+    add_person(app, "dan@example.com", "Can view");
+}
+
+fn assert_budget_panel_stays(app: &Headless) {
+    assert!(app.screen().matches("label:Close sharing").unwrap());
+    assert!(app.screen().shows("dan@example.com"));
+}
+
+fn type_new_name(app: &mut Headless, name: &str) {
+    app.clear("label:New name").unwrap();
+    app.type_text("label:New name", name).unwrap();
+}
+
+#[test]
+fn a_late_rename_leaves_a_panel_opened_since_up() {
+    let (mut app, fake) = start();
+    pick_nth(&mut app, 3);
+    press(&mut app, "label:Rename");
+    type_new_name(&mut app, "Better notes");
+    fake.hold("write:gws_drive_rename");
+    press(&mut app, "label:Save this name");
+    press(&mut app, "label:Cancel this");
+    share_budget_with_dan(&mut app, &fake);
+    fake.release("write:gws_drive_rename");
+    settle(&mut app);
+    assert_budget_panel_stays(&app);
+    assert!(app.screen().shows("Renamed."), "it went through");
+}
+
+#[test]
+fn a_late_rename_leaves_the_same_file_opened_again_up() {
+    let (mut app, fake) = start();
+    pick_nth(&mut app, 3);
+    press(&mut app, "label:Rename");
+    type_new_name(&mut app, "Better notes");
+    fake.hold("write:gws_drive_rename");
+    press(&mut app, "label:Save this name");
+    press(&mut app, "label:Cancel this");
+    press(&mut app, "label:Rename");
+    type_new_name(&mut app, "Other notes");
+    fake.release("write:gws_drive_rename");
+    settle(&mut app);
+    assert_eq!(
+        app.screen().input_text("label:New name").unwrap().unwrap(),
+        "Other notes"
+    );
+}
+
+#[test]
+fn a_late_new_folder_leaves_a_name_being_typed_since_up() {
+    let (mut app, fake) = start();
+    press(&mut app, "label:New folder");
+    app.type_text("label:Folder name", "Quotes").unwrap();
+    fake.hold("write:gws_drive_folder");
+    press(&mut app, "label:Make this folder");
+    press(&mut app, "label:Cancel this");
+    pick_nth(&mut app, 3);
+    press(&mut app, "label:Rename");
+    type_new_name(&mut app, "Better notes");
+    fake.release("write:gws_drive_folder");
+    settle(&mut app);
+    assert_eq!(
+        app.screen().input_text("label:New name").unwrap().unwrap(),
+        "Better notes"
+    );
+    assert!(app.screen().shows("Made a new folder on Google Drive."));
+}
+
+#[test]
+fn a_late_move_leaves_a_panel_opened_since_up() {
+    let (mut app, fake) = start();
+    open_mover(&mut app);
+    press(&mut app, "label:Go into this folder >> text:Clients");
+    fake.hold("write:gws_drive_move");
+    press(&mut app, "label:Move here");
+    press(&mut app, "label:Cancel this move");
+    share_budget_with_dan(&mut app, &fake);
+    fake.release("write:gws_drive_move");
+    settle(&mut app);
+    assert_budget_panel_stays(&app);
+    assert!(app.screen().shows("Moved."), "it went through");
+}
+
+#[test]
+fn a_list_read_late_for_another_file_is_never_shown_under_this_ones_name() {
+    let (mut app, fake) = start();
+    budget_people(&fake);
+    fake.hold("access:notes");
+    pick_nth(&mut app, 3);
+    press(&mut app, "label:Share");
+    press(&mut app, "label:Close sharing");
+    key(&mut app, "down");
+    fake.hold("access:budget");
+    press(&mut app, "label:Share");
+    fake.release("access:notes");
+    settle(&mut app);
+    assert!(app.screen().shows("Budget.xlsx"), "the panel's name");
+    assert!(!app.screen().shows("Ana Reyes <ana@example.com>"));
+    assert!(app.screen().shows("Reading who has this…"));
+    fake.release("access:budget");
+    settle(&mut app);
+    assert!(app.screen().shows("Eve Stone <eve@example.com>"));
+}
+
 #[test]
 fn a_share_that_fails_changes_nothing_and_stays_to_be_tried_again() {
     let (mut app, fake) = start();

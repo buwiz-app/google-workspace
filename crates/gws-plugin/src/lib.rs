@@ -119,6 +119,14 @@ impl Core {
             Some(gws_store::key_from_seed(seed));
     }
 
+    /// The store's key, once the Bot has given it.
+    pub(crate) fn key(&self) -> Option<String> {
+        self.store_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Whether the Bot has provisioned this process.
     pub fn provisioned(&self) -> bool {
         self.store_key

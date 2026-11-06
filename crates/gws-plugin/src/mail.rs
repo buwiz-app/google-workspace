@@ -415,7 +415,6 @@ pub fn start(core: Arc<Core>) -> JoinHandle<()> {
 /// this process ever saw it signed in. False if it couldn't, and then a marker
 /// on disk has the next sync try again, even after a restart.
 pub fn reconcile(core: &Core) -> bool {
-    crate::files::clear_when_signed_out(core);
     let cleared = with_store(core, |store| {
         for account in store.accounts()? {
             if !core.accounts.holds(&account) {

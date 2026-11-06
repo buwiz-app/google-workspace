@@ -135,7 +135,6 @@ impl Store {
             "drive_listed",
             "drive_views",
             "drive_files",
-            "opened",
             "state",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE account = ?"), [account])?;

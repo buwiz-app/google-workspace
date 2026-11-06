@@ -868,9 +868,11 @@ fn a_press_gets_its_document_through_the_real_server_and_the_model_gets_nothing(
             .as_str()
             .unwrap_or_else(|| panic!("{opened}")),
     );
-    assert_eq!(
-        path.parent().unwrap(),
-        std::fs::canonicalize(data.join("open/drv-open")).unwrap()
+    let folder = path.parent().unwrap();
+    assert_eq!(folder.file_name().unwrap(), "drv-open");
+    assert!(
+        folder.starts_with(std::fs::canonicalize(&data).unwrap()),
+        "{path:?}"
     );
     assert_eq!(std::fs::read(&path).unwrap(), b"PK fake");
     assert_eq!(document["name"], "Roof quote.docx");

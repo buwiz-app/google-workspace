@@ -162,11 +162,11 @@ impl Paths {
         self.dir.join("wipe-pending")
     }
 
-    /// Where open Drive files and attachments are: `open/<id>/<name>`. They sit
-    /// unencrypted while the viewer has them, so they go after upload or
-    /// discard, after 24 hours, and at sign-out.
-    pub fn open_dir(&self) -> PathBuf {
-        self.dir.join("open")
+    /// Where this install keeps open Drive files and attachments, as
+    /// `<id>/<name>` below it. An edit here can't be fetched again, so a sign-out
+    /// leaves one, and only the person's own press or an uninstall removes it.
+    pub fn open_dir(&self, key: &str) -> PathBuf {
+        self.dir.join(format!("open-{}", install_id(key)))
     }
 }
 
@@ -301,7 +301,7 @@ pub fn wipe(paths: &Paths, key: &str) -> Result<()> {
         gone(fs::remove_file(side))?;
     }
     gone(fs::remove_file(&db))?;
-    gone(fs::remove_dir_all(paths.open_dir()))?;
+    gone(fs::remove_dir_all(paths.open_dir(key)))?;
     let _ = fs::remove_dir(&paths.dir);
     Ok(())
 }
@@ -493,8 +493,8 @@ mod tests {
         let paths = Paths::in_dir(&dir.0);
         let key = key();
         drop(Store::open(&paths, &key).unwrap());
-        fs::create_dir_all(paths.open_dir()).unwrap();
-        fs::write(paths.open_dir().join("a.docx"), b"x").unwrap();
+        fs::create_dir_all(paths.open_dir(&key)).unwrap();
+        fs::write(paths.open_dir(&key).join("a.docx"), b"x").unwrap();
         let sides: Vec<String> = ["-journal", "-wal", "-shm"]
             .iter()
             .map(|s| format!("{}{s}", paths.db(&key).display()))
@@ -505,7 +505,7 @@ mod tests {
         let other = paths.dir.join("someone-elses.txt");
         fs::write(&other, b"keep me").unwrap();
         wipe(&paths, &key).unwrap();
-        assert!(other.exists() && !paths.db(&key).exists() && !paths.open_dir().exists());
+        assert!(other.exists() && !paths.db(&key).exists() && !paths.open_dir(&key).exists());
         assert!(
             sides.iter().all(|s| !std::path::Path::new(s).exists()),
             "no stale journal for a later store"

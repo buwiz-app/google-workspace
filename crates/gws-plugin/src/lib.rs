@@ -11,6 +11,7 @@
 pub mod accounts;
 pub mod apis;
 pub mod clean;
+pub mod compose;
 pub mod gmail;
 pub mod js;
 pub mod mail;
@@ -49,19 +50,37 @@ pub struct Core {
     pub pushed: std::sync::atomic::AtomicBool,
     /// What a person's actions changed, for Undo.
     pub undos: Mutex<mail::Undos>,
+    /// Drafts the model wrote and the person hasn't touched.
+    pub model_drafts: Mutex<std::collections::HashSet<String>>,
+    /// Files on their way into a draft: memory only, like a key.
+    pub uploads: Mutex<compose::Uploads>,
+    /// Sends a person's press has allowed, each good for one.
+    pub armed: Mutex<compose::Armed>,
+    /// One write or send at a time on a draft, by its id.
+    pub gates: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
+    /// Google's asked-for warm-up of its contact search is done.
+    pub warm: std::sync::atomic::AtomicBool,
+    /// How saves too slow for their caller came out.
+    pub jobs: Mutex<compose::Jobs>,
 }
 
 impl Core {
     pub fn new(apis: &Apis, paths: Result<Paths, gws_store::Error>) -> Self {
         Self {
             accounts: Accounts::default(),
-            gmail: Gmail::new(&apis.gmail),
+            gmail: Gmail::new(&apis.gmail).with_people(&apis.people),
             paths,
             store_key: Mutex::new(None),
             store: Mutex::new(None),
             sync: mail::Waker::default(),
             tickets: Mutex::default(),
             undos: Mutex::default(),
+            model_drafts: Mutex::default(),
+            uploads: Mutex::default(),
+            armed: Mutex::default(),
+            gates: Mutex::default(),
+            warm: std::sync::atomic::AtomicBool::new(false),
+            jobs: Mutex::default(),
             pushed: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -84,6 +103,14 @@ impl Core {
     pub fn run(&self, tool: &str, args: &Value) -> Value {
         mail::run(self, tool, args)
             .unwrap_or_else(|| tools::run(&self.gmail, &self.accounts, tool, args))
+    }
+
+    /// A tool the model called, from a chat or a routine.
+    pub fn run_for_model(&self, tool: &str, args: &Value) -> Value {
+        if tool == tools::MAIL_DRAFT_SAVE {
+            return compose::save_for_model(self, args);
+        }
+        self.run(tool, args)
     }
 
     /// `buwiz.account.set` or `.clear`. After either, the store keeps only
@@ -110,7 +137,7 @@ impl Core {
 
     /// [`Self::run`] for the model in a chat: a mail search also offers a card.
     pub fn run_for_chat(&self, tool: &str, args: &Value) -> Value {
-        let mut result = self.run(tool, args);
+        let mut result = self.run_for_model(tool, args);
         mail::offer_card(self, tool, args, &mut result);
         result
     }

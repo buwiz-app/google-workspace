@@ -2,6 +2,7 @@
 //! and Drive, each a full screen of its own. The manifest names them; the
 //! plugin serves the tools they call.
 
+mod compose;
 mod mail;
 pub mod reader;
 mod shell;

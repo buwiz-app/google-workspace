@@ -48,6 +48,8 @@ struct Request {
     method: String,
     target: String,
     authorization: String,
+    /// The `Content-Type`.
+    kind: String,
     body: Vec<u8>,
 }
 
@@ -105,7 +107,7 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
     reader.read_line(&mut line).ok()?;
     let mut parts = line.split(' ');
     let (method, target) = (parts.next()?.to_owned(), parts.next()?.to_owned());
-    let (mut authorization, mut length) = (String::new(), 0usize);
+    let (mut authorization, mut kind, mut length) = (String::new(), String::new(), 0usize);
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
@@ -114,6 +116,8 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         if let Some((k, v)) = h.split_once(':') {
             if k.eq_ignore_ascii_case("authorization") {
                 authorization = v.trim().to_owned();
+            } else if k.eq_ignore_ascii_case("content-type") {
+                kind = v.trim().to_owned();
             } else if k.eq_ignore_ascii_case("content-length") {
                 length = v.trim().parse().unwrap_or(0);
             }
@@ -125,6 +129,7 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         method,
         target,
         authorization,
+        kind,
         body,
     })
 }
@@ -210,6 +215,8 @@ pub struct Mail {
     pub html: Option<String>,
     /// `(file name, mime, bytes)`.
     pub attachments: Vec<(String, String, Vec<u8>)>,
+    /// Its `Message-ID`, for a search by it.
+    pub message_id: String,
 }
 
 /// What a fake account starts with.
@@ -270,6 +277,7 @@ impl Seed {
                     text: format!("Hello,\n\nThis is fake mail number {i} from {name}.\n\nThanks"),
                     html: (i % 2 == 0).then(|| format!("<html><body><p>Hello,</p><p>This is <b>fake</b> mail number {i} from {name}.</p></body></html>")),
                     attachments: Vec::new(),
+                    message_id: String::new(),
                 }
             })
             .collect();
@@ -309,6 +317,7 @@ impl Seed {
                 text: "plain".into(),
                 html: Some(HOSTILE_HTML.replace("{stub}", stub)),
                 attachments: Vec::new(),
+                message_id: String::new(),
             },
         );
         self
@@ -352,7 +361,12 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 fn headers(m: &Mail) -> Value {
-    json!([{"name": "From", "value": m.from}, {"name": "To", "value": m.to}, {"name": "Subject", "value": m.subject}, {"name": "Date", "value": rfc2822(m.at)}])
+    let id = if m.message_id.is_empty() {
+        format!("<{}@stub.example.com>", m.id)
+    } else {
+        m.message_id.clone()
+    };
+    json!([{"name": "From", "value": m.from}, {"name": "To", "value": m.to}, {"name": "Subject", "value": m.subject}, {"name": "Date", "value": rfc2822(m.at)}, {"name": "Message-ID", "value": id}])
 }
 
 fn snippet(m: &Mail) -> String {
@@ -386,6 +400,10 @@ struct Account {
     writes_left: Option<usize>,
     wrote: bool,
     reads_fail_after_write: bool,
+    /// `(draft id, message id, raw message, thread)`.
+    drafts: Vec<(String, String, String, Option<String>)>,
+    next_draft: u64,
+    sent: Vec<Sent>,
     history: i64,
     /// `(history id, change)`, oldest first.
     changes: Vec<(i64, Value)>,
@@ -397,7 +415,240 @@ struct Account {
     log: Vec<Seen>,
 }
 
+/// A message sent through the stub, as it arrived.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Sent {
+    pub to: String,
+    pub cc: String,
+    pub bcc: String,
+    pub subject: String,
+    pub body: String,
+    pub message_id: String,
+    pub in_reply_to: String,
+    /// `(file name, type, bytes)`.
+    pub attachments: Vec<(String, String, Vec<u8>)>,
+}
+
+/// A header's value in a block of headers.
+fn header_in(head: &str, name: &str) -> String {
+    let wanted = format!("{}:", name.to_lowercase());
+    head.lines()
+        .find(|l| l.to_lowercase().starts_with(&wanted))
+        .map(|l| l[wanted.len()..].trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// What a base64 body holds, however it's wrapped.
+fn unwrapped(body: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    let plain: String = body.split_whitespace().collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(plain)
+        .unwrap_or_default()
+}
+
+/// A boundary named in a `Content-Type`.
+fn boundary_of(kind: &str) -> Option<String> {
+    let (_, rest) = kind.split_once("boundary=")?;
+    Some(rest.split(';').next()?.trim().trim_matches('"').to_owned())
+}
+
+/// A multipart body's parts, each with its headers still on, as bytes: a part
+/// can be a whole message.
+fn parts_of(body: &[u8], boundary: &str) -> Vec<Vec<u8>> {
+    let mark = format!("--{boundary}").into_bytes();
+    let mut parts = Vec::new();
+    let mut from = None;
+    let mut i = 0;
+    while i + mark.len() <= body.len() {
+        if body[i..].starts_with(&mark) {
+            if let Some(start) = from {
+                let end = i.saturating_sub(2).max(start);
+                parts.push(body[start..end].to_vec());
+            }
+            i += mark.len();
+            if body[i..].starts_with(b"--") {
+                return parts;
+            }
+            i += 2;
+            from = Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    parts
+}
+
+impl Sent {
+    fn of(raw: &str) -> Sent {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(raw)
+            .unwrap_or_default();
+        let message = String::from_utf8_lossy(&bytes).into_owned();
+        let (head, body) = message.split_once("\r\n\r\n").unwrap_or((&message, ""));
+        let field = |name: &str| {
+            head.lines()
+                .find_map(|l| l.strip_prefix(&format!("{name}: ")))
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let plain = |value: String| match value
+            .strip_prefix("=?UTF-8?B?")
+            .and_then(|v| v.strip_suffix("?="))
+        {
+            Some(encoded) => base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or(value),
+            None => value,
+        };
+        let mut attachments = Vec::new();
+        let mut text = String::from_utf8(unwrapped(body)).unwrap_or_default();
+        if let Some(boundary) = boundary_of(&header_in(head, "Content-Type")) {
+            for (at, part) in parts_of(body.as_bytes(), &boundary).iter().enumerate() {
+                let part = String::from_utf8_lossy(part);
+                let (head, bytes) = part.split_once("\r\n\r\n").unwrap_or((&part, ""));
+                if at == 0 {
+                    text = String::from_utf8(unwrapped(bytes)).unwrap_or_default();
+                    continue;
+                }
+                let disposition = header_in(head, "Content-Disposition");
+                let name = match disposition.split_once("filename*=UTF-8''") {
+                    Some((_, name)) => decode(name),
+                    None => disposition
+                        .split_once("filename=")
+                        .map(|(_, n)| n.trim_matches('"').to_owned())
+                        .unwrap_or_default(),
+                };
+                let kind = header_in(head, "Content-Type");
+                attachments.push((name, kind, unwrapped(bytes)));
+            }
+        }
+        Sent {
+            to: field("To"),
+            cc: field("Cc"),
+            bcc: field("Bcc"),
+            subject: plain(field("Subject")),
+            body: text,
+            message_id: field("Message-ID"),
+            in_reply_to: field("In-Reply-To"),
+            attachments,
+        }
+    }
+
+    fn resource(&self, id: &str, thread: Option<&str>) -> Value {
+        let header = |name: &str, value: &str| json!({"name": name, "value": value});
+        let headers = json!([
+            header("To", &self.to),
+            header("Cc", &self.cc),
+            header("Bcc", &self.bcc),
+            header("Subject", &self.subject),
+            header("Message-ID", &self.message_id),
+        ]);
+        let text = json!({"mimeType": "text/plain", "body": {"data": b64(self.body.as_bytes())}});
+        if self.attachments.is_empty() {
+            let mut payload = text;
+            payload["headers"] = headers;
+            return json!({"id": id, "threadId": thread, "payload": payload});
+        }
+        let mut parts = vec![text];
+        for (at, (name, kind, bytes)) in self.attachments.iter().enumerate() {
+            parts.push(json!({"mimeType": kind, "filename": name, "body": {"attachmentId": format!("att-{at}"), "size": bytes.len()}}));
+        }
+        json!({"id": id, "threadId": thread, "payload": {"mimeType": "multipart/mixed", "headers": headers, "parts": parts}})
+    }
+}
+
 impl Account {
+    /// The People API's two searches: contacts, and who the person's mail knows.
+    fn people(&mut self, r: &Request) -> Reply {
+        if self
+            .only_grants
+            .as_deref()
+            .is_some_and(|g| !g.contains("contacts"))
+        {
+            return Self::insufficient();
+        }
+        let query = r.param("query").unwrap_or_default().to_lowercase();
+        let found: Vec<Value> = [("Zed Contact", "zed@contacts.example")]
+            .iter()
+            .filter(|(name, address)| {
+                !query.is_empty()
+                    && (name.to_lowercase().contains(&query) || address.contains(&query))
+            })
+            .map(|(name, address)| json!({"person": {"names": [{"displayName": name}], "emailAddresses": [{"value": address}]}}))
+            .collect();
+        Reply::json(200, json!({"results": found}))
+    }
+
+    /// Gmail's upload door: a metadata part and the message itself, handed on
+    /// as the same draft write its plain door takes.
+    fn upload(&mut self, mut r: Request, rest: &str) -> Reply {
+        use base64::Engine as _;
+        let parts = boundary_of(&r.kind)
+            .map(|b| parts_of(&r.body, &b))
+            .unwrap_or_default();
+        let [metadata, message] = parts.as_slice() else {
+            return Reply::json(
+                400,
+                json!({"error": {"code": 400, "message": "Bad upload."}}),
+            );
+        };
+        let after_head = |part: &[u8]| {
+            let at = part.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(0);
+            part[at + 4..].to_vec()
+        };
+        let mut body: Value = serde_json::from_slice(&after_head(metadata)).unwrap_or(json!({}));
+        body["message"]["raw"] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(after_head(message))
+            .into();
+        r.body = body.to_string().into_bytes();
+        self.gmail(&r, rest)
+    }
+
+    fn lacks_modify(&self) -> bool {
+        self.only_grants
+            .as_deref()
+            .is_some_and(|g| !g.contains("gmail.modify"))
+    }
+
+    fn insufficient() -> Reply {
+        Reply::json(
+            403,
+            json!({"error": {"code": 403, "message": "Request had insufficient authentication scopes."}}),
+        )
+    }
+
+    /// The thread a draft sits in: Gmail gives a new draft one of its own.
+    fn draft_thread(id: &str, thread: &Option<String>) -> String {
+        thread.clone().unwrap_or_else(|| format!("draft-{id}"))
+    }
+
+    /// Each draft as Gmail lists it: a message in a thread, labelled DRAFT.
+    fn draft_mails(&self) -> Vec<Mail> {
+        self.drafts
+            .iter()
+            .map(|(id, message, raw, thread)| {
+                let sent = Sent::of(raw);
+                Mail {
+                    id: message.clone(),
+                    thread: Self::draft_thread(id, thread),
+                    labels: vec!["DRAFT".to_owned()],
+                    from: FAKE_EMAIL.to_owned(),
+                    to: sent.to,
+                    subject: sent.subject,
+                    at: 1_793_955_600_000,
+                    text: sent.body,
+                    html: None,
+                    attachments: sent.attachments,
+                    message_id: sent.message_id,
+                }
+            })
+            .collect()
+    }
+
     fn resource(&self, m: &Mail, format: &str, wanted: &[String]) -> Value {
         let mut v = json!({"id": m.id, "threadId": m.thread, "labelIds": m.labels, "snippet": snippet(m), "historyId": self.history.to_string(), "internalDate": m.at.to_string(), "sizeEstimate": m.text.len()});
         match format {
@@ -431,8 +682,27 @@ impl Account {
         if !labels.iter().all(|l| m.labels.contains(l)) {
             return false;
         }
+        // one `{a b}` group: any of its terms will do
+        let (q, any) = match q.split_once('{').zip(q.split_once('}')) {
+            Some(((before, rest), (_, after))) => {
+                let group = rest.split('}').next().unwrap_or_default();
+                (format!("{before} {after}"), Some(group.to_owned()))
+            }
+            None => (q.to_owned(), None),
+        };
+        if let Some(any) = any
+            && !any.split_whitespace().any(|t| Self::matches(m, t, &[]))
+        {
+            return false;
+        }
         q.split_whitespace().all(|term| {
             let term = term.to_lowercase();
+            if term == "in:sent" {
+                return m.labels.iter().any(|l| l == "SENT");
+            }
+            if let Some(to) = term.strip_prefix("to:") {
+                return m.to.to_lowercase().contains(to.trim_matches('"'));
+            }
             if let Some(from) = term.strip_prefix("from:") {
                 return m.from.to_lowercase().contains(from);
             }
@@ -445,6 +715,9 @@ impl Account {
                     "starred" => m.labels.iter().any(|l| l == "STARRED"),
                     _ => true,
                 };
+            }
+            if let Some(id) = term.strip_prefix("rfc822msgid:") {
+                return m.message_id.eq_ignore_ascii_case(id);
             }
             if term.contains(':') {
                 return true;
@@ -557,12 +830,20 @@ impl Account {
                 None => not_found(),
             },
             ("GET", ["messages", id, "attachments", att]) => {
-                let found = self.mails.iter().find(|m| m.id == *id).and_then(|m| {
-                    att.rsplit('-')
-                        .next()
-                        .and_then(|i| i.parse::<usize>().ok())
-                        .and_then(|i| m.attachments.get(i))
-                });
+                let at = att.rsplit('-').next().and_then(|i| i.parse::<usize>().ok());
+                let held = self
+                    .drafts
+                    .iter()
+                    .find(|d| d.1 == *id)
+                    .map(|d| Sent::of(&d.2));
+                let found = match &held {
+                    Some(draft) => at.and_then(|i| draft.attachments.get(i)),
+                    None => self
+                        .mails
+                        .iter()
+                        .find(|m| m.id == *id)
+                        .and_then(|m| at.and_then(|i| m.attachments.get(i))),
+                };
                 match found {
                     Some((_, _, bytes)) => {
                         Reply::json(200, json!({"size": bytes.len(), "data": b64(bytes)}))
@@ -573,7 +854,11 @@ impl Account {
             ("GET", ["threads"]) => {
                 let mut seen = Vec::new();
                 let mut found = Vec::new();
-                for m in self.mails.iter().filter(|m| Self::matches(m, &q, &labels)) {
+                let drafts = self.draft_mails();
+                let held = drafts
+                    .iter()
+                    .filter(|_| labels.iter().any(|l| l == "DRAFT"));
+                for m in held.chain(self.mails.iter().filter(|m| Self::matches(m, &q, &labels))) {
                     if !seen.contains(&m.thread) {
                         seen.push(m.thread.clone());
                         found.push(json!({"id": m.thread, "snippet": snippet(m), "historyId": self.history.to_string()}));
@@ -582,7 +867,13 @@ impl Account {
                 Reply::json(200, Self::page(found, "threads", start, max))
             }
             ("GET", ["threads", id]) => {
-                let mut mails: Vec<&Mail> = self.mails.iter().filter(|m| m.thread == *id).collect();
+                let drafts = self.draft_mails();
+                let mut mails: Vec<&Mail> = self
+                    .mails
+                    .iter()
+                    .chain(&drafts)
+                    .filter(|m| m.thread == *id)
+                    .collect();
                 if mails.is_empty() {
                     return not_found();
                 }
@@ -595,6 +886,101 @@ impl Account {
                     200,
                     json!({"id": id, "historyId": self.history.to_string(), "messages": messages}),
                 )
+            }
+            ("POST", ["drafts"]) | ("PUT", ["drafts", _]) => {
+                if self.lacks_modify() {
+                    return Self::insufficient();
+                }
+                let body: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+                let raw = body
+                    .pointer("/message/raw")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let thread = body
+                    .pointer("/message/threadId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                self.next_draft += 1;
+                let message = format!("m{}", self.next_draft);
+                let id = match segs.as_slice() {
+                    [_, id] => {
+                        let Some(held) = self.drafts.iter_mut().find(|d| d.0 == *id) else {
+                            return not_found();
+                        };
+                        held.1 = message.clone();
+                        held.2 = raw;
+                        held.3 = thread;
+                        (*id).to_owned()
+                    }
+                    _ => {
+                        let id = format!("d{}", self.next_draft);
+                        self.drafts.push((id.clone(), message.clone(), raw, thread));
+                        id
+                    }
+                };
+                Reply::json(200, json!({"id": id, "message": {"id": message}}))
+            }
+            ("GET", ["drafts"]) => {
+                let listed: Vec<Value> = self
+                    .drafts
+                    .iter()
+                    .map(|(id, message, _, thread)| json!({"id": id, "message": {"id": message, "threadId": Self::draft_thread(id, thread)}}))
+                    .collect();
+                Reply::json(200, json!({"drafts": listed}))
+            }
+            ("GET", ["drafts", id]) => match self.drafts.iter().find(|d| d.0 == *id) {
+                Some((id, message, raw, thread)) => {
+                    let sent = Sent::of(raw);
+                    Reply::json(
+                        200,
+                        json!({"id": id, "message": sent.resource(message, thread.as_deref())}),
+                    )
+                }
+                None => not_found(),
+            },
+            ("DELETE", ["drafts", id]) => {
+                let before = self.drafts.len();
+                self.drafts.retain(|d| d.0 != *id);
+                if self.drafts.len() == before {
+                    return not_found();
+                }
+                Reply(204, "text/plain", Vec::new(), Vec::new())
+            }
+            ("POST", ["drafts", "send"]) => {
+                if self.lacks_modify() {
+                    return Self::insufficient();
+                }
+                let body: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+                let id = body["id"].as_str().unwrap_or_default();
+                let Some(at) = self.drafts.iter().position(|d| d.0 == id) else {
+                    return not_found();
+                };
+                let (_, message, raw, thread) = self.drafts.remove(at);
+                let sent = Sent::of(&raw);
+                self.history += 1;
+                // it stays in its thread, and the change shows in history, as with Gmail
+                let thread = Self::draft_thread(id, &thread);
+                let history = self.history;
+                self.changes.push((history, json!({"id": history.to_string(), "messagesAdded": [{"message": {"id": message, "threadId": thread, "labelIds": ["SENT"]}}]})));
+                self.mails.insert(
+                    0,
+                    Mail {
+                        id: message.clone(),
+                        thread: thread.clone(),
+                        labels: vec!["SENT".to_owned()],
+                        from: FAKE_EMAIL.to_owned(),
+                        to: sent.to.clone(),
+                        subject: sent.subject.clone(),
+                        at: 1_793_955_600_000,
+                        text: sent.body.clone(),
+                        html: None,
+                        attachments: sent.attachments.clone(),
+                        message_id: sent.message_id.clone(),
+                    },
+                );
+                self.sent.push(sent);
+                Reply::json(200, json!({"id": message, "threadId": thread}))
             }
             ("POST", ["threads", id, action]) | ("POST", ["messages", id, action]) => {
                 if self.writes_left == Some(0) {
@@ -765,6 +1151,16 @@ impl Account {
         if let Some(rest) = path.strip_prefix(GMAIL) {
             return self.gmail(&r, rest);
         }
+        if path.starts_with("/people/v1/") {
+            return self.people(&r);
+        }
+        if let Some(rest) = path
+            .strip_prefix("/upload")
+            .and_then(|p| p.strip_prefix(GMAIL))
+        {
+            let rest = rest.to_owned();
+            return self.upload(r, &rest);
+        }
         Reply::json(
             404,
             json!({"error": {"code": 404, "message": "No such API in the stub."}}),
@@ -772,10 +1168,41 @@ impl Account {
     }
 }
 
+/// Where a test stops one request before it does anything, so that what must not
+/// happen in a gap can be made to land in it, with no sleeping.
+#[derive(Default)]
+struct Door {
+    state: Mutex<DoorState>,
+    moved: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct DoorState {
+    /// The method, and what ends the path.
+    holding: Option<(String, String)>,
+    arrived: bool,
+}
+
+impl Door {
+    fn pass(&self, r: &Request) {
+        let mut state = self.state.lock().unwrap();
+        let held = |h: &(String, String)| r.method == h.0 && r.path().ends_with(&h.1);
+        if !state.holding.as_ref().is_some_and(held) {
+            return;
+        }
+        state.arrived = true;
+        self.moved.notify_all();
+        while state.holding.is_some() {
+            state = self.moved.wait(state).unwrap();
+        }
+    }
+}
+
 /// A whole fake Google account on a port of its own.
 pub struct FakeGoogle {
     port: u16,
     account: Arc<Mutex<Account>>,
+    door: Arc<Door>,
 }
 
 impl FakeGoogle {
@@ -791,9 +1218,39 @@ impl FakeGoogle {
             only_grants: seed.only_grants,
             ..Account::default()
         }));
-        let shared = account.clone();
-        let port = listen(port, move |r| shared.lock().unwrap().handle(r));
-        Self { port, account }
+        let (shared, door) = (account.clone(), Arc::new(Door::default()));
+        let waits = door.clone();
+        let port = listen(port, move |r| {
+            waits.pass(&r);
+            shared.lock().unwrap().handle(r)
+        });
+        Self {
+            port,
+            account,
+            door,
+        }
+    }
+
+    /// Stops requests of `method` whose path ends in `path`, before they do
+    /// anything, until [`Self::release`].
+    pub fn hold(&self, method: &str, path: &str) {
+        let mut state = self.door.state.lock().unwrap();
+        state.holding = Some((method.to_owned(), path.to_owned()));
+        state.arrived = false;
+    }
+
+    /// Until a held request has come.
+    pub fn wait_for_held(&self) {
+        let mut state = self.door.state.lock().unwrap();
+        while !state.arrived {
+            state = self.door.moved.wait(state).unwrap();
+        }
+    }
+
+    /// Lets what's held go on.
+    pub fn release(&self) {
+        self.door.state.lock().unwrap().holding = None;
+        self.door.moved.notify_all();
     }
 
     /// `http://127.0.0.1:<port>`: what `GWS_STUB_BASE` names.
@@ -812,6 +1269,11 @@ impl FakeGoogle {
             .into_iter()
             .filter(|s| s.method != "GET" && !s.target.starts_with("/token"))
             .collect()
+    }
+
+    /// What was sent, oldest first.
+    pub fn sent(&self) -> Vec<Sent> {
+        self.account.lock().unwrap().sent.clone()
     }
 
     /// Each mail's labels, sorted: what a test compares across an undo.

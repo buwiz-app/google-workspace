@@ -23,7 +23,11 @@ pub const HEADER_MAX: usize = 1024;
 pub const GMAIL_API: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 pub const BODY_MAX: usize = 64 * 1024;
 pub const SNIPPET_MAX: usize = 200;
+pub const PEOPLE_API: &str = "https://people.googleapis.com/v1";
 const TIMEOUT: Duration = Duration::from_secs(30);
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+/// A 25 MB attachment as Gmail answers it, in base64 inside JSON.
+const ATTACHMENT_MAX: u64 = 40 * 1024 * 1024;
 /// Requests in flight for one search.
 const METADATA_AT_ONCE: usize = 8;
 /// A list or metadata answer.
@@ -47,7 +51,11 @@ pub enum Failure {
 /// The Gmail API at a base URL.
 #[derive(Clone)]
 pub struct Gmail {
+    /// Where address suggestions come from.
+    people: String,
     agent: ureq::Agent,
+    /// For what's big: a whole attachment each way.
+    slow: ureq::Agent,
     base: String,
 }
 
@@ -76,10 +84,63 @@ impl Gmail {
             .timeout_global(Some(TIMEOUT))
             .user_agent("buwiz-gws")
             .build();
+        let slow = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .timeout_global(Some(UPLOAD_TIMEOUT))
+            .user_agent("buwiz-gws")
+            .build();
         Self {
+            people: PEOPLE_API.to_owned(),
             agent: config.new_agent(),
+            slow: slow.new_agent(),
             base: base.trim_end_matches('/').to_owned(),
         }
+    }
+
+    /// The same, with the People API at `base`.
+    pub fn with_people(mut self, base: &str) -> Self {
+        self.people = base.trim_end_matches('/').to_owned();
+        self
+    }
+
+    /// `(name, address)` of the person's contacts, and of the people Google
+    /// keeps from their mail, that match `query`. An empty `query` is the
+    /// warm-up Google asks for before the first search.
+    pub fn contacts(&self, auth: &Bearer, query: &str) -> Result<Vec<(String, String)>, Failure> {
+        let mut found = Vec::new();
+        for (path, mask) in [
+            ("people:searchContacts", "names,emailAddresses"),
+            ("otherContacts:search", "names,emailAddresses"),
+        ] {
+            let req = self
+                .agent
+                .get(format!("{}/{path}", self.people))
+                .header("authorization", auth.header())
+                .header("accept", "application/json")
+                .query("query", query)
+                .query("readMask", mask)
+                .query("pageSize", "10");
+            let Some(v) = Self::answer(req.call(), FULL_MAX)? else {
+                continue;
+            };
+            let people = v.get("results").and_then(Value::as_array);
+            for person in people.into_iter().flatten() {
+                let name = person
+                    .pointer("/person/names/0/displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let addresses = person
+                    .pointer("/person/emailAddresses")
+                    .and_then(Value::as_array);
+                for address in addresses.into_iter().flatten() {
+                    if let Some(address) = address.get("value").and_then(Value::as_str) {
+                        found.push((name.to_owned(), address.to_owned()));
+                    }
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// A GET of `path` under the base: its JSON, or `None` for a 404.
@@ -102,7 +163,7 @@ impl Gmail {
         Self::answer(req.call(), cap)
     }
 
-    /// A POST: every write there is, and only a person's press leads here.
+    /// A POST: a person's press, or a draft the model filled, which sends nothing.
     fn post(&self, auth: &Bearer, path: String, body: &Value) -> Result<Option<Value>, Failure> {
         let url = format!("{}/{path}", self.base);
         let req = self
@@ -137,6 +198,8 @@ impl Gmail {
                 ))
             })?;
         match status {
+            // a delete answers with nothing
+            200 | 204 if body.is_empty() => Ok(Some(Value::Null)),
             200 => serde_json::from_slice(&body)
                 .map(Some)
                 .map_err(|_| Failure::Plain("Gmail's answer is not JSON".to_owned())),
@@ -151,10 +214,11 @@ impl Gmail {
                 if status == 403 && why.contains("insufficient") {
                     return Err(Failure::NeedsAccess);
                 }
-                Err(Failure::Plain(format!(
-                    "Gmail answered {status}: {}",
-                    js::slice_utf16(why, 300)
-                )))
+                Err(Failure::Plain(match status {
+                    429 => "Gmail is busy right now. Try again in a moment.".to_owned(),
+                    500.. => "Gmail had a problem just now. Try again.".to_owned(),
+                    _ => format!("Gmail didn't accept that: {}", js::slice_utf16(why, 300)),
+                }))
             }
         }
     }
@@ -182,7 +246,20 @@ impl Gmail {
     /// Each message's From, Subject, Date and snippet (`format=metadata`),
     /// fetched together; `None` for one Gmail no longer has.
     pub fn metadata(&self, auth: &Bearer, ids: &[String]) -> Result<Vec<Option<Value>>, Failure> {
-        let headers = ["From", "Subject", "Date"].map(|h| ("metadataHeaders", h.to_owned()));
+        self.metadata_with(auth, ids, &["From", "Subject", "Date"])
+    }
+
+    /// Each message's `names` headers, in order.
+    pub fn metadata_with(
+        &self,
+        auth: &Bearer,
+        ids: &[String],
+        names: &[&str],
+    ) -> Result<Vec<Option<Value>>, Failure> {
+        let headers: Vec<(&str, String)> = names
+            .iter()
+            .map(|h| ("metadataHeaders", (*h).to_owned()))
+            .collect();
         let mut out = Vec::with_capacity(ids.len());
         for batch in ids.chunks(METADATA_AT_ONCE) {
             let done: Result<Vec<_>, Failure> = std::thread::scope(|scope| {
@@ -302,7 +379,7 @@ impl Gmail {
         auth: &Bearer,
         ids: &[String],
     ) -> Result<Vec<Option<Value>>, Failure> {
-        let headers = ["From", "Subject", "Date"].map(|h| ("metadataHeaders", h.to_owned()));
+        let headers = ["From", "To", "Subject", "Date"].map(|h| ("metadataHeaders", h.to_owned()));
         let mut out = Vec::with_capacity(ids.len());
         for batch in ids.chunks(METADATA_AT_ONCE) {
             let done: Result<Vec<_>, Failure> = std::thread::scope(|scope| {
@@ -367,6 +444,138 @@ impl Gmail {
                 })
                 .collect(),
         ))
+    }
+
+    /// A draft write's JSON, without the message when that goes as a part.
+    fn draft_metadata(thread: Option<&str>) -> Value {
+        match thread {
+            Some(thread) => serde_json::json!({"message": {"threadId": thread}}),
+            None => serde_json::json!({"message": {}}),
+        }
+    }
+
+    fn draft_body(raw: &str, thread: Option<&str>) -> Value {
+        let mut body = Self::draft_metadata(thread);
+        body["message"]["raw"] = raw.into();
+        body
+    }
+
+    pub fn draft_create(
+        &self,
+        auth: &Bearer,
+        raw: &str,
+        thread: Option<&str>,
+    ) -> Result<Option<Value>, Failure> {
+        self.post(auth, "drafts".to_owned(), &Self::draft_body(raw, thread))
+    }
+
+    pub fn draft_update(
+        &self,
+        auth: &Bearer,
+        id: &str,
+        raw: &str,
+        thread: Option<&str>,
+    ) -> Result<Option<Value>, Failure> {
+        let req = self
+            .agent
+            .put(format!("{}/drafts/{id}", self.base))
+            .header("authorization", auth.header())
+            .header("accept", "application/json")
+            .header("content-type", "application/json");
+        let body = Self::draft_body(raw, thread).to_string();
+        Self::answer(req.send(body.as_bytes()), FULL_MAX)
+    }
+
+    /// A draft with attachments, through Gmail's upload door: the JSON one
+    /// takes a few megabytes, this one the whole message. `id` replaces a draft.
+    pub fn draft_upload(
+        &self,
+        auth: &Bearer,
+        id: Option<&str>,
+        message: &[u8],
+        thread: Option<&str>,
+    ) -> Result<Option<Value>, Failure> {
+        let boundary = "buwiz-gws-upload-boundary";
+        let metadata = Self::draft_metadata(thread);
+        let mut body = format!(
+            "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata}\r\n--{boundary}\r\nContent-Type: message/rfc822\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(message);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let base = self.base.replacen("/gmail/v1/", "/upload/gmail/v1/", 1);
+        let kind = format!("multipart/related; boundary={boundary}");
+        let url = match id {
+            Some(id) => format!("{base}/drafts/{id}"),
+            None => format!("{base}/drafts"),
+        };
+        let req = match id {
+            Some(_) => self.slow.put(&url),
+            None => self.slow.post(&url),
+        };
+        let req = req
+            .query("uploadType", "multipart")
+            .header("authorization", auth.header())
+            .header("accept", "application/json")
+            .header("content-type", &kind);
+        Self::answer(req.send(&body[..]), FULL_MAX)
+    }
+
+    /// An attachment's bytes, from the message that holds it.
+    pub fn attachment(
+        &self,
+        auth: &Bearer,
+        message: &str,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>, Failure> {
+        let url = format!("{}/messages/{message}/attachments/{id}", self.base);
+        let req = self
+            .slow
+            .get(&url)
+            .header("authorization", auth.header())
+            .header("accept", "application/json");
+        let Some(v) = Self::answer(req.call(), ATTACHMENT_MAX)? else {
+            return Ok(None);
+        };
+        let data = v.get("data").and_then(Value::as_str).unwrap_or_default();
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(data.trim_end_matches('='))
+            .map_err(|_| Failure::Plain("That attachment came back damaged.".to_owned()))?;
+        Ok(Some(bytes))
+    }
+
+    /// The id of the draft in conversation `thread`, among the newest there are.
+    pub fn draft_in_thread(&self, auth: &Bearer, thread: &str) -> Result<Option<String>, Failure> {
+        let query = vec![("maxResults", "500".to_owned())];
+        let Some(list) = self.get(auth, "drafts".to_owned(), query, FULL_MAX)? else {
+            return Ok(None);
+        };
+        Ok(list
+            .get("drafts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|d| d.pointer("/message/threadId").and_then(Value::as_str) == Some(thread))
+            .and_then(|d| d.get("id")?.as_str().map(str::to_owned)))
+    }
+
+    pub fn draft(&self, auth: &Bearer, id: &str) -> Result<Option<Value>, Failure> {
+        let query = vec![("format", "full".to_owned())];
+        self.get(auth, format!("drafts/{id}"), query, FULL_MAX)
+    }
+
+    pub fn draft_delete(&self, auth: &Bearer, id: &str) -> Result<(), Failure> {
+        let req = self
+            .agent
+            .delete(format!("{}/drafts/{id}", self.base))
+            .header("authorization", auth.header());
+        Self::answer(req.call(), FULL_MAX).map(drop)
+    }
+
+    /// `false` when Gmail has no such draft.
+    pub fn draft_send(&self, auth: &Bearer, id: &str) -> Result<bool, Failure> {
+        let body = serde_json::json!({"id": id});
+        Ok(self.post(auth, "drafts/send".to_owned(), &body)?.is_some())
     }
 
     pub fn modify_thread(

@@ -27,6 +27,8 @@ pub struct Thread {
     /// The display name of the latest sender, else the address.
     pub sender: String,
     pub address: String,
+    /// Who the person's latest message here went to; empty if they wrote none.
+    pub recipient: String,
     /// Unix milliseconds of the latest message.
     pub at: i64,
     pub unread: bool,
@@ -43,6 +45,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Thread> {
         snippet: r.get("snippet")?,
         sender: r.get("sender")?,
         address: r.get("address")?,
+        recipient: r.get("recipient")?,
         at: r.get("at")?,
         unread: r.get("unread")?,
         starred: r.get("starred")?,
@@ -82,8 +85,8 @@ impl Store {
     pub fn put_thread(&self, account: &str, t: &Thread) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO threads(account, id, subject, snippet, sender, address, at, unread, starred, messages, attachment) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![account, t.id, t.subject, t.snippet, t.sender, t.address, t.at, t.unread, t.starred, t.messages, t.attachment],
+            "INSERT OR REPLACE INTO threads(account, id, subject, snippet, sender, address, recipient, at, unread, starred, messages, attachment) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![account, t.id, t.subject, t.snippet, t.sender, t.address, t.recipient, t.at, t.unread, t.starred, t.messages, t.attachment],
         )?;
         tx.execute(
             "DELETE FROM thread_labels WHERE account = ? AND thread = ?",
@@ -165,6 +168,20 @@ impl Store {
         );
         let mut q = self.conn.prepare("SELECT * FROM threads WHERE account = ?1 AND (subject LIKE ?2 ESCAPE '\\' OR sender LIKE ?2 ESCAPE '\\' OR address LIKE ?2 ESCAPE '\\' OR snippet LIKE ?2 ESCAPE '\\') ORDER BY at DESC LIMIT ?3")?;
         let rows = q.query_map(params![account, like, take], row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// `(name, address)` of who mail came from, newest first, whose name or
+    /// address has `text` in it.
+    pub fn senders(&self, account: &str, text: &str, take: i64) -> Result<Vec<(String, String)>> {
+        let like = format!(
+            "%{}%",
+            text.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let mut q = self.conn.prepare("SELECT sender, address FROM threads WHERE account = ?1 AND address != '' AND (sender LIKE ?2 ESCAPE '\\' OR address LIKE ?2 ESCAPE '\\') GROUP BY address ORDER BY MAX(at) DESC LIMIT ?3")?;
+        let rows = q.query_map(params![account, like, take], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 

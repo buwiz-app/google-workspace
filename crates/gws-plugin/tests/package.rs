@@ -44,7 +44,7 @@ fn the_template_matches_the_served_manifest() {
     );
     assert_eq!(
         b["accounts"],
-        json!([{"id": "google", "provider": "google", "label": "Google account", "scopes": ["https://www.googleapis.com/auth/gmail.modify"], "required": true}])
+        json!([{"id": "google", "provider": "google", "label": "Google account", "scopes": ["https://www.googleapis.com/auth/gmail.modify", "https://www.googleapis.com/auth/contacts.readonly", "https://www.googleapis.com/auth/contacts.other.readonly"], "required": true}])
     );
     assert!(b.get("signature").is_none(), "the release script signs it");
 }
@@ -201,7 +201,7 @@ fn the_signed_package_passes_the_bots_checks() {
         p["value"],
         json!({
             "id": "app.buwiz.google-workspace", "short": "gws", "version": env!("CARGO_PKG_VERSION"), "server": "gws",
-            "accounts": [{"id": "google", "provider": "google", "label": "Google account", "scopes": ["https://www.googleapis.com/auth/gmail.modify"], "required": true}],
+            "accounts": [{"id": "google", "provider": "google", "label": "Google account", "scopes": ["https://www.googleapis.com/auth/gmail.modify", "https://www.googleapis.com/auth/contacts.readonly", "https://www.googleapis.com/auth/contacts.other.readonly"], "required": true}],
             "files": [{"path": "manifest.signed.json", "asset": "manifest.signed.json", "sha256": sha("manifest.signed.json")}],
             "binary": {"path": "bin/buwiz-gws", "asset": "buwiz-gws-macos-aarch64", "sha256": sha("buwiz-gws-macos-aarch64")},
         })

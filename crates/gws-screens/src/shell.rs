@@ -2,14 +2,40 @@
 //! signed-in account, which is more than being signed in. Each screen's own
 //! content comes in its slice.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use buwiz_app::Bridge;
-use nsh_core::element::{Element, ParentElement, Root, dynamic, signal, text, view};
+use nsh_core::element::{Element, ParentElement, Root, Signal, dynamic, signal, text, view};
 use serde_json::{Value, json};
 
 pub(crate) const BG: &str = "bg-[#f6f6f4] dark:bg-[#151515]";
 pub(crate) const MUTE: &str = "text-[#5c5c5c] dark:text-[#a0a0a0]";
+
+/// A person's action waiting its turn.
+pub(crate) type Job = Pin<Box<dyn Future<Output = ()>>>;
+
+/// Which of several answers out at once still counts: the latest asked for.
+#[derive(Clone, Copy)]
+pub(crate) struct Latest(Signal<u64>);
+
+impl Latest {
+    pub(crate) fn new() -> Self {
+        Self(signal(0))
+    }
+
+    /// A new question: every earlier one stops counting.
+    pub(crate) fn ask(self) -> u64 {
+        let turn = self.0.get_untracked() + 1;
+        self.0.set(turn);
+        turn
+    }
+
+    pub(crate) fn counts(self, turn: u64) -> bool {
+        self.0.get_untracked() == turn
+    }
+}
 
 /// How many times a busy answer is tried again before it's shown.
 pub(crate) const RETRIES: u32 = 5;

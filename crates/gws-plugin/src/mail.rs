@@ -18,10 +18,12 @@ use crate::accounts::Bearer;
 use crate::clean;
 use crate::gmail::{self, Failure};
 use crate::tools::{
-    MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK,
-    MAIL_THREAD, MAIL_TRASH, MAIL_UNDO, SEARCH_MAIL, fail, failed, ok,
+    MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_DRAFT_DELETE, MAIL_DRAFT_OF, MAIL_DRAFT_READ,
+    MAIL_DRAFT_SAVE, MAIL_JOB, MAIL_JOB_START, MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK,
+    MAIL_REPLY_START, MAIL_SEND, MAIL_SEND_ARM, MAIL_SEND_DISARM, MAIL_THREAD, MAIL_TRASH,
+    MAIL_UNDO, PEOPLE_SUGGEST, SEARCH_MAIL, UPLOAD_CHUNK, UPLOAD_DROP, fail, failed, ok,
 };
-use crate::{Core, js};
+use crate::{Core, compose, js};
 
 /// Rows a list page holds.
 pub const PAGE: i64 = 50;
@@ -54,6 +56,7 @@ fn now_ms() -> i64 {
 pub enum Subject {
     Search(String),
     Thread(String),
+    Draft(String),
 }
 
 /// How many rows a card shows.
@@ -62,6 +65,18 @@ const CARD_ROWS: usize = 5;
 /// Offers a card with a chat's mail search. Nothing about the mail goes in it:
 /// props hold a ticket, and the card reads its rows itself.
 pub fn offer_card(core: &Core, tool: &str, args: &Value, result: &mut Value) {
+    if tool == MAIL_DRAFT_SAVE {
+        let saved = result.pointer("/structuredContent/draft");
+        if let Some(draft) = saved.and_then(Value::as_str) {
+            let ticket = core
+                .tickets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .issue(&Subject::Draft(draft.to_owned()));
+            result["_meta"] = json!({"buwiz/open": {"app": "mail", "props": {"draft": ticket}, "title": "Mail", "placement": "inline"}});
+        }
+        return;
+    }
     let found = result
         .pointer("/structuredContent/items")
         .and_then(Value::as_array)
@@ -354,7 +369,7 @@ impl Waker {
         self.bell.notify_all();
     }
 
-    fn seen(&self) {
+    pub(crate) fn seen(&self) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).1 = Some(Instant::now());
     }
 
@@ -449,7 +464,7 @@ fn with_own_store<T>(
     f(store).map_err(|e| Failure::Plain(e.message))
 }
 
-fn with_store<T>(
+pub(crate) fn with_store<T>(
     core: &Core,
     f: impl FnOnce(&Store) -> gws_store::Result<T>,
 ) -> Result<T, Failure> {
@@ -491,6 +506,23 @@ fn millis(message: &Value) -> i64 {
         .unwrap_or(0)
 }
 
+/// Who the person's latest message in a thread went to: "Ana Reyes", or "Ana
+/// Reyes and 2 more". Empty when the person wrote nothing there.
+fn recipient_of(messages: &[Value]) -> String {
+    let theirs = messages.iter().rev().find(|m| {
+        m.get("labelIds")
+            .and_then(Value::as_array)
+            .is_some_and(|l| l.iter().any(|l| l == "SENT" || l == "DRAFT"))
+    });
+    let to = theirs.map(|m| gmail::header(m, "To")).unwrap_or_default();
+    let people = compose::split_list(&to);
+    match people.as_slice() {
+        [] => String::new(),
+        [one] => sender_of(one).0,
+        [first, rest @ ..] => format!("{} and {} more", sender_of(first).0, rest.len()),
+    }
+}
+
 /// A thread's list row from Gmail's answer.
 pub fn row_of(thread: &Value) -> Option<Thread> {
     let messages = thread
@@ -517,6 +549,7 @@ pub fn row_of(thread: &Value) -> Option<Thread> {
         snippet: gmail::snippet(last),
         sender,
         address,
+        recipient: recipient_of(messages),
         at: millis(last),
         unread: labels.iter().any(|l| l == "UNREAD"),
         starred: labels.iter().any(|l| l == "STARRED"),
@@ -695,6 +728,7 @@ fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
         }
     }
     let rows = with_store(core, |store| store.threads(&account, &label, skip, PAGE))?;
+    let rows: Vec<Thread> = rows.into_iter().map(|t| addressed(t, &label)).collect();
     let total = with_store(core, |store| store.thread_count(&account, &label))?;
     // no token on record yet is not the end: only an empty one is
     let more =
@@ -702,6 +736,14 @@ fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
     Ok(ok(
         json!({"threads": rows.iter().map(row_json).collect::<Vec<_>>(), "more": more || skip + PAGE < total, "saved": false}),
     ))
+}
+
+/// In Sent and Drafts a row names who it's for: the sender there is the person.
+fn addressed(mut t: Thread, label: &str) -> Thread {
+    if matches!(label, "SENT" | "DRAFT") && !t.recipient.is_empty() {
+        t.sender = format!("To: {}", t.recipient);
+    }
+    t
 }
 
 /// Where a label's next page token is kept; empty means no more pages.
@@ -941,15 +983,46 @@ pub fn run(core: &Core, tool: &str, args: &Value) -> Option<Value> {
         MAIL_CARD => card(core, args),
         MAIL_MARK | MAIL_LABEL | MAIL_ARCHIVE | MAIL_TRASH => act(core, tool, args),
         MAIL_UNDO => undo(core, args),
+        MAIL_DRAFT_SAVE => compose::save(core, args),
+        MAIL_DRAFT_READ => compose::read(core, args),
+        MAIL_DRAFT_DELETE => compose::delete(core, args),
+        MAIL_SEND => compose::send(core, args),
+        MAIL_REPLY_START => compose::reply_start(core, args),
+        MAIL_JOB => compose::job(core, args),
+        MAIL_JOB_START => compose::job_start(core),
+        MAIL_SEND_ARM => compose::arm(core, args),
+        MAIL_SEND_DISARM => compose::disarm(core, args),
+        PEOPLE_SUGGEST => compose::suggest(core, args),
+        MAIL_DRAFT_OF => compose::draft_of(core, args),
+        UPLOAD_CHUNK => compose::upload_chunk(core, args),
+        UPLOAD_DROP => compose::upload_drop(core, args),
         _ => return None,
     };
     core.sync.seen();
-    Some(result.unwrap_or_else(failed))
+    let answer = result.unwrap_or_else(failed);
+    if tool == MAIL_DRAFT_SAVE {
+        compose::finish_job(core, args, &answer);
+    }
+    Some(answer)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_names_who_the_persons_last_message_went_to() {
+        let message = |labels: Value, to: &str| json!({"labelIds": labels, "payload": {"headers": [{"name": "To", "value": to}]}});
+        let them = message(json!(["INBOX"]), "me@example.com");
+        let one = message(json!(["SENT"]), "\"Reyes, Ana\" <ana@example.com>");
+        let three = message(
+            json!(["DRAFT"]),
+            "Ana <a@example.com>, b@example.com, c@example.com",
+        );
+        assert_eq!(recipient_of(std::slice::from_ref(&them)), "");
+        assert_eq!(recipient_of(&[one.clone(), them]), "Reyes, Ana");
+        assert_eq!(recipient_of(&[one, three]), "Ana and 2 more");
+    }
 
     mod signing_out {
         use super::*;

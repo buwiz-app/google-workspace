@@ -7,8 +7,6 @@
 //! The Bot's `agent_hub::filter` tests hold that on the bytes it sends.
 
 use std::collections::HashSet;
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use buwiz_app::{Bridge, Placement};
@@ -20,8 +18,9 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use url::Url;
 
+use crate::compose::{self, Compose};
 use crate::reader;
-use crate::shell::{BG, MUTE, RETRIES, backoff, sleep};
+use crate::shell::{BG, Job, Latest, MUTE, RETRIES, backoff, sleep};
 
 const INK: &str = "text-[#1c1c1c] dark:text-[#f0f0f0]";
 const RAIL: &str = "bg-[#efefec] dark:bg-[#0f0f0f]";
@@ -182,27 +181,6 @@ pub fn notice(status: &str, saved: bool) -> Option<&'static str> {
     }
 }
 
-/// Which of several answers out at once still counts: the latest asked for.
-#[derive(Clone, Copy)]
-struct Latest(Signal<u64>);
-
-impl Latest {
-    fn new() -> Self {
-        Self(signal(0))
-    }
-
-    /// A new question: every earlier one stops counting.
-    fn ask(self) -> u64 {
-        let turn = self.0.get_untracked() + 1;
-        self.0.set(turn);
-        turn
-    }
-
-    fn counts(self, turn: u64) -> bool {
-        self.0.get_untracked() == turn
-    }
-}
-
 /// A page's rows the list doesn't hold yet: mail moving between pages can
 /// bring one back, and each row's id must stay unique.
 fn new_rows(have: &[Row], page: Vec<Row>) -> Vec<Row> {
@@ -230,10 +208,13 @@ struct Mail {
     /// Conversations picked with `x`, which actions take over the open one.
     picked: Signal<Vec<String>>,
     jobs: Signal<UnboundedSender<Job>>,
+    compose: Compose,
     /// The label picker is open.
     labeling: Signal<bool>,
     /// What can be undone, and what to say about it.
     undo: Signal<Option<(String, String)>>,
+    /// The undo already pressed, while it waits for its answer.
+    undoing: Signal<Option<String>>,
     page: Signal<Option<String>>,
     links: Signal<Vec<String>>,
     images: Signal<i64>,
@@ -244,7 +225,7 @@ struct Mail {
     loading: Signal<bool>,
     /// What became of an action: it stays until the person dismisses it or
     /// acts again, as a reload can come at any moment.
-    told: Signal<Option<String>>,
+    told: Signal<Option<Told>>,
     /// Why the list didn't load, in words for the person.
     problem: Signal<Option<String>>,
     seq: Signal<i64>,
@@ -285,16 +266,47 @@ fn list_args(query: &str, search: Option<String>, label: String, skip: usize) ->
     }
 }
 
-async fn load_list(b: Bridge, m: Mail, skip: usize) {
-    let turn = m.list_turn.ask();
-    let args = list_args(
+fn list_now(m: Mail, skip: usize) -> Value {
+    list_args(
         &m.query.get_untracked(),
         m.search.get_untracked(),
         m.label.get_untracked(),
         skip,
-    );
+    )
+}
+
+fn rows_in(v: &Value) -> Vec<Row> {
+    v.get("threads")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Row::of)
+        .collect()
+}
+
+fn show_list(m: Mail, rows: Vec<Row>, v: &Value) {
+    // a pick that left the list is one nobody can see
+    m.picked
+        .update(|p| p.retain(|id| rows.iter().any(|r| r.id == *id)));
+    m.rows.set(rows);
+    m.more.set(v.get("more") == Some(&Value::Bool(true)));
+    m.saved.set(v.get("saved") == Some(&Value::Bool(true)));
+    m.signed_out.set(false);
+    m.problem.set(None);
+}
+
+fn list_failed(m: Mail, e: String) {
+    if e == "sign-in" {
+        m.signed_out.set(true);
+    } else {
+        m.problem.set(Some(e));
+    }
+}
+
+async fn load_list(b: Bridge, m: Mail, skip: usize) {
+    let turn = m.list_turn.ask();
     m.loading.set(true);
-    let answer = read(&b, "gws_mail_list", args).await;
+    let answer = read(&b, "gws_mail_list", list_now(m, skip)).await;
     // a later load owns the list and the flag now
     if !m.list_turn.counts(turn) {
         return;
@@ -302,34 +314,78 @@ async fn load_list(b: Bridge, m: Mail, skip: usize) {
     m.loading.set(false);
     match answer {
         Ok(v) => {
-            let mut rows: Vec<Row> = v
-                .get("threads")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Row::of)
-                .collect();
+            let mut rows = rows_in(&v);
             if skip > 0 {
                 let mut all = m.rows.get_untracked();
                 all.append(&mut new_rows(&all, rows));
                 rows = all;
             }
-            // a pick that left the list is one nobody can see
-            m.picked
-                .update(|p| p.retain(|id| rows.iter().any(|r| r.id == *id)));
-            m.rows.set(rows);
-            m.more.set(v.get("more") == Some(&Value::Bool(true)));
-            m.saved.set(v.get("saved") == Some(&Value::Bool(true)));
-            m.signed_out.set(false);
-            m.problem.set(None);
+            show_list(m, rows, &v);
         }
-        Err(e) if e == "sign-in" => m.signed_out.set(true),
-        Err(e) => m.problem.set(Some(e)),
+        Err(e) => list_failed(m, e),
     }
 }
 
-/// A person's action waiting its turn.
-type Job = Pin<Box<dyn Future<Output = ()>>>;
+/// The list read again where it stands: as far down as it had got, and a page
+/// further while a pick isn't found, as new mail pushes rows down. A pick not
+/// found by then has left this list, and the screen says so.
+async fn reload(b: Bridge, m: Mail) {
+    let turn = m.list_turn.ask();
+    let reach = m.rows.with_untracked(Vec::len);
+    m.loading.set(true);
+    let mut rows: Vec<Row> = Vec::new();
+    let last = loop {
+        let answer = read(&b, "gws_mail_list", list_now(m, rows.len())).await;
+        if !m.list_turn.counts(turn) {
+            return;
+        }
+        let v = match answer {
+            Ok(v) => v,
+            Err(e) => {
+                m.loading.set(false);
+                list_failed(m, e);
+                return;
+            }
+        };
+        let fresh = new_rows(&rows, rows_in(&v));
+        let page = fresh.len();
+        rows.extend(fresh);
+        let seeking = m
+            .picked
+            .with_untracked(|p| p.iter().any(|id| !rows.iter().any(|r| r.id == *id)));
+        let enough = reach + if seeking { page } else { 0 };
+        if page == 0 || rows.len() >= enough || v.get("more") != Some(&Value::Bool(true)) {
+            break v;
+        }
+    };
+    m.loading.set(false);
+    let picks = m.picked.with_untracked(Vec::len);
+    show_list(m, rows, &last);
+    match picks - m.picked.with_untracked(Vec::len) {
+        0 => {}
+        1 => tell_too(m, "A picked conversation left this list."),
+        n => tell_too(m, &format!("{n} picked conversations left this list.")),
+    }
+}
+
+/// A line about what became of an action, and the undo of the one it's about.
+#[derive(Clone, PartialEq)]
+struct Told {
+    line: String,
+    undo: Option<String>,
+}
+
+fn tell(m: Mail, line: String, undo: Option<String>) {
+    m.told.set(Some(Told { line, undo }));
+}
+
+/// A line that doesn't replace what's being said already.
+fn tell_too(m: Mail, line: &str) {
+    match m.told.get_untracked() {
+        Some(Told { line: said, undo }) => tell(m, format!("{said} {line}"), undo),
+        None => tell(m, line.to_owned(), None),
+    }
+}
 
 /// Hands `job` to the screen's own task. A press's task dies with the view it
 /// was pressed on, and an action redraws what it's pressed on: an action
@@ -391,8 +447,9 @@ async fn act(
     }
     match once(&b, tool, args).await {
         Ok(v) => {
-            if let Some(undo) = v.get("undo").and_then(Value::as_str) {
-                m.undo.set(Some((undo.to_owned(), said.to_owned())));
+            let undo = v.get("undo").and_then(Value::as_str).map(str::to_owned);
+            if let Some(undo) = &undo {
+                m.undo.set(Some((undo.clone(), said.to_owned())));
             }
             let done = if v.get("threads").is_some() {
                 thread_ids(&v)
@@ -400,12 +457,13 @@ async fn act(
                 ids.clone()
             };
             let missed: Vec<String> = ids.iter().filter(|i| !done.contains(i)).cloned().collect();
-            m.told.set((!missed.is_empty()).then(|| {
-                format!(
+            m.told.set((!missed.is_empty()).then(|| Told {
+                line: format!(
                     "{} of {} went through. The rest didn't.",
                     done.len(),
                     ids.len()
-                )
+                ),
+                undo,
             }));
             // what failed stays picked, ready to try again, with anything picked since
             m.picked.update(|p| p.retain(|id| !done.contains(id)));
@@ -431,7 +489,7 @@ async fn act(
             }
         }
         Err(e) if e == "sign-in" => m.signed_out.set(true),
-        Err(e) => m.told.set(Some(e)),
+        Err(e) => tell(m, e, None),
     }
 }
 
@@ -441,24 +499,39 @@ async fn undo_last(b: Bridge, m: Mail, undo: Option<String>) {
     let Some(undo) = undo else {
         return;
     };
-    match once(&b, "gws_mail_undo", json!({"undo": undo})).await {
+    let answer = once(&b, "gws_mail_undo", json!({"undo": undo})).await;
+    if m.undoing.with_untracked(|u| u.as_ref() == Some(&undo)) {
+        m.undoing.set(None);
+    }
+    match answer {
         Ok(_) => {
             if m.undo
                 .with_untracked(|u| u.as_ref().is_some_and(|(id, _)| *id == undo))
             {
                 m.undo.set(None);
             }
-            m.told.set(None);
-            load_list(b, m, 0).await;
+            // what's said about another action still stands
+            if m.told
+                .with_untracked(|t| t.as_ref().is_some_and(|t| t.undo.as_ref() == Some(&undo)))
+            {
+                m.told.set(None);
+            }
+            reload(b, m).await;
         }
         // the bar stays, so it can be pressed again
-        Err(e) => m.told.set(Some(e)),
+        Err(e) => tell(m, e, Some(undo)),
     }
 }
 
-/// What Undo would take back right now.
-fn last_action(m: Mail) -> Option<String> {
-    m.undo.get_untracked().map(|(id, _)| id)
+/// What Undo would take back right now, and nothing while that's on its way: a
+/// second press would ask for what the first already took.
+fn claim_undo(m: Mail) -> Option<String> {
+    let (id, _) = m.undo.get_untracked()?;
+    if m.undoing.with_untracked(|u| u.as_ref() == Some(&id)) {
+        return None;
+    }
+    m.undoing.set(Some(id.clone()));
+    Some(id)
 }
 
 async fn load_labels(b: Bridge, m: Mail) {
@@ -474,6 +547,10 @@ async fn open(b: Bridge, m: Mail, index: usize) {
     else {
         return;
     };
+    // a draft goes to the panel: the reader has nothing of it to open
+    if m.label.with_untracked(|l| l == "DRAFT") {
+        return compose::resume(b, m.compose, id);
+    }
     m.chosen.set(Some(id.clone()));
     let unread = m
         .rows
@@ -552,7 +629,7 @@ async fn watch(b: Bridge, m: Mail) {
             if v.get("changed") == Some(&Value::Bool(true))
                 && m.query.with_untracked(String::is_empty)
             {
-                load_list(b.clone(), m, 0).await;
+                reload(b.clone(), m).await;
                 load_labels(b.clone(), m).await;
             }
         }
@@ -568,6 +645,7 @@ fn press_class(on: bool) -> String {
 }
 
 fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
+    let writes = b.clone();
     // the highlight is a binding on each row, not read here: a rebuild on the
     // chosen label would drop the pressed row, and the load it started with it
     let list = dynamic(move || {
@@ -608,6 +686,20 @@ fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
         .app_class(Some(
             format!("w-[190px] pt-3 border-r {LINE} {RAIL}").into(),
         ))
+        .child(
+            view().app_class(Some("px-2 py-2".into())).child(
+                view()
+                    .app_class(Some(
+                        "items-center px-3 py-1.5 rounded-md bg-[#2563eb]".into(),
+                    ))
+                    .label("Write a message")
+                    .on_press(move || compose::start(writes.clone(), m.compose))
+                    .child(
+                        text("Write")
+                            .app_class(Some("text-[13px] font-semibold text-white".into())),
+                    ),
+            ),
+        )
         .child(list)
 }
 
@@ -734,7 +826,7 @@ fn list_pane(b: Bridge, m: Mail) -> impl IntoElement {
                 ),
         )
         .child(dynamic(move || match m.told.get() {
-            Some(line) => view()
+            Some(Told { line, .. }) => view()
                 .app_class(Some(
                     format!("flex-row items-center gap-2 px-3 py-1 border-b {LINE}").into(),
                 ))
@@ -794,6 +886,15 @@ fn tool(label: &'static str, shows: &'static str, press: impl Fn() + 'static) ->
 
 /// What can be done to the open conversation, or to the picked ones.
 fn toolbar(b: Bridge, m: Mail) -> impl IntoElement {
+    let writes = b.clone();
+    let answer = move |mode: &'static str| {
+        let b = writes.clone();
+        move || {
+            if let Some(thread) = m.chosen.get_untracked() {
+                compose::reply(b.clone(), m.compose, thread, mode);
+            }
+        }
+    };
     let go = move |tool: &'static str,
                    args: Value,
                    said: &'static str,
@@ -818,8 +919,11 @@ fn toolbar(b: Bridge, m: Mail) -> impl IntoElement {
     };
     view()
         .app_class(Some(
-            format!("flex-row gap-1 px-2 py-1 border-b {LINE}").into(),
+            format!("flex-row flex-wrap gap-1 px-2 py-1 border-b {LINE}").into(),
         ))
+        .child(tool("Reply to this", "Reply", answer("reply")))
+        .child(tool("Reply to everyone", "Reply all", answer("all")))
+        .child(tool("Forward this", "Forward", answer("forward")))
         .child(tool(
             "Archive this",
             "Archive",
@@ -931,6 +1035,19 @@ fn label_picker(b: Bridge, m: Mail) -> impl IntoElement {
 }
 
 fn reader_pane(b: Bridge, m: Mail) -> impl IntoElement {
+    view()
+        .app_class(Some(format!("flex-1 {PANEL}").into()))
+        .child(dynamic(move || {
+            let pane = view().app_class(Some("flex-1".into()));
+            if m.compose.open.get() {
+                pane.child(compose::panel(b.clone(), m.compose))
+            } else {
+                pane.child(reading(b.clone(), m))
+            }
+        }))
+}
+
+fn reading(b: Bridge, m: Mail) -> impl IntoElement {
     let picking = b.clone();
     let bar = dynamic(move || {
         if m.chosen.with(Option::is_none) && m.picked.with(Vec::is_empty) {
@@ -941,7 +1058,7 @@ fn reader_pane(b: Bridge, m: Mail) -> impl IntoElement {
             .child(label_picker(picking.clone(), m))
     });
     view()
-        .app_class(Some(format!("flex-1 {PANEL}").into()))
+        .app_class(Some("flex-1".into()))
         .child(bar)
         .child(dynamic(move || match m.page.get() {
             Some(page) => view()
@@ -994,7 +1111,7 @@ fn undo_bar(b: Bridge, m: Mail) -> impl IntoElement {
                         .app_class(Some("px-3 py-1".into()))
                         .label("Undo that")
                         .on_press(move || {
-                            run(m, undo_last(b.clone(), m, last_action(m)));
+                            run(m, undo_last(b.clone(), m, claim_undo(m)));
                         })
                         .child(text("Undo").app_class(Some(format!("text-[12px] {INK}").into()))),
                 )
@@ -1095,7 +1212,7 @@ fn keys(b: Bridge, m: Mail) {
     });
     on_key("shift+/", move |_| m.help.set(!m.help.get_untracked()));
     let (archive, trash, star) = (acts.clone(), acts.clone(), acts.clone());
-    let (read_it, unread_it, back) = (acts.clone(), acts.clone(), acts);
+    let (read_it, unread_it, back) = (acts.clone(), acts.clone(), acts.clone());
     on_key("e", move |_| {
         run(
             m,
@@ -1175,6 +1292,27 @@ fn keys(b: Bridge, m: Mail) {
             ),
         );
     });
+    let (new, answer) = (acts.clone(), acts.clone());
+    on_key("c", move |_| compose::start(new.clone(), m.compose));
+    for (key, mode) in [("r", "reply"), ("a", "all"), ("f", "forward")] {
+        let b = answer.clone();
+        on_key(key, move |_| {
+            if let Some(thread) = m.chosen.get_untracked() {
+                compose::reply(b.clone(), m.compose, thread, mode);
+            }
+        });
+    }
+    let (sending, keeping) = (acts.clone(), acts);
+    on_key("cmd+enter", move |_| {
+        if m.compose.open.get_untracked() {
+            compose::send(sending.clone(), m.compose);
+        }
+    });
+    on_key("escape", move |_| {
+        if m.compose.open.get_untracked() {
+            compose::keep(keeping.clone(), m.compose);
+        }
+    });
     on_key("x", move |_| {
         if let Some(id) = m.chosen.get_untracked() {
             m.picked.update(|p| match p.iter().position(|x| *x == id) {
@@ -1184,7 +1322,7 @@ fn keys(b: Bridge, m: Mail) {
         }
     });
     on_key("z", move |_| {
-        run(m, undo_last(back.clone(), m, last_action(m)));
+        run(m, undo_last(back.clone(), m, claim_undo(m)));
     });
 }
 
@@ -1389,6 +1527,9 @@ fn help_view() -> impl IntoElement {
         "Shift+I, Shift+U  read, unread",
         "x  pick",
         "z  undo",
+        "c  write a message",
+        "r, a, f  reply, reply all, forward",
+        "Cmd+Enter  send",
         "/  search",
         "?  this help",
     ];
@@ -1400,19 +1541,25 @@ fn help_view() -> impl IntoElement {
 
 pub fn build(bridge: Bridge) -> Root {
     buwiz_app::root(bridge, move |b| {
-        if b.viewport_now().placement == Placement::Inline {
-            return view().child(card(b));
-        }
         let props = b.props();
         let prop = |k: &str| props.get(k).and_then(Value::as_str).map(str::to_owned);
+        if b.viewport_now().placement == Placement::Inline {
+            return match prop("draft") {
+                Some(ticket) => view().child(compose::card(b, ticket)),
+                None => view().child(card(b)),
+            };
+        }
         let (jobs, mut waiting) = unbounded_channel::<Job>();
+        let (writer, writing) = Compose::new();
         let m = Mail {
+            compose: writer,
             problem: signal(None),
             told: signal(None),
+            undoing: signal(None),
             list_turn: Latest::new(),
             open_turn: Latest::new(),
             labels: signal(column(&Value::Null)),
-            label: signal("INBOX".to_owned()),
+            label: signal(prop("view").unwrap_or_else(|| "INBOX".to_owned())),
             rows: signal(Vec::new()),
             more: signal(false),
             query: signal(String::new()),
@@ -1437,6 +1584,8 @@ pub fn build(bridge: Bridge) -> Root {
         b.spawn(load_list(b.clone(), m, 0));
         b.spawn(load_labels(b.clone(), m));
         b.spawn(watch(b.clone(), m));
+        b.spawn(compose::work(writing));
+        b.spawn(compose::autosave(b.clone(), writer));
         b.spawn(async move {
             while let Some(job) = waiting.recv().await {
                 job.await;
@@ -1445,8 +1594,11 @@ pub fn build(bridge: Bridge) -> Root {
         if let Some(ticket) = prop("thread") {
             b.spawn(open_ticket(b.clone(), m, ticket));
         }
+        if let Some(ticket) = prop("draft") {
+            compose::resume_ticket(b.clone(), writer, ticket);
+        }
         let (rail, list, guide) = (b.clone(), b.clone(), b.clone());
-        let (undoing, pane) = (b.clone(), b.clone());
+        let (undoing, pane, holding) = (b.clone(), b.clone(), b.clone());
         view()
             .app_class(Some(format!("flex-1 {BG}").into()))
             .child(dynamic(move || {
@@ -1464,6 +1616,7 @@ pub fn build(bridge: Bridge) -> Root {
                             .child(list_pane(list.clone(), m))
                             .child(reader_pane(pane.clone(), m)),
                     )
+                    .child(compose::hold_bar(holding.clone(), writer))
                     .child(undo_bar(undoing.clone(), m))
                     .child(link_bar(m))
                     .child(dynamic(move || {

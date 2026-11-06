@@ -285,10 +285,13 @@ fn run(plugin: Gws, manifest: Served) -> std::io::Result<()> {
                 let (core, out, cancels) = (core.clone(), out.clone(), cancels.clone());
                 // a routine's turn has no one to show a card to
                 let chat = caller.origin == Origin::Agent && caller.routine.is_none();
+                let model = matches!(caller.origin, Origin::Agent | Origin::Routine);
                 running.push(std::thread::spawn(move || {
                     let result = answer(|| {
                         if chat {
                             core.run_for_chat(&name, &args)
+                        } else if model {
+                            core.run_for_model(&name, &args)
                         } else {
                             core.run(&name, &args)
                         }
@@ -370,9 +373,10 @@ mod tests {
 
     #[test]
     fn no_write_is_the_models_or_a_routines() {
+        // a draft it fills sends nothing: Send is the person's
         let writes: Vec<&str> = tools::defs()
             .iter()
-            .filter(|d| !d.read_only)
+            .filter(|d| !d.read_only && d.name != tools::MAIL_DRAFT_SAVE)
             .map(|d| d.name)
             .collect();
         for name in [
@@ -381,6 +385,10 @@ mod tests {
             "gws_mail_archive",
             "gws_mail_trash",
             "gws_mail_undo",
+            "gws_mail_draft_delete",
+            "gws_mail_send_arm",
+            "gws_mail_send_disarm",
+            "gws_mail_send",
         ] {
             assert!(writes.contains(&name), "{name}");
         }

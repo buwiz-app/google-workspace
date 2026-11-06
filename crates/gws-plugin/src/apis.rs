@@ -6,6 +6,7 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Apis {
     pub gmail: String,
+    pub people: String,
 }
 
 /// Names the stub Google, in a `stub` build.
@@ -15,6 +16,7 @@ impl Apis {
     pub fn google() -> Self {
         Self {
             gmail: crate::gmail::GMAIL_API.to_owned(),
+            people: crate::gmail::PEOPLE_API.to_owned(),
         }
     }
 
@@ -23,6 +25,7 @@ impl Apis {
         let base = base.trim_end_matches('/');
         Self {
             gmail: format!("{base}/gmail/v1/users/me"),
+            people: format!("{base}/people/v1"),
         }
     }
 

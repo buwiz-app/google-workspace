@@ -35,6 +35,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
          CREATE INDEX threads_of_label ON thread_labels(account, label);
          CREATE TABLE bodies(account TEXT NOT NULL, thread TEXT NOT NULL, view TEXT NOT NULL, size INTEGER NOT NULL, used INTEGER NOT NULL, PRIMARY KEY(account, thread));",
     ),
+    (
+        3,
+        "ALTER TABLE threads ADD COLUMN recipient TEXT NOT NULL DEFAULT '';",
+    ),
 ];
 
 /// Why the store didn't open or answer: a stable `code` and a message for people.
@@ -83,7 +87,17 @@ impl Paths {
     /// `GWS_DATA_DIR`, else `~/Library/Application Support/app.buwiz.google-workspace`.
     /// A folder that isn't absolute is refused: the working folder is nobody's store.
     pub fn from_env() -> Result<Self> {
-        Self::from_vars(std::env::var_os(DATA_DIR_ENV), std::env::var_os("HOME"))
+        let data = std::env::var_os(DATA_DIR_ENV);
+        // cargo leaves this on all a test starts, so a test that names no folder
+        // stops here, not in the person's. A release never has this check.
+        let tested = cfg!(debug_assertions) && std::env::var_os("CARGO_MANIFEST_DIR").is_some();
+        if tested && data.as_ref().is_none_or(|d| d.is_empty()) {
+            return Err(error(
+                "data_dir",
+                "Under cargo, GWS_DATA_DIR must name a folder.",
+            ));
+        }
+        Self::from_vars(data, std::env::var_os("HOME"))
     }
 
     fn from_vars(

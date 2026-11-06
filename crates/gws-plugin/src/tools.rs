@@ -60,6 +60,19 @@ pub const MAIL_LABEL: &str = "gws_mail_label";
 pub const MAIL_ARCHIVE: &str = "gws_mail_archive";
 pub const MAIL_TRASH: &str = "gws_mail_trash";
 pub const MAIL_UNDO: &str = "gws_mail_undo";
+pub const MAIL_DRAFT_SAVE: &str = "gws_mail_draft_save";
+pub const MAIL_DRAFT_READ: &str = "gws_mail_draft_read";
+pub const MAIL_DRAFT_DELETE: &str = "gws_mail_draft_delete";
+pub const MAIL_SEND: &str = "gws_mail_send";
+pub const MAIL_REPLY_START: &str = "gws_mail_reply_start";
+pub const MAIL_JOB: &str = "gws_mail_job";
+pub const MAIL_JOB_START: &str = "gws_mail_job_start";
+pub const PEOPLE_SUGGEST: &str = "gws_people_suggest";
+pub const MAIL_SEND_ARM: &str = "gws_mail_send_arm";
+pub const MAIL_SEND_DISARM: &str = "gws_mail_send_disarm";
+pub const MAIL_DRAFT_OF: &str = "gws_mail_draft_of";
+pub const UPLOAD_CHUNK: &str = "gws_upload_chunk";
+pub const UPLOAD_DROP: &str = "gws_upload_drop";
 
 /// A write: the person's, on a screen, and never the model's.
 fn write(name: &'static str, description: &'static str, input_schema: Value) -> Def {
@@ -170,6 +183,98 @@ pub fn defs() -> Vec<Def> {
             json!({"type": "object", "properties": {"undo": {"type": "string"}}, "required": ["undo"]}),
         ),
         Def {
+            name: MAIL_DRAFT_SAVE,
+            description: "Write a draft, or replace one. It sends nothing: the person reads it and presses Send.",
+            input_schema: json!({"type": "object", "properties": {"draft": {"type": "string"}, "to": {"type": "array", "items": {"type": "string"}}, "cc": {"type": "array", "items": {"type": "string"}}, "bcc": {"type": "array", "items": {"type": "string"}}, "subject": {"type": "string"}, "body": {"type": "string"}, "thread": {"type": "string"}, "in_reply_to": {"type": "string"}, "references": {"type": "string"}, "message_id": {"type": "string"}, "attachments": {"type": "array", "items": {"type": "string"}}, "keep": {"type": "array", "items": {"type": "object"}}, "job": {"type": "string"}, "armed": {"type": "string"}}}),
+            read_only: false,
+            audience: AGENT_AND_APP,
+            open_world: true,
+        },
+        Def {
+            name: MAIL_DRAFT_READ,
+            description: "A draft as it stands, with the revision Send needs.",
+            input_schema: json!({"type": "object", "properties": {"draft": {"type": "string"}, "ticket": {"type": "string"}, "review": {"type": "boolean"}}}),
+            read_only: true,
+            audience: APP_ONLY,
+            open_world: true,
+        },
+        Def {
+            name: MAIL_REPLY_START,
+            description: "A reply, reply-all or forward, filled in from a conversation.",
+            input_schema: json!({"type": "object", "properties": {"thread": {"type": "string"}, "mode": {"type": "string", "enum": ["reply", "all", "forward"]}}, "required": ["thread"]}),
+            read_only: true,
+            audience: APP_ONLY,
+            open_world: true,
+        },
+        write(
+            MAIL_DRAFT_DELETE,
+            "Delete a draft for good. A person's alone.",
+            json!({"type": "object", "properties": {"draft": {"type": "string"}}, "required": ["draft"]}),
+        ),
+        write(
+            MAIL_SEND_ARM,
+            "The person pressed Send: what lets the send that follows go. Called at the press, as who pressed is only known then.",
+            json!({"type": "object", "properties": {"draft": {"type": "string"}, "revision": {"type": "string"}}}),
+        ),
+        write(
+            MAIL_SEND_DISARM,
+            "The person took a Send back: its press is spent, and the draft is free again.",
+            json!({"type": "object", "properties": {"armed": {"type": "string"}}, "required": ["armed"]}),
+        ),
+        write(
+            MAIL_SEND,
+            "Send the draft the person read. A person's alone.",
+            json!({"type": "object", "properties": {"draft": {"type": "string"}, "revision": {"type": "string"}, "message_id": {"type": "string"}, "armed": {"type": "string"}}, "required": ["draft", "revision", "armed"]}),
+        ),
+        Def {
+            name: MAIL_DRAFT_OF,
+            description: "The draft in a conversation, if there's one.",
+            input_schema: json!({"type": "object", "properties": {"thread": {"type": "string"}}, "required": ["thread"]}),
+            read_only: true,
+            audience: APP_ONLY,
+            open_world: true,
+        },
+        Def {
+            name: PEOPLE_SUGGEST,
+            description: "People to write to whose name or address starts like this.",
+            input_schema: json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}),
+            read_only: true,
+            audience: APP_ONLY,
+            open_world: true,
+        },
+        Def {
+            name: MAIL_JOB_START,
+            description: "An id for a save that may outlast its call.",
+            input_schema: json!({"type": "object"}),
+            read_only: false,
+            audience: APP_ONLY,
+            open_world: false,
+        },
+        Def {
+            name: MAIL_JOB,
+            description: "How a slow draft save came out, by the job it named.",
+            input_schema: json!({"type": "object", "properties": {"job": {"type": "string"}}, "required": ["job"]}),
+            read_only: true,
+            audience: APP_ONLY,
+            open_world: false,
+        },
+        Def {
+            name: UPLOAD_CHUNK,
+            description: "Part of a file to attach, held in memory until the draft's sent.",
+            input_schema: json!({"type": "object", "properties": {"upload": {"type": "string"}, "name": {"type": "string"}, "type": {"type": "string"}, "at": {"type": "integer"}, "data": {"type": "string"}}, "required": ["at", "data"]}),
+            read_only: false,
+            audience: APP_ONLY,
+            open_world: false,
+        },
+        Def {
+            name: UPLOAD_DROP,
+            description: "Forget a file that was to be attached.",
+            input_schema: json!({"type": "object", "properties": {"upload": {"type": "string"}}, "required": ["upload"]}),
+            read_only: false,
+            audience: APP_ONLY,
+            open_world: false,
+        },
+        Def {
             name: RESOLVE,
             description: "Resolve the /gws command.",
             input_schema: json!({"type": "object"}),
@@ -272,10 +377,46 @@ fn features(scopes: &[String]) -> Value {
     })
 }
 
+/// The mailbox views `/mail` and `@gws:mail:` offer: what's shown, the label.
+const VIEWS: [(&str, &str); 6] = [
+    ("Inbox", "INBOX"),
+    ("Unread", "UNREAD"),
+    ("Drafts", "DRAFT"),
+    ("Sent", "SENT"),
+    ("Important", "IMPORTANT"),
+    ("Starred", "STARRED"),
+];
+
+/// `/mail [view]` and `@gws:mail:`. While it's being typed the views are a list
+/// that the text filters; said, it opens that view and no model hears of it.
+fn resolve_mail(value: &str, listing: bool) -> Value {
+    let matching = |(name, _): &&(&str, &str)| name.to_lowercase().starts_with(value);
+    if listing {
+        let choices: Vec<Value> = VIEWS
+            .iter()
+            .filter(matching)
+            .map(|(name, _)| json!({"label": name, "value": name.to_lowercase()}))
+            .collect();
+        return ok(json!({"result": "choices", "choices": choices}));
+    }
+    let (title, label) = VIEWS.iter().find(matching).unwrap_or(&VIEWS[0]);
+    ok(
+        json!({"result": "open", "app": "mail", "title": title, "placement": "full", "props": {"view": label}}),
+    )
+}
+
 /// `/mail`, `/calendar`, `/drive`, and `/gws <one of them>`: opens that screen.
 fn resolve(args: &Value) -> Value {
     let name = js::string_or_empty(args.get("name"));
     let value = js::trim(&js::string_or_empty(args.get("value"))).to_lowercase();
+    if name == "gws-draft" {
+        return ok(json!({"result": "prompt", "text": "Draft an email to "}));
+    }
+    if name == "mail" {
+        let kind = js::string_or_empty(args.get("kind"));
+        let listing = kind == "scope" && args.get("complete") == Some(&Value::Bool(true));
+        return resolve_mail(&value, listing);
+    }
     let wanted = if name == "gws" {
         value.as_str()
     } else {
@@ -327,6 +468,52 @@ fn read_mail(gmail: &Gmail, accounts: &Accounts, args: &Value) -> Result<Value, 
     Ok(ok(
         json!({"id": id, "from": h("From"), "to": h("To"), "subject": h("Subject"), "date": h("Date"), "body": gmail::cap_bytes(&gmail::body(&m), BODY_MAX), "untrusted": UNTRUSTED}),
     ))
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    fn resolved(args: Value) -> Value {
+        resolve(&args)["structuredContent"].clone()
+    }
+
+    #[test]
+    fn at_mail_lists_the_views_and_filters_them_as_typed() {
+        let all = resolved(json!({"kind": "scope", "name": "mail", "value": "", "complete": true}));
+        let names: Vec<&str> = all["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["Inbox", "Unread", "Drafts", "Sent", "Important", "Starred"]
+        );
+        let some =
+            resolved(json!({"kind": "scope", "name": "mail", "value": "s", "complete": true}));
+        assert_eq!(some["choices"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_view_said_opens_it_and_reaches_no_model() {
+        let open =
+            resolved(json!({"kind": "scope", "name": "mail", "value": "sent", "complete": false}));
+        assert_eq!(open["result"], "open");
+        assert_eq!(open["props"]["view"], "SENT");
+        let command = resolved(json!({"kind": "command", "name": "mail", "value": "starred"}));
+        assert_eq!(command["props"]["view"], "STARRED");
+        let plain = resolved(json!({"kind": "command", "name": "mail", "value": ""}));
+        assert_eq!(plain["props"]["view"], "INBOX");
+    }
+
+    #[test]
+    fn gws_draft_only_fills_the_composer() {
+        let prompt = resolved(json!({"kind": "command", "name": "gws-draft", "value": ""}));
+        assert_eq!(prompt["result"], "prompt");
+        assert_eq!(prompt["text"], "Draft an email to ");
+    }
 }
 
 #[cfg(test)]

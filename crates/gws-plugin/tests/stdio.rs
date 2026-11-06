@@ -456,6 +456,7 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
             "gws_mail_send",
             "gws_mail_draft_of",
             "gws_people_suggest",
+            "gws_mail_job_start",
             "gws_mail_job",
             "gws_upload_chunk",
             "gws_upload_drop",

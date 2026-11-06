@@ -59,7 +59,7 @@ pub struct Core {
     /// Google's asked-for warm-up of its contact search is done.
     pub warm: std::sync::atomic::AtomicBool,
     /// How saves too slow for their caller came out.
-    pub jobs: Mutex<std::collections::VecDeque<(String, Value)>>,
+    pub jobs: Mutex<compose::Jobs>,
 }
 
 impl Core {

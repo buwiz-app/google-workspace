@@ -2,7 +2,7 @@
 //! Send sends the very message the person read: a draft that changed since
 //! has a new revision, and refuses until it's read again.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::MutexGuard;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -23,10 +23,20 @@ const BODY_MAX: usize = 1024 * 1024;
 
 /// The most attachments one message carries: Gmail's own limit.
 pub const ATTACHMENTS_MAX: usize = 25 * 1024 * 1024;
+/// The whole message as it goes up, in its base64: the most Google's page gives
+/// for this upload. Whether Gmail then sends a file near the 25 MB line is not
+/// proven, only that it arrives whole at the stub; a refusal shows at Send.
+const MESSAGE_MAX: usize = 36_000_000;
 /// What waits in memory, across every message being written.
 const UPLOADS_MAX: usize = 2 * ATTACHMENTS_MAX;
 /// How many finished saves wait for a screen to ask.
 const JOBS_MAX: usize = 16;
+
+/// A refusal the screen must act on, not only show. The Bot hands a screen a
+/// failed tool's words and no code, so this comes as an answer.
+fn refusal(code: &str, why: &str) -> Value {
+    ok(json!({"refused": code, "message": why}))
+}
 
 /// A file in a message.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -158,31 +168,65 @@ pub fn upload_drop(core: &Core, args: &Value) -> Result<Value, Failure> {
     Ok(ok(json!({"dropped": true})))
 }
 
-/// A slow save's outcome, for a caller that stopped waiting: the Bot gives a
-/// call 30 seconds, and a big attachment on a slow line takes longer.
-pub fn finish_job(core: &Core, args: &Value, answer: &Value) {
-    let job = js::string_or_empty(args.get("job"));
-    if !gmail::id_ok(&job) {
-        return;
-    }
-    let mut jobs = core.jobs.lock().unwrap_or_else(|e| e.into_inner());
-    if jobs.len() == JOBS_MAX {
-        jobs.pop_front();
-    }
-    jobs.push_back((job, answer.clone()));
+/// Saves a screen may ask after: the Bot gives a call 30 seconds, and a big
+/// attachment on a slow line takes longer. Only this module makes a job's id,
+/// so nothing a model passes can plant an answer or hold a screen waiting.
+#[derive(Default)]
+pub struct Jobs {
+    running: VecDeque<String>,
+    done: VecDeque<(String, Value)>,
+    next: u64,
 }
 
-/// `gws_mail_job`: how a save came out, or that it's still going.
+fn jobs(core: &Core) -> MutexGuard<'_, Jobs> {
+    core.jobs.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What can't be guessed from what came before.
+fn nonce() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos())
+}
+
+/// `gws_mail_job_start`: an id for the save that's about to be asked for.
+pub fn job_start(core: &Core) -> Result<Value, Failure> {
+    let mut held = jobs(core);
+    held.next += 1;
+    let job = format!("job{}x{:x}", held.next, nonce());
+    if held.running.len() == JOBS_MAX {
+        held.running.pop_front();
+    }
+    held.running.push_back(job.clone());
+    Ok(ok(json!({"job": job})))
+}
+
+/// Keeps a save's outcome, if it was one a job was started for.
+pub fn finish_job(core: &Core, args: &Value, answer: &Value) {
+    let job = js::string_or_empty(args.get("job"));
+    let mut held = jobs(core);
+    let Some(at) = held.running.iter().position(|j| *j == job) else {
+        return;
+    };
+    held.running.remove(at);
+    if held.done.len() == JOBS_MAX {
+        held.done.pop_front();
+    }
+    held.done.push_back((job, answer.clone()));
+}
+
+/// `gws_mail_job`: how a save came out, that it's still going, or that this
+/// process knows nothing of it.
 pub fn job(core: &Core, args: &Value) -> Result<Value, Failure> {
     let job = js::string_or_empty(args.get("job"));
-    let mut jobs = core.jobs.lock().unwrap_or_else(|e| e.into_inner());
-    Ok(match jobs.iter().position(|(id, _)| *id == job) {
-        Some(at) => {
-            let (_, answer) = jobs.remove(at).unwrap_or_default();
-            ok(json!({"done": true, "answer": answer}))
-        }
-        None => ok(json!({"done": false})),
-    })
+    let mut held = jobs(core);
+    if let Some(at) = held.done.iter().position(|(id, _)| *id == job)
+        && let Some((_, answer)) = held.done.remove(at)
+    {
+        return Ok(ok(json!({"done": true, "answer": answer})));
+    }
+    let running = held.running.contains(&job);
+    Ok(ok(json!({"done": false, "gone": !running})))
 }
 
 /// A message being written.
@@ -223,21 +267,27 @@ fn upload_ids(args: &Value) -> Vec<String> {
         .collect()
 }
 
+/// What a save carries: every file, and the uploads made of files the draft had.
+#[derive(Default)]
+struct Gathered {
+    parts: Vec<Part>,
+    /// `(the attachment's id, the upload that holds it now)`.
+    kept: Vec<(String, String)>,
+}
+
 /// Every file a save carries: what was uploaded, then what the draft already
-/// had. `Err` is the person's answer: a message must not lose a file quietly.
-fn gather(core: &Core, auth: &Bearer, args: &Value) -> Result<Result<Vec<Part>, Value>, Failure> {
-    let mut parts = Vec::new();
+/// had. Those are held as uploads from here on, as saving gives the draft a new
+/// message and leaves their ids behind. `Err` is the person's answer: a message
+/// must not lose a file quietly.
+fn gather(core: &Core, auth: &Bearer, args: &Value) -> Result<Result<Gathered, Value>, Failure> {
+    let gone = || fail("attachment_gone", "An attachment is gone. Attach it again.");
+    let mut got = Gathered::default();
     {
         let held = uploads(core);
         for id in upload_ids(args) {
             match held.files.get(&id) {
-                Some(upload) => parts.push(upload.part.clone()),
-                None => {
-                    return Ok(Err(fail(
-                        "not_found",
-                        "An attachment is gone. Attach it again.",
-                    )));
-                }
+                Some(upload) => got.parts.push(upload.part.clone()),
+                None => return Ok(Err(gone())),
             }
         }
     }
@@ -246,40 +296,109 @@ fn gather(core: &Core, auth: &Bearer, args: &Value) -> Result<Result<Vec<Part>, 
             return Ok(Err(fail("invalid_args", "That isn't an attachment.")));
         }
         let Some(bytes) = core.gmail.attachment(auth, &keep.message, &keep.id)? else {
-            return Ok(Err(fail(
-                "not_found",
-                "An attachment is gone. Attach it again.",
-            )));
+            return Ok(Err(gone()));
         };
-        parts.push(Part {
+        let part = Part {
             name: keep.name,
             mime: keep.mime,
             bytes,
-        });
+        };
+        let mut held = uploads(core);
+        if held.held_bytes() + part.bytes.len() > UPLOADS_MAX {
+            return Ok(Err(fail(
+                "too_big",
+                "That's too much to attach at once. Send or discard a message first.",
+            )));
+        }
+        let upload = held.start(part.name.clone(), part.mime.clone());
+        if let Some(file) = held.files.get_mut(&upload) {
+            file.part.bytes.clone_from(&part.bytes);
+        }
+        got.kept.push((keep.id, upload));
+        got.parts.push(part);
     }
-    if parts.iter().map(|p| p.bytes.len()).sum::<usize>() > ATTACHMENTS_MAX {
+    if got.parts.iter().map(|p| p.bytes.len()).sum::<usize>() > ATTACHMENTS_MAX {
+        drop_kept(core, &got);
         return Ok(Err(fail(
             "too_big",
             "That's over Gmail's 25 MB limit for one message.",
         )));
     }
-    Ok(Ok(parts))
+    Ok(Ok(got))
 }
 
-/// An address alone, as `a@b.c` or `Name <a@b.c>`, if it's one a header can hold.
+fn drop_kept(core: &Core, got: &Gathered) {
+    let mut held = uploads(core);
+    for (_, upload) in &got.kept {
+        held.files.remove(upload);
+    }
+}
+
+/// An address alone, from `a@b.c` or `Name <a@b.c>`, if it's a plain one: what
+/// passes here is safe in a header and between quotes in a Gmail query.
 fn address(text: &str) -> Option<String> {
     let text = text.trim();
-    let bare = text
-        .rsplit_once('<')
-        .and_then(|(_, rest)| rest.strip_suffix('>'))
-        .unwrap_or(text);
-    let (name, host) = bare.split_once('@')?;
-    let clean = |s: &str| {
-        !s.is_empty()
-            && s.chars()
-                .all(|c| !c.is_control() && !c.is_whitespace() && !"<>,;\"".contains(c))
+    let bare = match text.rsplit_once('<') {
+        Some((_, rest)) => rest.strip_suffix('>')?,
+        None => text,
     };
-    (clean(name) && clean(host) && host.contains('.')).then(|| bare.to_owned())
+    let (local, host) = bare.split_once('@')?;
+    let local_ok = !local.is_empty()
+        && local.len() <= 64
+        && !local.starts_with('.')
+        && !local.ends_with('.')
+        && !local.contains("..")
+        && local
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".!#$%&'*+-/=?^_~".contains(&b));
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    let host_ok = host.len() <= 253 && host.contains('.') && host.split('.').all(label_ok);
+    (local_ok && host_ok).then(|| bare.to_owned())
+}
+
+/// A `Message-ID` plain enough to go in a Gmail query as it is.
+fn message_id_ok(id: &str) -> bool {
+    id.strip_prefix('<')
+        .and_then(|i| i.strip_suffix('>'))
+        .is_some_and(|i| address(i).is_some())
+}
+
+/// A header's list, split where a comma really separates two: a name in quotes
+/// or an address in brackets can hold one.
+fn split_list(list: &str) -> Vec<&str> {
+    let (mut parts, mut from) = (Vec::new(), 0);
+    let (mut quoted, mut bracket, mut escaped) = (false, false, false);
+    for (at, c) in list.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '<' if !quoted => bracket = true,
+            '>' if !quoted => bracket = false,
+            ',' if !quoted && !bracket => {
+                parts.push(&list[from..at]);
+                from = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&list[from..]);
+    parts.retain(|p| !p.trim().is_empty());
+    parts
+}
+
+/// Everyone in a header, whole: an address where it's one, else as written, so
+/// that a person sees it and a save refuses it rather than it going missing.
+fn listed(list: &str) -> Vec<String> {
+    split_list(list)
+        .iter()
+        .map(|p| address(p).unwrap_or_else(|| p.trim().to_owned()))
+        .collect()
 }
 
 fn addresses(v: Option<&Value>) -> Result<Vec<String>, String> {
@@ -288,7 +407,7 @@ fn addresses(v: Option<&Value>) -> Result<Vec<String>, String> {
             .iter()
             .filter_map(|i| i.as_str().map(str::to_owned))
             .collect(),
-        Some(Value::String(s)) => s.split(',').map(str::to_owned).collect(),
+        Some(Value::String(s)) => split_list(s).iter().map(|p| (*p).to_owned()).collect(),
         _ => Vec::new(),
     };
     list.iter()
@@ -445,7 +564,24 @@ pub fn save_for_model(core: &Core, args: &Value) -> Value {
             "That draft is the person's. Write a new one instead.",
         );
     }
-    let result = core.run(MAIL_DRAFT_SAVE, args);
+    // what ties a save to a screen and a press is the app's alone
+    let mut args = args.clone();
+    if let Some(args) = args.as_object_mut() {
+        for key in ["job", "armed", "message_id"] {
+            args.remove(key);
+        }
+    }
+    let result = core.run(MAIL_DRAFT_SAVE, &args);
+    if let Some(code) = result
+        .pointer("/structuredContent/refused")
+        .and_then(Value::as_str)
+    {
+        let why = result.pointer("/structuredContent/message");
+        return fail(
+            code,
+            why.and_then(Value::as_str).unwrap_or("That didn't work."),
+        );
+    }
     if let Some(id) = result
         .pointer("/structuredContent/draft")
         .and_then(Value::as_str)
@@ -466,70 +602,122 @@ pub fn save(core: &Core, args: &Value) -> Result<Value, Failure> {
     if !held.is_empty() && !gmail::id_ok(&held) {
         return Ok(fail("invalid_args", "That isn't a draft."));
     }
-    let message_id = Some(js::string_or_empty(args.get("message_id")))
-        .filter(|m| m.starts_with('<') && m.ends_with('>') && !m.contains(['\r', '\n']))
+    let named = js::string_or_empty(args.get("message_id"));
+    let message_id = Some(named.clone())
+        .filter(|m| message_id_ok(m))
         .unwrap_or_else(new_message_id);
-    let parts = match gather(core, &auth, args)? {
-        Ok(parts) => parts,
+    let got = match gather(core, &auth, args)? {
+        Ok(got) => got,
         Err(refused) => return Ok(refused),
     };
     let thread = draft.thread.as_deref();
-    let saved = if !parts.is_empty() {
-        let replaces = Some(held.as_str()).filter(|h| !h.is_empty());
-        let message = draft.message(&message_id, &parts);
-        core.gmail.draft_upload(&auth, replaces, &message, thread)?
-    } else if held.is_empty() {
-        core.gmail
-            .draft_create(&auth, &draft.raw(&message_id), thread)?
+    let saved = if got.parts.is_empty() {
+        if held.is_empty() {
+            core.gmail
+                .draft_create(&auth, &draft.raw(&message_id), thread)
+        } else {
+            core.gmail
+                .draft_update(&auth, &held, &draft.raw(&message_id), thread)
+        }
     } else {
-        core.gmail
-            .draft_update(&auth, &held, &draft.raw(&message_id), thread)?
+        let message = draft.message(&message_id, &got.parts);
+        if message.len() > MESSAGE_MAX {
+            drop_kept(core, &got);
+            return Ok(fail(
+                "too_big",
+                "That's over what Gmail takes for one message, once it's encoded.",
+            ));
+        }
+        let replaces = Some(held.as_str()).filter(|h| !h.is_empty());
+        core.gmail.draft_upload(&auth, replaces, &message, thread)
     };
-    let Some(saved) = saved else {
-        return Ok(fail("not_found", "That draft is gone."));
+    if !matches!(saved, Ok(Some(_))) {
+        drop_kept(core, &got);
+    }
+    let Some(saved) = saved? else {
+        // a draft that's gone may be one that went: writing it anew would send it twice
+        if in_sent(core, &auth, &named)? {
+            return Ok(refusal(
+                "already_sent",
+                "This message has already gone. It's in Sent.",
+            ));
+        }
+        return Ok(refusal("not_found", "That draft is gone."));
     };
     // a person's edit makes it theirs: `save_for_model` claims it back only for itself
     model_drafts(core).remove(&held);
-    let id = saved
-        .pointer("/id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let text = |path: &str| saved.pointer(path).and_then(Value::as_str);
+    let id = text("/id").unwrap_or_default();
     let mut files = uploads(core);
-    for upload in upload_ids(args) {
+    let kept_ids = got.kept.iter().map(|(_, upload)| upload.clone());
+    for upload in upload_ids(args).into_iter().chain(kept_ids) {
         if let Some(file) = files.files.get_mut(&upload) {
             file.draft = Some(id.to_owned());
         }
     }
     drop(files);
+    let armed_by = js::string_or_empty(args.get("armed"));
+    if let Some(revision) = text("/message/id") {
+        armed(core).bind(&armed_by, id, revision);
+    }
+    let kept: Vec<Value> = got
+        .kept
+        .iter()
+        .map(|(attachment, upload)| json!({"id": attachment, "upload": upload}))
+        .collect();
     Ok(ok(json!({
         "draft": saved.pointer("/id"),
         "revision": saved.pointer("/message/id"),
         "message_id": message_id,
+        "kept": kept,
     })))
+}
+
+/// Whether the message with this `Message-ID` is in Sent.
+fn in_sent(core: &Core, auth: &Bearer, message_id: &str) -> Result<bool, Failure> {
+    if !message_id_ok(message_id) {
+        return Ok(false);
+    }
+    let found = core
+        .gmail
+        .search(auth, &format!("rfc822msgid:{message_id}"), 1)?;
+    Ok(!found.is_empty())
 }
 
 /// The most recipients looked up in Sent: past that, all count as new.
 const LOOKED_UP_MAX: usize = 20;
 
-/// Who in `to`, `cc` and `bcc` the person has never written to.
-fn new_to(core: &Core, auth: &Bearer, lists: &[String]) -> Result<Vec<String>, Failure> {
-    let all: Vec<String> = lists
+/// How many sent mails are read for who they went to.
+const SENT_READ_MAX: usize = 50;
+
+/// Who of `people` the person has never written to, in one search. A person
+/// past the first few, or crowded out of the mails read, counts as new: the
+/// mistake that costs a second look, not one that hides a stranger.
+fn new_to(core: &Core, auth: &Bearer, people: &[String]) -> Result<Vec<String>, Failure> {
+    let wanted: Vec<String> = people
         .iter()
-        .flat_map(|l| l.split(','))
-        .filter_map(address)
+        .take(LOOKED_UP_MAX)
+        .filter_map(|p| address(p))
+        .map(|p| format!("to:\"{p}\""))
         .collect();
-    let mut new = Vec::new();
-    for (at, who) in all.iter().enumerate() {
-        let known = at < LOOKED_UP_MAX
-            && !core
-                .gmail
-                .search(auth, &format!("in:sent to:{who}"), 1)?
-                .is_empty();
-        if !known {
-            new.push(who.clone());
-        }
+    if wanted.is_empty() {
+        return Ok(people.to_vec());
     }
-    Ok(new)
+    let query = format!("in:sent {{{}}}", wanted.join(" "));
+    let ids = core.gmail.search(auth, &query, SENT_READ_MAX)?;
+    let mails = core.gmail.metadata_with(auth, &ids, &["To", "Cc", "Bcc"])?;
+    let known: HashSet<String> = mails
+        .iter()
+        .flatten()
+        .flat_map(|m| ["To", "Cc", "Bcc"].map(|h| gmail::header(m, h)))
+        .flat_map(|h| listed(&h))
+        .map(|a| a.to_lowercase())
+        .collect();
+    Ok(people
+        .iter()
+        .filter(|p| !known.contains(&p.to_lowercase()))
+        .cloned()
+        .collect())
 }
 
 /// `gws_mail_draft_read`: a draft as it stands, with the revision Send needs. By
@@ -537,8 +725,8 @@ fn new_to(core: &Core, auth: &Bearer, lists: &[String]) -> Result<Vec<String>, F
 pub fn read(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (auth, me) = core.accounts.session().ok_or(Failure::AccountRequired)?;
     let ticket = js::string_or_empty(args.get("ticket"));
-    let review = !ticket.is_empty();
-    let id = if review {
+    let review = !ticket.is_empty() || args.get("review") == Some(&Value::Bool(true));
+    let id = if !ticket.is_empty() {
         let tickets = core.tickets.lock().unwrap_or_else(|e| e.into_inner());
         match tickets.subject(&ticket) {
             Some(Subject::Draft(id)) => id.clone(),
@@ -555,8 +743,13 @@ pub fn read(core: &Core, args: &Value) -> Result<Value, Failure> {
     };
     let message = held.get("message").cloned().unwrap_or(Value::Null);
     let h = |name| gmail::short_header(&message, name);
+    // recipients are read whole: `short_header` is for showing, and would cut a
+    // list, or cut an address into a different one
+    let people = |name| listed(&gmail::header(&message, name));
+    let (to, cc, bcc) = (people("To"), people("Cc"), people("Bcc"));
     let new = if review {
-        new_to(core, &auth, &[h("To"), h("Cc"), h("Bcc")])?
+        let all: Vec<String> = to.iter().chain(&cc).chain(&bcc).cloned().collect();
+        new_to(core, &auth, &all)?
     } else {
         Vec::new()
     };
@@ -566,9 +759,9 @@ pub fn read(core: &Core, args: &Value) -> Result<Value, Failure> {
         "new": new,
         "revision": message.get("id"),
         "message_id": h("Message-ID"),
-        "to": h("To"),
-        "cc": h("Cc"),
-        "bcc": h("Bcc"),
+        "to": to,
+        "cc": cc,
+        "bcc": bcc,
         "subject": h("Subject"),
         "body": gmail::body(&message),
         "thread": message.get("threadId"),
@@ -612,20 +805,30 @@ const ARMED_FOR: Duration = Duration::from_secs(900);
 /// gap. So the call that decides comes at the press, and the send needs its answer.
 #[derive(Default)]
 pub struct Armed {
-    presses: Vec<(String, Instant)>,
+    presses: Vec<Press>,
     next: u64,
 }
 
+struct Press {
+    token: String,
+    at: Instant,
+    /// The draft and revision it sends: known at once on a card, and after the
+    /// save in the panel. Nothing else goes out on it.
+    sends: Option<(String, String)>,
+}
+
 impl Armed {
-    fn take(&mut self, token: &str) -> bool {
-        self.presses.retain(|(_, at)| at.elapsed() < ARMED_FOR);
-        match self.presses.iter().position(|(t, _)| t == token) {
-            Some(at) => {
-                self.presses.remove(at);
-                true
-            }
-            None => false,
+    fn bind(&mut self, token: &str, draft: &str, revision: &str) {
+        if let Some(press) = self.presses.iter_mut().find(|p| p.token == token) {
+            press.sends = Some((draft.to_owned(), revision.to_owned()));
         }
+    }
+
+    /// Spends the press, whatever comes of it: what it sends, if it's still good.
+    fn take(&mut self, token: &str) -> Option<(String, String)> {
+        self.presses.retain(|p| p.at.elapsed() < ARMED_FOR);
+        let at = self.presses.iter().position(|p| p.token == token)?;
+        self.presses.remove(at).sends
     }
 }
 
@@ -635,14 +838,16 @@ fn armed(core: &Core) -> MutexGuard<'_, Armed> {
 
 /// `gws_mail_send_arm`: the person pressed Send. The model's call never gets
 /// here: this tool is the app's alone, and a press of the AI's goes out as the AI.
-pub fn arm(core: &Core) -> Result<Value, Failure> {
+pub fn arm(core: &Core, args: &Value) -> Result<Value, Failure> {
     let mut held = armed(core);
     held.next += 1;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    let token = format!("a{}-{nanos:x}", held.next);
-    held.presses.push((token.clone(), Instant::now()));
+    let token = format!("a{}x{:x}", held.next, nonce());
+    let text = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_owned);
+    held.presses.push(Press {
+        token: token.clone(),
+        at: Instant::now(),
+        sends: text("draft").zip(text("revision")),
+    });
     Ok(ok(json!({"armed": token})))
 }
 
@@ -706,38 +911,37 @@ pub fn send(core: &Core, args: &Value) -> Result<Value, Failure> {
         return Ok(fail("invalid_args", "That isn't a draft."));
     }
     let Some(held) = core.gmail.draft(&auth, &id)? else {
-        let sent = !message_id.is_empty()
-            && !core
-                .gmail
-                .search(&auth, &format!("rfc822msgid:{message_id}"), 1)?
-                .is_empty();
-        return Ok(if sent {
+        return Ok(if in_sent(core, &auth, &message_id)? {
             ok(json!({"sent": true, "already": true}))
         } else {
-            fail("not_found", "That draft is gone.")
+            refusal("not_found", "That draft is gone.")
         });
     };
+    // spent here, whatever comes of it: a refused send needs a new press
+    let press = armed(core).take(&js::string_or_empty(args.get("armed")));
+    if press != Some((id.clone(), revision.clone())) {
+        return Ok(refusal("not_allowed", "Only a person's press sends mail."));
+    }
     let message = held.get("message").cloned().unwrap_or(Value::Null);
     if message.get("id").and_then(Value::as_str) != Some(revision.as_str()) {
-        return Ok(fail(
+        return Ok(refusal(
             "changed",
             "This draft changed after you read it. Read it again before sending.",
         ));
     }
     if let Some(allowed) = only_to() {
         let all = ["To", "Cc", "Bcc"].map(|h| gmail::header(&message, h));
-        let names = all.iter().flat_map(|h| h.split(',')).map(str::trim);
-        if let Some(other) = outside(&allowed, names.filter(|n| !n.is_empty())) {
-            return Ok(fail(
+        let names: Vec<String> = all.iter().flat_map(|h| listed(h)).collect();
+        if let Some(other) = outside(&allowed, names.iter().map(String::as_str)) {
+            return Ok(refusal(
                 "not_allowed",
                 &format!("This test run writes only to {allowed}, not {other}."),
             ));
         }
     }
-    if !armed(core).take(&js::string_or_empty(args.get("armed"))) {
-        return Ok(fail("not_allowed", "Only a person's press sends mail."));
+    if !core.gmail.draft_send(&auth, &id)? {
+        return Ok(refusal("not_found", "That draft is gone."));
     }
-    core.gmail.draft_send(&auth, &id)?;
     uploads(core).free_draft(&id);
     Ok(ok(json!({"sent": true})))
 }
@@ -764,11 +968,10 @@ pub fn reply_start(core: &Core, args: &Value) -> Result<Value, Failure> {
         .signed_in()
         .map(|(who, _)| who)
         .unwrap_or_default();
-    let others = |list: &str| {
-        list.split(',')
-            .filter_map(address)
-            .filter(|a| !a.eq_ignore_ascii_case(&me))
-            .collect::<Vec<_>>()
+    let others = |name: &str| {
+        let mut people = listed(&gmail::header(last, name));
+        people.retain(|a| !a.eq_ignore_ascii_case(&me));
+        people
     };
     let subject = h("Subject");
     let quoted: String = gmail::body(last)
@@ -785,22 +988,30 @@ pub fn reply_start(core: &Core, args: &Value) -> Result<Value, Failure> {
             "body": format!("\n\n---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {subject}\nTo: {}\n\n{}", h("From"), h("Date"), h("To"), gmail::body(last)),
         }),
         _ => {
-            let from = h("Reply-To");
-            let from = if from.is_empty() { h("From") } else { from };
-            let mut to = others(&from);
+            let reply_to = others("Reply-To");
+            let note = reply_note(&listed(&gmail::header(last, "From")), &reply_to);
+            let mut to = if reply_to.is_empty() {
+                others("From")
+            } else {
+                reply_to
+            };
             // the last word was the person's own: it goes on to whoever that went to
             if to.is_empty() {
-                to = others(&h("To"));
+                to = others("To");
             }
             let mut cc = Vec::new();
             if mode == "all" {
-                to.extend(others(&h("To")));
-                cc = others(&h("Cc"));
+                to.extend(others("To"));
+                cc = others("Cc");
+                // a name on both lists, or twice on one, is written to once
+                let mut seen = HashSet::new();
+                to.retain(|a| seen.insert(a.to_lowercase()));
+                cc.retain(|a| seen.insert(a.to_lowercase()));
             }
             let message_id = h("Message-ID");
             let references = format!("{} {message_id}", h("References"));
             json!({
-                "to": to, "cc": cc,
+                "to": to, "cc": cc, "note": note,
                 "subject": prefixed("Re: ", &subject),
                 "body": said,
                 "thread": id,
@@ -810,6 +1021,20 @@ pub fn reply_start(core: &Core, args: &Value) -> Result<Value, Failure> {
         }
     };
     Ok(ok(answer))
+}
+
+/// What to say when a reply won't go to the sender: anyone can set Reply-To.
+fn reply_note(from: &[String], reply_to: &[String]) -> String {
+    let same = |a: &String| from.iter().any(|f| f.eq_ignore_ascii_case(a));
+    if reply_to.iter().all(same) {
+        return String::new();
+    }
+    let (goes_to, sender) = (reply_to.join(", "), from.join(", "));
+    format!(
+        "Replies go to {}, not the sender, {}.",
+        js::slice_utf16(&goes_to, 200),
+        js::slice_utf16(&sender, 200)
+    )
 }
 
 fn prefixed(prefix: &str, subject: &str) -> String {
@@ -849,6 +1074,13 @@ mod tests {
             "<a@b.c",
             "a b@c.d",
             "\"a\"@b.c",
+            "a(b)@c.d",
+            "a:b@c.d",
+            "a@b@c.d",
+            "a@b.c OR from:x",
+            "a@-b.c",
+            ".a@b.c",
+            "a..b@c.d",
         ] {
             assert!(Draft::of(&json!({"to": [bad]})).is_err(), "{bad:?}");
         }
@@ -895,6 +1127,34 @@ mod tests {
             outside(allowed, ["support@buwiz.com", "x@example.com"].into_iter()),
             Some("x@example.com")
         );
+    }
+
+    #[test]
+    fn a_list_splits_only_where_a_comma_separates_two() {
+        assert_eq!(
+            listed("\"Doe, Jane\" <jane@x.co>, ben@x.co,, \"a\\\", b\" <c@x.co>"),
+            ["jane@x.co", "ben@x.co", "c@x.co"]
+        );
+        assert_eq!(listed("not one, ben@x.co"), ["not one", "ben@x.co"]);
+    }
+
+    #[test]
+    fn a_reply_to_someone_other_than_the_sender_is_said() {
+        let of = |a: &str| vec![a.to_owned()];
+        assert_eq!(reply_note(&of("a@x.co"), &[]), "");
+        assert_eq!(reply_note(&of("a@x.co"), &of("A@x.co")), "");
+        assert_eq!(
+            reply_note(&of("a@x.co"), &of("eve@y.co")),
+            "Replies go to eve@y.co, not the sender, a@x.co."
+        );
+    }
+
+    #[test]
+    fn only_a_plain_message_id_reaches_a_query() {
+        assert!(message_id_ok("<a1.b2@buwiz.local>"));
+        for bad in ["a@b.c", "<a b@c.d>", "<a@b.c> OR in:sent", "<a\"@b.c>"] {
+            assert!(!message_id_ok(bad), "{bad}");
+        }
     }
 
     #[test]

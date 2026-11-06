@@ -19,9 +19,9 @@ use crate::clean;
 use crate::gmail::{self, Failure};
 use crate::tools::{
     MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_DRAFT_DELETE, MAIL_DRAFT_OF, MAIL_DRAFT_READ,
-    MAIL_DRAFT_SAVE, MAIL_JOB, MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK, MAIL_REPLY_START,
-    MAIL_SEND, MAIL_SEND_ARM, MAIL_THREAD, MAIL_TRASH, MAIL_UNDO, PEOPLE_SUGGEST, SEARCH_MAIL,
-    UPLOAD_CHUNK, UPLOAD_DROP, fail, failed, ok,
+    MAIL_DRAFT_SAVE, MAIL_JOB, MAIL_JOB_START, MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK,
+    MAIL_REPLY_START, MAIL_SEND, MAIL_SEND_ARM, MAIL_THREAD, MAIL_TRASH, MAIL_UNDO, PEOPLE_SUGGEST,
+    SEARCH_MAIL, UPLOAD_CHUNK, UPLOAD_DROP, fail, failed, ok,
 };
 use crate::{Core, compose, js};
 
@@ -962,7 +962,8 @@ pub fn run(core: &Core, tool: &str, args: &Value) -> Option<Value> {
         MAIL_SEND => compose::send(core, args),
         MAIL_REPLY_START => compose::reply_start(core, args),
         MAIL_JOB => compose::job(core, args),
-        MAIL_SEND_ARM => compose::arm(core),
+        MAIL_JOB_START => compose::job_start(core),
+        MAIL_SEND_ARM => compose::arm(core, args),
         PEOPLE_SUGGEST => compose::suggest(core, args),
         MAIL_DRAFT_OF => compose::draft_of(core, args),
         UPLOAD_CHUNK => compose::upload_chunk(core, args),

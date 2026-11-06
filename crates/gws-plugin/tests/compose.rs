@@ -23,7 +23,10 @@ fn lunch() -> Value {
 }
 
 fn send(core: &Core, draft: &Value) -> Value {
-    let armed = data(core.run("gws_mail_send_arm", &json!({})));
+    let armed = data(core.run(
+        "gws_mail_send_arm",
+        &json!({"draft": draft["draft"], "revision": draft["revision"]}),
+    ));
     core.run(
         "gws_mail_send",
         &json!({"draft": draft["draft"], "revision": draft["revision"], "message_id": draft["message_id"], "armed": armed["armed"]}),
@@ -37,9 +40,9 @@ fn what_was_read_is_what_arrives() {
     let saved = data(core.run("gws_mail_draft_save", &lunch()));
     assert_eq!(google.sent(), [], "saving sends nothing");
     let read = data(core.run("gws_mail_draft_read", &json!({"draft": saved["draft"]})));
-    assert_eq!(read["to"], "ana@example.com");
-    assert_eq!(read["cc"], "ben@example.com");
-    assert_eq!(read["bcc"], "cara@example.com");
+    assert_eq!(read["to"], json!(["ana@example.com"]));
+    assert_eq!(read["cc"], json!(["ben@example.com"]));
+    assert_eq!(read["bcc"], json!(["cara@example.com"]));
     assert_eq!(read["subject"], "Lunch ñ");
     assert_eq!(read["body"], "Noon?\nThe usual place.");
 
@@ -60,18 +63,24 @@ fn a_send_with_no_press_behind_it_goes_nowhere() {
     let saved = data(core.run("gws_mail_draft_save", &lunch()));
     let args = |armed: &Value| json!({"draft": saved["draft"], "revision": saved["revision"], "armed": armed});
     let refused = core.run("gws_mail_send", &args(&json!("a1-made-up")));
-    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(
+        refused["structuredContent"]["refused"].is_string(),
+        "{refused}"
+    );
     assert_eq!(google.sent(), []);
 
-    let press = data(core.run("gws_mail_send_arm", &json!({})));
+    let press = data(core.run(
+        "gws_mail_send_arm",
+        &json!({"draft": saved["draft"], "revision": saved["revision"]}),
+    ));
     data(core.run("gws_mail_send", &args(&press["armed"])));
     let second = data(core.run("gws_mail_draft_save", &lunch()));
     let again = core.run(
         "gws_mail_send",
         &json!({"draft": second["draft"], "revision": second["revision"], "armed": press["armed"]}),
     );
-    assert_eq!(
-        again["isError"], true,
+    assert!(
+        again["structuredContent"]["refused"].is_string(),
         "a press is good for one send: {again}"
     );
     assert_eq!(google.sent().len(), 1);
@@ -89,7 +98,10 @@ fn a_draft_changed_since_it_was_read_is_not_sent() {
     assert_ne!(edited["revision"], read["revision"]);
 
     let refused = send(&core, &read);
-    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(
+        refused["structuredContent"]["refused"].is_string(),
+        "{refused}"
+    );
     assert!(refused.to_string().contains("changed after you read it"));
     assert_eq!(google.sent(), []);
 }
@@ -112,7 +124,10 @@ fn a_draft_deleted_elsewhere_says_so_and_nothing_goes() {
     let saved = data(core.run("gws_mail_draft_save", &lunch()));
     data(core.run("gws_mail_draft_delete", &json!({"draft": saved["draft"]})));
     let refused = send(&core, &saved);
-    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(
+        refused["structuredContent"]["refused"].is_string(),
+        "{refused}"
+    );
     assert!(refused.to_string().contains("That draft is gone."));
     assert_eq!(google.sent(), []);
 }
@@ -351,21 +366,185 @@ fn the_model_attaches_nothing() {
 fn a_save_too_slow_for_its_caller_can_be_asked_after() {
     let google = FakeGoogle::start(Seed::demo(2));
     let core = signed_in(&google, "job");
+    let started = data(core.run("gws_mail_job_start", &json!({})));
+    let j1 = started["job"].clone();
+    let asked = data(core.run("gws_mail_job", &json!({"job": j1})));
     assert_eq!(
-        data(core.run("gws_mail_job", &json!({"job": "j1"})))["done"],
-        false
+        (&asked["done"], &asked["gone"]),
+        (&json!(false), &json!(false))
     );
     let mut draft = lunch();
-    draft["job"] = json!("j1");
+    draft["job"] = j1.clone();
     let saved = data(core.run("gws_mail_draft_save", &draft));
-    let job = data(core.run("gws_mail_job", &json!({"job": "j1"})));
+    let job = data(core.run("gws_mail_job", &json!({"job": j1})));
     assert_eq!(job["done"], true);
     assert_eq!(job["answer"]["structuredContent"]["draft"], saved["draft"]);
+    let told = data(core.run("gws_mail_job", &json!({"job": j1})));
+    assert_eq!(told["gone"], true, "told once");
+}
+
+#[test]
+fn a_job_the_plugin_did_not_start_plants_nothing_and_holds_nobody() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "job-model");
+    let started = data(core.run("gws_mail_job_start", &json!({})));
+    let mut draft = lunch();
+    draft["job"] = started["job"].clone();
+    data(core.run_for_model("gws_mail_draft_save", &draft));
+    let asked = data(core.run("gws_mail_job", &json!({"job": started["job"]})));
     assert_eq!(
-        data(core.run("gws_mail_job", &json!({"job": "j1"})))["done"],
-        false,
-        "told once"
+        asked["done"], false,
+        "the model can't answer for it: {asked}"
     );
+
+    draft["job"] = json!("made-up");
+    data(core.run("gws_mail_draft_save", &draft));
+    let made_up = data(core.run("gws_mail_job", &json!({"job": "made-up"})));
+    assert_eq!(
+        (&made_up["done"], &made_up["gone"]),
+        (&json!(false), &json!(true))
+    );
+}
+
+#[test]
+fn a_press_sends_only_the_draft_and_revision_it_was_for_and_a_refusal_spends_it() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "bound");
+    let mine = data(core.run("gws_mail_draft_save", &lunch()));
+    let other = data(core.run("gws_mail_draft_save", &lunch()));
+    let press = data(core.run(
+        "gws_mail_send_arm",
+        &json!({"draft": mine["draft"], "revision": mine["revision"]}),
+    ));
+    let elsewhere = core.run(
+        "gws_mail_send",
+        &json!({"draft": other["draft"], "revision": other["revision"], "armed": press["armed"]}),
+    );
+    assert!(
+        elsewhere["structuredContent"]["refused"].is_string(),
+        "{elsewhere}"
+    );
+    let spent = core.run(
+        "gws_mail_send",
+        &json!({"draft": mine["draft"], "revision": mine["revision"], "armed": press["armed"]}),
+    );
+    assert!(
+        spent["structuredContent"]["refused"].is_string(),
+        "a refusal spent it: {spent}"
+    );
+    assert_eq!(google.sent(), []);
+
+    let press = data(core.run("gws_mail_send_arm", &json!({})));
+    let unbound = core.run(
+        "gws_mail_send",
+        &json!({"draft": mine["draft"], "revision": mine["revision"], "armed": press["armed"]}),
+    );
+    assert!(
+        unbound["structuredContent"]["refused"].is_string(),
+        "bound to nothing, it sends nothing"
+    );
+
+    let press = data(core.run("gws_mail_send_arm", &json!({})));
+    let mut again = lunch();
+    again["draft"] = mine["draft"].clone();
+    again["armed"] = press["armed"].clone();
+    let saved = data(core.run("gws_mail_draft_save", &again));
+    data(core.run(
+        "gws_mail_send",
+        &json!({"draft": saved["draft"], "revision": saved["revision"], "armed": press["armed"]}),
+    ));
+    assert_eq!(google.sent().len(), 1, "the save bound it");
+}
+
+#[test]
+fn saving_a_sent_draft_again_says_so_and_writes_nothing() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "resave");
+    let saved = data(core.run("gws_mail_draft_save", &lunch()));
+    data(send(&core, &saved));
+    let mut again = lunch();
+    again["draft"] = saved["draft"].clone();
+    again["message_id"] = saved["message_id"].clone();
+    let refused = core.run("gws_mail_draft_save", &again);
+    assert_eq!(
+        refused["structuredContent"]["refused"], "already_sent",
+        "{refused}"
+    );
+    assert_eq!(google.sent().len(), 1);
+}
+
+#[test]
+fn a_long_list_is_read_whole() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "whole");
+    let many: Vec<String> = (0..60)
+        .map(|n| format!("person{n}@long-domain-name.example"))
+        .collect();
+    let saved = data(core.run("gws_mail_draft_save", &json!({"to": many, "body": "Hi"})));
+    let read = data(core.run(
+        "gws_mail_draft_read",
+        &json!({"draft": saved["draft"], "review": true}),
+    ));
+    assert_eq!(read["to"], json!(many), "every one, none cut");
+    assert_eq!(read["new"], json!(many));
+}
+
+#[test]
+fn reply_all_keeps_everyone_on_a_long_list() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "reply-all");
+    let many: Vec<String> = (0..60)
+        .map(|n| format!("person{n}@long-domain-name.example"))
+        .collect();
+    let saved = data(core.run("gws_mail_draft_save", &json!({"to": many, "body": "Hi"})));
+    data(send(&core, &saved));
+    let found = data(core.run("gws_search_mail", &json!({"query": "in:sent"})));
+    let id = found["items"][0]["id"].clone();
+    let all = data(core.run(
+        "gws_mail_reply_start",
+        &json!({"thread": id, "mode": "all"}),
+    ));
+    assert_eq!(all["to"].as_array().unwrap().len(), 60, "{all}");
+}
+
+#[test]
+fn over_the_encoded_limit_is_refused_before_it_goes_up() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "encoded");
+    let bytes = file(25 * 1024 * 1024);
+    let mut draft = lunch();
+    draft["body"] = json!("x".repeat(1024 * 1024));
+    draft["attachments"] = json!([attach(&core, "a.pdf", &bytes)]);
+    let refused = core.run("gws_mail_draft_save", &draft);
+    assert_eq!(refused["isError"], true);
+    assert!(
+        refused.to_string().contains("once it's encoded"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn saving_twice_keeps_a_drafts_file_though_its_message_changed() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "twice-keep");
+    let bytes = file(2048);
+    let mut draft = lunch();
+    draft["attachments"] = json!([attach(&core, "a.pdf", &bytes)]);
+    let saved = data(core.run("gws_mail_draft_save", &draft));
+    let read = data(core.run("gws_mail_draft_read", &json!({"draft": saved["draft"]})));
+    let file0 = &read["attachments"][0];
+    let mut edit = lunch();
+    edit["draft"] = saved["draft"].clone();
+    edit["keep"] = json!([{"message": read["revision"], "id": file0["id"], "name": file0["name"], "mime": file0["mime"]}]);
+    let second = data(core.run("gws_mail_draft_save", &edit));
+    let upload = second["kept"][0]["upload"].clone();
+    assert!(upload.is_string(), "{second}");
+    let mut third = lunch();
+    third["draft"] = saved["draft"].clone();
+    third["attachments"] = json!([upload]);
+    let third = data(core.run("gws_mail_draft_save", &third));
+    data(send(&core, &third));
+    assert!(google.sent()[0].attachments[0].2 == bytes);
 }
 
 fn suggested(core: &Core, query: &str) -> Vec<String> {

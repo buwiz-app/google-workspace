@@ -21,7 +21,10 @@ fn data(answer: Value) -> Value {
 }
 
 fn send(core: &Core, draft: &Value) -> Value {
-    let armed = data(core.run("gws_mail_send_arm", &json!({})));
+    let armed = data(core.run(
+        "gws_mail_send_arm",
+        &json!({"draft": draft["draft"], "revision": draft["revision"]}),
+    ));
     core.run(
         "gws_mail_send",
         &json!({"draft": draft["draft"], "revision": draft["revision"], "armed": armed["armed"]}),
@@ -41,7 +44,10 @@ fn a_test_run_on_a_real_account_cannot_write_to_anyone_else() {
     ] {
         let saved = data(core.run("gws_mail_draft_save", &draft));
         let refused = send(&core, &saved);
-        assert_eq!(refused["isError"], true, "{draft}: {refused}");
+        assert!(
+            refused["structuredContent"]["refused"].is_string(),
+            "{draft}: {refused}"
+        );
         assert!(refused.to_string().contains("writes only to"), "{refused}");
     }
     assert_eq!(google.sent(), []);

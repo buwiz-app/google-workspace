@@ -649,13 +649,26 @@ impl Account {
         if !labels.iter().all(|l| m.labels.contains(l)) {
             return false;
         }
+        // one `{a b}` group: any of its terms will do
+        let (q, any) = match q.split_once('{').zip(q.split_once('}')) {
+            Some(((before, rest), (_, after))) => {
+                let group = rest.split('}').next().unwrap_or_default();
+                (format!("{before} {after}"), Some(group.to_owned()))
+            }
+            None => (q.to_owned(), None),
+        };
+        if let Some(any) = any
+            && !any.split_whitespace().any(|t| Self::matches(m, t, &[]))
+        {
+            return false;
+        }
         q.split_whitespace().all(|term| {
             let term = term.to_lowercase();
             if term == "in:sent" {
                 return m.labels.iter().any(|l| l == "SENT");
             }
             if let Some(to) = term.strip_prefix("to:") {
-                return m.to.to_lowercase().contains(to);
+                return m.to.to_lowercase().contains(to.trim_matches('"'));
             }
             if let Some(from) = term.strip_prefix("from:") {
                 return m.from.to_lowercase().contains(from);

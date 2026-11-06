@@ -66,6 +66,7 @@ pub const MAIL_DRAFT_DELETE: &str = "gws_mail_draft_delete";
 pub const MAIL_SEND: &str = "gws_mail_send";
 pub const MAIL_REPLY_START: &str = "gws_mail_reply_start";
 pub const MAIL_JOB: &str = "gws_mail_job";
+pub const MAIL_JOB_START: &str = "gws_mail_job_start";
 pub const PEOPLE_SUGGEST: &str = "gws_people_suggest";
 pub const MAIL_SEND_ARM: &str = "gws_mail_send_arm";
 pub const MAIL_DRAFT_OF: &str = "gws_mail_draft_of";
@@ -183,7 +184,7 @@ pub fn defs() -> Vec<Def> {
         Def {
             name: MAIL_DRAFT_SAVE,
             description: "Write a draft, or replace one. It sends nothing: the person reads it and presses Send.",
-            input_schema: json!({"type": "object", "properties": {"draft": {"type": "string"}, "to": {"type": "array", "items": {"type": "string"}}, "cc": {"type": "array", "items": {"type": "string"}}, "bcc": {"type": "array", "items": {"type": "string"}}, "subject": {"type": "string"}, "body": {"type": "string"}, "thread": {"type": "string"}, "in_reply_to": {"type": "string"}, "references": {"type": "string"}, "message_id": {"type": "string"}, "attachments": {"type": "array", "items": {"type": "string"}}, "keep": {"type": "array", "items": {"type": "object"}}, "job": {"type": "string"}}}),
+            input_schema: json!({"type": "object", "properties": {"draft": {"type": "string"}, "to": {"type": "array", "items": {"type": "string"}}, "cc": {"type": "array", "items": {"type": "string"}}, "bcc": {"type": "array", "items": {"type": "string"}}, "subject": {"type": "string"}, "body": {"type": "string"}, "thread": {"type": "string"}, "in_reply_to": {"type": "string"}, "references": {"type": "string"}, "message_id": {"type": "string"}, "attachments": {"type": "array", "items": {"type": "string"}}, "keep": {"type": "array", "items": {"type": "object"}}, "job": {"type": "string"}, "armed": {"type": "string"}}}),
             read_only: false,
             audience: AGENT_AND_APP,
             open_world: true,
@@ -191,7 +192,7 @@ pub fn defs() -> Vec<Def> {
         Def {
             name: MAIL_DRAFT_READ,
             description: "A draft as it stands, with the revision Send needs.",
-            input_schema: json!({"type": "object", "properties": {"draft": {"type": "string"}, "ticket": {"type": "string"}}}),
+            input_schema: json!({"type": "object", "properties": {"draft": {"type": "string"}, "ticket": {"type": "string"}, "review": {"type": "boolean"}}}),
             read_only: true,
             audience: APP_ONLY,
             open_world: true,
@@ -212,7 +213,7 @@ pub fn defs() -> Vec<Def> {
         write(
             MAIL_SEND_ARM,
             "The person pressed Send: what lets the send that follows go. Called at the press, as who pressed is only known then.",
-            json!({"type": "object"}),
+            json!({"type": "object", "properties": {"draft": {"type": "string"}, "revision": {"type": "string"}}}),
         ),
         write(
             MAIL_SEND,
@@ -234,6 +235,14 @@ pub fn defs() -> Vec<Def> {
             read_only: true,
             audience: APP_ONLY,
             open_world: true,
+        },
+        Def {
+            name: MAIL_JOB_START,
+            description: "An id for a save that may outlast its call.",
+            input_schema: json!({"type": "object"}),
+            read_only: false,
+            audience: APP_ONLY,
+            open_world: false,
         },
         Def {
             name: MAIL_JOB,

@@ -245,7 +245,20 @@ impl Gmail {
     /// Each message's From, Subject, Date and snippet (`format=metadata`),
     /// fetched together; `None` for one Gmail no longer has.
     pub fn metadata(&self, auth: &Bearer, ids: &[String]) -> Result<Vec<Option<Value>>, Failure> {
-        let headers = ["From", "Subject", "Date"].map(|h| ("metadataHeaders", h.to_owned()));
+        self.metadata_with(auth, ids, &["From", "Subject", "Date"])
+    }
+
+    /// Each message's `names` headers, in order.
+    pub fn metadata_with(
+        &self,
+        auth: &Bearer,
+        ids: &[String],
+        names: &[&str],
+    ) -> Result<Vec<Option<Value>>, Failure> {
+        let headers: Vec<(&str, String)> = names
+            .iter()
+            .map(|h| ("metadataHeaders", (*h).to_owned()))
+            .collect();
         let mut out = Vec::with_capacity(ids.len());
         for batch in ids.chunks(METADATA_AT_ONCE) {
             let done: Result<Vec<_>, Failure> = std::thread::scope(|scope| {
@@ -558,9 +571,10 @@ impl Gmail {
         Self::answer(req.call(), FULL_MAX).map(drop)
     }
 
-    pub fn draft_send(&self, auth: &Bearer, id: &str) -> Result<(), Failure> {
+    /// `false` when Gmail has no such draft.
+    pub fn draft_send(&self, auth: &Bearer, id: &str) -> Result<bool, Failure> {
         let body = serde_json::json!({"id": id});
-        self.post(auth, "drafts/send".to_owned(), &body).map(drop)
+        Ok(self.post(auth, "drafts/send".to_owned(), &body)?.is_some())
     }
 
     pub fn modify_thread(

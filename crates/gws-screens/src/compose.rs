@@ -29,6 +29,8 @@ const FIELD: &str = "border-b px-3 py-1.5 text-[13px]";
 const HOLD: Duration = Duration::from_secs(5);
 /// How often the hold looks to see if it was undone.
 const TICK: Duration = Duration::from_millis(100);
+/// How many times a slow save is asked after: past the plugin's own ten minutes.
+const JOB_ASKS: u32 = 330;
 /// How long typing rests before a draft saves.
 const AUTOSAVE: Duration = Duration::from_secs(2);
 /// A file's bytes per call: under 256 KiB of arguments once in base64.
@@ -70,6 +72,10 @@ pub struct Letter {
     in_reply_to: String,
     references: String,
     files: Vec<File>,
+    /// A Send of this letter ended with no word of whether it went.
+    unsure: bool,
+    /// What the person should know about who a reply goes to.
+    note: String,
 }
 
 impl Letter {
@@ -156,6 +162,8 @@ impl Letter {
             in_reply_to: text("in_reply_to").to_owned(),
             references: text("references").to_owned(),
             files,
+            unsure: false,
+            note: text("note").to_owned(),
         }
     }
 }
@@ -186,6 +194,13 @@ pub struct Compose {
     said: Signal<Option<String>>,
     /// Deleting the draft waits on a second press.
     asking: Signal<bool>,
+    /// From Send's press until it's held or refused: what's sent is what was
+    /// showing at the press, so nothing typed after it can be left out.
+    frozen: Signal<bool>,
+    /// A picker or a file's arrival is under way.
+    attaching: Signal<bool>,
+    /// Send waits on a second press: these people are new to the person.
+    confirming: Signal<Option<Vec<String>>>,
     stage: Signal<Option<Stage>>,
     /// The letter a Send took, until it's gone or undone.
     held: Signal<Option<Letter>>,
@@ -211,6 +226,9 @@ impl Compose {
             saving: signal(false),
             said: signal(None),
             asking: signal(false),
+            frozen: signal(false),
+            attaching: signal(false),
+            confirming: signal(None),
             stage: signal(None),
             held: signal(None),
             hold: Latest::new(),
@@ -239,8 +257,13 @@ impl Compose {
     }
 
     fn edit(self, change: impl FnOnce(&mut Letter)) {
+        if self.frozen.get_untracked() {
+            return;
+        }
         self.letter.update(change);
         self.edits.set(self.edits.get_untracked() + 1);
+        // what was asked about may not be what's there now
+        self.confirming.set(None);
     }
 
     fn fill(self, letter: Letter) {
@@ -250,6 +273,8 @@ impl Compose {
         self.extra.set(extra);
         self.said.set(None);
         self.asking.set(false);
+        self.confirming.set(None);
+        self.frozen.set(false);
     }
 
     fn close(self) {
@@ -280,7 +305,7 @@ pub async fn autosave(b: Bridge, c: Compose) {
             let b = b.clone();
             c.run(async move {
                 // an address half typed isn't one yet: leaving says so, not this
-                let _ = save(&b, c).await;
+                let _ = save(&b, c, &Value::Null).await;
                 c.saving.set(false);
             });
         }
@@ -288,61 +313,119 @@ pub async fn autosave(b: Bridge, c: Compose) {
 }
 
 /// A tool's answer as a screen gets it, from a result that came by way of a job.
-fn answered(result: &Value) -> Result<Value, String> {
+fn answered(result: &Value) -> Result<Value, BuwizError> {
+    let content = result.get("structuredContent").cloned();
     if result.get("isError") == Some(&Value::Bool(true)) {
-        let why = result.pointer("/content/0/text").and_then(Value::as_str);
-        return Err(why.unwrap_or("That didn't work.").to_owned());
+        let text = |path: &str| result.pointer(path).and_then(Value::as_str);
+        return Err(BuwizError::new(
+            text("/structuredContent/code").unwrap_or("failed"),
+            false,
+            text("/content/0/text").unwrap_or("That didn't work."),
+        ));
     }
-    Ok(result
-        .get("structuredContent")
-        .cloned()
-        .unwrap_or(Value::Null))
+    Ok(content.unwrap_or(Value::Null))
 }
 
-/// How a save too slow for its call came out: it goes on in the plugin.
-async fn wait_for(b: &Bridge, job: &str) -> Result<Value, String> {
-    loop {
+/// How a save too slow for its call came out: it goes on in the plugin. An
+/// upload gives up after ten minutes, so this needn't wait longer than that.
+async fn wait_for(b: &Bridge, job: &str) -> Result<Value, BuwizError> {
+    let lost = || BuwizError::new("failed", false, "That save was lost. Try again.");
+    for _ in 0..JOB_ASKS {
         sleep(AUTOSAVE).await;
-        let v = b
-            .call("gws_mail_job", json!({"job": job}))
-            .await
-            .map_err(|e| e.message)?;
+        let v = b.call("gws_mail_job", json!({"job": job})).await?;
         if v.get("done") == Some(&Value::Bool(true)) {
             return answered(v.get("answer").unwrap_or(&Value::Null));
         }
+        if v.get("gone") == Some(&Value::Bool(true)) {
+            return Err(lost());
+        }
     }
+    Err(lost())
 }
 
-async fn write(b: &Bridge, c: Compose, letter: &Letter) -> Result<Value, BuwizError> {
-    let job = format!("job{}", c.fresh());
+/// One save. Only a message with files can outlast its call, so only that gets
+/// a job to ask after.
+async fn write(b: &Bridge, letter: &Letter, armed: &Value) -> Result<Value, BuwizError> {
     let mut args = letter.args();
-    args["job"] = job.clone().into();
+    if !armed.is_null() {
+        args["armed"] = armed.clone();
+    }
+    if letter.files.is_empty() {
+        return b.call("gws_mail_draft_save", args).await;
+    }
+    let job = b.call("gws_mail_job_start", json!({})).await?;
+    let job = job.get("job").and_then(Value::as_str).unwrap_or_default();
+    args["job"] = job.into();
     match b.call("gws_mail_draft_save", args).await {
-        Err(e) if e.code == "timeout" => wait_for(b, &job)
-            .await
-            .map_err(|why| BuwizError::new("failed", false, why)),
+        Err(e) if e.code == "timeout" => wait_for(b, job).await,
         answer => answer,
     }
 }
 
-/// Writes the letter to its draft. One deleted elsewhere is written anew.
-async fn save(b: &Bridge, c: Compose) -> Result<(), String> {
+/// What a refusal the screen must act on says. A failed tool reaches a screen as
+/// words with no code, so these come as answers.
+fn refused_text(v: &Value) -> Option<&str> {
+    v.get("refused").and_then(Value::as_str)
+}
+
+fn refused(answer: &Result<Value, BuwizError>) -> Option<&str> {
+    answer.as_ref().ok().and_then(refused_text)
+}
+
+/// Writes the letter to its draft, with the press that will send it, if any.
+/// A draft deleted elsewhere is written anew, but never one that may have gone:
+/// sending that again is the worst thing this screen could do. `false` says the
+/// message had already gone.
+async fn save(b: &Bridge, c: Compose, armed: &Value) -> Result<bool, String> {
     let seen = c.edits.get_untracked();
     let mut letter = c.letter.get_untracked();
-    let mut answer = write(b, c, &letter).await;
-    if matches!(&answer, Err(e) if e.code == "not_found") && letter.draft.is_some() {
+    let mut answer = write(b, &letter, armed).await;
+    if refused(&answer) == Some("not_found") && letter.draft.is_some() {
+        if letter.unsure {
+            c.letter.update(|l| {
+                l.unsure = false;
+                l.draft = None;
+                l.revision = None;
+                l.message_id = None;
+            });
+            return Err(
+                "That draft is gone, and the message may have gone out. Look in Sent, and press Send again only if it isn't there."
+                    .to_owned(),
+            );
+        }
         letter.draft = None;
-        answer = write(b, c, &letter).await;
+        answer = write(b, &letter, armed).await;
+    }
+    if refused(&answer) == Some("already_sent") {
+        c.close();
+        c.stage.set(Some(Stage::Sent));
+        return Ok(false);
     }
     let v = answer.map_err(|e| e.message)?;
     let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
+    if refused_text(&v).is_some() {
+        return Err(text("message").unwrap_or_else(|| "That didn't work.".to_owned()));
+    }
+    let kept = v.get("kept").and_then(Value::as_array);
     c.letter.update(|l| {
         l.draft = text("draft");
         l.revision = text("revision");
         l.message_id = text("message_id");
+        // those attachments' ids left with the old message: the plugin holds them now
+        for held in kept.into_iter().flatten() {
+            let id = held.get("id");
+            let was = |f: &&mut File| f.keep.as_ref().and_then(|k| k.get("id")) == id;
+            if let Some(file) = l.files.iter_mut().find(was) {
+                file.keep = None;
+                file.upload = held
+                    .get("upload")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+        }
     });
     c.saved.set(seen);
-    Ok(())
+    Ok(true)
 }
 
 /// What's open is saved before something else takes its place. `false` leaves
@@ -351,8 +434,8 @@ async fn put_away(b: &Bridge, c: Compose) -> bool {
     if !c.open.get_untracked() || c.letter.with_untracked(Letter::blank) || !c.dirty() {
         return true;
     }
-    match save(b, c).await {
-        Ok(()) => true,
+    match save(b, c, &Value::Null).await {
+        Ok(_) => true,
         Err(why) => {
             c.said.set(Some(why));
             false
@@ -523,10 +606,12 @@ fn attach(b: Bridge, c: Compose) {
             .set(Some("This screen can't reach your files.".to_owned()));
         return;
     };
+    c.attaching.set(true);
     c.run(async move {
         let files = match pick.await {
             Ok(files) => files,
             Err(e) => {
+                c.attaching.set(false);
                 c.said.set(Some(e.message));
                 return;
             }
@@ -563,6 +648,7 @@ fn attach(b: Bridge, c: Compose) {
                 c.edit(|l| l.files.retain(|f| f.key != key));
             }
         }
+        c.attaching.set(false);
     });
 }
 
@@ -592,30 +678,64 @@ fn not_ready(l: &Letter) -> Option<&'static str> {
     None
 }
 
-/// Send: the press's own call, the save, the hold, then the send.
+/// Send: the press's own call, the save, a look at who it goes to, the hold,
+/// then the send.
 pub fn send(b: Bridge, c: Compose) {
-    if let Some(why) = c.letter.with_untracked(not_ready) {
+    press_send(b, c, false);
+}
+
+fn press_send(b: Bridge, c: Compose, confirmed: bool) {
+    let why = if c.attaching.get_untracked() {
+        Some("A file is still coming in.")
+    } else {
+        c.letter.with_untracked(not_ready)
+    };
+    if let Some(why) = why {
         c.said.set(Some(why.to_owned()));
         return;
     }
     c.said.set(None);
+    c.confirming.set(None);
+    c.frozen.set(true);
     let press = b.call("gws_mail_send_arm", json!({}));
     c.run(async move {
-        let armed = match press.await {
-            Ok(v) => v.get("armed").cloned().unwrap_or(Value::Null),
-            Err(e) => {
-                c.said.set(Some(e.message));
-                return;
-            }
-        };
-        if let Err(why) = save(&b, c).await {
-            c.said.set(Some(why));
-            return;
-        }
-        if let Err(why) = hold_and_send(&b, c, armed).await {
+        if let Err(why) = send_pressed(&b, c, press, confirmed).await {
             c.said.set(Some(why));
         }
+        c.frozen.set(false);
     });
+}
+
+async fn send_pressed(
+    b: &Bridge,
+    c: Compose,
+    press: impl Future<Output = Result<Value, BuwizError>>,
+    confirmed: bool,
+) -> Result<(), String> {
+    let press = press.await.map_err(|e| e.message)?;
+    let armed = press.get("armed").cloned().unwrap_or(Value::Null);
+    if !save(b, c, &armed).await? {
+        return Ok(());
+    }
+    if !confirmed {
+        let draft = c.letter.with_untracked(|l| l.draft.clone());
+        let args = json!({"draft": draft, "review": true});
+        let read = b.call("gws_mail_draft_read", args).await;
+        let new = people_new(&read.map_err(|e| e.message)?);
+        if !new.is_empty() {
+            c.confirming.set(Some(new));
+            return Ok(());
+        }
+    }
+    hold_and_send(b, c, armed).await
+}
+
+fn people_new(review: &Value) -> Vec<String> {
+    let new = review.get("new").and_then(Value::as_array);
+    new.into_iter()
+        .flatten()
+        .filter_map(|n| n.as_str().map(str::to_owned))
+        .collect()
 }
 
 /// The five seconds, then the send of the letter as it stands, which must be
@@ -642,21 +762,32 @@ async fn hold_and_send(b: &Bridge, c: Compose, armed: Value) -> Result<(), Strin
     let mut answer = b.call("gws_mail_send", args.clone()).await;
     // an answer lost on the way: asking again finds it in Sent, and it can't go
     // twice, as the press it needs is spent
-    if matches!(&answer, Err(e) if e.retryable) {
+    let lost = matches!(&answer, Err(e) if e.retryable);
+    if lost {
         answer = b.call("gws_mail_send", args).await;
     }
-    match answer {
-        Ok(_) => {
+    let why = match (&answer, refused(&answer)) {
+        (Ok(_), None) => {
             c.held.set(None);
             c.stage.set(Some(Stage::Sent));
-            Ok(())
+            return Ok(());
         }
-        Err(e) => {
-            c.stage.set(None);
-            bring_back(b, c).await;
-            Err(e.message)
+        (Ok(v), Some(_)) => v
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("That didn't work."),
+        (Err(e), _) => e.message.as_str(),
+    };
+    // only a refusal to a first try is sure it didn't go
+    let sure = !lost && matches!(refused(&answer), Some("changed" | "not_allowed"));
+    c.stage.set(None);
+    c.held.update(|held| {
+        if let Some(held) = held {
+            held.unsure = !sure;
         }
-    }
+    });
+    bring_back(b, c).await;
+    Err(why.to_owned())
 }
 
 /// The held letter, back in the panel. What was written since is kept as a draft.
@@ -731,6 +862,7 @@ fn line(c: Compose, name: &'static str, at: Place) -> Input {
             at(&mut letter).clone()
         })
         .placeholder(name.to_owned())
+        .readonly(move || c.frozen.get())
         .app_class(Some(format!("{FIELD} {LINE} {INK}").into()))
 }
 
@@ -738,7 +870,7 @@ fn line(c: Compose, name: &'static str, at: Place) -> Input {
 /// as setting a field's value answers with a change of its own.
 fn typed(c: Compose, at: Place, value: &str) -> bool {
     let mut letter = c.letter.get_untracked();
-    if at(&mut letter) == value {
+    if at(&mut letter) == value || c.frozen.get_untracked() {
         return false;
     }
     let value = value.to_owned();
@@ -874,6 +1006,7 @@ pub fn panel(b: Bridge, c: Compose) -> impl IntoElement {
                 input()
                     .label("Message")
                     .multiline(true)
+                    .readonly(move || c.frozen.get())
                     .value(move || c.letter.with(|l| l.body.clone()))
                     .placeholder("Message".to_owned())
                     .app_class(Some(format!("flex-1 px-3 py-2 text-[13px] {INK}").into()))
@@ -891,14 +1024,35 @@ pub fn panel(b: Bridge, c: Compose) -> impl IntoElement {
             rows.into_iter()
                 .fold(view(), move |v, file| v.child(file_row(b.clone(), c, file)))
         }))
-        .child(dynamic(move || match c.said.get() {
-            Some(line) => view()
-                .app_class(Some(format!("px-3 py-1 border-t {LINE}").into()))
-                .child(text(line).app_class(Some(format!("text-[12px] {INK}").into()))),
-            None => view(),
+        .child(dynamic(move || {
+            let note = c.letter.with(|l| l.note.clone());
+            let lines = [Some(note).filter(|n| !n.is_empty()), c.said.get()];
+            lines.into_iter().flatten().fold(view(), |column, line| {
+                column.child(
+                    view()
+                        .app_class(Some(format!("px-3 py-1 border-t {LINE}").into()))
+                        .child(text(line).app_class(Some(format!("text-[12px] {INK}").into()))),
+                )
+            })
         }))
         .child(dynamic(move || {
             let ask = ask.clone();
+            if let Some(new) = c.confirming.get() {
+                let line = format!("New to you: {}. Send it?", new.join(", "));
+                return view()
+                    .app_class(Some(
+                        format!("flex-row items-center gap-2 px-2 py-1 border-t {LINE}").into(),
+                    ))
+                    .child(
+                        text(line).app_class(Some(format!("flex-1 px-1 text-[12px] {INK}").into())),
+                    )
+                    .child(press_text("Keep writing", "Keep writing", move || {
+                        c.confirming.set(None);
+                    }))
+                    .child(press_text("Send it", "Send it", move || {
+                        press_send(ask.clone(), c, true);
+                    }));
+            }
             if c.asking.get() {
                 return view()
                     .app_class(Some(
@@ -1021,7 +1175,10 @@ fn review_line(label: &'static str, value: String) -> View {
 /// The Send press on a card: its own call first, as in the panel. A draft that
 /// changed since it showed is refused by revision, and shown again as it is.
 fn send_reviewed(b: Bridge, c: Compose, ticket: String, review: Signal<Option<Review>>) {
-    let press = b.call("gws_mail_send_arm", json!({}));
+    let shown = c
+        .letter
+        .with_untracked(|l| json!({"draft": l.draft, "revision": l.revision}));
+    let press = b.call("gws_mail_send_arm", shown);
     c.run(async move {
         let armed = match press.await {
             Ok(v) => v.get("armed").cloned().unwrap_or(Value::Null),
@@ -1152,7 +1309,8 @@ pub fn card(b: Bridge, ticket: String) -> View {
                 .child(open)
                 .child(view().app_class(Some("flex-1".into())));
             if !stranger {
-                let needs_asking = recipients(&letter) > FEW || !letter.bcc.is_empty();
+                let needs_asking =
+                    recipients(&letter) > FEW || !letter.bcc.is_empty() || !shown.new.is_empty();
                 let name = ticket.clone();
                 if c.asking.get() {
                     row = row

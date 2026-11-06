@@ -402,7 +402,8 @@ fn guest_field(b: Bridge, m: Cal) -> impl IntoElement {
         .child(row(
             "Guests",
             input()
-                .label("Add a guest")
+                // the @ keeps the AI out: what it staged here would go at the person's press
+                .label("Guest's address, like name@company.com")
                 .value(move || m.editor.form.with(|f| f.typing.clone()))
                 .placeholder("Add a guest".to_owned())
                 .readonly(move || m.editor.saving.get())

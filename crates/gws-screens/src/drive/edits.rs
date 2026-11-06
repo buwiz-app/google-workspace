@@ -1,7 +1,8 @@
 //! A file opened from here. A press opens it in the Bot's viewer; a bar then
 //! says what to do with one edited here, with the buttons of the plan's table.
 //! Nothing here uploads by itself: `gws_file_upload` is called from a press and
-//! nowhere else, and the plugin refuses what would overwrite.
+//! nowhere else, and the plugin refuses what would overwrite. `write.rs` has the
+//! rest of what changes Drive.
 //!
 //! Each call starts at the press itself, before anything else can run: the Bot
 //! judges who pressed by the moment of the call, and only a person's press
@@ -29,7 +30,7 @@ pub(super) struct Said {
     done: bool,
 }
 
-fn say(m: Drive, line: &str) {
+pub(super) fn say(m: Drive, line: &str) {
     m.said.set(Some(Said {
         line: line.to_owned(),
         link: None,
@@ -39,7 +40,7 @@ fn say(m: Drive, line: &str) {
 
 /// A failed call, as the person hears it. The Bot gives a call 30 seconds, and
 /// the plugin goes on past that, so a timeout isn't a failure.
-fn failed_line(e: &BuwizError) -> String {
+pub(super) fn failed_line(e: &BuwizError) -> String {
     if e.code == "timeout" {
         "Google Drive is taking a while. It's still going, so try again in a moment.".to_owned()
     } else if e.message.contains("Sign in to Google") {
@@ -144,7 +145,17 @@ fn discard(b: &Bridge, m: Drive, id: &str) {
 
 /// A press in a bar: as wide as what's around it at most, so its words wrap
 /// and it never runs off the edge.
-fn press(label: &'static str, name: &str, on: impl Fn() + 'static) -> View {
+pub(super) fn press(label: &'static str, name: &str, on: impl Fn() + 'static) -> View {
+    press_as(label, label.to_owned(), name, on)
+}
+
+/// [`press`] showing words of its own: its label stays fixed whatever they say.
+pub(super) fn press_as(
+    label: &'static str,
+    shows: String,
+    name: &str,
+    on: impl Fn() + 'static,
+) -> View {
     view()
         .app_class(Some(
             format!("max-w-full px-2 py-1 rounded-md border {LINE}").into(),
@@ -152,7 +163,7 @@ fn press(label: &'static str, name: &str, on: impl Fn() + 'static) -> View {
         .label(label)
         .accessibility_value(value(name))
         .on_press(on)
-        .child(text(label).app_class(Some(format!("text-[12px] {INK}").into())))
+        .child(text(shows).app_class(Some(format!("text-[12px] {INK}").into())))
 }
 
 /// The buttons of the plan's table, by what's on Drive.

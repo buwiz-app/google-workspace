@@ -65,6 +65,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     // nor has it the part of each attachment, which is what opens one now
     (7, "DELETE FROM bodies;"),
+    // what the person may do with a file. No list was read asking for that, so
+    // each is read again: a row that says nothing offers presses Google refuses
+    (
+        8,
+        "ALTER TABLE drive_files ADD COLUMN can TEXT;
+         DELETE FROM drive_listed;
+         DELETE FROM drive_views;",
+    ),
 ];
 
 /// Why the store didn't open or answer: a stable `code` and a message for people.
@@ -526,6 +534,7 @@ mod tests {
             .conn()
             .execute_batch(
                 "INSERT INTO bodies(account, thread, view, size, used) VALUES('a', 't', '{}', 2, 1);
+                 ALTER TABLE drive_files DROP COLUMN can;
                  PRAGMA user_version = 6;",
             )
             .unwrap();

@@ -1134,8 +1134,11 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "buwiz-app",
+ "buwiz-gws",
  "chrono",
  "chrono-tz",
+ "gws-fake-google",
+ "gws-store",
  "nsh-core",
  "nsh-engine",
  "nsh-testing",

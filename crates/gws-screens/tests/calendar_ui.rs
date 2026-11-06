@@ -447,9 +447,9 @@ fn write_one(app: &mut Headless, title: &str) {
 }
 
 fn add_guest(app: &mut Headless, address: &str) {
-    app.type_text("label:Add a guest", address)
+    app.type_text("label:Guest's address, like name@company.com", address)
         .expect("it takes the address");
-    app.submit("label:Add a guest")
+    app.submit("label:Guest's address, like name@company.com")
         .expect("it takes the address in");
     settle(app);
 }
@@ -961,8 +961,11 @@ fn save_says_what_it_will_do_and_the_call_carries_those_guests() {
 fn an_address_still_being_typed_counts_and_goes() {
     let (mut app, fake) = start();
     write_one(&mut app, "Lunch");
-    app.type_text("label:Add a guest", "ana@example.com")
-        .expect("it types");
+    app.type_text(
+        "label:Guest's address, like name@company.com",
+        "ana@example.com",
+    )
+    .expect("it types");
     settle(&mut app);
     assert!(
         app.screen().shows("Save and invite 1"),
@@ -980,8 +983,11 @@ fn an_address_still_being_typed_counts_and_goes() {
 fn a_comma_ends_an_address_and_a_guest_can_be_taken_off() {
     let (mut app, fake) = start();
     write_one(&mut app, "Lunch");
-    app.type_text("label:Add a guest", "ana@example.com, ben@example.com, ")
-        .expect("it types");
+    app.type_text(
+        "label:Guest's address, like name@company.com",
+        "ana@example.com, ben@example.com, ",
+    )
+    .expect("it types");
     settle(&mut app);
     assert!(
         app.screen().shows("Save and invite 2"),
@@ -1001,7 +1007,8 @@ fn a_comma_ends_an_address_and_a_guest_can_be_taken_off() {
 fn a_guest_that_isnt_an_address_stops_the_save_and_says_so() {
     let (mut app, fake) = start();
     write_one(&mut app, "Lunch");
-    app.type_text("label:Add a guest", "ana").expect("it types");
+    app.type_text("label:Guest's address, like name@company.com", "ana")
+        .expect("it types");
     press(&mut app, "label:Save this event");
     assert!(app.screen().shows("Check this guest's address: ana"));
     assert_eq!(fake.writes(), 0);
@@ -1012,13 +1019,14 @@ fn a_guest_that_isnt_an_address_stops_the_save_and_says_so() {
 fn a_suggestion_becomes_a_guest() {
     let (mut app, fake) = start();
     write_one(&mut app, "Lunch");
-    app.type_text("label:Add a guest", "an").expect("it types");
+    app.type_text("label:Guest's address, like name@company.com", "an")
+        .expect("it types");
     app.wait_for_within("label:Use this address", WAIT)
         .expect("it suggests");
     assert_eq!(last(&fake, "gws_cal_people")["query"], "an");
     press(&mut app, "label:Use this address");
     assert!(app.screen().shows("Save and invite 1"));
-    assert_eq!(field(&app, "Add a guest"), "");
+    assert_eq!(field(&app, "Guest's address, like name@company.com"), "");
     assert!(!app.screen().matches("label:Use this address").unwrap());
 }
 
@@ -1833,7 +1841,8 @@ fn assert_no_label_holds(app: &Headless, secrets: &[&str], at: &str) {
         );
     }
     assert!(
-        !app.screen().matches("label:/@/").unwrap(),
+        // the one fixed sample address keeps the AI out of the guest field
+        !app.screen().matches("label:/@example/").unwrap(),
         "{at}: a label holds an address"
     );
 }
@@ -1883,7 +1892,8 @@ fn no_screen_puts_a_title_a_guest_or_a_place_in_a_label() {
     assert!(app.screen().shows("ana@example.com"));
     assert_no_label_holds(&app, &secrets, "editor");
 
-    app.type_text("label:Add a guest", "an").expect("it types");
+    app.type_text("label:Guest's address, like name@company.com", "an")
+        .expect("it types");
     app.wait_for_within("label:Use this address", WAIT)
         .expect("it suggests");
     assert_no_label_holds(&app, &secrets, "suggestions");

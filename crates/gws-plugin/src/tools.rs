@@ -99,6 +99,14 @@ pub const DRIVE_PREVIEW: &str = "gws_drive_preview";
 pub const DRIVE_CARD: &str = "gws_drive_card";
 pub const SEARCH_DRIVE: &str = "gws_search_drive";
 pub const READ_DOC_TEXT: &str = "gws_read_doc_text";
+pub const DRIVE_ACCESS: &str = "gws_drive_access";
+pub const DRIVE_UPLOAD: &str = "gws_drive_upload";
+pub const DRIVE_FOLDER: &str = "gws_drive_folder";
+pub const DRIVE_RENAME: &str = "gws_drive_rename";
+pub const DRIVE_MOVE: &str = "gws_drive_move";
+pub const DRIVE_TRASH: &str = "gws_drive_trash";
+pub const DRIVE_SHARE: &str = "gws_drive_share";
+pub const DRIVE_UNDO: &str = "gws_drive_undo";
 pub const FILE_OPEN: &str = "gws_file_open";
 pub const FILE_EDITS: &str = "gws_file_edits";
 pub const FILE_UPLOAD: &str = "gws_file_upload";
@@ -291,7 +299,7 @@ pub fn defs() -> Vec<Def> {
         },
         Def {
             name: UPLOAD_CHUNK,
-            description: "Part of a file to attach, held in memory until the draft's sent.",
+            description: "Part of a file to attach or upload, held in memory until it's sent.",
             input_schema: json!({"type": "object", "properties": {"upload": {"type": "string"}, "name": {"type": "string"}, "type": {"type": "string"}, "at": {"type": "integer"}, "data": {"type": "string"}}, "required": ["at", "data"]}),
             read_only: false,
             audience: APP_ONLY,
@@ -469,6 +477,49 @@ pub fn defs() -> Vec<Def> {
             audience: APP_ONLY,
             open_world: true,
         },
+        Def {
+            name: DRIVE_ACCESS,
+            description: "Everyone who has a file, each with their role, and a mark of the list as read.",
+            input_schema: json!({"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}),
+            read_only: true,
+            audience: APP_ONLY,
+            open_world: true,
+        },
+        write(
+            DRIVE_UPLOAD,
+            "Put a file the person picked into a folder of their Drive. A person's press alone.",
+            json!({"type": "object", "properties": {"upload": {"type": "string"}, "parent": {"type": "string"}}, "required": ["upload", "parent"]}),
+        ),
+        write(
+            DRIVE_FOLDER,
+            "Make a new folder. A person's press alone.",
+            json!({"type": "object", "properties": {"parent": {"type": "string"}, "name": {"type": "string"}}, "required": ["parent", "name"]}),
+        ),
+        write(
+            DRIVE_RENAME,
+            "Rename a file or folder. A person's press alone.",
+            json!({"type": "object", "properties": {"id": {"type": "string"}, "name": {"type": "string"}}, "required": ["id", "name"]}),
+        ),
+        write(
+            DRIVE_MOVE,
+            "Move a file or folder into another folder. A person's press alone.",
+            json!({"type": "object", "properties": {"id": {"type": "string"}, "to": {"type": "string"}}, "required": ["id", "to"]}),
+        ),
+        write(
+            DRIVE_TRASH,
+            "Move files to the Trash, never deleting any for good. A person's alone.",
+            json!({"type": "object", "properties": {"ids": {"type": "array", "items": {"type": "string"}, "maxItems": 100}}, "required": ["ids"]}),
+        ),
+        write(
+            DRIVE_SHARE,
+            "Share a file with people and take people off it, on the list the person read. A person's alone.",
+            json!({"type": "object", "properties": {"id": {"type": "string"}, "add": {"type": "array", "items": {"type": "object", "properties": {"email": {"type": "string"}, "role": {"type": "string", "enum": ["reader", "commenter", "writer"]}}, "required": ["email", "role"]}}, "remove": {"type": "array", "items": {"type": "string"}}, "message": {"type": "string"}, "seen": {"type": "string"}}, "required": ["id", "seen"]}),
+        ),
+        write(
+            DRIVE_UNDO,
+            "Put back exactly what a rename, a move or a trashing changed.",
+            json!({"type": "object", "properties": {"undo": {"type": "string"}}, "required": ["undo"]}),
+        ),
         write(
             FILE_OPEN,
             "Download a Drive file to this Mac for the Bot's viewer, a Google file as docx, xlsx or pptx. A person's press alone.",

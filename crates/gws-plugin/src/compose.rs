@@ -86,6 +86,12 @@ impl Uploads {
         id
     }
 
+    /// A whole file for Drive, which takes it from here: the press spends it,
+    /// so a second press can't send it twice and nothing stays in memory.
+    pub(crate) fn take(&mut self, id: &str) -> Option<Part> {
+        self.files.remove(id).map(|u| u.part)
+    }
+
     fn free_draft(&mut self, draft: &str) {
         self.files.retain(|_, u| u.draft.as_deref() != Some(draft));
     }
@@ -846,11 +852,14 @@ pub fn delete(core: &Core, args: &Value) -> Result<Value, Failure> {
 /// Who may be written to, when a test against a real account says: nobody but
 /// this address, checked before a request leaves. It's in every build, as that
 /// test needs a real one, and all it can do is narrow who mail goes to.
-fn only_to() -> Option<String> {
+pub(crate) fn only_to() -> Option<String> {
     std::env::var("GWS_ONLY_TO").ok().filter(|a| !a.is_empty())
 }
 
-fn outside<'a>(allowed: &str, recipients: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+pub(crate) fn outside<'a>(
+    allowed: &str,
+    recipients: impl Iterator<Item = &'a str>,
+) -> Option<&'a str> {
     let mut recipients = recipients;
     recipients.find(|r| !r.eq_ignore_ascii_case(allowed))
 }

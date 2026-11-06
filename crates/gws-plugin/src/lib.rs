@@ -64,6 +64,8 @@ pub struct Core {
     pub pushed: std::sync::atomic::AtomicBool,
     /// What a person's actions changed, for Undo.
     pub undos: Mutex<mail::Undos>,
+    /// The same for Drive.
+    pub drive_undos: Mutex<drive::write::Undos>,
     /// Drafts the model wrote and the person hasn't touched.
     pub model_drafts: Mutex<std::collections::HashSet<String>>,
     /// Files on their way into a draft: memory only, like a key.
@@ -102,6 +104,7 @@ impl Core {
             sync: mail::Waker::default(),
             tickets: Mutex::default(),
             undos: Mutex::default(),
+            drive_undos: Mutex::default(),
             model_drafts: Mutex::default(),
             uploads: Mutex::default(),
             armed: Mutex::default(),
@@ -143,6 +146,7 @@ impl Core {
         mail::run(self, tool, args)
             .or_else(|| calendar::run(self, tool, args))
             .or_else(|| drive::run(self, tool, args))
+            .or_else(|| drive::write::run(self, tool, args))
             .or_else(|| files::run(self, tool, args))
             .unwrap_or_else(|| tools::run(&self.gmail, &self.accounts, tool, args))
     }

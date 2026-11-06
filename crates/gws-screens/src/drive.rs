@@ -1,7 +1,8 @@
 //! Drive: a side column, a header and a folder as a list or a grid, with a
 //! file's details beside them. A press on a file opens it in the Bot's viewer;
-//! `edits.rs` has that, and the only presses here that write to Drive. The
-//! details stay a press away, on each row's own Details.
+//! `edits.rs` has that and what comes back from it. `write.rs`, `mover.rs` and
+//! `share.rs` have the presses that change Drive. The details stay a press away,
+//! on each row's own Details.
 //!
 //! The label rule is Mail's (see the top of `mail.rs`): a press or a row has a
 //! fixed `label`, and what's the person's own goes in `accessibility_value` and
@@ -12,6 +13,9 @@ mod detail;
 mod edits;
 mod file;
 mod list;
+mod mover;
+mod share;
+mod write;
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -117,6 +121,27 @@ struct Drive {
     storage: Signal<Option<String>>,
     account: Signal<Account>,
     seq: Signal<i64>,
+    /// What's being renamed, moved, shared or made.
+    acting: Signal<Option<write::Acting>>,
+    /// Which opening of that it is. Only `start_acting` and `stop_acting` move it.
+    opening: Latest,
+    /// The name being typed for that.
+    typed: Signal<String>,
+    /// A write is on its way, so nothing presses it twice.
+    writing: Signal<bool>,
+    /// What can be undone, and what to say about it.
+    undo: Signal<Option<(String, String)>>,
+    /// The undo already pressed, while it waits for its answer.
+    undoing: Signal<Option<String>>,
+    /// The list is one folder, and Google lets a new file go in it.
+    here_adds: Signal<bool>,
+    /// That folder's id, as a file's parents say it.
+    here: Signal<Option<String>>,
+    /// Files picked for upload and still to land.
+    sending: Signal<Vec<write::Sending>>,
+    next_send: Signal<u64>,
+    mover: mover::Mover,
+    sharing: share::Sharing,
     /// Reads started by a press, each run on its own: what they were pressed on
     /// can be rebuilt, and a task dies with its view.
     reads: Signal<UnboundedSender<Job>>,
@@ -204,6 +229,10 @@ fn show_answer(m: Drive, v: &Value) {
     if m.search.with_untracked(Option::is_none) && v.get("path").is_some() {
         m.path.set(path_in(v));
     }
+    m.here_adds
+        .set(v.get("can_add") == Some(&Value::Bool(true)));
+    m.here
+        .set(v.get("at").and_then(Value::as_str).map(str::to_owned));
     m.problem.set(None);
 }
 
@@ -359,6 +388,10 @@ fn start_over(b: &Bridge, m: Drive) {
     // now, not when the load's turn comes: an old answer could land between
     m.list_turn.ask();
     close_details(m);
+    // a name being typed for a folder is for the folder that's going
+    write::stop_acting(m);
+    m.here_adds.set(false);
+    m.here.set(None);
     m.rows.set(Vec::new());
     m.more.set(false);
     m.saved.set(false);
@@ -540,9 +573,11 @@ fn across(m: Drive) -> usize {
     }
 }
 
-/// The details are over the rows, so the keys have nothing to move.
+/// The details are over the rows, or something is being done to them, so the
+/// keys have nothing to move.
 fn rows_covered(m: Drive) -> bool {
-    m.open.with_untracked(Option::is_some) && window().width.0 < DETAILS_FROM
+    m.acting.with_untracked(Option::is_some)
+        || (m.open.with_untracked(Option::is_some) && window().width.0 < DETAILS_FROM)
 }
 
 fn keys(b: Bridge, m: Drive) {
@@ -586,7 +621,7 @@ fn keys(b: Bridge, m: Drive) {
                 .with_untracked(|r| r.iter().find(|r| r.id == id).cloned())
         })
     };
-    let details = b.clone();
+    let (details, back) = (b.clone(), b.clone());
     on_key_with("enter", options, move |_| {
         if let Some(row) = chosen().filter(|_| free()) {
             open_row(&b, m, row);
@@ -600,6 +635,20 @@ fn keys(b: Bridge, m: Drive) {
     on_key_with("/", options, move |_| {
         if free() {
             m.search_box.focus();
+        }
+    });
+    let once = KeyOptions {
+        when: When::NotEditing,
+        repeat: false,
+    };
+    on_key_with("f2", once, move |_| {
+        if free() {
+            write::start_rename(m);
+        }
+    });
+    on_key_with("cmd+z", once, move |_| {
+        if free() {
+            write::undo(&back, m);
         }
     });
 }
@@ -790,9 +839,19 @@ fn notice(b: Bridge, m: Drive) -> impl IntoElement {
 fn rows_and_details(b: Bridge, m: Drive) -> impl IntoElement {
     let beside = computed(|| window().width.0 >= DETAILS_FROM);
     let open = computed(move || m.open.with(Option::is_some));
-    let covered = computed(move || open.get() && !beside.get());
+    let panel = computed(move || m.acting.with(write::Acting::panel));
+    let covered = computed(move || panel.get() || (open.get() && !beside.get()));
+    let over = b.clone();
     view()
         .app_class(Some("flex-1 flex-row min-h-0".into()))
+        .child(dynamic(move || {
+            if !panel.get() {
+                return view();
+            }
+            view()
+                .app_class(Some("flex-1 min-w-0".into()))
+                .child(write::panel(over.clone(), m))
+        }))
         .child(dynamic(move || {
             if covered.get() {
                 return view();
@@ -807,7 +866,7 @@ fn rows_and_details(b: Bridge, m: Drive) -> impl IntoElement {
                 .child(list::body(b.clone(), m))
         }))
         .child(dynamic(move || {
-            if !open.get() {
+            if !open.get() || panel.get() {
                 return view();
             }
             let place = if beside.get() {
@@ -822,7 +881,7 @@ fn rows_and_details(b: Bridge, m: Drive) -> impl IntoElement {
 fn screen(b: Bridge, m: Drive) -> impl IntoElement {
     let wide = computed(|| window().width.0 >= SIDE_FROM);
     let (top, trail, head, line, body) = (b.clone(), b.clone(), b.clone(), b.clone(), b.clone());
-    let (said, edited) = (b.clone(), b.clone());
+    let (said, edited, writes) = (b.clone(), b.clone(), b.clone());
     let main = view()
         .app_class(Some(format!("flex-1 min-w-0 {PANEL}").into()))
         .child(dynamic(move || {
@@ -837,6 +896,7 @@ fn screen(b: Bridge, m: Drive) -> impl IntoElement {
         .child(notice(line, m))
         .child(edits::said_line(said, m))
         .child(edits::bars(edited, m))
+        .child(write::bars(writes, m))
         .child(rows_and_details(body, m));
     view()
         .app_class(Some("flex-1 flex-row".into()))
@@ -906,6 +966,18 @@ pub fn build(bridge: Bridge) -> Root {
             pressed: signal(HashSet::new()),
             said: signal(None),
             discarding: signal(None),
+            acting: signal(None),
+            opening: Latest::new(),
+            typed: signal(String::new()),
+            writing: signal(false),
+            undo: signal(None),
+            undoing: signal(None),
+            here_adds: signal(false),
+            here: signal(None),
+            sending: signal(Vec::new()),
+            next_send: signal(0),
+            mover: mover::Mover::new(),
+            sharing: share::Sharing::new(),
             file_turn: Latest::new(),
             facts: signal(FactsState::Reading),
             preview: signal(Preview::Reading),

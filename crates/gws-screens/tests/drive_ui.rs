@@ -6,7 +6,7 @@
 //! and inside a scroll view nothing is clipped across at all. So width tests
 //! read the frames the engine really gave, through [`Frames`].
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,6 +23,18 @@ const LONG_NAME: &str = "A very long file name for a quarterly planning spreadsh
 const LONG_OWNER: &str = "Maria Concepcion Fernandez de la Cruz y Villanueva Santos";
 /// One pixel, as an image's first bytes must be: the screen looks at them.
 const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABpfZFQAAAAABJRU5ErkJggg==";
+/// What the Bot says, word for word, when a press came from the AI.
+const AI_REFUSED: &str = "Only a person can do this in Google Workspace, and this press came from the AI, so nothing was sent. To go ahead, press it yourself.";
+/// Every call that changes Drive.
+const WRITES: [&str; 7] = [
+    "gws_drive_upload",
+    "gws_drive_folder",
+    "gws_drive_rename",
+    "gws_drive_move",
+    "gws_drive_trash",
+    "gws_drive_share",
+    "gws_drive_undo",
+];
 
 fn file(id: &str, name: &str, kind: &str, owner: &str) -> Value {
     json!({
@@ -118,6 +130,28 @@ struct Fake {
     uploads: Mutex<HashMap<String, Value>>,
     /// An open's failure, as the Bot reports it.
     open_fails: Mutex<Option<BuwizError>>,
+    /// A press of the AI's: every write is refused as the Bot refuses it.
+    ai: Mutex<bool>,
+    /// A write's failure, as the Bot reports a failed tool.
+    write_fails: Mutex<Option<String>>,
+    /// In place of a good answer, by tool.
+    write_answers: Mutex<HashMap<String, Value>>,
+    /// What writes did to the rows, so a list read after one shows it.
+    renamed: Mutex<HashMap<String, String>>,
+    gone: Mutex<HashSet<String>>,
+    /// New rows, by the folder they're in, or "root".
+    added: Mutex<HashMap<String, Vec<Value>>>,
+    /// A folder's `can_add`, where it's refused, and where it's `at`.
+    no_add: Mutex<HashSet<String>>,
+    /// What `gws_drive_access` answers, by file.
+    access: Mutex<HashMap<String, Value>>,
+    access_fails: Mutex<Option<String>>,
+    /// The files a pick gives, and the bytes behind each.
+    picks: Mutex<Vec<(String, Vec<u8>)>>,
+    no_picks: Mutex<bool>,
+    /// Bytes as they came, by upload.
+    chunks: Mutex<HashMap<String, Vec<u8>>>,
+    uploaded: Mutex<Vec<(String, Vec<u8>, String)>>,
     calls: Mutex<Vec<(String, Value)>>,
     host: Mutex<Vec<(String, Value)>>,
     hold: Mutex<Vec<String>>,
@@ -162,12 +196,138 @@ impl Fake {
         let skip = args["skip"].as_u64().unwrap_or(0) as usize;
         let rows = self.rows.lock().unwrap().clone();
         let all = rows.unwrap_or_else(|| all_rows(args));
+        let gone = self.gone.lock().unwrap().clone();
+        let renamed = self.renamed.lock().unwrap().clone();
+        let folder = args["folder"].as_str();
+        let view = args["view"].as_str().unwrap_or_default();
+        let place = match folder {
+            Some(folder) => Some(folder),
+            None if view == "my" => Some("root"),
+            None => None,
+        };
+        let new = place
+            .and_then(|p| self.added.lock().unwrap().get(p).cloned())
+            .unwrap_or_default();
+        let all: Vec<Value> = all
+            .into_iter()
+            .chain(new)
+            .filter(|f| !gone.contains(f["id"].as_str().unwrap()))
+            .map(|mut f| {
+                if let Some(name) = renamed.get(f["id"].as_str().unwrap()) {
+                    f["name"] = json!(name);
+                }
+                f
+            })
+            .collect();
         let page: Vec<Value> = all.iter().skip(skip).take(PAGE).cloned().collect();
         let path = self.path.lock().unwrap().clone();
+        let can_add = place.is_some_and(|p| !self.no_add.lock().unwrap().contains(p));
         json!({
             "files": page, "more": skip + PAGE < all.len(), "saved": *self.saved.lock().unwrap(),
             "path": path.unwrap_or_else(|| path_of(args)),
+            "at": place, "can_add": can_add,
         })
+    }
+
+    /// A row as a write answers it, whatever list it's in.
+    fn written(&self, id: &str) -> Value {
+        let mut row = file(id, "Written", "file", "me");
+        if let Some(name) = self.renamed.lock().unwrap().get(id) {
+            row["name"] = json!(name);
+        }
+        row
+    }
+
+    fn write(&self, tool: &str, args: &Value) -> Value {
+        if let Some(answer) = self.write_answers.lock().unwrap().get(tool) {
+            return answer.clone();
+        }
+        let id = args["id"].as_str().unwrap_or_default();
+        match tool {
+            "gws_drive_rename" => {
+                let name = args["name"].as_str().unwrap().to_owned();
+                self.renamed.lock().unwrap().insert(id.to_owned(), name);
+                json!({"undo": "du1", "files": [self.written(id)]})
+            }
+            "gws_drive_move" => {
+                self.gone.lock().unwrap().insert(id.to_owned());
+                json!({"undo": "du2", "files": [self.written(id)]})
+            }
+            "gws_drive_trash" => {
+                let ids = args["ids"].as_array().unwrap();
+                let mut rows = Vec::new();
+                for id in ids {
+                    let id = id.as_str().unwrap();
+                    self.gone.lock().unwrap().insert(id.to_owned());
+                    let mut row = self.written(id);
+                    row["trashed"] = json!(true);
+                    rows.push(row);
+                }
+                json!({"undo": "du3", "files": rows})
+            }
+            "gws_drive_undo" => {
+                self.gone.lock().unwrap().clear();
+                self.renamed.lock().unwrap().clear();
+                json!({"files": []})
+            }
+            "gws_drive_folder" => {
+                let name = args["name"].as_str().unwrap();
+                let row = file("made", name, "folder", "me");
+                let parent = args["parent"].as_str().unwrap().to_owned();
+                self.added
+                    .lock()
+                    .unwrap()
+                    .entry(parent)
+                    .or_default()
+                    .push(row.clone());
+                json!({"files": [row]})
+            }
+            "gws_drive_upload" => {
+                let upload = args["upload"].as_str().unwrap();
+                let bytes = self
+                    .chunks
+                    .lock()
+                    .unwrap()
+                    .remove(upload)
+                    .unwrap_or_default();
+                let parent = args["parent"].as_str().unwrap().to_owned();
+                let name = upload.strip_prefix("up:").unwrap_or(upload).to_owned();
+                let row = file(&format!("new-{name}"), &name, "file", "me");
+                self.uploaded
+                    .lock()
+                    .unwrap()
+                    .push((name, bytes, parent.clone()));
+                self.added
+                    .lock()
+                    .unwrap()
+                    .entry(parent)
+                    .or_default()
+                    .push(row.clone());
+                json!({"files": [row]})
+            }
+            "gws_drive_share" => {
+                let added = args["add"].as_array().map_or(0, Vec::len);
+                let removed = args["remove"].as_array().map_or(0, Vec::len);
+                json!({"added": added, "removed": removed, "files": [self.written(id)]})
+            }
+            other => panic!("not a write: {other}"),
+        }
+    }
+
+    fn who_has(&self, id: &str) -> Value {
+        self.access
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| {
+                json!({"seen": "mark-1", "people": [
+                    {"id": "p-me", "kind": "user", "name": "Owner Fake", "email": "owner@example.com", "role": "owner", "you": true, "removable": false},
+                    {"id": "p-ana", "kind": "user", "name": "Ana Reyes", "email": "ana@example.com", "role": "writer", "you": false, "removable": true},
+                    {"id": "p-ben", "kind": "user", "name": "", "email": "ben@example.com", "role": "reader", "you": false, "removable": true},
+                    {"id": "anyoneWithLink", "kind": "anyone", "name": "Anyone with the link", "email": "", "role": "reader", "you": false, "removable": false},
+                ]})
+            })
     }
 
     fn details(&self, id: &str) -> Value {
@@ -207,7 +367,11 @@ impl Host for Fake {
         let props = if props.is_null() { json!({}) } else { props };
         let p = json!({
             "props": props, "app": {"plugin": "app.buwiz.google-workspace", "app": "drive"},
-            "granted": ["buwiz.call", "buwiz.open"],
+            "granted": if *self.no_picks.lock().unwrap() {
+                json!(["buwiz.call", "buwiz.open"])
+            } else {
+                json!(["buwiz.call", "buwiz.open", "buwiz.pickFile"])
+            },
             "viewport": {"width": 1000, "height": 600, "placement": placement},
         });
         p.as_object().unwrap().clone()
@@ -216,6 +380,24 @@ impl Host for Fake {
     fn post(&self, _: &str, _: Value) {}
 
     fn call(&self, method: &str, data: Value, done: Done) {
+        if method == "buwiz.pickFile" {
+            let picks = self.picks.lock().unwrap();
+            if let Some(id) = data["read"].as_str() {
+                let at: usize = id.parse().unwrap();
+                let bytes = &picks[at].1;
+                use base64::Engine as _;
+                let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+                return done(Ok(json!(data)));
+            }
+            let files: Vec<Value> = picks
+                .iter()
+                .enumerate()
+                .map(|(at, (name, bytes))| {
+                    json!({"id": at.to_string(), "name": name, "size": bytes.len(), "type": "text/plain"})
+                })
+                .collect();
+            return done(Ok(json!(files)));
+        }
         if method != "buwiz.call" {
             self.host.lock().unwrap().push((method.to_owned(), data));
             return done(Ok(Value::Null));
@@ -225,7 +407,42 @@ impl Host for Fake {
             .lock()
             .unwrap()
             .push((tool.to_owned(), args.clone()));
+        if WRITES.contains(&tool) {
+            if *self.ai.lock().unwrap() {
+                return done(Err(BuwizError::new("permission_denied", false, AI_REFUSED)));
+            }
+            if let Some(why) = self.write_fails.lock().unwrap().clone() {
+                return done(Err(BuwizError::new("tool_error", false, why)));
+            }
+        }
         let (name, answer) = match tool {
+            tool if WRITES.contains(&tool) => (format!("write:{tool}"), self.write(tool, args)),
+            "gws_upload_chunk" => {
+                let upload = args["upload"].as_str().map_or_else(
+                    || format!("up:{}", args["name"].as_str().unwrap()),
+                    str::to_owned,
+                );
+                use base64::Engine as _;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(args["data"].as_str().unwrap())
+                    .unwrap();
+                let mut chunks = self.chunks.lock().unwrap();
+                let held = chunks.entry(upload.clone()).or_default();
+                held.extend_from_slice(&bytes);
+                (String::new(), json!({"upload": upload, "size": held.len()}))
+            }
+            "gws_upload_drop" => {
+                let upload = args["upload"].as_str().unwrap();
+                self.chunks.lock().unwrap().remove(upload);
+                (String::new(), json!({"dropped": true}))
+            }
+            "gws_drive_access" => {
+                if let Some(why) = self.access_fails.lock().unwrap().clone() {
+                    return done(Err(BuwizError::new("tool_error", false, why)));
+                }
+                let id = args["id"].as_str().unwrap();
+                (format!("access:{id}"), self.who_has(id))
+            }
             "gws_status" => (
                 String::new(),
                 self.status.lock().unwrap().clone().unwrap_or_else(
@@ -355,12 +572,15 @@ fn a_card() -> Value {
 
 /// A view's parent, its left edge there and its width.
 type Placed = (Option<NodeId>, f32, f32);
+/// A view's top edge in its parent, and its height.
+type Tall = (f32, f32);
 
 /// Where the engine put every view, read from what it told the platform, and
 /// each image it was asked to show.
 #[derive(Clone, Default)]
 struct Frames {
     views: Arc<Mutex<HashMap<NodeId, Placed>>>,
+    tall: Arc<Mutex<HashMap<NodeId, Tall>>>,
     images: Arc<Mutex<Vec<String>>>,
     /// Each text's view, by what it reads now.
     texts: Arc<Mutex<HashMap<NodeId, String>>>,
@@ -369,8 +589,10 @@ struct Frames {
 impl Frames {
     fn watch(&self, app: &mut Headless) {
         let (views, images, texts) = (self.views.clone(), self.images.clone(), self.texts.clone());
+        let tall = self.tall.clone();
         app.observe(move |_, batch| {
             let mut views = views.lock().unwrap();
+            let mut tall = tall.lock().unwrap();
             let mut texts = texts.lock().unwrap();
             for item in &batch.items {
                 match item {
@@ -380,6 +602,7 @@ impl Frames {
                     MountItem::Frame { id, frame } => {
                         let view = views.entry(*id).or_default();
                         (view.1, view.2) = (frame.origin.x.0, frame.size.width.0);
+                        tall.insert(*id, (frame.origin.y.0, frame.size.height.0));
                     }
                     MountItem::Text { id, text, .. } => {
                         texts.insert(*id, text.text.clone());
@@ -414,6 +637,18 @@ impl Frames {
         let views = self.views.lock().unwrap();
         let (parent, _, width) = views[&id];
         (width, views[&parent.expect("a parent")].2)
+    }
+
+    /// `id`'s top and bottom edges on screen, as if nothing scrolled.
+    fn heights(&self, id: NodeId) -> (f32, f32) {
+        let (views, tall) = (self.views.lock().unwrap(), self.tall.lock().unwrap());
+        let (mut top, height) = *tall.get(&id).expect("a view with a frame");
+        let mut parent = views.get(&id).and_then(|v| v.0);
+        while let Some(at) = parent {
+            top += tall.get(&at).map_or(0.0, |t| t.0);
+            parent = views.get(&at).and_then(|v| v.0);
+        }
+        (top, top + height)
     }
 
     /// `id`'s left and right edges on screen.
@@ -1935,6 +2170,19 @@ fn each_button_makes_its_own_call_and_the_bar_goes_with_the_file() {
     }
 }
 
+/// The AI's view drops a button whose name its text doesn't repeat, so these
+/// stay out of its reach: with the panel open it mustn't stage who's shared with.
+#[test]
+fn the_share_list_presses_say_less_than_their_labels() {
+    let (mut app, _fake) = start();
+    open_share(&mut app);
+    assert!(app.screen().matches("label:Add this person").unwrap());
+    assert!(!app.screen().shows("Add this person"));
+    assert!(app.screen().shows("Add"));
+    assert!(!app.screen().shows("Take this person off"));
+    assert!(app.screen().shows("Remove"));
+}
+
 #[test]
 fn keeping_the_edits_after_discard_asks_changes_nothing() {
     let (mut app, fake, _) =
@@ -2094,7 +2342,8 @@ fn assert_no_label_holds(app: &Headless, secrets: &[&str], at: &str) {
         );
     }
     assert!(
-        !app.screen().matches("label:/@/").unwrap(),
+        // the one fixed sample address keeps the AI out of the guest field
+        !app.screen().matches("label:/@example/").unwrap(),
         "{at}: a label holds an address"
     );
 }
@@ -2296,4 +2545,1677 @@ fn a_cards_presses_and_long_values_stay_whole_at_every_width() {
     for (_, right) in owners {
         assert!(right <= 100.5, "a long owner runs to {right}");
     }
+}
+
+// --- Writing: what's offered -------------------------------------------------
+
+/// Moves the cursor to row `n`, from nothing picked.
+fn pick_nth(app: &mut Headless, n: usize) {
+    for _ in 0..=n {
+        app.press_key("down").expect("the key presses");
+    }
+    settle(app);
+}
+
+fn with_can(mut row: Value, can: &[&str]) -> Value {
+    row["can"] = json!(can);
+    row
+}
+
+const ROW_PRESSES: [&str; 4] = [
+    "label:Rename",
+    "label:Move",
+    "label:Share",
+    "label:Move to trash",
+];
+const FOLDER_PRESSES: [&str; 2] = ["label:New folder", "label:Upload a file to Google Drive"];
+
+fn offered(app: &Headless, selectors: &[&str]) -> Vec<String> {
+    selectors
+        .iter()
+        .filter(|s| app.screen().matches(s).unwrap())
+        .map(|s| (*s).to_owned())
+        .collect()
+}
+
+#[test]
+fn a_picked_row_gets_its_presses_and_a_folder_its_own() {
+    let (mut app, _) = start();
+    assert_eq!(offered(&app, &FOLDER_PRESSES), FOLDER_PRESSES);
+    assert_eq!(offered(&app, &ROW_PRESSES), Vec::<String>::new());
+    pick_nth(&mut app, 3);
+    assert_eq!(offered(&app, &ROW_PRESSES), ROW_PRESSES);
+}
+
+#[test]
+fn only_a_folder_that_takes_files_offers_a_new_one() {
+    let (mut app, fake) = start();
+    for view in ["Shared", "Recent", "Starred", "Trash"] {
+        press(&mut app, &format!("label:{view}"));
+        assert_eq!(
+            offered(&app, &FOLDER_PRESSES),
+            Vec::<String>::new(),
+            "{view}"
+        );
+    }
+    press(&mut app, "label:My Drive");
+    assert_eq!(offered(&app, &FOLDER_PRESSES), FOLDER_PRESSES);
+    fake.no_add.lock().unwrap().insert("clients".to_owned());
+    open(&mut app, "Clients");
+    assert_eq!(
+        offered(&app, &FOLDER_PRESSES),
+        Vec::<String>::new(),
+        "Google says this folder takes nothing new"
+    );
+    press(&mut app, "label:Shared");
+    open(&mut app, "From Ben");
+    assert_eq!(offered(&app, &FOLDER_PRESSES), FOLDER_PRESSES);
+}
+
+#[test]
+fn a_search_offers_no_folder_to_put_a_file_in() {
+    let (mut app, _) = start();
+    app.type_text("label:Search Google Drive", "found").unwrap();
+    app.submit("label:Search Google Drive").unwrap();
+    settle(&mut app);
+    assert_eq!(offered(&app, &FOLDER_PRESSES), Vec::<String>::new());
+}
+
+#[test]
+fn a_shared_file_the_person_cant_change_offers_no_press_and_f2_does_nothing() {
+    let fake = Arc::new(Fake::default());
+    *fake.rows.lock().unwrap() = Some(vec![
+        with_can(file("read", "Read only", "doc", "Ana Reyes"), &[]),
+        with_can(file("name", "Rename only", "doc", "Ana Reyes"), &["rename"]),
+    ]);
+    let (mut app, _) = open_app(fake.clone(), 1000.0, 600.0);
+    app.wait_for_within("text:Read only", WAIT).unwrap();
+    settle(&mut app);
+    pick_nth(&mut app, 0);
+    assert_eq!(offered(&app, &ROW_PRESSES), Vec::<String>::new());
+    assert!(app.screen().shows("You can't change this here."));
+    key(&mut app, "f2");
+    assert!(
+        !app.screen().matches("label:New name").unwrap(),
+        "no rename"
+    );
+    key(&mut app, "down");
+    assert_eq!(offered(&app, &ROW_PRESSES), ["label:Rename"]);
+    for tool in WRITES {
+        assert!(fake.called(tool).is_empty(), "{tool}");
+    }
+}
+
+#[test]
+fn many_picked_can_go_to_the_trash_and_a_rename_is_for_one() {
+    let (mut app, _) = start();
+    pick_nth(&mut app, 3);
+    key(&mut app, "shift+down");
+    assert_eq!(offered(&app, &ROW_PRESSES), ["label:Move to trash"]);
+    assert!(app.screen().shows("Move 2 to trash"));
+    key(&mut app, "f2");
+    assert!(!app.screen().matches("label:New name").unwrap());
+}
+
+#[test]
+fn one_file_the_person_cant_trash_takes_the_press_from_all_that_are_picked() {
+    let fake = Arc::new(Fake::default());
+    let all = ["rename", "move", "share", "trash"];
+    *fake.rows.lock().unwrap() = Some(vec![
+        with_can(file("mine", "Mine", "doc", "me"), &all),
+        with_can(file("theirs", "Theirs", "doc", "Ana Reyes"), &["rename"]),
+    ]);
+    let (mut app, _) = open_app(fake, 1000.0, 600.0);
+    app.wait_for_within("text:Mine", WAIT).unwrap();
+    settle(&mut app);
+    pick_nth(&mut app, 0);
+    assert!(app.screen().matches("label:Move to trash").unwrap());
+    key(&mut app, "shift+down");
+    assert!(!app.screen().matches("label:Move to trash").unwrap());
+}
+
+#[test]
+fn what_is_in_the_trash_has_no_presses() {
+    let (mut app, _) = start();
+    press(&mut app, "label:Trash");
+    key(&mut app, "down");
+    assert_eq!(selected(&app), [0]);
+    assert_eq!(offered(&app, &ROW_PRESSES), Vec::<String>::new());
+    assert!(!app.screen().shows("You can't change this here."));
+}
+
+// --- Writing: rename, new folder ---------------------------------------------
+
+#[test]
+fn f2_renames_the_row_picked_and_it_shows_with_no_wait() {
+    let (mut app, fake) = start();
+    pick_nth(&mut app, 3);
+    key(&mut app, "f2");
+    assert_eq!(
+        app.screen().input_text("label:New name").unwrap().unwrap(),
+        "Notes"
+    );
+    app.clear("label:New name").unwrap();
+    app.type_text("label:New name", "Better notes").unwrap();
+    app.submit("label:New name").unwrap();
+    settle(&mut app);
+    assert_eq!(
+        fake.called("gws_drive_rename"),
+        [json!({"id": "notes", "name": "Better notes"})]
+    );
+    assert!(
+        app.screen().shows("Better notes"),
+        "{:?}",
+        app.screen().texts()
+    );
+    assert!(!app.screen().matches("label:New name").unwrap());
+    assert!(app.screen().shows("Renamed."));
+}
+
+#[test]
+fn the_rename_press_does_what_f2_does_and_a_name_that_didnt_change_writes_nothing() {
+    let (mut app, fake) = start();
+    pick_nth(&mut app, 3);
+    press(&mut app, "label:Rename");
+    assert!(app.screen().matches("label:New name").unwrap());
+    press(&mut app, "label:Save this name");
+    assert!(fake.called("gws_drive_rename").is_empty());
+    assert!(!app.screen().matches("label:New name").unwrap());
+    press(&mut app, "label:Rename");
+    app.clear("label:New name").unwrap();
+    press(&mut app, "label:Save this name");
+    assert!(app.screen().shows("Type a name first."));
+    assert!(fake.called("gws_drive_rename").is_empty());
+    press(&mut app, "label:Cancel this");
+    assert!(!app.screen().matches("label:New name").unwrap());
+    assert!(app.screen().shows("Notes"));
+}
+
+#[test]
+fn f2_and_undo_stay_out_of_a_field() {
+    let (mut app, fake) = start();
+    pick_nth(&mut app, 3);
+    key(&mut app, "f2");
+    app.clear("label:New name").unwrap();
+    app.type_text("label:New name", "Renamed").unwrap();
+    app.submit("label:New name").unwrap();
+    settle(&mut app);
+    key(&mut app, "/");
+    key(&mut app, "f2");
+    key(&mut app, "cmd+z");
+    assert!(
+        !app.screen().matches("label:New name").unwrap(),
+        "no rename"
+    );
+    assert!(fake.called("gws_drive_undo").is_empty(), "no undo");
+}
+
+#[test]
+fn keys_leave_the_rows_alone_while_a_name_is_being_typed() {
+    let (mut app, fake) = start();
+    pick_nth(&mut app, 3);
+    key(&mut app, "f2");
+    for k in ["down", "up", "shift+down", "f2", "cmd+z"] {
+        key(&mut app, k);
+    }
+    assert_eq!(selected(&app), [3]);
+    assert!(fake.called("gws_drive_undo").is_empty());
+}
+
+#[test]
+fn a_rename_google_refuses_changes_nothing_says_why_and_can_be_tried_again() {
+    let (mut app, fake) = start();
+    pick_nth(&mut app, 3);
+    key(&mut app, "f2");
+    app.clear("label:New name").unwrap();
+    app.type_text("label:New name", "Other").unwrap();
+    fake.write_answers.lock().unwrap().insert(
+        "gws_drive_rename".to_owned(),
+        json!({"refused": "no_access", "message": "This account can't do that in Google Drive, so nothing changed."}),
+    );
+    let reads = fake.called("gws_drive_list").len();
+    app.submit("label:New name").unwrap();
+    settle(&mut app);
+    assert!(
+        app.screen()
+            .shows("This account can't do that in Google Drive, so nothing changed.")
+    );
+    assert!(app.screen().shows("Notes"), "the row as it was");
+    assert!(
+        !app.screen().matches("label:Undo that").unwrap(),
+        "nothing to undo"
+    );
+    assert_eq!(
+        app.screen().input_text("label:New name").unwrap().unwrap(),
+        "Other",
+        "what was typed stays"
+    );
+    assert_eq!(
+        fake.called("gws_drive_list").len(),
+        reads,
+        "nothing read again"
+    );
+    fake.write_answers.lock().unwrap().clear();
+    app.submit("label:New name").unwrap();
+    settle(&mut app);
+    assert!(app.screen().shows("Other"));
+}
+
+#[test]
+fn a_new_folder_goes_in_the_folder_that_is_open_and_shows() {
+    let (mut app, fake) = start();
+    press(&mut app, "label:New folder");
+    assert_eq!(
+        app.screen()
+            .input_text("label:Folder name")
+            .unwrap()
+            .unwrap(),
+        "",
+        "a new one starts empty"
+    );
+    app.type_text("label:Folder name", "Quotes").unwrap();
+    press(&mut app, "label:Make this folder");
+    assert_eq!(
+        fake.called("gws_drive_folder"),
+        [json!({"parent": "root", "name": "Quotes"})]
+    );
+    assert!(app.screen().shows("Quotes"));
+    assert!(app.screen().shows("Made a new folder on Google Drive."));
+
+    open(&mut app, "Clients");
+    press(&mut app, "label:New folder");
+    app.type_text("label:Folder name", "Inner").unwrap();
+    app.submit("label:Folder name").unwrap();
+    settle(&mut app);
+    assert_eq!(
+        last_of(&fake, "gws_drive_folder"),
+        json!({"parent": "clients", "name": "Inner"})
+    );
+}
+
+#[test]
+fn a_name_half_typed_goes_with_the_folder_it_was_for() {
+    let (mut app, fake) = start();
+    press(&mut app, "label:New folder");
+    app.type_text("label:Folder name", "For My Drive").unwrap();
+    press(&mut app, "label:Starred");
+    assert!(!app.screen().matches("label:Folder name").unwrap());
+    assert!(fake.called("gws_drive_folder").is_empty());
+}
+
+// --- Writing: Undo -----------------------------------------------------------
+
+fn rename_notes(app: &mut Headless) {
+    pick_nth(app, 3);
+    key(app, "f2");
+    app.clear("label:New name").unwrap();
+    app.type_text("label:New name", "Better notes").unwrap();
+    app.submit("label:New name").unwrap();
+    settle(app);
+}
+
+#[test]
+fn undo_puts_a_rename_back_by_its_press_and_by_cmd_z() {
+    let (mut app, fake) = start();
+    rename_notes(&mut app);
+    press(&mut app, "label:Undo that");
+    assert_eq!(fake.called("gws_drive_undo"), [json!({"undo": "du1"})]);
+    assert!(app.screen().shows("Notes"));
+    assert!(!app.screen().shows("Better notes"));
+    assert!(!app.screen().matches("label:Undo that").unwrap(), "spent");
+
+    let (mut app, fake) = start();
+    rename_notes(&mut app);
+    key(&mut app, "cmd+z");
+    assert_eq!(fake.called("gws_drive_undo"), [json!({"undo": "du1"})]);
+    assert!(app.screen().shows("Notes"));
+    key(&mut app, "cmd+z");
+    assert_eq!(
+        fake.called("gws_drive_undo").len(),
+        1,
+        "nothing left to undo"
+    );
+}
+
+#[test]
+fn a_second_undo_while_the_first_is_on_its_way_is_no_second_call() {
+    let (mut app, fake) = start();
+    rename_notes(&mut app);
+    fake.hold("write:gws_drive_undo");
+    press(&mut app, "label:Undo that");
+    key(&mut app, "cmd+z");
+    assert_eq!(fake.called("gws_drive_undo").len(), 1);
+    fake.release("write:gws_drive_undo");
+}
+
+#[test]
+fn an_undo_that_fails_keeps_the_bar_changes_nothing_and_says_why() {
+    let (mut app, fake) = start();
+    rename_notes(&mut app);
+    *fake.write_fails.lock().unwrap() = Some("Google Drive is busy right now.".to_owned());
+    press(&mut app, "label:Undo that");
+    assert!(app.screen().shows("Google Drive is busy right now."));
+    assert!(app.screen().shows("Better notes"), "the row as it was");
+    assert!(app.screen().matches("label:Undo that").unwrap());
+    *fake.write_fails.lock().unwrap() = None;
+    press(&mut app, "label:Undo that");
+    assert!(app.screen().shows("Notes"));
+}
+
+// --- Writing: the Trash ------------------------------------------------------
+
+#[test]
+fn trash_takes_every_row_picked_and_undo_brings_them_back() {
+    let (mut app, fake) = start();
+    pick_nth(&mut app, 3);
+    key(&mut app, "shift+down");
+    key(&mut app, "shift+down");
+    press(&mut app, "label:Move to trash");
+    assert_eq!(
+        fake.called("gws_drive_trash"),
+        [json!({"ids": ["notes", "budget", "photo"]})]
+    );
+    for gone in ["Notes", "Budget.xlsx", "Photo.png"] {
+        assert!(!app.screen().shows(gone), "{gone}");
+    }
+    assert!(app.screen().shows("Film.mp4"));
+    assert!(app.screen().shows("Moved 3 items to Trash."));
+    assert_eq!(
+        selected(&app),
+        Vec::<usize>::new(),
+        "no pick of what's gone"
+    );
+    press(&mut app, "label:Undo that");
+    for back in ["Notes", "Budget.xlsx", "Photo.png"] {
+        assert!(app.screen().shows(back), "{back}");
+    }
+}
+
+#[test]
+fn a_trash_that_fails_changes_nothing_and_keeps_the_picks() {
+    let (mut app, fake) = start();
+    pick_nth(&mut app, 3);
+    key(&mut app, "shift+down");
+    *fake.write_fails.lock().unwrap() = Some("Google Drive is busy right now.".to_owned());
+    let reads = fake.called("gws_drive_list").len();
+    press(&mut app, "label:Move to trash");
+    assert!(app.screen().shows("Google Drive is busy right now."));
+    assert!(app.screen().shows("Notes") && app.screen().shows("Budget.xlsx"));
+    assert_eq!(selected(&app), [3, 4]);
+    assert!(!app.screen().matches("label:Undo that").unwrap());
+    assert_eq!(fake.called("gws_drive_list").len(), reads);
+}
+
+#[test]
+fn a_trash_that_went_partway_says_so_and_can_be_undone() {
+    let (mut app, fake) = start();
+    pick_nth(&mut app, 3);
+    key(&mut app, "shift+down");
+    fake.gone.lock().unwrap().insert("notes".to_owned());
+    fake.write_answers.lock().unwrap().insert(
+        "gws_drive_trash".to_owned(),
+        json!({"undo": "du9", "partial": true, "files": [file("notes", "Notes", "doc", "me")]}),
+    );
+    press(&mut app, "label:Move to trash");
+    assert!(
+        app.screen()
+            .shows("Only some of these went to the Trash. The rest didn't.")
+    );
+    assert!(!app.screen().shows("Notes"));
+    assert!(app.screen().shows("Budget.xlsx"));
+    press(&mut app, "label:Undo that");
+    assert_eq!(fake.called("gws_drive_undo"), [json!({"undo": "du9"})]);
+}
+
+#[test]
+fn a_press_on_trash_can_only_go_once_while_it_is_on_its_way() {
+    let (mut app, fake) = start();
+    pick_nth(&mut app, 3);
+    fake.hold("write:gws_drive_trash");
+    press(&mut app, "label:Move to trash");
+    press(&mut app, "label:Move to trash");
+    assert_eq!(fake.called("gws_drive_trash").len(), 1);
+    assert!(
+        app.screen().shows("Notes"),
+        "nothing moves until the answer"
+    );
+    fake.release("write:gws_drive_trash");
+}
+
+#[test]
+fn a_trashed_file_shut_in_the_details_closes_them() {
+    let (mut app, fake) = start();
+    details(&mut app, "Notes");
+    assert!(app.screen().matches("label:Close these details").unwrap());
+    fake.write_answers.lock().unwrap().insert(
+        "gws_drive_trash".to_owned(),
+        json!({"undo": "du9", "files": [{"id": "notes", "name": "Notes", "trashed": true}]}),
+    );
+    fake.gone.lock().unwrap().insert("notes".to_owned());
+    press(&mut app, "label:Move to trash");
+    assert!(!app.screen().matches("label:Close these details").unwrap());
+}
+
+#[test]
+fn a_search_loses_what_was_trashed_without_asking_google_again() {
+    let (mut app, fake) = start();
+    app.type_text("label:Search Google Drive", "found").unwrap();
+    app.submit("label:Search Google Drive").unwrap();
+    settle(&mut app);
+    assert!(app.screen().shows("Found file"));
+    key(&mut app, "down");
+    press(&mut app, "label:Move to trash");
+    assert!(!app.screen().shows("Found file"));
+    assert!(app.screen().shows("Found folder"));
+    assert_eq!(fake.called("gws_search_drive").len(), 1);
+}
+
+/// The Bot sends an AI's press out as the AI, and it's refused before any
+/// plugin code. The label an AI could read gets it no further than that.
+#[test]
+fn the_ais_press_on_any_write_changes_nothing_and_says_so() {
+    let (mut app, fake) = start();
+    pick_nth(&mut app, 3);
+    *fake.ai.lock().unwrap() = true;
+    press(&mut app, "label:Move to trash");
+    assert!(app.screen().shows(AI_REFUSED), "{:?}", app.screen().texts());
+    assert!(app.screen().shows("Notes"));
+    assert!(!app.screen().matches("label:Undo that").unwrap());
+    assert_eq!(selected(&app), [3]);
+    key(&mut app, "f2");
+    app.clear("label:New name").unwrap();
+    app.type_text("label:New name", "From the AI").unwrap();
+    press(&mut app, "label:Save this name");
+    assert!(app.screen().shows(AI_REFUSED));
+    assert!(app.screen().shows("Notes"));
+    assert!(!app.screen().shows("Renamed."));
+    assert!(fake.renamed.lock().unwrap().is_empty());
+    assert!(fake.gone.lock().unwrap().is_empty());
+}
+
+// --- Writing: the folder chooser ---------------------------------------------
+
+fn open_mover(app: &mut Headless) {
+    pick_nth(app, 3);
+    press(app, "label:Move");
+    app.wait_for_within("label:Go into this folder", WAIT)
+        .expect("the folders");
+    settle(app);
+}
+
+#[test]
+fn the_chooser_lists_folders_alone_and_never_what_is_moving() {
+    let (mut app, _) = start();
+    pick_nth(&mut app, 0);
+    press(&mut app, "label:Move");
+    settle(&mut app);
+    assert_eq!(app.screen().count("label:Go into this folder").unwrap(), 2);
+    assert!(app.screen().shows("Big folder") && app.screen().shows("Some folder"));
+    assert!(!app.screen().shows("Clients"), "not inside itself");
+    assert!(!app.screen().shows("Budget.xlsx"), "only folders");
+}
+
+#[test]
+fn a_move_goes_down_to_a_folder_and_there_and_back_up_the_trail() {
+    let (mut app, fake) = start();
+    open_mover(&mut app);
+    press(&mut app, "label:Go into this folder >> text:Clients");
+    assert!(app.screen().shows("Acme"), "{:?}", app.screen().texts());
+    assert!(app.screen().matches("label:Back to this folder").unwrap());
+    press(&mut app, "label:Go to My Drive");
+    assert!(app.screen().shows("Big folder"));
+    press(&mut app, "label:Go into this folder >> text:Clients");
+    press(&mut app, "label:Go into this folder >> text:Acme");
+    press(&mut app, "label:Back to this folder >> text:Clients");
+    assert!(app.screen().shows("Acme"));
+    press(&mut app, "label:Move here");
+    assert_eq!(
+        fake.called("gws_drive_move"),
+        [json!({"id": "notes", "to": "clients"})]
+    );
+    assert!(
+        !app.screen().matches("label:Move here").unwrap(),
+        "it closed"
+    );
+    assert!(!app.screen().shows("Notes"), "left the list");
+    assert!(app.screen().shows("Moved."));
+    press(&mut app, "label:Undo that");
+    assert_eq!(fake.called("gws_drive_undo"), [json!({"undo": "du2"})]);
+    assert!(app.screen().shows("Notes"));
+}
+
+#[test]
+fn move_here_is_not_offered_where_it_is_or_where_google_would_refuse() {
+    let fake = Arc::new(Fake::default());
+    let mut notes = file("notes", "Notes", "doc", "me");
+    notes["parents"] = json!(["root"]);
+    *fake.rows.lock().unwrap() = Some(vec![file("clients", "Clients", "folder", "me"), notes]);
+    let (mut app, _) = open_app(fake.clone(), 1000.0, 600.0);
+    app.wait_for_within("text:Notes", WAIT).unwrap();
+    settle(&mut app);
+    pick_nth(&mut app, 1);
+    press(&mut app, "label:Move");
+    assert!(app.screen().shows("It's in this folder now."));
+    assert!(!app.screen().matches("label:Move here").unwrap());
+    fake.no_add.lock().unwrap().insert("clients".to_owned());
+    press(&mut app, "label:Go into this folder >> text:Clients");
+    assert!(app.screen().shows("You can't add to this folder."));
+    assert!(!app.screen().matches("label:Move here").unwrap());
+}
+
+#[test]
+fn a_move_that_fails_keeps_the_chooser_and_the_row() {
+    let (mut app, fake) = start();
+    open_mover(&mut app);
+    press(&mut app, "label:Go into this folder >> text:Clients");
+    *fake.write_fails.lock().unwrap() = Some("Google Drive is busy right now.".to_owned());
+    press(&mut app, "label:Move here");
+    assert!(app.screen().shows("Google Drive is busy right now."));
+    assert!(app.screen().matches("label:Move here").unwrap());
+    press(&mut app, "label:Cancel this move");
+    assert!(app.screen().shows("Notes"), "the row as it was");
+    assert!(!app.screen().matches("label:Undo that").unwrap());
+}
+
+#[test]
+fn a_folder_that_cant_be_read_says_why_and_offers_no_move() {
+    let (mut app, fake) = start();
+    open_mover(&mut app);
+    *fake.fail_from.lock().unwrap() = Some((0, "This account can't read that.".to_owned()));
+    press(&mut app, "label:Go into this folder >> text:Clients");
+    assert!(app.screen().shows("This account can't read that."));
+    assert!(!app.screen().matches("label:Move here").unwrap());
+}
+
+#[test]
+fn a_late_answer_from_a_folder_left_does_not_fill_the_chooser() {
+    let (mut app, fake) = start();
+    open_mover(&mut app);
+    fake.hold("clients");
+    press(&mut app, "label:Go into this folder >> text:Clients");
+    press(&mut app, "label:Go to My Drive");
+    assert!(app.screen().shows("Big folder"));
+    fake.release("clients");
+    settle(&mut app);
+    assert!(app.screen().shows("Big folder"));
+    assert!(!app.screen().shows("Acme"));
+}
+
+// --- Writing: Share ----------------------------------------------------------
+
+fn open_share(app: &mut Headless) {
+    pick_nth(app, 3);
+    press(app, "label:Share");
+    app.wait_for_within("text:Who will have access", WAIT)
+        .expect("the list");
+    settle(app);
+}
+
+fn add_person(app: &mut Headless, address: &str, role: &str) {
+    app.type_text("label:Email address, like name@company.com", address)
+        .unwrap();
+    press(app, &format!("label:{role}"));
+    press(app, "label:Add this person");
+}
+
+#[test]
+fn share_shows_every_person_and_role_before_the_press_can_be_made() {
+    let (mut app, fake) = start();
+    open_share(&mut app);
+    assert_eq!(fake.called("gws_drive_access"), [json!({"id": "notes"})]);
+    for shown in [
+        "Owner Fake <owner@example.com> (you)",
+        "Ana Reyes <ana@example.com>",
+        "ben@example.com",
+        "Anyone with the link",
+        "Owner",
+        "Can edit",
+        "Can view",
+    ] {
+        assert!(
+            app.screen().shows(shown),
+            "{shown}: {:?}",
+            app.screen().texts()
+        );
+    }
+    assert_eq!(app.screen().count("label:Someone with access").unwrap(), 4);
+    assert!(
+        !app.screen()
+            .matches("label:Share with these people")
+            .unwrap(),
+        "nothing to press yet"
+    );
+    assert!(app.screen().shows("Add someone to share this with."));
+    assert!(
+        app.screen()
+            .shows("Sharing by link isn't here. Google Drive's own page has it.")
+    );
+    add_person(&mut app, "cara@example.com", "Can comment");
+    add_person(&mut app, "dan@example.com", "Can edit");
+    assert_eq!(app.screen().count("label:Someone with access").unwrap(), 6);
+    assert!(app.screen().shows("cara@example.com"));
+    assert!(app.screen().shows("Can comment"));
+    assert_eq!(
+        app.screen().count("text:New").unwrap(),
+        2,
+        "each new address is marked"
+    );
+    assert!(app.screen().shows("Share with 2 people"));
+}
+
+#[test]
+fn the_press_sends_exactly_what_is_on_the_screen() {
+    let (mut app, fake) = start();
+    open_share(&mut app);
+    add_person(&mut app, "cara@example.com", "Can comment");
+    press(&mut app, "label:Take this person off >> nth=1");
+    assert!(app.screen().shows("Will lose access"));
+    assert!(app.screen().shows("Leaving"));
+    assert!(app.screen().shows("Share with 1 person and remove 1"));
+    press(&mut app, "label:Share with these people");
+    assert_eq!(
+        fake.called("gws_drive_share"),
+        [json!({
+            "id": "notes",
+            "add": [{"email": "cara@example.com", "role": "commenter"}],
+            "remove": ["p-ben"],
+            "seen": "mark-1",
+        })]
+    );
+    assert!(app.screen().shows("Shared with 1 person and removed 1."));
+    assert!(
+        !app.screen()
+            .matches("label:Share with these people")
+            .unwrap()
+    );
+    assert!(app.screen().shows("Budget.xlsx"), "the rows are back");
+}
+
+#[test]
+fn nobody_who_would_lose_the_file_is_on_the_list_of_who_has_it() {
+    let (mut app, fake) = start();
+    open_share(&mut app);
+    press(&mut app, "label:Take this person off >> nth=0");
+    assert!(app.screen().shows("Remove 1 person"));
+    assert_eq!(
+        app.screen().count("label:Take this person off").unwrap(),
+        1,
+        "only Ben is left to take off"
+    );
+    assert_eq!(app.screen().count("label:Keep this person").unwrap(), 1);
+    press(&mut app, "label:Keep this person");
+    assert!(!app.screen().shows("Will lose access"));
+    assert!(app.screen().shows("Add someone to share this with."));
+    assert!(fake.called("gws_drive_share").is_empty());
+}
+
+#[test]
+fn someone_with_no_remove_press_has_none_the_owner_the_person_and_the_link() {
+    let (mut app, _) = start();
+    open_share(&mut app);
+    assert_eq!(app.screen().count("label:Take this person off").unwrap(), 2);
+}
+
+#[test]
+fn an_address_is_checked_and_nobody_gets_on_twice() {
+    let (mut app, fake) = start();
+    open_share(&mut app);
+    app.type_text(
+        "label:Email address, like name@company.com",
+        "not an address",
+    )
+    .unwrap();
+    press(&mut app, "label:Add this person");
+    assert!(
+        app.screen()
+            .shows("That doesn't look like an email address.")
+    );
+    app.clear("label:Email address, like name@company.com")
+        .unwrap();
+    app.type_text(
+        "label:Email address, like name@company.com",
+        "ANA@example.com",
+    )
+    .unwrap();
+    press(&mut app, "label:Add this person");
+    assert!(app.screen().shows("That person has this file already."));
+    app.clear("label:Email address, like name@company.com")
+        .unwrap();
+    add_person(&mut app, "cara@example.com", "Can view");
+    app.type_text(
+        "label:Email address, like name@company.com",
+        "cara@example.com",
+    )
+    .unwrap();
+    press(&mut app, "label:Add this person");
+    assert!(app.screen().shows("That person has this file already."));
+    assert_eq!(app.screen().count("text:New").unwrap(), 1);
+    assert!(fake.called("gws_drive_share").is_empty());
+}
+
+#[test]
+fn an_address_left_in_the_field_stops_the_press_with_a_word() {
+    let (mut app, fake) = start();
+    open_share(&mut app);
+    add_person(&mut app, "cara@example.com", "Can view");
+    app.type_text(
+        "label:Email address, like name@company.com",
+        "dan@example.com",
+    )
+    .unwrap();
+    press(&mut app, "label:Share with these people");
+    assert!(app.screen().shows("Add that address, or clear it, first."));
+    assert!(fake.called("gws_drive_share").is_empty());
+}
+
+#[test]
+fn enter_in_the_address_adds_it_and_never_shares() {
+    let (mut app, fake) = start();
+    open_share(&mut app);
+    app.type_text(
+        "label:Email address, like name@company.com",
+        "cara@example.com",
+    )
+    .unwrap();
+    app.submit("label:Email address, like name@company.com")
+        .unwrap();
+    settle(&mut app);
+    assert!(app.screen().shows("Share with 1 person"));
+    assert!(fake.called("gws_drive_share").is_empty());
+}
+
+#[test]
+fn a_list_that_cant_be_read_offers_no_press() {
+    let (mut app, fake) = start();
+    *fake.access_fails.lock().unwrap() = Some("Google Drive is busy right now.".to_owned());
+    pick_nth(&mut app, 3);
+    press(&mut app, "label:Share");
+    assert!(app.screen().shows("Google Drive is busy right now."));
+    add_person(&mut app, "cara@example.com", "Can view");
+    assert!(
+        !app.screen()
+            .matches("label:Share with these people")
+            .unwrap()
+    );
+    *fake.access_fails.lock().unwrap() = None;
+    press(&mut app, "label:Read who has this again");
+    assert!(app.screen().shows("Ana Reyes <ana@example.com>"));
+    assert!(
+        app.screen()
+            .matches("label:Share with these people")
+            .unwrap()
+    );
+}
+
+#[test]
+fn the_press_waits_for_the_whole_list() {
+    let (mut app, fake) = start();
+    fake.hold("access:notes");
+    pick_nth(&mut app, 3);
+    press(&mut app, "label:Share");
+    add_person(&mut app, "cara@example.com", "Can view");
+    assert!(app.screen().shows("Reading who has this…"));
+    assert!(
+        !app.screen()
+            .matches("label:Share with these people")
+            .unwrap()
+    );
+    fake.release("access:notes");
+    settle(&mut app);
+    assert!(
+        app.screen()
+            .matches("label:Share with these people")
+            .unwrap()
+    );
+}
+
+#[test]
+fn a_list_that_moved_comes_back_to_be_read_and_keeps_who_was_added() {
+    let (mut app, fake) = start();
+    open_share(&mut app);
+    add_person(&mut app, "cara@example.com", "Can view");
+    fake.write_answers.lock().unwrap().insert(
+        "gws_drive_share".to_owned(),
+        json!({"refused": "changed", "message": "Who has this file changed since you looked, so nothing changed. Check the list again."}),
+    );
+    fake.access.lock().unwrap().insert(
+        "notes".to_owned(),
+        json!({"seen": "mark-2", "people": [
+            {"id": "p-me", "name": "Owner Fake", "email": "owner@example.com", "role": "owner", "you": true},
+            {"id": "p-eve", "name": "Eve Stone", "email": "eve@example.com", "role": "writer", "removable": true},
+        ]}),
+    );
+    press(&mut app, "label:Share with these people");
+    assert!(app.screen().shows(
+        "Who has this file changed since you looked, so nothing changed. Check the list again."
+    ));
+    assert!(
+        app.screen().shows("Eve Stone <eve@example.com>"),
+        "the new list"
+    );
+    assert!(!app.screen().shows("ben@example.com"));
+    assert!(app.screen().shows("cara@example.com"));
+    fake.write_answers.lock().unwrap().clear();
+    press(&mut app, "label:Share with these people");
+    assert_eq!(last_of(&fake, "gws_drive_share")["seen"], "mark-2");
+}
+
+/// The list Budget.xlsx has, which is nobody Notes has.
+fn budget_people(fake: &Fake) {
+    fake.access.lock().unwrap().insert(
+        "budget".to_owned(),
+        json!({"seen": "mark-budget", "people": [
+            {"id": "p-me", "name": "Owner Fake", "email": "owner@example.com", "role": "owner", "you": true},
+            {"id": "p-eve", "name": "Eve Stone", "email": "eve@example.com", "role": "writer", "removable": true},
+        ]}),
+    );
+}
+
+/// A press on Notes held on its way, ending in `answer`, and the person gone on
+/// to the panel for Budget.xlsx, with Dan added and Eve leaving.
+fn press_notes_then_stage_budget(app: &mut Headless, fake: &Fake, answer: Value) {
+    budget_people(fake);
+    open_share(app);
+    add_person(app, "cara@example.com", "Can view");
+    fake.write_answers
+        .lock()
+        .unwrap()
+        .insert("gws_drive_share".to_owned(), answer);
+    fake.hold("write:gws_drive_share");
+    press(app, "label:Share with these people");
+    press(app, "label:Close sharing");
+    key(app, "down");
+    press(app, "label:Share");
+    add_person(app, "dan@example.com", "Can view");
+    press(app, "label:Take this person off");
+    assert_budget_untouched(app, fake);
+}
+
+/// The panel is still Budget.xlsx's, as the person left it.
+fn assert_budget_untouched(app: &Headless, fake: &Fake) {
+    assert!(app.screen().matches("label:Close sharing").unwrap());
+    assert!(app.screen().shows("Budget.xlsx"), "the panel's name");
+    assert!(app.screen().shows("Eve Stone <eve@example.com>"));
+    assert!(!app.screen().shows("Ana Reyes <ana@example.com>"));
+    assert!(!app.screen().shows("ben@example.com"));
+    assert!(app.screen().shows("dan@example.com"));
+    assert!(app.screen().shows("Share with 1 person and remove 1"));
+    let notes = json!({"id": "notes"});
+    let reads = fake.called("gws_drive_access");
+    assert_eq!(reads.iter().filter(|a| **a == notes).count(), 1);
+}
+
+/// What the next press sends is Budget.xlsx's own.
+fn assert_budget_press_is_its_own(app: &mut Headless, fake: &Fake) {
+    fake.write_answers.lock().unwrap().clear();
+    press(app, "label:Share with these people");
+    assert_eq!(
+        last_of(fake, "gws_drive_share"),
+        json!({
+            "id": "budget",
+            "add": [{"email": "dan@example.com", "role": "reader"}],
+            "remove": ["p-eve"],
+            "seen": "mark-budget",
+        })
+    );
+}
+
+#[test]
+fn a_late_refusal_for_another_file_loads_nobody_under_this_files_name() {
+    let (mut app, fake) = start();
+    let moved = json!({"refused": "changed", "message": "Who has this file changed since you looked, so nothing changed. Check the list again."});
+    press_notes_then_stage_budget(&mut app, &fake, moved);
+    fake.release("write:gws_drive_share");
+    settle(&mut app);
+    assert_budget_untouched(&app, &fake);
+    assert!(!app.screen().shows("Check the list again"));
+    assert_budget_press_is_its_own(&mut app, &fake);
+}
+
+#[test]
+fn a_late_partial_share_for_another_file_clears_nothing_staged_here() {
+    let (mut app, fake) = start();
+    let partial = json!({"added": 1, "removed": 0, "partial": true, "files": []});
+    press_notes_then_stage_budget(&mut app, &fake, partial);
+    fake.release("write:gws_drive_share");
+    settle(&mut app);
+    assert_budget_untouched(&app, &fake);
+    assert!(
+        app.screen()
+            .shows("Only part of your earlier share went through.")
+    );
+    assert_budget_press_is_its_own(&mut app, &fake);
+}
+
+#[test]
+fn a_late_share_for_another_file_leaves_this_panel_open() {
+    let (mut app, fake) = start();
+    let done = json!({"added": 1, "removed": 0, "files": []});
+    press_notes_then_stage_budget(&mut app, &fake, done);
+    let lists = fake.called("gws_drive_list").len();
+    fake.release("write:gws_drive_share");
+    settle(&mut app);
+    assert_budget_untouched(&app, &fake);
+    assert!(app.screen().shows("Your earlier share went through."));
+    assert!(!app.screen().shows("Shared with 1 person."));
+    assert_eq!(
+        fake.called("gws_drive_list").len(),
+        lists + 1,
+        "the rows still take what went through"
+    );
+    assert_budget_press_is_its_own(&mut app, &fake);
+}
+
+#[test]
+fn a_share_that_lands_after_cancel_still_says_so() {
+    let (mut app, fake) = start();
+    open_share(&mut app);
+    add_person(&mut app, "cara@example.com", "Can view");
+    fake.hold("write:gws_drive_share");
+    press(&mut app, "label:Share with these people");
+    press(&mut app, "label:Close sharing");
+    fake.release("write:gws_drive_share");
+    settle(&mut app);
+    assert!(app.screen().shows("Your earlier share went through."));
+    assert!(!app.screen().matches("label:Close sharing").unwrap());
+}
+
+#[test]
+fn a_late_answer_from_an_earlier_opening_of_the_same_file_leaves_this_one_be() {
+    for (answer, said) in [
+        (
+            json!({"refused": "changed", "message": "Who has this file changed since you looked, so nothing changed. Check the list again."}),
+            None,
+        ),
+        (
+            json!({"added": 1, "removed": 0, "partial": true, "files": []}),
+            Some("Only part of your earlier share went through."),
+        ),
+        (
+            json!({"added": 1, "removed": 0, "files": []}),
+            Some("Your earlier share went through."),
+        ),
+    ] {
+        let (mut app, fake) = start();
+        open_share(&mut app);
+        add_person(&mut app, "cara@example.com", "Can view");
+        fake.write_answers
+            .lock()
+            .unwrap()
+            .insert("gws_drive_share".to_owned(), answer);
+        fake.hold("write:gws_drive_share");
+        press(&mut app, "label:Share with these people");
+        press(&mut app, "label:Close sharing");
+        press(&mut app, "label:Share");
+        add_person(&mut app, "dan@example.com", "Can view");
+        fake.release("write:gws_drive_share");
+        settle(&mut app);
+        assert!(app.screen().matches("label:Close sharing").unwrap());
+        assert!(app.screen().shows("dan@example.com"), "{said:?}");
+        assert!(!app.screen().shows("cara@example.com"), "{said:?}");
+        assert_eq!(fake.called("gws_drive_access").len(), 2, "{said:?}");
+        if let Some(said) = said {
+            assert!(app.screen().shows(said));
+        }
+    }
+}
+
+/// Budget.xlsx's share panel, opened after the rows came back, with Dan added.
+fn share_budget_with_dan(app: &mut Headless, fake: &Fake) {
+    budget_people(fake);
+    key(app, "down");
+    press(app, "label:Share");
+    add_person(app, "dan@example.com", "Can view");
+}
+
+fn assert_budget_panel_stays(app: &Headless) {
+    assert!(app.screen().matches("label:Close sharing").unwrap());
+    assert!(app.screen().shows("dan@example.com"));
+}
+
+fn type_new_name(app: &mut Headless, name: &str) {
+    app.clear("label:New name").unwrap();
+    app.type_text("label:New name", name).unwrap();
+}
+
+#[test]
+fn a_late_rename_leaves_a_panel_opened_since_up() {
+    let (mut app, fake) = start();
+    pick_nth(&mut app, 3);
+    press(&mut app, "label:Rename");
+    type_new_name(&mut app, "Better notes");
+    fake.hold("write:gws_drive_rename");
+    press(&mut app, "label:Save this name");
+    press(&mut app, "label:Cancel this");
+    share_budget_with_dan(&mut app, &fake);
+    fake.release("write:gws_drive_rename");
+    settle(&mut app);
+    assert_budget_panel_stays(&app);
+    assert!(app.screen().shows("Renamed."), "it went through");
+}
+
+#[test]
+fn a_late_rename_leaves_the_same_file_opened_again_up() {
+    let (mut app, fake) = start();
+    pick_nth(&mut app, 3);
+    press(&mut app, "label:Rename");
+    type_new_name(&mut app, "Better notes");
+    fake.hold("write:gws_drive_rename");
+    press(&mut app, "label:Save this name");
+    press(&mut app, "label:Cancel this");
+    press(&mut app, "label:Rename");
+    type_new_name(&mut app, "Other notes");
+    fake.release("write:gws_drive_rename");
+    settle(&mut app);
+    assert_eq!(
+        app.screen().input_text("label:New name").unwrap().unwrap(),
+        "Other notes"
+    );
+}
+
+#[test]
+fn a_late_new_folder_leaves_a_name_being_typed_since_up() {
+    let (mut app, fake) = start();
+    press(&mut app, "label:New folder");
+    app.type_text("label:Folder name", "Quotes").unwrap();
+    fake.hold("write:gws_drive_folder");
+    press(&mut app, "label:Make this folder");
+    press(&mut app, "label:Cancel this");
+    pick_nth(&mut app, 3);
+    press(&mut app, "label:Rename");
+    type_new_name(&mut app, "Better notes");
+    fake.release("write:gws_drive_folder");
+    settle(&mut app);
+    assert_eq!(
+        app.screen().input_text("label:New name").unwrap().unwrap(),
+        "Better notes"
+    );
+    assert!(app.screen().shows("Made a new folder on Google Drive."));
+}
+
+#[test]
+fn a_late_move_leaves_a_panel_opened_since_up() {
+    let (mut app, fake) = start();
+    open_mover(&mut app);
+    press(&mut app, "label:Go into this folder >> text:Clients");
+    fake.hold("write:gws_drive_move");
+    press(&mut app, "label:Move here");
+    press(&mut app, "label:Cancel this move");
+    share_budget_with_dan(&mut app, &fake);
+    fake.release("write:gws_drive_move");
+    settle(&mut app);
+    assert_budget_panel_stays(&app);
+    assert!(app.screen().shows("Moved."), "it went through");
+}
+
+#[test]
+fn a_list_read_late_for_another_file_is_never_shown_under_this_ones_name() {
+    let (mut app, fake) = start();
+    budget_people(&fake);
+    fake.hold("access:notes");
+    pick_nth(&mut app, 3);
+    press(&mut app, "label:Share");
+    press(&mut app, "label:Close sharing");
+    key(&mut app, "down");
+    fake.hold("access:budget");
+    press(&mut app, "label:Share");
+    fake.release("access:notes");
+    settle(&mut app);
+    assert!(app.screen().shows("Budget.xlsx"), "the panel's name");
+    assert!(!app.screen().shows("Ana Reyes <ana@example.com>"));
+    assert!(app.screen().shows("Reading who has this…"));
+    fake.release("access:budget");
+    settle(&mut app);
+    assert!(app.screen().shows("Eve Stone <eve@example.com>"));
+}
+
+#[test]
+fn a_share_that_fails_changes_nothing_and_stays_to_be_tried_again() {
+    let (mut app, fake) = start();
+    open_share(&mut app);
+    add_person(&mut app, "cara@example.com", "Can view");
+    *fake.write_fails.lock().unwrap() = Some("Google Drive is busy right now.".to_owned());
+    press(&mut app, "label:Share with these people");
+    assert!(app.screen().shows("Google Drive is busy right now."));
+    assert!(app.screen().shows("cara@example.com"));
+    assert!(app.screen().shows("Share with 1 person"));
+    assert!(
+        app.screen()
+            .matches("label:Share with these people")
+            .unwrap()
+    );
+}
+
+#[test]
+fn a_share_that_went_partway_shows_who_has_it_now() {
+    let (mut app, fake) = start();
+    open_share(&mut app);
+    add_person(&mut app, "cara@example.com", "Can view");
+    fake.write_answers.lock().unwrap().insert(
+        "gws_drive_share".to_owned(),
+        json!({"added": 1, "removed": 0, "partial": true, "files": []}),
+    );
+    let reads = fake.called("gws_drive_access").len();
+    press(&mut app, "label:Share with these people");
+    assert!(
+        app.screen()
+            .shows("Only part of that went through. This is who has it now.")
+    );
+    assert_eq!(fake.called("gws_drive_access").len(), reads + 1);
+    assert_eq!(app.screen().count("text:New").unwrap(), 0);
+}
+
+#[test]
+fn the_ais_press_on_share_shares_with_nobody_and_says_so() {
+    let (mut app, fake) = start();
+    open_share(&mut app);
+    add_person(&mut app, "cara@example.com", "Can edit");
+    *fake.ai.lock().unwrap() = true;
+    press(&mut app, "label:Share with these people");
+    assert!(app.screen().shows(AI_REFUSED));
+    assert!(
+        app.screen()
+            .matches("label:Share with these people")
+            .unwrap()
+    );
+    assert!(!app.screen().shows("Shared with 1 person."));
+}
+
+#[test]
+fn a_press_on_share_can_only_go_once_while_it_is_on_its_way() {
+    let (mut app, fake) = start();
+    open_share(&mut app);
+    add_person(&mut app, "cara@example.com", "Can view");
+    fake.hold("write:gws_drive_share");
+    press(&mut app, "label:Share with these people");
+    press(&mut app, "label:Share with these people");
+    assert_eq!(fake.called("gws_drive_share").len(), 1);
+    fake.release("write:gws_drive_share");
+}
+
+#[test]
+fn a_folder_offers_no_commenting() {
+    let (mut app, _) = start();
+    pick_nth(&mut app, 0);
+    press(&mut app, "label:Share");
+    settle(&mut app);
+    assert!(app.screen().matches("label:Can view").unwrap());
+    assert!(app.screen().matches("label:Can edit").unwrap());
+    assert!(!app.screen().matches("label:Can comment").unwrap());
+}
+
+#[test]
+fn closing_share_goes_back_to_the_rows_and_the_place() {
+    let (mut app, fake) = start();
+    open_share(&mut app);
+    add_person(&mut app, "cara@example.com", "Can edit");
+    assert!(!app.screen().shows("Budget.xlsx"), "it has the rows' room");
+    press(&mut app, "label:Close sharing");
+    assert!(app.screen().shows("Budget.xlsx"));
+    assert!(fake.called("gws_drive_share").is_empty());
+    press(&mut app, "label:Share");
+    settle(&mut app);
+    assert_eq!(app.screen().count("text:New").unwrap(), 0, "a fresh start");
+}
+
+// --- Writing: uploads --------------------------------------------------------
+
+fn start_picked(files: &[(&str, &[u8])]) -> (Headless, Arc<Fake>) {
+    let (app, fake) = start();
+    *fake.picks.lock().unwrap() = files
+        .iter()
+        .map(|(name, bytes)| ((*name).to_owned(), bytes.to_vec()))
+        .collect();
+    (app, fake)
+}
+
+#[test]
+fn a_picked_file_goes_up_in_chunks_into_the_folder_that_is_open() {
+    let (mut app, fake) = start_picked(&[("Quote.txt", b"fake quote")]);
+    open(&mut app, "Clients");
+    press(&mut app, "label:Upload a file to Google Drive");
+    settle(&mut app);
+    let uploads = fake.uploaded.lock().unwrap().clone();
+    assert_eq!(
+        uploads,
+        [(
+            "Quote.txt".to_owned(),
+            b"fake quote".to_vec(),
+            "clients".to_owned()
+        )]
+    );
+    assert!(app.screen().shows("Uploaded to Google Drive."));
+    assert!(app.screen().shows("Quote.txt"), "in the list with no wait");
+    assert_eq!(
+        app.screen()
+            .count("label:A file going to Google Drive")
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn a_big_file_goes_in_chunks_with_nothing_lost() {
+    let bytes: Vec<u8> = (0..500_000).map(|n| (n % 251) as u8).collect();
+    let (mut app, fake) = start_picked(&[("Big.bin", &bytes)]);
+    press(&mut app, "label:Upload a file to Google Drive");
+    settle(&mut app);
+    assert_eq!(fake.called("gws_upload_chunk").len(), 3);
+    assert_eq!(fake.uploaded.lock().unwrap()[0].1, bytes);
+    assert_eq!(fake.uploaded.lock().unwrap()[0].2, "root");
+}
+
+#[test]
+fn several_files_go_one_after_another() {
+    let (mut app, fake) = start_picked(&[("One.txt", b"1"), ("Two.txt", b"2")]);
+    press(&mut app, "label:Upload a file to Google Drive");
+    settle(&mut app);
+    let names: Vec<String> = fake
+        .uploaded
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|u| u.0.clone())
+        .collect();
+    assert_eq!(names, ["One.txt", "Two.txt"]);
+    assert!(app.screen().shows("One.txt") && app.screen().shows("Two.txt"));
+}
+
+#[test]
+fn a_file_goes_where_the_press_was_whatever_happens_after() {
+    let (mut app, fake) = start_picked(&[("Stay.txt", b"x")]);
+    open(&mut app, "Clients");
+    fake.hold("write:gws_drive_upload");
+    press(&mut app, "label:Upload a file to Google Drive");
+    press(&mut app, "label:My Drive");
+    fake.release("write:gws_drive_upload");
+    settle(&mut app);
+    assert_eq!(fake.uploaded.lock().unwrap()[0].2, "clients");
+}
+
+#[test]
+fn an_upload_that_fails_says_why_and_goes_again_from_the_file() {
+    let (mut app, fake) = start_picked(&[("Quote.txt", b"fake quote")]);
+    fake.write_answers.lock().unwrap().insert(
+        "gws_drive_upload".to_owned(),
+        json!({"refused": "no_space", "message": "Your Google storage is full, so nothing changed."}),
+    );
+    press(&mut app, "label:Upload a file to Google Drive");
+    settle(&mut app);
+    assert!(
+        app.screen()
+            .shows("Your Google storage is full, so nothing changed.")
+    );
+    assert!(fake.uploaded.lock().unwrap().is_empty());
+    assert!(!app.screen().shows("Uploaded to Google Drive."));
+    fake.write_answers.lock().unwrap().clear();
+    fake.chunks.lock().unwrap().clear();
+    press(&mut app, "label:Try this upload again");
+    settle(&mut app);
+    assert_eq!(fake.uploaded.lock().unwrap()[0].1, b"fake quote");
+    assert_eq!(
+        app.screen()
+            .count("label:A file going to Google Drive")
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn a_failed_upload_can_be_forgotten() {
+    let (mut app, fake) = start_picked(&[("Quote.txt", b"fake quote")]);
+    *fake.write_fails.lock().unwrap() = Some("Google Drive is busy right now.".to_owned());
+    press(&mut app, "label:Upload a file to Google Drive");
+    settle(&mut app);
+    assert!(app.screen().shows("Google Drive is busy right now."));
+    press(&mut app, "label:Forget this upload");
+    assert_eq!(
+        app.screen()
+            .count("label:A file going to Google Drive")
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn over_the_limit_a_file_says_so_and_nothing_is_read_or_sent() {
+    let bytes = vec![0u8; 25 * 1024 * 1024 + 1];
+    let (mut app, fake) = start_picked(&[("Film.mov", &bytes)]);
+    press(&mut app, "label:Upload a file to Google Drive");
+    settle(&mut app);
+    assert!(
+        app.screen()
+            .shows("This file is over the 25 MB this screen can upload.")
+    );
+    assert!(fake.called("gws_upload_chunk").is_empty());
+    assert!(!app.screen().matches("label:Try this upload again").unwrap());
+}
+
+#[test]
+fn cancelling_the_picker_does_nothing() {
+    let (mut app, fake) = start_picked(&[]);
+    press(&mut app, "label:Upload a file to Google Drive");
+    settle(&mut app);
+    assert!(fake.called("gws_upload_chunk").is_empty());
+    assert!(fake.called("gws_drive_upload").is_empty());
+}
+
+#[test]
+fn a_screen_with_no_picker_says_so() {
+    let fake = Arc::new(Fake::default());
+    *fake.no_picks.lock().unwrap() = true;
+    let (mut app, _) = open_app(fake, 1000.0, 600.0);
+    app.wait_for_within("text:Notes", WAIT).unwrap();
+    settle(&mut app);
+    press(&mut app, "label:Upload a file to Google Drive");
+    assert!(app.screen().shows("This screen can't reach your files."));
+}
+
+// --- Writing: narrow, and nothing absolute -----------------------------------
+
+#[test]
+fn the_action_bar_keeps_every_press_whole_at_every_width() {
+    let (mut app, _, frames) = start_long();
+    pick_nth(&mut app, 0);
+    assert_whole(&app, &frames, &ROW_PRESSES, 1000.0);
+    assert_whole(&app, &frames, &FOLDER_PRESSES, 1000.0);
+    sweep(&mut app, &frames, &ROW_PRESSES);
+    sweep(&mut app, &frames, &FOLDER_PRESSES);
+    assert_whole(
+        &app,
+        &frames,
+        &[
+            "label:Open this item >> nth=0",
+            "label:Show details >> nth=0",
+        ],
+        100.0,
+    );
+}
+
+#[test]
+fn the_name_bars_keep_their_presses_whole_at_every_width() {
+    let (mut app, _, frames) = start_long();
+    pick_nth(&mut app, 0);
+    key(&mut app, "f2");
+    sweep(
+        &mut app,
+        &frames,
+        &["label:Save this name", "label:Cancel this"],
+    );
+    press(&mut app, "label:Cancel this");
+    press(&mut app, "label:New folder");
+    sweep(
+        &mut app,
+        &frames,
+        &["label:Make this folder", "label:Cancel this"],
+    );
+}
+
+#[test]
+fn the_undo_bar_and_a_failed_upload_keep_their_presses_whole_at_every_width() {
+    let (mut app, fake, frames) = start_long();
+    *fake.picks.lock().unwrap() = vec![(LONG_NAME.to_owned(), b"x".to_vec())];
+    pick_nth(&mut app, 0);
+    key(&mut app, "f2");
+    app.submit("label:New name").unwrap();
+    settle(&mut app);
+    app.clear("label:New name").ok();
+    key(&mut app, "f2");
+    app.clear("label:New name").unwrap();
+    app.type_text("label:New name", "Other").unwrap();
+    app.submit("label:New name").unwrap();
+    settle(&mut app);
+    *fake.write_fails.lock().unwrap() = Some(LONG_NAME.to_owned());
+    press(&mut app, "label:Upload a file to Google Drive");
+    settle(&mut app);
+    sweep(
+        &mut app,
+        &frames,
+        &[
+            "label:Undo that",
+            "label:Forget this upload",
+            "label:Try this upload again",
+        ],
+    );
+}
+
+/// The press that matters most on a screen that's short of room.
+fn assert_reachable(app: &Headless, frames: &Frames, selector: &str, width: f32, height: f32) {
+    let id = app
+        .screen()
+        .press_target(selector)
+        .unwrap_or_else(|e| panic!("{selector}: {e}"))
+        .unwrap_or_else(|| panic!("{selector} went at {width} x {height}"));
+    let (left, right) = frames.edges(id);
+    let (top, bottom) = frames.heights(id);
+    assert!(
+        left >= -0.5 && right <= width + 0.5 && top >= -0.5 && bottom <= height + 0.5,
+        "{selector} at {width} x {height}: {left}-{right} across, {top}-{bottom} down"
+    );
+}
+
+/// Sizes a window can really be, and a few it can't.
+const SIZES: [(f32, f32); 8] = [
+    (1000.0, 700.0),
+    (1000.0, 360.0),
+    (640.0, 420.0),
+    (420.0, 700.0),
+    (300.0, 700.0),
+    (300.0, 480.0),
+    (240.0, 700.0),
+    (160.0, 700.0),
+];
+
+fn many_people(n: usize) -> Value {
+    let mut people = vec![
+        json!({"id": "p-me", "name": "Owner Fake", "email": "owner@example.com", "role": "owner", "you": true}),
+    ];
+    people.extend((0..n).map(|i| {
+        json!({"id": format!("p{i}"), "name": format!("{i} {LONG_OWNER}"), "email": format!("person{i}@example.com"), "role": "reader", "removable": true})
+    }));
+    json!({"seen": "many", "people": people})
+}
+
+#[test]
+fn a_long_list_of_people_scrolls_and_share_stays_on_screen_at_every_size() {
+    let (mut app, fake, frames) = start_long();
+    fake.access
+        .lock()
+        .unwrap()
+        .insert("long".to_owned(), many_people(60));
+    pick_nth(&mut app, 0);
+    press(&mut app, "label:Share");
+    app.wait_for_within("text:Who will have access", WAIT)
+        .unwrap();
+    add_person(&mut app, "cara@example.com", "Can edit");
+    assert_eq!(
+        app.screen().count("label:Someone with access").unwrap(),
+        62,
+        "every one of them is on the list"
+    );
+    assert!(
+        app.screen()
+            .shows(&format!("59 {LONG_OWNER} <person59@example.com>"))
+    );
+    for (width, height) in SIZES {
+        app.set_viewport(size(px(width), px(height))).unwrap();
+        settle(&mut app);
+        assert_reachable(
+            &app,
+            &frames,
+            "label:Share with these people",
+            width,
+            height,
+        );
+        assert_reachable(&app, &frames, "label:Close sharing", width, height);
+    }
+    press(&mut app, "label:Share with these people");
+    assert_eq!(fake.called("gws_drive_share").len(), 1, "and it presses");
+}
+
+#[test]
+fn every_press_in_share_stays_whole_at_every_width() {
+    let (mut app, fake, frames) = start_long();
+    fake.access
+        .lock()
+        .unwrap()
+        .insert("long".to_owned(), many_people(3));
+    pick_nth(&mut app, 0);
+    press(&mut app, "label:Share");
+    app.wait_for_within("text:Who will have access", WAIT)
+        .unwrap();
+    add_person(&mut app, LONG_NAME.replace(' ', "").as_str(), "Can edit");
+    app.clear("label:Email address, like name@company.com")
+        .unwrap();
+    add_person(&mut app, "cara@example.com", "Can edit");
+    press(&mut app, "label:Take this person off >> nth=0");
+    sweep(
+        &mut app,
+        &frames,
+        &[
+            "label:Can view",
+            "label:Can comment",
+            "label:Can edit",
+            "label:Add this person",
+            "label:Take this person off >> nth=0",
+            "label:Don't add this person",
+            "label:Keep this person",
+            "label:Share with these people",
+            "label:Close sharing",
+        ],
+    );
+}
+
+#[test]
+fn a_long_list_of_folders_keeps_move_here_on_screen_at_every_size() {
+    let (mut app, fake, frames) = start_long();
+    let mut rows = long_rows();
+    rows.extend((0..80).map(|n| {
+        file(
+            &format!("f{n}"),
+            &format!("{n} {LONG_NAME}"),
+            "folder",
+            "me",
+        )
+    }));
+    *fake.rows.lock().unwrap() = Some(rows);
+    press(&mut app, "label:Recent");
+    press(&mut app, "label:My Drive");
+    pick_nth(&mut app, 0);
+    press(&mut app, "label:Move");
+    app.wait_for_within("label:Go into this folder", WAIT)
+        .unwrap();
+    settle(&mut app);
+    assert_eq!(app.screen().count("label:Go into this folder").unwrap(), 81);
+    for (width, height) in SIZES {
+        app.set_viewport(size(px(width), px(height))).unwrap();
+        settle(&mut app);
+        assert_reachable(&app, &frames, "label:Move here", width, height);
+        assert_reachable(&app, &frames, "label:Cancel this move", width, height);
+    }
+    press(&mut app, "label:Go into this folder >> nth=0");
+    sweep(
+        &mut app,
+        &frames,
+        &[
+            "label:Go to My Drive",
+            "label:Back to this folder >> nth=0",
+            "label:Cancel this move",
+        ],
+    );
+}
+
+/// `absolute` hides a press from the layout a narrow screen depends on.
+#[test]
+fn nothing_pressable_here_is_placed_by_hand() {
+    for source in [
+        include_str!("../src/drive/write.rs"),
+        include_str!("../src/drive/mover.rs"),
+        include_str!("../src/drive/share.rs"),
+    ] {
+        assert!(!source.contains("absolute"));
+    }
+}
+
+// --- Writing: the label rule -------------------------------------------------
+
+const PEOPLE_SECRETS: [&str; 7] = [
+    "Ana",
+    "Reyes",
+    "ben@example.com",
+    "cara",
+    "Owner Fake",
+    "Anyone with the link",
+    "person59",
+];
+
+#[test]
+fn no_label_in_share_holds_a_person_an_address_or_a_file() {
+    let (mut app, fake) = start();
+    fake.access
+        .lock()
+        .unwrap()
+        .insert("notes".to_owned(), many_people(60));
+    pick_nth(&mut app, 3);
+    press(&mut app, "label:Share");
+    app.wait_for_within("text:Who will have access", WAIT)
+        .unwrap();
+    add_person(&mut app, "cara@example.com", "Can edit");
+    press(&mut app, "label:Take this person off >> nth=0");
+    assert!(
+        app.screen().shows("cara@example.com"),
+        "the audit isn't looking at nothing"
+    );
+    assert_no_label_holds(&app, &PEOPLE_SECRETS, "share");
+    assert_no_label_holds(&app, &SECRETS, "share");
+
+    press(&mut app, "label:Close sharing");
+    fake.access.lock().unwrap().clear();
+    press(&mut app, "label:Share");
+    settle(&mut app);
+    assert!(app.screen().shows("Ana Reyes <ana@example.com>"));
+    assert_no_label_holds(&app, &PEOPLE_SECRETS, "share, the usual people");
+    assert_no_label_holds(&app, &SECRETS, "share, the usual people");
+}
+
+#[test]
+fn no_label_on_a_bar_or_the_chooser_holds_a_name() {
+    let (mut app, fake) = start();
+    *fake.picks.lock().unwrap() = vec![("Budget secret.txt".to_owned(), b"x".to_vec())];
+    pick_nth(&mut app, 4);
+    assert!(app.screen().matches("label:Rename").unwrap());
+    assert_no_label_holds(&app, &SECRETS, "the action bar");
+    key(&mut app, "f2");
+    assert_no_label_holds(&app, &SECRETS, "the rename bar");
+    press(&mut app, "label:Cancel this");
+    press(&mut app, "label:Move");
+    settle(&mut app);
+    assert!(app.screen().shows("Clients"));
+    assert_no_label_holds(&app, &SECRETS, "the chooser");
+    press(&mut app, "label:Go into this folder >> text:Clients");
+    assert_no_label_holds(&app, &SECRETS, "the chooser's trail");
+    press(&mut app, "label:Cancel this move");
+    *fake.write_fails.lock().unwrap() = Some("Google Drive is busy.".to_owned());
+    press(&mut app, "label:Upload a file to Google Drive");
+    settle(&mut app);
+    assert!(app.screen().shows("Budget secret.txt"));
+    assert_no_label_holds(&app, &SECRETS, "an upload");
+}
+
+/// What a press says afterwards is a fixed line: a name in one would be a bare
+/// text, which `ui_look` can send.
+#[test]
+fn what_a_press_says_afterwards_holds_no_name() {
+    let (mut app, fake) = start();
+    pick_nth(&mut app, 4);
+    press(&mut app, "label:Move to trash");
+    let told = app
+        .screen()
+        .texts()
+        .iter()
+        .filter(|t| t.starts_with("Moved"))
+        .map(|t| (*t).to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(told, ["Moved to Trash."]);
+    assert_eq!(fake.called("gws_drive_trash").len(), 1);
 }

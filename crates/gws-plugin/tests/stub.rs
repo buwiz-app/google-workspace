@@ -216,6 +216,115 @@ fn calendar_and_drive_opens_cant_reach_mail() {
     assert_eq!(google.writes(), []);
 }
 
+const INBOX: &str = "INBOX";
+const OWNER: &str = "owner@example.com";
+
+/// A signed-in core with mail in its store, for the sign-out tests.
+fn with_mail(google: &FakeGoogle, name: &str, expires_at: u64) -> Core {
+    let dir = std::env::temp_dir().join(format!("gws-stub-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let core = Core::new(&Apis::at(&google.base()), Ok(gws_store::Paths::in_dir(dir)));
+    core.unlock("seed");
+    let set = core.account("buwiz.account.set", &sign_in(OWNER, 4_000_000_000));
+    assert_ne!(set["isError"], true, "{set}");
+    gws::mail::sync(&core).unwrap();
+    assert!(rows(&core, OWNER) > 0);
+    if expires_at != 4_000_000_000 {
+        core.account("buwiz.account.set", &sign_in(OWNER, expires_at));
+    }
+    core
+}
+
+fn sign_in(subject: &str, expires_at: u64) -> Value {
+    json!({"account": "google", "label": "default", "provider": "google", "subject": subject, "scopes": ["https://www.googleapis.com/auth/gmail.readonly"], "access_token": "fake-access-1", "token_type": "Bearer", "expires_at": expires_at})
+}
+
+fn rows(core: &Core, account: &str) -> usize {
+    let held = core.store().unwrap();
+    held.as_ref()
+        .unwrap()
+        .threads(account, INBOX, 0, 100)
+        .unwrap()
+        .len()
+}
+
+fn sign_out() -> Value {
+    json!({"account": "google", "label": "default"})
+}
+
+#[test]
+fn an_expired_sign_in_still_takes_its_mail_with_it() {
+    let google = FakeGoogle::start(Seed::demo(6));
+    let core = with_mail(&google, "lapsed-sign-out", 1);
+    assert!(core.accounts.signed_in().is_none(), "the token has expired");
+    core.account("buwiz.account.clear", &sign_out());
+    assert_eq!(rows(&core, OWNER), 0);
+}
+
+#[test]
+fn signing_in_as_someone_else_on_the_label_forgets_the_last_one() {
+    let google = FakeGoogle::start(Seed::demo(6));
+    let core = with_mail(&google, "swap", 4_000_000_000);
+    core.account(
+        "buwiz.account.set",
+        &sign_in("other@example.com", 4_000_000_000),
+    );
+    assert_eq!(rows(&core, OWNER), 0);
+}
+
+#[test]
+fn a_refreshed_token_keeps_the_mail() {
+    let google = FakeGoogle::start(Seed::demo(6));
+    let core = with_mail(&google, "refresh", 4_000_000_000);
+    let before = rows(&core, OWNER);
+    core.account("buwiz.account.set", &sign_in(OWNER, 4_000_000_001));
+    assert_eq!(rows(&core, OWNER), before);
+}
+
+#[test]
+fn nothing_lands_after_a_sign_out_however_late_it_arrives() {
+    let google = FakeGoogle::start(Seed::demo(6));
+    let core = with_mail(&google, "late", 4_000_000_000);
+    core.account("buwiz.account.clear", &sign_out());
+    // what a sync caught mid-flight goes on to do
+    let late = gws::mail::write_as(&core, OWNER, |store| store.set_state(OWNER, "late", "1"));
+    assert!(late.is_err(), "the account is gone");
+    let state = |account: &str, key: &str| {
+        core.store()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .state(account, key)
+            .unwrap()
+    };
+    assert_eq!(state(OWNER, "late"), None);
+    assert!(gws::mail::sync(&core).is_err(), "no sync starts for nobody");
+    assert_eq!(
+        state("", "mail_status"),
+        None,
+        "nothing lands under no name"
+    );
+}
+
+#[test]
+fn a_sign_out_that_could_not_clear_says_so_and_tries_again() {
+    let google = FakeGoogle::start(Seed::demo(6));
+    let core = with_mail(&google, "retry", 4_000_000_000);
+    let said = core.store_unavailable_while(|| core.account("buwiz.account.clear", &sign_out()));
+    assert_eq!(said["structuredContent"]["mail_kept"], true, "{said}");
+    assert!(rows(&core, OWNER) > 0, "it's still there");
+    let _ = gws::mail::sync(&core);
+    assert_eq!(rows(&core, OWNER), 0, "the next sync cleared it");
+}
+
+#[test]
+fn uninstall_before_provision_says_its_files_stayed() {
+    let google = FakeGoogle::start(Seed::default());
+    let dir = std::env::temp_dir().join(format!("gws-stub-unprov-{}", std::process::id()));
+    let core = Core::new(&Apis::at(&google.base()), Ok(gws_store::Paths::in_dir(dir)));
+    assert_eq!(core.uninstall().unwrap_err().code, "not_provisioned");
+}
+
 #[test]
 fn uninstall_says_when_it_could_not_reach_the_files() {
     let google = FakeGoogle::start(Seed::default());

@@ -149,9 +149,44 @@ fn starts_with_any_case(value: &str, prefix: &str) -> bool {
         .is_some_and(|start| start.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
+/// `style` without its CSS comments: `display:/**/none` hides as
+/// `display:none` does.
+fn no_comments(style: &str) -> String {
+    let mut out = String::with_capacity(style.len());
+    let mut rest = style;
+    while let Some(at) = rest.find("/*") {
+        out.push_str(&rest[..at]);
+        rest = rest[at + 2..]
+            .find("*/")
+            .map_or("", |end| &rest[at + 2 + end + 2..]);
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A declaration without `!important`, in any case or spacing.
+fn no_important(declaration: &str) -> String {
+    let lower = declaration.to_ascii_lowercase();
+    let mut out = String::with_capacity(declaration.len());
+    let mut at = 0;
+    while let Some(bang) = lower[at..].find('!').map(|n| at + n) {
+        out.push_str(&declaration[at..bang]);
+        let after = lower[bang + 1..].trim_start();
+        if after.starts_with("important") {
+            at = declaration.len() - after.len() + "important".len();
+        } else {
+            out.push('!');
+            at = bang + 1;
+        }
+    }
+    out.push_str(&declaration[at..]);
+    out
+}
+
 /// A `style` value without any declaration that could load something. A
 /// backslash goes too: CSS escapes spell `url(` other ways.
 fn safe_style(style: &str) -> String {
+    let style = no_comments(style);
     let risky = |d: &&str| {
         let d: String = d
             .chars()
@@ -177,7 +212,7 @@ fn safe_style(style: &str) -> String {
     style
         .split(';')
         .filter(|d| !risky(d))
-        .map(|d| d.replace("!important", "").replace("! important", ""))
+        .map(no_important)
         .collect::<Vec<_>>()
         .join(";")
 }
@@ -340,28 +375,78 @@ fn no_size(value: &str, at_most: f32) -> bool {
     number.parse::<f32>().is_ok_and(|n| n <= at_most)
 }
 
-/// Whether a `style` hides what's in it from a person looking at the page.
-fn hidden(style: &str) -> bool {
-    let style: String = style
+/// A CSS colour as red, green, blue and alpha, for the forms mail uses.
+fn colour(value: &str) -> Option<[u8; 4]> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "transparent" => return Some([0, 0, 0, 0]),
+        "white" => return Some([255, 255, 255, 255]),
+        "black" => return Some([0, 0, 0, 255]),
+        _ => {}
+    }
+    if let Some(hex) = value.strip_prefix('#') {
+        let digit = |c: char| c.to_digit(16).map(|d| d as u8);
+        let digits: Vec<u8> = hex.chars().map(digit).collect::<Option<_>>()?;
+        let wide: Vec<u8> = match digits.len() {
+            3 | 4 => digits.iter().map(|d| d * 17).collect(),
+            6 | 8 => digits.chunks(2).map(|p| p[0] * 16 + p[1]).collect(),
+            _ => return None,
+        };
+        return Some([wide[0], wide[1], wide[2], *wide.get(3).unwrap_or(&255)]);
+    }
+    let inside = value
+        .strip_prefix("rgba(")
+        .or_else(|| value.strip_prefix("rgb("))?
+        .strip_suffix(')')?;
+    let parts: Vec<f32> = inside
+        .split([',', '/', ' '])
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse().ok())
+        .collect::<Option<_>>()?;
+    let alpha = parts.get(3).map_or(255.0, |a| a * 255.0);
+    Some([
+        *parts.first()? as u8,
+        *parts.get(1)? as u8,
+        *parts.get(2)? as u8,
+        alpha as u8,
+    ])
+}
+
+/// Whether text in `ink` can't be told from `paper`.
+fn unreadable(ink: [u8; 4], paper: [u8; 4]) -> bool {
+    ink[3] < 13 || (0..3).all(|c| ink[c].abs_diff(paper[c]) <= 16)
+}
+
+/// A `style`, reduced to the declarations a browser would read.
+fn declarations(style: &str) -> Vec<(String, String)> {
+    let style: String = no_comments(style)
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect::<String>()
-        .to_ascii_lowercase()
-        .replace("!important", "");
+        .to_ascii_lowercase();
+    style
+        .split(';')
+        .filter_map(|d| d.split_once(':'))
+        .map(|(name, value)| (name.to_owned(), no_important(value)))
+        .collect()
+}
+
+/// Whether a `style` hides what's in it from a person looking at the page.
+fn hidden(style: &str) -> bool {
     let far_off = |v: &str| {
         v.strip_prefix('-')
             .is_some_and(|v| !no_size(v, 100.0) && v.starts_with(|c: char| c.is_ascii_digit()))
     };
-    style
-        .split(';')
-        .filter_map(|d| d.split_once(':'))
-        .any(|(name, value)| match name {
+    declarations(style)
+        .iter()
+        .any(|(name, value)| match name.as_str() {
             "display" => value == "none",
             "visibility" => value == "hidden" || value == "collapse",
             "opacity" => no_size(value, 0.05),
             "font-size" => no_size(value, 1.0),
+            "font" => value.starts_with("0/") || value.starts_with("0px"),
+            "mso-hide" => value == "all",
             "width" | "height" | "max-width" | "max-height" => no_size(value, 0.0),
-            "color" => value == "transparent",
             "clip" => value.starts_with("rect(0"),
             "clip-path" => value.starts_with("inset(50%") || value.starts_with("inset(100%"),
             "transform" => value.contains("scale(0"),
@@ -370,6 +455,17 @@ fn hidden(style: &str) -> bool {
         })
 }
 
+/// The last value `style` gives any of `names`.
+fn declared(style: &str, names: &[&str]) -> Option<String> {
+    declarations(style)
+        .into_iter()
+        .rev()
+        .find(|(name, _)| names.contains(&name.as_str()))
+        .map(|(_, value)| value)
+}
+
+/// The reader's light page, which a mail with no background of its own is on.
+const PAGE: [u8; 4] = [255, 255, 255, 255];
 /// Elements with no closing tag.
 const VOID: &[&str] = &["area", "br", "col", "hr", "img", "wbr"];
 
@@ -386,19 +482,38 @@ fn tag_end(html: &str) -> usize {
         .map_or(html.len(), |at| at + 1)
 }
 
-fn style_of(tag: &str) -> Option<String> {
-    let value = tag.split_once(" style=\"")?.1;
+/// An attribute of a cleaned tag.
+fn attribute(tag: &str, name: &str) -> Option<String> {
+    let value = tag.split_once(&format!(" {name}=\""))?.1;
     Some(gmail::decode_entities(value.split('"').next()?))
 }
 
-/// `html` as plain text: what a person sees of it in the reader, read from the
-/// same cleaned markup, so the model is told nothing the person can't see.
+/// The tag's own background, if it gives one that can be read.
+fn background(tag: &str) -> Option<[u8; 4]> {
+    let style = attribute(tag, "style").unwrap_or_default();
+    let value = declared(&style, &["background-color", "background"])
+        .or_else(|| attribute(tag, "bgcolor"))?;
+    colour(&value).filter(|c| c[3] > 0)
+}
+
+/// The tag's own text colour: its style's, else `<font color>`'s.
+fn ink(tag: &str) -> Option<[u8; 4]> {
+    let style = attribute(tag, "style").unwrap_or_default();
+    colour(&declared(&style, &["color"]).or_else(|| attribute(tag, "color"))?)
+}
+
+/// `html` as plain text, read from the markup the reader shows, without what
+/// that markup plainly hides. No filter can catch every way to hide text, so
+/// this narrows what a mail can slip to the model and proves nothing: what
+/// protects the model is that each result says these are the sender's words.
 pub fn visible_text(html: &str) -> String {
     let (links, images): (Found, Found) = Default::default();
     let html = builder(links, images).clean(html).to_string();
     let mut text = String::new();
     // inside a hidden element: its name, and how many of that name are open
     let mut hiding: Option<(String, usize)> = None;
+    // the backgrounds of the elements open now, innermost last
+    let mut open: Vec<(String, Option<[u8; 4]>)> = Vec::new();
     let mut rest = html.as_str();
     while !rest.is_empty() {
         let lt = rest.find('<').unwrap_or(rest.len());
@@ -428,9 +543,22 @@ pub fn visible_text(html: &str) -> String {
             }
             continue;
         }
-        if !closing && !void && style_of(tag).is_some_and(|s| hidden(&s)) {
-            hiding = Some((name, 1));
-        } else if gmail::BLOCKS.contains(&name.as_str()) {
+        if closing {
+            if let Some(at) = open.iter().rposition(|(n, _)| *n == name) {
+                open.truncate(at);
+            }
+        } else if !void {
+            let paper = background(tag)
+                .or_else(|| open.iter().rev().find_map(|(_, bg)| *bg))
+                .unwrap_or(PAGE);
+            let unseen = ink(tag).is_some_and(|ink| unreadable(ink, paper));
+            if unseen || attribute(tag, "style").is_some_and(|s| hidden(&s)) {
+                hiding = Some((name, 1));
+                continue;
+            }
+            open.push((name.clone(), background(tag)));
+        }
+        if gmail::BLOCKS.contains(&name.as_str()) {
             text.push('\n');
         } else if name == "td" || name == "th" {
             text.push(' ');
@@ -478,6 +606,20 @@ mod tests {
             "font-size:0",
             "font-size:0px",
             "font-size:1px",
+            "display:/**/none",
+            "visibility:/* x */hidden",
+            "opacity:/**/0",
+            "display:none!IMPORTANT",
+            "font:0/0 a",
+            "mso-hide:all",
+            "color:#fff",
+            "color:#FFFFFF",
+            "color:white",
+            "color:rgb(255,255,255)",
+            "color:#fefefe",
+            "color:rgba(0,0,0,0)",
+            "color:#000;background:#000",
+            "color:#123456;background-color:#123456",
             "height:0;overflow:hidden",
             "max-height:0px",
             "width:0",
@@ -495,6 +637,27 @@ mod tests {
         // a quoted `>` doesn't end the tag early, and no attribute is text
         let quoted = r#"<div title="a>b" style="display:none">IGNORE</div><span title="x>IGNORE">seen</span>"#;
         assert_eq!(visible_text(quoted), "seen");
+        // a font's colour counts, and what it's on
+        assert_eq!(
+            visible_text(r##"<font color="#ffffff">IGNORE</font><p>seen</p>"##),
+            "seen"
+        );
+        assert_eq!(
+            visible_text(
+                r##"<table bgcolor="#000000"><tr><td><font color="#fff">seen</font></td></tr></table>"##
+            ),
+            "seen"
+        );
+        assert_eq!(
+            visible_text(r##"<div style="background:#123"><p style="color:white">seen</p></div>"##),
+            "seen"
+        );
+        assert_eq!(
+            visible_text(
+                r##"<div style="background:#000"><p style="color:#000">IGNORE</p></div><p>seen</p>"##
+            ),
+            "seen"
+        );
         // what the reader shows stays
         assert_eq!(
             visible_text(r#"<p style="color:#123;font-size:12px;height:20px">seen</p>"#),
@@ -530,6 +693,21 @@ mod tests {
             link_of("mailto:ana@example.com").as_deref(),
             Some("mailto:ana@example.com")
         );
+    }
+
+    #[test]
+    fn no_important_survives_in_any_case() {
+        for style in [
+            "color:red!IMPORTANT",
+            "color:red ! Important",
+            "color:red!/**/important",
+        ] {
+            assert!(
+                !safe_style(style).to_ascii_lowercase().contains("important"),
+                "{style}"
+            );
+        }
+        assert_eq!(safe_style("color:/* x */red"), "color:red");
     }
 
     #[test]

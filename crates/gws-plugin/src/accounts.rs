@@ -3,6 +3,7 @@
 //! `buwiz.account.set` and takes it back with `buwiz.account.clear`. The
 //! token lives in memory only: never logged, written or echoed.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use serde_json::Value;
@@ -12,7 +13,15 @@ pub const GOOGLE: &str = "google";
 
 /// The pushed accounts.
 #[derive(Default)]
-pub struct Accounts(Mutex<buwiz_plugin::Accounts>);
+pub struct Accounts(Mutex<Held>);
+
+/// The SDK's accounts, and who each label's sign-in is, live or expired: an
+/// expired token is still someone's mail on this Mac.
+#[derive(Default)]
+struct Held {
+    tokens: buwiz_plugin::Accounts,
+    who: BTreeMap<String, String>,
+}
 
 /// The `Authorization` value for a request.
 pub struct Bearer(String);
@@ -30,35 +39,72 @@ impl std::fmt::Debug for Bearer {
 }
 
 impl Accounts {
-    fn held(&self) -> std::sync::MutexGuard<'_, buwiz_plugin::Accounts> {
+    fn held(&self) -> std::sync::MutexGuard<'_, Held> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// `buwiz.account.set`'s arguments.
     pub fn set(&self, args: &Value) -> Value {
-        self.held()
-            .set(args.as_object().unwrap_or(&serde_json::Map::new()))
+        self.update(args, |tokens, args| tokens.set(args))
     }
 
     /// `buwiz.account.clear`'s arguments.
     pub fn clear(&self, args: &Value) -> Value {
-        self.held()
-            .clear(args.as_object().unwrap_or(&serde_json::Map::new()))
+        self.update(args, |tokens, args| tokens.clear(args))
+    }
+
+    fn update(
+        &self,
+        args: &Value,
+        apply: impl FnOnce(&mut buwiz_plugin::Accounts, &serde_json::Map<String, Value>) -> Value,
+    ) -> Value {
+        let mut held = self.held();
+        let result = apply(
+            &mut held.tokens,
+            args.as_object().unwrap_or(&serde_json::Map::new()),
+        );
+        if let Some(label) = args.get("label").and_then(Value::as_str) {
+            let now = held
+                .tokens
+                .labelled(GOOGLE, label)
+                .map(|a| a.subject.clone());
+            match now {
+                Some(who) => held.who.insert(label.to_owned(), who),
+                None => held.who.remove(label),
+            };
+        }
+        result
     }
 
     /// Forgets every token (`buwiz.uninstall`).
     pub fn forget(&self) {
-        self.held().forget();
+        let mut held = self.held();
+        held.tokens.forget();
+        held.who.clear();
+    }
+
+    /// Whose sign-in `label` holds, live or expired.
+    pub fn who(&self, label: &str) -> Option<String> {
+        self.held().who.get(label).cloned()
+    }
+
+    /// Whether any sign-in is `subject`'s, live or expired.
+    pub fn holds(&self, subject: &str) -> bool {
+        self.held().who.values().any(|who| who == subject)
     }
 
     /// The Google account's live token.
     pub fn google(&self) -> Option<Bearer> {
-        self.held().get(GOOGLE).map(|a| Bearer(a.authorization()))
+        self.held()
+            .tokens
+            .get(GOOGLE)
+            .map(|a| Bearer(a.authorization()))
     }
 
     /// Who is signed in and what the sign-in covers.
     pub fn signed_in(&self) -> Option<(String, Vec<String>)> {
         self.held()
+            .tokens
             .get(GOOGLE)
             .map(|a| (a.subject.clone(), a.scopes.clone()))
     }

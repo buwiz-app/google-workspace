@@ -192,11 +192,56 @@ pub fn start(core: Arc<Core>) -> JoinHandle<()> {
     })
 }
 
-/// Clears what's held for `account`, who has signed out.
-pub fn forget(core: &Core, account: &str) {
-    if let Err(Failure::Plain(why)) = with_store(core, |store| store.forget_account(account)) {
-        eprintln!("buwiz-gws: couldn't clear the signed-out account's mail: {why}");
+/// Clears what's held for `account`, who has signed out. False if it couldn't
+/// yet: [`retry_wipes`] goes on trying.
+pub fn forget(core: &Core, account: &str) -> bool {
+    let wiped = with_store(core, |store| store.forget_account(account)).is_ok();
+    if !wiped {
+        eprintln!("buwiz-gws: couldn't clear a signed-out account's mail yet");
+        core.wipes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(account.to_owned());
     }
+    wiped
+}
+
+/// Clears what an earlier sign-out couldn't, unless that account came back.
+fn retry_wipes(core: &Core) {
+    let waiting = std::mem::take(&mut *core.wipes.lock().unwrap_or_else(|e| e.into_inner()));
+    for account in waiting {
+        if !core.accounts.holds(&account) {
+            forget(core, &account);
+        }
+    }
+}
+
+/// [`with_own_store`] for a test that plays a sync still in flight.
+#[doc(hidden)]
+pub fn write_as<T>(
+    core: &Core,
+    account: &str,
+    f: impl FnOnce(&Store) -> gws_store::Result<T>,
+) -> Result<T, Failure> {
+    with_own_store(core, account, f)
+}
+
+/// [`with_store`] for a write, which only goes in while `account` is signed
+/// in. Checked under the store's lock, which a sign-out's clear takes too, so
+/// a sync still in flight can't put back what was cleared.
+fn with_own_store<T>(
+    core: &Core,
+    account: &str,
+    f: impl FnOnce(&Store) -> gws_store::Result<T>,
+) -> Result<T, Failure> {
+    let held = core.store().map_err(|e| Failure::Plain(e.message))?;
+    if !core.accounts.holds(account) {
+        return Err(Failure::AccountRequired);
+    }
+    let store = held
+        .as_ref()
+        .ok_or_else(|| Failure::Plain("The local mail store isn't open.".to_owned()))?;
+    f(store).map_err(|e| Failure::Plain(e.message))
 }
 
 fn with_store<T>(
@@ -293,15 +338,7 @@ fn fetch_rows(
 ) -> Result<Vec<Thread>, Failure> {
     let found = core.gmail.threads_metadata(auth, ids)?;
     let mut rows = Vec::with_capacity(ids.len());
-    // a sync that outlives its sign-in must not put back what was cleared
-    if core
-        .accounts
-        .signed_in()
-        .is_none_or(|(who, _)| who != account)
-    {
-        return Err(Failure::AccountRequired);
-    }
-    with_store(core, |store| {
+    with_own_store(core, account, |store| {
         for (id, thread) in ids.iter().zip(found) {
             match thread.as_ref().and_then(row_of) {
                 Some(row) => {
@@ -333,11 +370,11 @@ fn sync_labels(core: &Core, auth: &Bearer, account: &str) -> Result<(), Failure>
             })
         })
         .collect();
-    with_store(core, |store| store.put_labels(account, &labels))
+    with_own_store(core, account, |store| store.put_labels(account, &labels))
 }
 
 fn bump(core: &Core, account: &str) -> Result<i64, Failure> {
-    with_store(core, |store| {
+    with_own_store(core, account, |store| {
         let next = store
             .state(account, SEQ)?
             .and_then(|s| s.parse::<i64>().ok())
@@ -348,44 +385,48 @@ fn bump(core: &Core, account: &str) -> Result<i64, Failure> {
     })
 }
 
-fn sync_once(core: &Core) -> Result<bool, Failure> {
-    let (auth, account) = signed_in(core)?;
-    let cursor = with_store(core, |store| store.state(&account, HISTORY))?;
+fn sync_once(core: &Core, auth: &Bearer, account: &str) -> Result<bool, Failure> {
+    let cursor = with_store(core, |store| store.state(account, HISTORY))?;
     let changed = match cursor
         .as_deref()
-        .map(|c| core.gmail.history(&auth, c))
+        .map(|c| core.gmail.history(auth, c))
         .transpose()?
         .flatten()
     {
         Some((touched, newest)) => {
-            fetch_rows(core, &auth, &account, &touched)?;
-            with_store(core, |store| store.set_state(&account, HISTORY, &newest))?;
+            fetch_rows(core, auth, account, &touched)?;
+            with_own_store(core, account, |store| {
+                store.set_state(account, HISTORY, &newest)
+            })?;
             !touched.is_empty()
         }
         // no cursor, or one Google has forgotten: start from the inbox again
         None => {
-            let newest = core.gmail.history_now(&auth)?.unwrap_or_default();
+            let newest = core.gmail.history_now(auth)?.unwrap_or_default();
             let (ids, next) =
                 core.gmail
-                    .thread_ids(&auth, Some("INBOX"), None, None, PAGE as usize)?;
-            fetch_rows(core, &auth, &account, &ids)?;
-            with_store(core, |store| {
-                store.set_state(&account, HISTORY, &newest)?;
-                store.set_state(&account, &page_key("INBOX"), next.as_deref().unwrap_or(""))
+                    .thread_ids(auth, Some("INBOX"), None, None, PAGE as usize)?;
+            fetch_rows(core, auth, account, &ids)?;
+            with_own_store(core, account, |store| {
+                store.set_state(account, HISTORY, &newest)?;
+                store.set_state(account, &page_key("INBOX"), next.as_deref().unwrap_or(""))
             })?;
             true
         }
     };
     // counts move only with the mail, and each label costs a request
     if changed {
-        sync_labels(core, &auth, &account)?;
+        sync_labels(core, auth, account)?;
     }
     Ok(changed)
 }
 
 /// One sync, and its outcome kept for the screens. A change bumps the sequence.
 pub fn sync(core: &Core) -> Result<(), Failure> {
-    let result = sync_once(core);
+    retry_wipes(core);
+    // who this sync is for, from here to its last write
+    let (auth, account) = signed_in(core)?;
+    let result = sync_once(core, &auth, &account);
     let status = match &result {
         Ok(_) => "ok",
         Err(Failure::Offline(_)) => "offline",
@@ -393,12 +434,9 @@ pub fn sync(core: &Core) -> Result<(), Failure> {
         Err(Failure::AccountRequired) => return Err(Failure::AccountRequired),
         Err(Failure::Plain(_)) => "failed",
     };
-    let account = core
-        .accounts
-        .signed_in()
-        .map(|(s, _)| s)
-        .unwrap_or_default();
-    with_store(core, |store| store.set_state(&account, STATUS, status))?;
+    with_own_store(core, &account, |store| {
+        store.set_state(&account, STATUS, status)
+    })?;
     if matches!(result, Ok(true)) {
         bump(core, &account)?;
     }
@@ -483,7 +521,7 @@ fn fill(core: &Core, auth: &Bearer, account: &str, label: &str) -> Result<(), Fa
         core.gmail
             .thread_ids(auth, Some(label), None, held.as_deref(), PAGE as usize)?;
     fetch_rows(core, auth, account, &ids)?;
-    with_store(core, |store| {
+    with_own_store(core, account, |store| {
         store.set_state(account, &key, next.as_deref().unwrap_or(""))
     })
 }
@@ -667,7 +705,7 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
         return Ok(fail("not_found", "That conversation is gone."));
     };
     let view = view_of(&full);
-    with_store(core, |store| {
+    with_own_store(core, &account, |store| {
         store.put_view(&account, &id, &view.to_string(), now_ms())
     })?;
     Ok(ok(view))

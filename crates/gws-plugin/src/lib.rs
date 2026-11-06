@@ -45,6 +45,8 @@ pub struct Core {
     pub sync: mail::Waker,
     /// What a card's tickets stand for: a search, or a thread.
     pub tickets: Mutex<mail::Tickets>,
+    /// Signed-out accounts whose mail couldn't be cleared yet.
+    pub wipes: Mutex<Vec<String>>,
 }
 
 impl Core {
@@ -57,6 +59,7 @@ impl Core {
             store: Mutex::new(None),
             sync: mail::Waker::default(),
             tickets: Mutex::default(),
+            wipes: Mutex::default(),
         }
     }
 
@@ -80,20 +83,43 @@ impl Core {
             .unwrap_or_else(|| tools::run(&self.gmail, &self.accounts, tool, args))
     }
 
-    /// `buwiz.account.set` or `.clear`. A sign-out takes that account's mail
-    /// with it: subjects and bodies have no business outliving the sign-in.
+    /// `buwiz.account.set` or `.clear`. A label that stops being someone's
+    /// takes their mail with it, whether its token had expired or not: subjects
+    /// and bodies have no business outliving the sign-in.
     pub fn account(&self, method: &str, args: &Value) -> Value {
-        let who = || self.accounts.signed_in().map(|(who, _)| who);
-        let was = who();
-        let result = if method == "buwiz.account.set" {
+        let label = args
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let was = self.accounts.who(label);
+        let mut result = if method == "buwiz.account.set" {
             self.accounts.set(args)
         } else {
             self.accounts.clear(args)
         };
-        if let Some(gone) = was.filter(|_| who().is_none()) {
-            mail::forget(self, &gone);
+        let gone = was.filter(|who| !self.accounts.holds(who));
+        if let Some(gone) = gone
+            && !mail::forget(self, &gone)
+        {
+            // the caller hears, and the sync thread keeps trying
+            result["structuredContent"]["mail_kept"] = Value::Bool(true);
         }
         self.sync.wake();
+        result
+    }
+
+    /// Runs `f` with no store to reach, as a failing disk would leave it.
+    #[doc(hidden)]
+    pub fn store_unavailable_while<T>(&self, f: impl FnOnce() -> T) -> T {
+        let key = self
+            .store_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let open = self.store.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let result = f();
+        *self.store.lock().unwrap_or_else(|e| e.into_inner()) = open;
+        *self.store_key.lock().unwrap_or_else(|e| e.into_inner()) = key;
         result
     }
 
@@ -137,7 +163,11 @@ impl Core {
             .clone()
         {
             Some(key) => gws_store::wipe(paths, &key),
-            None => Ok(()),
+            // the files are named from the key, so without it none can be found
+            None => Err(gws_store::Error {
+                code: "not_provisioned",
+                message: "The plugin was never given its key, so its files stay.".to_owned(),
+            }),
         }
     }
 }
@@ -187,8 +217,8 @@ impl Plugin for Gws {
     fn uninstall(&mut self) {
         if let Err(e) = self.core.uninstall() {
             eprintln!(
-                "buwiz-gws: uninstall left the plugin's files in place: {}",
-                e.code
+                "buwiz-gws: uninstall left the plugin's files in place: {}: {}",
+                e.code, e.message
             );
         }
     }

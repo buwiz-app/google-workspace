@@ -839,7 +839,7 @@ async fn begin(b: Bridge, m: Drive) {
 pub fn build(bridge: Bridge) -> Root {
     buwiz_app::root(bridge, move |b| {
         if b.viewport_now().placement == Placement::Inline {
-            return view().child(card::files(b));
+            return crate::shell::card_frame().child(card::files(b));
         }
         let props = b.props();
         let prop = |k: &str| props.get(k).and_then(Value::as_str).map(str::to_owned);

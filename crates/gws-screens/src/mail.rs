@@ -1445,8 +1445,8 @@ pub fn build(bridge: Bridge) -> Root {
         let prop = |k: &str| props.get(k).and_then(Value::as_str).map(str::to_owned);
         if b.viewport_now().placement == Placement::Inline {
             return match prop("draft") {
-                Some(ticket) => view().child(compose::card(b, ticket)),
-                None => view().child(card(b)),
+                Some(ticket) => crate::shell::card_frame().child(compose::card(b, ticket)),
+                None => crate::shell::card_frame().child(card(b)),
             };
         }
         let (jobs, mut waiting) = unbounded_channel::<Job>();

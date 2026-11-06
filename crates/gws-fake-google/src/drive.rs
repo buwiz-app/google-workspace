@@ -165,6 +165,10 @@ pub(crate) fn demo() -> Vec<FakeFile> {
             .inside("drv-photos")
             .holding(&TINY_PNG)
             .modified(ago(5)),
+        FakeFile::new("drv-site-photo", "Site photo.png", "image/png")
+            .inside("drv-photos")
+            .holding(include_bytes!("site-photo.png"))
+            .modified(ago(6)),
         notes,
         FakeFile::new("drv-sheet-invoices", "Invoices", GOOGLE_SHEET)
             .holding(b"number,total\n1042,1200\n")
@@ -544,7 +548,8 @@ impl Query {
             Self::TextHas(w) => {
                 has(&f.name, w)
                     || has(&f.description, w)
-                    || has(&String::from_utf8_lossy(&f.content), w)
+                    || (!f.mime.starts_with("image/")
+                        && has(&String::from_utf8_lossy(&f.content), w))
             }
             Self::NameIs(w) => f.name == *w,
             Self::MimeIs(w) => f.mime == *w,

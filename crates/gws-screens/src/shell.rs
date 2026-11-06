@@ -15,6 +15,12 @@ pub(crate) const MUTE: &str = "text-[#5c5c5c] dark:text-[#a0a0a0]";
 pub(crate) const INK: &str = "text-[#1c1c1c] dark:text-[#f0f0f0]";
 pub(crate) const RAIL: &str = "bg-[#efefec] dark:bg-[#0f0f0f]";
 pub(crate) const PANEL: &str = "bg-white dark:bg-[#1d1d1d]";
+
+/// What a card sits in. The Bot's frame can be taller than a short card, and
+/// the rest of it has to be the card and not a dark band.
+pub(crate) fn card_frame() -> nsh_core::element::View {
+    view().app_class(Some(format!("flex-1 {PANEL}").into()))
+}
 pub(crate) const LINE: &str = "border-black/10 dark:border-[#2b2b2b]";
 pub(crate) const CHOSEN: &str = "bg-[#e1ebfb] dark:bg-[#15253f]";
 pub(crate) const DIM: &str = "text-[#8a8a8a] dark:text-[#6e6e6e]";

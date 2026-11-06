@@ -45,7 +45,6 @@ pub(super) struct Sharing {
     leaving: Signal<HashSet<String>>,
     typed: Signal<String>,
     role: Signal<&'static str>,
-    message: Signal<String>,
     /// What's wrong with the address typed.
     problem: Signal<Option<&'static str>>,
     turn: Latest,
@@ -61,7 +60,6 @@ impl Sharing {
             leaving: signal(HashSet::new()),
             typed: signal(String::new()),
             role: signal("reader"),
-            message: signal(String::new()),
             problem: signal(None),
             turn: Latest::new(),
         }
@@ -109,7 +107,6 @@ pub(super) fn open(b: &Bridge, m: Drive, row: Row) {
     s.adding.set(Vec::new());
     s.leaving.set(HashSet::new());
     s.typed.set(String::new());
-    s.message.set(String::new());
     s.role.set("reader");
     s.problem.set(None);
     s.read.set(Read::Reading);
@@ -185,11 +182,7 @@ fn share(b: &Bridge, m: Drive, id: &str) {
         .iter()
         .map(|(email, role)| json!({"email": email, "role": role}))
         .collect();
-    let mut args = json!({"id": id, "add": add, "remove": remove, "seen": s.seen.get_untracked()});
-    let message = s.message.get_untracked();
-    if !adding.is_empty() && !message.trim().is_empty() {
-        args["message"] = json!(message.trim());
-    }
+    let args = json!({"id": id, "add": add, "remove": remove, "seen": s.seen.get_untracked()});
     let call = b.call("gws_drive_share", args);
     let (b, id) = (b.clone(), id.to_owned());
     m.writing.set(true);
@@ -293,19 +286,29 @@ fn people(m: Drive) -> impl IntoElement {
         let list = staying.into_iter().fold(list, |list, p| {
             let off = p.removable.then(|| {
                 let id = p.id.clone();
-                press("Take this person off", &p.who, move || {
-                    s.leaving.update(|l| {
-                        l.insert(id.clone());
-                    });
-                })
+                press_as(
+                    "Take this person off",
+                    "Remove".to_owned(),
+                    &p.who,
+                    move || {
+                        s.leaving.update(|l| {
+                            l.insert(id.clone());
+                        });
+                    },
+                )
             });
             list.child(person(p.who, p.role, "", off))
         });
         let list = s.adding.get().into_iter().fold(list, |list, (who, role)| {
             let address = who.clone();
-            let off = press("Don't add this person", &who, move || {
-                s.adding.update(|a| a.retain(|(a, _)| *a != address));
-            });
+            let off = press_as(
+                "Don't add this person",
+                "Remove".to_owned(),
+                &who,
+                move || {
+                    s.adding.update(|a| a.retain(|(a, _)| *a != address));
+                },
+            );
             list.child(person(who, role_line(role), "New", Some(off)))
         });
         if gone.is_empty() {
@@ -364,7 +367,8 @@ fn adder(m: Drive, folder: bool) -> View {
         .app_class(Some("gap-1 px-3 py-2".into()))
         .child(
             input()
-                .label("Add a person's email address")
+                // the @ keeps the AI out: what it staged here would go at the person's press
+                .label("Email address, like name@company.com")
                 .value(move || s.typed.get())
                 .placeholder("Add an email address".to_owned())
                 .auto_focus(true)
@@ -378,33 +382,11 @@ fn adder(m: Drive, folder: bool) -> View {
                 .on_submit(move |_: &str| add(m)),
         )
         .child(roles)
-        .child(press("Add this person", "", move || add(m)))
+        .child(press_as("Add this person", "Add".to_owned(), "", move || add(m)))
         .child(dynamic(move || match s.problem.get() {
             Some(why) => view().child(text(why).app_class(Some(format!("text-[11px] {INK}").into()))),
             None => view(),
         }))
-}
-
-/// Google's mail to whoever is added carries this. With nobody added no mail
-/// goes, so the field goes too.
-fn message_box(m: Drive) -> impl IntoElement {
-    let s = m.sharing;
-    let adding = computed(move || s.adding.with(|a| !a.is_empty()));
-    dynamic(move || {
-        if !adding.get() {
-            return view();
-        }
-        view().app_class(Some("px-3 py-2".into())).child(
-            input()
-                .label("Message to new people")
-                .value(move || s.message.get())
-                .placeholder("Add a message".to_owned())
-                .app_class(Some(
-                    format!("min-w-0 max-w-full rounded-lg border px-2.5 py-1 text-[13px] {BG} {LINE} {INK}").into(),
-                ))
-                .on_change(move |value: &str| s.message.set(value.to_owned())),
-        )
-    })
 }
 
 fn footer(b: Bridge, m: Drive, row: Row) -> View {
@@ -480,16 +462,12 @@ pub(super) fn pane(b: Bridge, m: Drive, row: Row) -> View {
         )
         .child(
             scroll().app_class(Some("flex-1 min-h-0".into())).child(
-                view()
-                    .child(adder(m, folder))
-                    .child(people(m))
-                    .child(message_box(m))
-                    .child(
-                        view().app_class(Some("px-3 py-2".into())).child(
-                            text("Sharing by link isn't here. Google Drive's own page has it.")
-                                .app_class(Some(format!("text-[11px] {DIM}").into())),
-                        ),
+                view().child(adder(m, folder)).child(people(m)).child(
+                    view().app_class(Some("px-3 py-2".into())).child(
+                        text("Sharing by link isn't here. Google Drive's own page has it.")
+                            .app_class(Some(format!("text-[11px] {DIM}").into())),
                     ),
+                ),
             ),
         )
         .child(footer(b, m, row))

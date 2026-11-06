@@ -2146,6 +2146,19 @@ fn each_button_makes_its_own_call_and_the_bar_goes_with_the_file() {
     }
 }
 
+/// The AI's view drops a button whose name its text doesn't repeat, so these
+/// stay out of its reach: with the panel open it mustn't stage who's shared with.
+#[test]
+fn the_share_list_presses_say_less_than_their_labels() {
+    let (mut app, _fake) = start();
+    open_share(&mut app);
+    assert!(app.screen().matches("label:Add this person").unwrap());
+    assert!(!app.screen().shows("Add this person"));
+    assert!(app.screen().shows("Add"));
+    assert!(!app.screen().shows("Take this person off"));
+    assert!(app.screen().shows("Remove"));
+}
+
 #[test]
 fn keeping_the_edits_after_discard_asks_changes_nothing() {
     let (mut app, fake, _) =
@@ -2305,7 +2318,8 @@ fn assert_no_label_holds(app: &Headless, secrets: &[&str], at: &str) {
         );
     }
     assert!(
-        !app.screen().matches("label:/@/").unwrap(),
+        // the one fixed sample address keeps the AI out of the guest field
+        !app.screen().matches("label:/@example/").unwrap(),
         "{at}: a label holds an address"
     );
 }
@@ -3114,7 +3128,7 @@ fn open_share(app: &mut Headless) {
 }
 
 fn add_person(app: &mut Headless, address: &str, role: &str) {
-    app.type_text("label:Add a person's email address", address)
+    app.type_text("label:Email address, like name@company.com", address)
         .unwrap();
     press(app, &format!("label:{role}"));
     press(app, "label:Add this person");
@@ -3170,8 +3184,6 @@ fn the_press_sends_exactly_what_is_on_the_screen() {
     let (mut app, fake) = start();
     open_share(&mut app);
     add_person(&mut app, "cara@example.com", "Can comment");
-    app.type_text("label:Message to new people", "Please look")
-        .unwrap();
     press(&mut app, "label:Take this person off >> nth=1");
     assert!(app.screen().shows("Will lose access"));
     assert!(app.screen().shows("Leaving"));
@@ -3183,7 +3195,6 @@ fn the_press_sends_exactly_what_is_on_the_screen() {
             "id": "notes",
             "add": [{"email": "cara@example.com", "role": "commenter"}],
             "remove": ["p-ben"],
-            "message": "Please look",
             "seen": "mark-1",
         })]
     );
@@ -3222,43 +3233,36 @@ fn someone_with_no_remove_press_has_none_the_owner_the_person_and_the_link() {
 }
 
 #[test]
-fn a_message_goes_only_with_someone_added() {
-    let (mut app, fake) = start();
-    open_share(&mut app);
-    assert!(!app.screen().matches("label:Message to new people").unwrap());
-    add_person(&mut app, "cara@example.com", "Can view");
-    app.type_text("label:Message to new people", "Goodbye")
-        .unwrap();
-    press(&mut app, "label:Don't add this person");
-    assert!(!app.screen().matches("label:Message to new people").unwrap());
-    press(&mut app, "label:Take this person off >> nth=0");
-    press(&mut app, "label:Share with these people");
-    let sent = last_of(&fake, "gws_drive_share");
-    assert_eq!(sent.get("message"), None, "{sent}");
-    assert_eq!(sent["add"], json!([]));
-    assert!(app.screen().shows("Removed 1 person."));
-}
-
-#[test]
 fn an_address_is_checked_and_nobody_gets_on_twice() {
     let (mut app, fake) = start();
     open_share(&mut app);
-    app.type_text("label:Add a person's email address", "not an address")
-        .unwrap();
+    app.type_text(
+        "label:Email address, like name@company.com",
+        "not an address",
+    )
+    .unwrap();
     press(&mut app, "label:Add this person");
     assert!(
         app.screen()
             .shows("That doesn't look like an email address.")
     );
-    app.clear("label:Add a person's email address").unwrap();
-    app.type_text("label:Add a person's email address", "ANA@example.com")
+    app.clear("label:Email address, like name@company.com")
         .unwrap();
+    app.type_text(
+        "label:Email address, like name@company.com",
+        "ANA@example.com",
+    )
+    .unwrap();
     press(&mut app, "label:Add this person");
     assert!(app.screen().shows("That person has this file already."));
-    app.clear("label:Add a person's email address").unwrap();
-    add_person(&mut app, "cara@example.com", "Can view");
-    app.type_text("label:Add a person's email address", "cara@example.com")
+    app.clear("label:Email address, like name@company.com")
         .unwrap();
+    add_person(&mut app, "cara@example.com", "Can view");
+    app.type_text(
+        "label:Email address, like name@company.com",
+        "cara@example.com",
+    )
+    .unwrap();
     press(&mut app, "label:Add this person");
     assert!(app.screen().shows("That person has this file already."));
     assert_eq!(app.screen().count("text:New").unwrap(), 1);
@@ -3270,8 +3274,11 @@ fn an_address_left_in_the_field_stops_the_press_with_a_word() {
     let (mut app, fake) = start();
     open_share(&mut app);
     add_person(&mut app, "cara@example.com", "Can view");
-    app.type_text("label:Add a person's email address", "dan@example.com")
-        .unwrap();
+    app.type_text(
+        "label:Email address, like name@company.com",
+        "dan@example.com",
+    )
+    .unwrap();
     press(&mut app, "label:Share with these people");
     assert!(app.screen().shows("Add that address, or clear it, first."));
     assert!(fake.called("gws_drive_share").is_empty());
@@ -3281,9 +3288,13 @@ fn an_address_left_in_the_field_stops_the_press_with_a_word() {
 fn enter_in_the_address_adds_it_and_never_shares() {
     let (mut app, fake) = start();
     open_share(&mut app);
-    app.type_text("label:Add a person's email address", "cara@example.com")
+    app.type_text(
+        "label:Email address, like name@company.com",
+        "cara@example.com",
+    )
+    .unwrap();
+    app.submit("label:Email address, like name@company.com")
         .unwrap();
-    app.submit("label:Add a person's email address").unwrap();
     settle(&mut app);
     assert!(app.screen().shows("Share with 1 person"));
     assert!(fake.called("gws_drive_share").is_empty());
@@ -3761,7 +3772,8 @@ fn every_press_in_share_stays_whole_at_every_width() {
     app.wait_for_within("text:Who will have access", WAIT)
         .unwrap();
     add_person(&mut app, LONG_NAME.replace(' ', "").as_str(), "Can edit");
-    app.clear("label:Add a person's email address").unwrap();
+    app.clear("label:Email address, like name@company.com")
+        .unwrap();
     add_person(&mut app, "cara@example.com", "Can edit");
     press(&mut app, "label:Take this person off >> nth=0");
     sweep(

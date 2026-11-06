@@ -235,12 +235,13 @@ fn share_shows_everyone_google_has_and_the_press_reaches_google_as_shown() {
         2,
         "not the owner, the person or the link"
     );
-    app.type_text("label:Add a person's email address", "cara@example.com")
-        .unwrap();
+    app.type_text(
+        "label:Email address, like name@company.com",
+        "cara@example.com",
+    )
+    .unwrap();
     press(&mut app, "label:Can edit");
     press(&mut app, "label:Add this person");
-    app.type_text("label:Message to new people", "Please look")
-        .unwrap();
     press(&mut app, "label:Take this person off >> nth=1");
     assert!(app.screen().shows("Share with 1 person and remove 1"));
     press(&mut app, "label:Share with these people");
@@ -263,7 +264,6 @@ fn share_shows_everyone_google_has_and_the_press_reaches_google_as_shown() {
         ]
     );
     let writes = google.drive_writes();
-    assert_eq!(writes[0].query["emailMessage"], "Please look");
     assert_eq!(writes[0].query["sendNotificationEmail"], "true");
     assert_eq!(writes[1].method, "DELETE");
 }
@@ -276,8 +276,11 @@ fn someone_new_since_the_list_was_read_is_shown_before_anything_goes() {
     press(&mut app, "label:Share");
     app.wait_for_within("text:Who will have access", WAIT)
         .unwrap();
-    app.type_text("label:Add a person's email address", "cara@example.com")
-        .unwrap();
+    app.type_text(
+        "label:Email address, like name@company.com",
+        "cara@example.com",
+    )
+    .unwrap();
     press(&mut app, "label:Add this person");
     google.edit_file("drv-a", |f| {
         f.people.push((

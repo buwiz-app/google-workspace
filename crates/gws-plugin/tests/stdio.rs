@@ -799,7 +799,7 @@ fn a_chats_drive_search_offers_the_files_card_through_the_real_server() {
     let manifest = manifest_file("drive-card");
     let data = std::env::temp_dir().join(format!("gws-stdio-drive-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+    let mut child = plugin()
         .arg("mcp")
         .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
         .env("GWS_STUB_BASE", google.base())

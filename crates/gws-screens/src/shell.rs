@@ -2,18 +2,40 @@
 //! signed-in account, which is more than being signed in. Each screen's own
 //! content comes in its slice.
 
+use std::time::Duration;
+
 use buwiz_app::Bridge;
 use nsh_core::element::{Element, ParentElement, Root, dynamic, signal, text, view};
 use serde_json::{Value, json};
 
-const BG: &str = "bg-[#f6f6f4] dark:bg-[#151515]";
-const MUTE: &str = "text-[#5c5c5c] dark:text-[#a0a0a0]";
+pub(crate) const BG: &str = "bg-[#f6f6f4] dark:bg-[#151515]";
+pub(crate) const MUTE: &str = "text-[#5c5c5c] dark:text-[#a0a0a0]";
+
+/// How many times a busy answer is tried again before it's shown.
+pub(crate) const RETRIES: u32 = 5;
+
+/// The wait before try `attempt + 1`.
+pub(crate) fn backoff(attempt: u32) -> Duration {
+    Duration::from_millis(250 << attempt.min(4))
+}
+
+/// A wait the screen's task can await.
+pub(crate) async fn sleep(wait: Duration) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(wait);
+        let _ = tx.send(());
+    });
+    let _ = rx.await;
+}
 
 #[derive(Clone, PartialEq)]
 enum Account {
     Loading,
     Covered,
     NotCovered,
+    /// Signed in, with no scopes on record: only trying will tell.
+    Unknown,
     SignedOut,
     Failed(String),
 }
@@ -23,7 +45,11 @@ fn account_of(status: &Value, name: &str) -> Account {
     if status.get("signed_in") != Some(&Value::Bool(true)) {
         return Account::SignedOut;
     }
-    if status.pointer(&format!("/features/{}", name.to_lowercase())) == Some(&Value::Bool(true)) { Account::Covered } else { Account::NotCovered }
+    match status.get("features").filter(|f| !f.is_null()) {
+        None => Account::Unknown,
+        Some(f) if f.get(name.to_lowercase()) == Some(&Value::Bool(true)) => Account::Covered,
+        Some(_) => Account::NotCovered,
+    }
 }
 
 fn line_of(account: Account, name: &str) -> String {
@@ -31,6 +57,9 @@ fn line_of(account: Account, name: &str) -> String {
         Account::Loading => "Loading…".to_owned(),
         Account::Covered => format!("{name} is connected to your Google account."),
         Account::NotCovered => format!("Your Google sign-in doesn't cover {name} yet."),
+        Account::Unknown => {
+            format!("You're signed in to Google. {name} will check its access when it needs it.")
+        }
         Account::SignedOut => "Connect your Google account on this app's page.".to_owned(),
         Account::Failed(message) => message,
     }
@@ -41,16 +70,23 @@ pub fn build(bridge: Bridge, name: &'static str) -> Root {
         let account = signal(Account::Loading);
         let reader = b.clone();
         b.spawn(async move {
-            match reader.call("gws_status", json!({})).await {
-                Ok(v) => account.set(account_of(&v, name)),
-                Err(e) => account.set(Account::Failed(e.message)),
+            for attempt in 0.. {
+                match reader.call("gws_status", json!({})).await {
+                    Ok(v) => return account.set(account_of(&v, name)),
+                    Err(e) if e.retryable && attempt < RETRIES => sleep(backoff(attempt)).await,
+                    Err(e) => return account.set(Account::Failed(e.message)),
+                }
             }
         });
         let body = dynamic(move || {
             let line = line_of(account.get(), name);
-            view().app_class(Some("flex-1 items-center justify-center".into())).child(text(line).app_class(Some(format!("text-[14px] {MUTE}").into())))
+            view()
+                .app_class(Some("flex-1 items-center justify-center".into()))
+                .child(text(line).app_class(Some(format!("text-[14px] {MUTE}").into())))
         });
-        view().app_class(Some(format!("flex-1 {BG}").into())).child(body)
+        view()
+            .app_class(Some(format!("flex-1 {BG}").into()))
+            .child(body)
     })
 }
 
@@ -59,12 +95,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_busy_answer_waits_longer_each_try() {
+        assert_eq!(backoff(0), Duration::from_millis(250));
+        assert_eq!(backoff(3), Duration::from_secs(2));
+        assert_eq!(backoff(40), Duration::from_secs(4), "and stops growing");
+    }
+
+    #[test]
     fn a_screen_says_connected_only_when_the_sign_in_covers_it() {
         let status = json!({"signed_in": true, "features": {"mail": true, "calendar": false, "drive": false}});
-        assert_eq!(line_of(account_of(&status, "Mail"), "Mail"), "Mail is connected to your Google account.");
-        assert_eq!(line_of(account_of(&status, "Calendar"), "Calendar"), "Your Google sign-in doesn't cover Calendar yet.");
-        assert_eq!(line_of(account_of(&status, "Drive"), "Drive"), "Your Google sign-in doesn't cover Drive yet.");
+        assert_eq!(
+            line_of(account_of(&status, "Mail"), "Mail"),
+            "Mail is connected to your Google account."
+        );
+        assert_eq!(
+            line_of(account_of(&status, "Calendar"), "Calendar"),
+            "Your Google sign-in doesn't cover Calendar yet."
+        );
+        assert_eq!(
+            line_of(account_of(&status, "Drive"), "Drive"),
+            "Your Google sign-in doesn't cover Drive yet."
+        );
         assert!(account_of(&json!({"signed_in": false}), "Mail") == Account::SignedOut);
-        assert!(account_of(&json!({"signed_in": true}), "Mail") == Account::NotCovered, "no word is no");
+        assert!(
+            account_of(&json!({"signed_in": true, "features": null}), "Mail") == Account::Unknown,
+            "not the same as missing"
+        );
+        assert!(account_of(&json!({"signed_in": true}), "Mail") == Account::Unknown);
     }
 }

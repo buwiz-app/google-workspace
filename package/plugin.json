@@ -1,7 +1,7 @@
 {
   "name": "google-workspace",
   "version": "1.4.0",
-  "description": "Mail, Calendar and Drive in Buwiz Bot, with the Google account you sign in to.",
+  "description": "Read your Gmail in Buwiz Bot, with the Google account you sign in to.",
   "author": { "name": "Buwiz" },
   "homepage": "https://github.com/buwiz-app/google-workspace",
   "mcpServers": {

@@ -35,7 +35,12 @@ struct Reply(u16, &'static str, Vec<u8>, Vec<(String, String)>);
 
 impl Reply {
     fn json(status: u16, v: Value) -> Self {
-        Self(status, "application/json", v.to_string().into_bytes(), Vec::new())
+        Self(
+            status,
+            "application/json",
+            v.to_string().into_bytes(),
+            Vec::new(),
+        )
     }
 }
 
@@ -53,7 +58,13 @@ impl Request {
 
     fn query(&self) -> BTreeMap<String, Vec<String>> {
         let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for pair in self.target.split_once('?').map_or("", |(_, q)| q).split('&').filter(|p| !p.is_empty()) {
+        for pair in self
+            .target
+            .split_once('?')
+            .map_or("", |(_, q)| q)
+            .split('&')
+            .filter(|p| !p.is_empty())
+        {
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
             out.entry(decode(k)).or_default().push(decode(v));
         }
@@ -70,7 +81,11 @@ fn decode(s: &str) -> String {
     let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
     let (mut out, mut i) = (Vec::with_capacity(bytes.len()), 0);
     while i < bytes.len() {
-        match (bytes[i], bytes.get(i + 1).copied().and_then(hex), bytes.get(i + 2).copied().and_then(hex)) {
+        match (
+            bytes[i],
+            bytes.get(i + 1).copied().and_then(hex),
+            bytes.get(i + 2).copied().and_then(hex),
+        ) {
             (b'+', ..) => out.push(b' '),
             (b'%', Some(high), Some(low)) => {
                 out.push(high * 16 + low);
@@ -106,13 +121,24 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body).ok()?;
-    Some(Request { method, target, authorization, body })
+    Some(Request {
+        method,
+        target,
+        authorization,
+        body,
+    })
 }
 
 fn write_reply(mut stream: TcpStream, r: Reply) {
     let Reply(status, kind, body, headers) = r;
-    let extra: String = headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
-    let head = format!("HTTP/1.1 {status} Fake\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n{extra}\r\n", body.len());
+    let extra: String = headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect();
+    let head = format!(
+        "HTTP/1.1 {status} Fake\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n{extra}\r\n",
+        body.len()
+    );
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(&body);
 }
@@ -154,11 +180,19 @@ pub fn serve(route: impl Fn(&str) -> (u16, String) + Send + Sync + 'static) -> F
     let log = seen.clone();
     let port = listen(0, move |r| {
         let target = r.target.trim_start_matches(GMAIL).to_owned();
-        log.lock().unwrap().push(Seen { method: r.method, target: target.clone(), authorization: r.authorization, body: String::from_utf8_lossy(&r.body).into_owned() });
+        log.lock().unwrap().push(Seen {
+            method: r.method,
+            target: target.clone(),
+            authorization: r.authorization,
+            body: String::from_utf8_lossy(&r.body).into_owned(),
+        });
         let (status, body) = route(&target);
         Reply(status, "application/json", body.into_bytes(), Vec::new())
     });
-    Fake { base: format!("http://127.0.0.1:{port}{GMAIL}"), seen }
+    Fake {
+        base: format!("http://127.0.0.1:{port}{GMAIL}"),
+        seen,
+    }
 }
 
 /// A fake mail.
@@ -182,6 +216,9 @@ pub struct Mail {
 #[derive(Debug, Clone, Default)]
 pub struct Seed {
     pub mails: Vec<Mail>,
+    /// The scope a sign-in gets whatever it asks for, as for someone who
+    /// signed in before an update asked for more.
+    pub only_grants: Option<String>,
 }
 
 const PEOPLE: [(&str, &str); 8] = [
@@ -194,7 +231,16 @@ const PEOPLE: [(&str, &str); 8] = [
     ("Billing", "billing@shop.example"),
     ("Weekly Digest", "news@digest.example"),
 ];
-const SUBJECTS: [&str; 8] = ["Lunch on Friday", "Roof quote, updated", "Your October receipt", "Five things this week", "Contract draft for review", "Photos from Saturday", "Office closed on the 14th", "Invoice 1042"];
+const SUBJECTS: [&str; 8] = [
+    "Lunch on Friday",
+    "Roof quote, updated",
+    "Your October receipt",
+    "Five things this week",
+    "Contract draft for review",
+    "Photos from Saturday",
+    "Office closed on the 14th",
+    "Invoice 1042",
+];
 /// 2026-11-06 09:00 UTC.
 const NOW_MS: i64 = 1_793_955_600_000;
 
@@ -227,7 +273,45 @@ impl Seed {
                 }
             })
             .collect();
-        Self { mails }
+        Self {
+            mails,
+            only_grants: None,
+        }
+    }
+}
+
+/// A mail built to reach out, run and mislead, aimed at this stub so its log
+/// shows anything that got through. `{stub}` is the stub's own address.
+pub const HOSTILE_HTML: &str = r##"<meta http-equiv="refresh" content="0;url={stub}/__refresh">
+<script>new Image().src='{stub}/__script'</script>
+<style>body{background:url({stub}/__css)}</style>
+<link rel=stylesheet href="{stub}/__link.css">
+<img src="{stub}/__pixel.png" onerror="location='{stub}/__onerror'" width=40 height=40 alt="tracking pixel">
+<iframe src="{stub}/__iframe"></iframe>
+<form action="{stub}/__form"><input name=q value=x><input type=submit value=Go></form>
+<div style="background:url({stub}/__style)">HOSTILE-BODY-TEXT from Mallory Fake</div>
+<p><a href="gws-link:0" style="font-size:24px">FORGED LINK</a></p>
+<p><a href="{stub}/__clicked" style="font-size:24px">REAL LINK</a></p>"##;
+
+impl Seed {
+    /// Adds the hostile mail, newest of all.
+    pub fn with_hostile(mut self, stub: &str) -> Self {
+        self.mails.insert(
+            0,
+            Mail {
+                id: "0000000000hostile".into(),
+                thread: "0000000000hostile".into(),
+                labels: vec!["INBOX".into(), "UNREAD".into()],
+                from: "Mallory Fake <mallory@evil.example>".into(),
+                to: FAKE_EMAIL.into(),
+                subject: "Hostile test mail".into(),
+                at: NOW_MS + 3_600_000,
+                text: "plain".into(),
+                html: Some(HOSTILE_HTML.replace("{stub}", stub)),
+                attachments: Vec::new(),
+            },
+        );
+        self
     }
 }
 
@@ -236,9 +320,18 @@ fn rfc2822(ms: i64) -> String {
     let days = ms.div_euclid(86_400_000);
     let secs = ms.div_euclid(1000).rem_euclid(86_400);
     let (y, m, d) = civil(days);
-    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     let weekdays = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-    format!("{}, {d:02} {} {y} {:02}:{:02}:{:02} +0000", weekdays[days.rem_euclid(7) as usize], months[(m - 1) as usize], secs / 3600, secs / 60 % 60, secs % 60)
+    format!(
+        "{}, {d:02} {} {y} {:02}:{:02}:{:02} +0000",
+        weekdays[days.rem_euclid(7) as usize],
+        months[(m - 1) as usize],
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    )
 }
 
 /// Days since 1970-01-01 as (year, month, day).
@@ -296,6 +389,7 @@ struct Account {
     oldest_history: i64,
     token_count: u64,
     granted: String,
+    only_grants: Option<String>,
     log: Vec<Seen>,
 }
 
@@ -307,7 +401,19 @@ impl Account {
             "metadata" => {
                 let mut p = payload(m, false);
                 if !wanted.is_empty() {
-                    let kept: Vec<Value> = p["headers"].as_array().into_iter().flatten().filter(|h| wanted.iter().any(|w| h["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(w)))).cloned().collect();
+                    let kept: Vec<Value> = p["headers"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|h| {
+                            wanted.iter().any(|w| {
+                                h["name"]
+                                    .as_str()
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(w))
+                            })
+                        })
+                        .cloned()
+                        .collect();
                     p["headers"] = json!(kept);
                 }
                 v["payload"] = p;
@@ -339,7 +445,9 @@ impl Account {
             if term.contains(':') {
                 return true;
             }
-            m.subject.to_lowercase().contains(&term) || m.from.to_lowercase().contains(&term) || m.text.to_lowercase().contains(&term)
+            m.subject.to_lowercase().contains(&term)
+                || m.from.to_lowercase().contains(&term)
+                || m.text.to_lowercase().contains(&term)
         })
     }
 
@@ -358,27 +466,80 @@ impl Account {
 
     fn gmail(&mut self, r: &Request, path: &str) -> Reply {
         let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        let not_found = || Reply::json(404, json!({"error": {"code": 404, "message": "Requested entity was not found."}}));
+        let not_found = || {
+            Reply::json(
+                404,
+                json!({"error": {"code": 404, "message": "Requested entity was not found."}}),
+            )
+        };
         let wanted = r.query().remove("metadataHeaders").unwrap_or_default();
         let format = r.param("format").unwrap_or_else(|| "full".to_owned());
         let labels = r.query().remove("labelIds").unwrap_or_default();
-        let (q, start) = (r.param("q").unwrap_or_default(), r.param("pageToken").and_then(|t| t.parse().ok()).unwrap_or(0));
-        let max = r.param("maxResults").and_then(|t| t.parse().ok()).unwrap_or(100).min(500);
+        let (q, start) = (
+            r.param("q").unwrap_or_default(),
+            r.param("pageToken")
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(0),
+        );
+        let max = r
+            .param("maxResults")
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(100)
+            .min(500);
         match (r.method.as_str(), segs.as_slice()) {
-            ("GET", ["profile"]) => Reply::json(200, json!({"emailAddress": FAKE_EMAIL, "messagesTotal": self.mails.len(), "threadsTotal": self.mails.len(), "historyId": self.history.to_string()})),
+            ("GET", ["profile"]) => Reply::json(
+                200,
+                json!({"emailAddress": FAKE_EMAIL, "messagesTotal": self.mails.len(), "threadsTotal": self.mails.len(), "historyId": self.history.to_string()}),
+            ),
             ("GET", ["labels"]) => {
-                let mut list: Vec<Value> = ["INBOX", "SENT", "DRAFT", "TRASH", "SPAM", "STARRED", "UNREAD", "IMPORTANT", "CATEGORY_PERSONAL"].iter().map(|l| json!({"id": l, "name": l, "type": "system"})).collect();
+                let mut list: Vec<Value> = [
+                    "INBOX",
+                    "SENT",
+                    "DRAFT",
+                    "TRASH",
+                    "SPAM",
+                    "STARRED",
+                    "UNREAD",
+                    "IMPORTANT",
+                    "CATEGORY_PERSONAL",
+                ]
+                .iter()
+                .map(|l| json!({"id": l, "name": l, "type": "system"}))
+                .collect();
                 list.push(json!({"id": "Label_1", "name": "Work", "type": "user"}));
                 list.push(json!({"id": "Label_2", "name": "Receipts", "type": "user"}));
                 Reply::json(200, json!({"labels": list}))
             }
             ("GET", ["labels", id]) => {
-                let total = self.mails.iter().filter(|m| m.labels.iter().any(|l| l == id)).count();
-                let unread = self.mails.iter().filter(|m| m.labels.iter().any(|l| l == id) && m.labels.iter().any(|l| l == "UNREAD")).count();
-                Reply::json(200, json!({"id": id, "name": id, "messagesTotal": total, "messagesUnread": unread, "threadsTotal": total, "threadsUnread": unread}))
+                let total = self
+                    .mails
+                    .iter()
+                    .filter(|m| m.labels.iter().any(|l| l == id))
+                    .count();
+                let unread = self
+                    .mails
+                    .iter()
+                    .filter(|m| {
+                        m.labels.iter().any(|l| l == id) && m.labels.iter().any(|l| l == "UNREAD")
+                    })
+                    .count();
+                let (name, kind) = match *id {
+                    "Label_1" => ("Work", "user"),
+                    "Label_2" => ("Receipts", "user"),
+                    other => (other, "system"),
+                };
+                Reply::json(
+                    200,
+                    json!({"id": id, "name": name, "type": kind, "messagesTotal": total, "messagesUnread": unread, "threadsTotal": total, "threadsUnread": unread}),
+                )
             }
             ("GET", ["messages"]) => {
-                let found = self.mails.iter().filter(|m| Self::matches(m, &q, &labels)).map(|m| json!({"id": m.id, "threadId": m.thread})).collect();
+                let found = self
+                    .mails
+                    .iter()
+                    .filter(|m| Self::matches(m, &q, &labels))
+                    .map(|m| json!({"id": m.id, "threadId": m.thread}))
+                    .collect();
                 Reply::json(200, Self::page(found, "messages", start, max))
             }
             ("GET", ["messages", id]) => match self.mails.iter().find(|m| m.id == *id) {
@@ -386,9 +547,16 @@ impl Account {
                 None => not_found(),
             },
             ("GET", ["messages", id, "attachments", att]) => {
-                let found = self.mails.iter().find(|m| m.id == *id).and_then(|m| att.rsplit('-').next().and_then(|i| i.parse::<usize>().ok()).and_then(|i| m.attachments.get(i)));
+                let found = self.mails.iter().find(|m| m.id == *id).and_then(|m| {
+                    att.rsplit('-')
+                        .next()
+                        .and_then(|i| i.parse::<usize>().ok())
+                        .and_then(|i| m.attachments.get(i))
+                });
                 match found {
-                    Some((_, _, bytes)) => Reply::json(200, json!({"size": bytes.len(), "data": b64(bytes)})),
+                    Some((_, _, bytes)) => {
+                        Reply::json(200, json!({"size": bytes.len(), "data": b64(bytes)}))
+                    }
                     None => not_found(),
                 }
             }
@@ -409,15 +577,29 @@ impl Account {
                     return not_found();
                 }
                 mails.sort_by_key(|m| m.at);
-                let messages: Vec<Value> = mails.iter().map(|m| self.resource(m, &format, &wanted)).collect();
-                Reply::json(200, json!({"id": id, "historyId": self.history.to_string(), "messages": messages}))
+                let messages: Vec<Value> = mails
+                    .iter()
+                    .map(|m| self.resource(m, &format, &wanted))
+                    .collect();
+                Reply::json(
+                    200,
+                    json!({"id": id, "historyId": self.history.to_string(), "messages": messages}),
+                )
             }
             ("GET", ["history"]) => {
-                let since: i64 = r.param("startHistoryId").and_then(|h| h.parse().ok()).unwrap_or(0);
+                let since: i64 = r
+                    .param("startHistoryId")
+                    .and_then(|h| h.parse().ok())
+                    .unwrap_or(0);
                 if since < self.oldest_history {
                     return not_found();
                 }
-                let list: Vec<Value> = self.changes.iter().filter(|(id, _)| *id > since).map(|(_, c)| c.clone()).collect();
+                let list: Vec<Value> = self
+                    .changes
+                    .iter()
+                    .filter(|(id, _)| *id > since)
+                    .map(|(_, c)| c.clone())
+                    .collect();
                 let mut v = json!({"historyId": self.history.to_string()});
                 if !list.is_empty() {
                     v["history"] = json!(list);
@@ -430,10 +612,21 @@ impl Account {
 
     fn token(&mut self, r: &Request) -> Reply {
         let form = String::from_utf8_lossy(&r.body).into_owned();
-        let param = |k: &str| form.split('&').find_map(|p| p.strip_prefix(&format!("{k}=")).map(decode));
+        let param = |k: &str| {
+            form.split('&')
+                .find_map(|p| p.strip_prefix(&format!("{k}=")).map(decode))
+        };
         self.token_count += 1;
-        let claims = b64(json!({"email": FAKE_EMAIL, "sub": "1000"}).to_string().as_bytes());
-        let scope = if self.granted.is_empty() { param("scope").unwrap_or_default() } else { self.granted.clone() };
+        let claims = b64(json!({"email": FAKE_EMAIL, "sub": "1000"})
+            .to_string()
+            .as_bytes());
+        let scope = self.only_grants.clone().unwrap_or_else(|| {
+            if self.granted.is_empty() {
+                param("scope").unwrap_or_default()
+            } else {
+                self.granted.clone()
+            }
+        });
         let mut v = json!({"access_token": format!("fake-access-{}", self.token_count), "token_type": "Bearer", "expires_in": 3599, "scope": scope, "id_token": format!("e30.{claims}.c2ln")});
         if param("grant_type").as_deref() == Some("authorization_code") {
             v["refresh_token"] = json!("fake-refresh");
@@ -443,19 +636,39 @@ impl Account {
 
     fn authorize(&mut self, r: &Request) -> Reply {
         // the person's consent: straight back to the app with a code
-        let (redirect, state) = (r.param("redirect_uri").unwrap_or_default(), r.param("state").unwrap_or_default());
+        let (redirect, state) = (
+            r.param("redirect_uri").unwrap_or_default(),
+            r.param("state").unwrap_or_default(),
+        );
         self.granted = r.param("scope").unwrap_or_default();
         let sep = if redirect.contains('?') { '&' } else { '?' };
-        Reply(302, "text/plain", Vec::new(), vec![("location".to_owned(), format!("{redirect}{sep}code=fake-code&state={state}"))])
+        Reply(
+            302,
+            "text/plain",
+            Vec::new(),
+            vec![(
+                "location".to_owned(),
+                format!("{redirect}{sep}code=fake-code&state={state}"),
+            )],
+        )
     }
 
     fn handle(&mut self, r: Request) -> Reply {
         let path = r.path().to_owned();
         if path != "/__log" {
-            self.log.push(Seen { method: r.method.clone(), target: r.target.clone(), authorization: r.authorization.clone(), body: String::from_utf8_lossy(&r.body).into_owned() });
+            self.log.push(Seen {
+                method: r.method.clone(),
+                target: r.target.clone(),
+                authorization: r.authorization.clone(),
+                body: String::from_utf8_lossy(&r.body).into_owned(),
+            });
         }
         if path == "/__log" {
-            let log: Vec<Value> = self.log.iter().map(|s| json!({"method": s.method, "target": s.target, "body": s.body})).collect();
+            let log: Vec<Value> = self
+                .log
+                .iter()
+                .map(|s| json!({"method": s.method, "target": s.target, "body": s.body}))
+                .collect();
             return Reply::json(200, json!({"log": log}));
         }
         if path == "/o/oauth2/v2/auth" {
@@ -465,12 +678,18 @@ impl Account {
             return self.token(&r);
         }
         if !r.authorization.starts_with("Bearer fake-") {
-            return Reply::json(401, json!({"error": {"code": 401, "message": "Request had invalid authentication credentials."}}));
+            return Reply::json(
+                401,
+                json!({"error": {"code": 401, "message": "Request had invalid authentication credentials."}}),
+            );
         }
         if let Some(rest) = path.strip_prefix(GMAIL) {
             return self.gmail(&r, rest);
         }
-        Reply::json(404, json!({"error": {"code": 404, "message": "No such API in the stub."}}))
+        Reply::json(
+            404,
+            json!({"error": {"code": 404, "message": "No such API in the stub."}}),
+        )
     }
 }
 
@@ -486,7 +705,13 @@ impl FakeGoogle {
     }
 
     pub fn start_on(port: u16, seed: Seed) -> Self {
-        let account = Arc::new(Mutex::new(Account { mails: seed.mails, history: 1000, oldest_history: 0, ..Account::default() }));
+        let account = Arc::new(Mutex::new(Account {
+            mails: seed.mails,
+            history: 1000,
+            oldest_history: 0,
+            only_grants: seed.only_grants,
+            ..Account::default()
+        }));
         let shared = account.clone();
         let port = listen(port, move |r| shared.lock().unwrap().handle(r));
         Self { port, account }
@@ -504,7 +729,10 @@ impl FakeGoogle {
 
     /// The requests that would change something at Google.
     pub fn writes(&self) -> Vec<Seen> {
-        self.log().into_iter().filter(|s| s.method != "GET" && !s.target.starts_with("/token")).collect()
+        self.log()
+            .into_iter()
+            .filter(|s| s.method != "GET" && !s.target.starts_with("/token"))
+            .collect()
     }
 
     /// A new mail arrives, as Gmail's history shows it.

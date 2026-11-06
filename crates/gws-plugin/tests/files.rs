@@ -18,7 +18,6 @@ use serde_json::{Value, json};
 const TOKEN: &str = "fake-access-1";
 const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const XLSX: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-const PPTX: &str = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 const NOON: i64 = 1_800_000_000_000;
 
 fn push(who: &str) -> Value {
@@ -610,6 +609,23 @@ fn a_copy_of_a_file_gone_from_drive_lands_in_my_drive_and_update_says_its_gone()
 }
 
 #[test]
+fn slides_go_to_the_browser_and_nothing_lands_here() {
+    let google = FakeGoogle::start(Seed::demo(0));
+    google.seed_file(FakeFile::new("drv-p", "Pitch", GOOGLE_SLIDES).holding(b"PK exported"));
+    let home = Home::new(&google.base(), "slides");
+    let answer = home.core.run("gws_file_open", &json!({"id": "drv-p"}));
+    assert_eq!(answer["structuredContent"]["refused"], "in_browser");
+    assert!(
+        answer["structuredContent"]["link"]
+            .as_str()
+            .unwrap()
+            .contains("/presentation/d/drv-p/")
+    );
+    assert!(answer["_meta"].is_null(), "the Bot has nothing to open");
+    assert!(!google.log().iter().any(|s| s.target.contains("/export")));
+}
+
+#[test]
 fn a_google_original_is_never_written_over_and_only_a_copy_goes_up() {
     let google = FakeGoogle::start(Seed::default());
     for (id, name, mime) in [
@@ -623,7 +639,6 @@ fn a_google_original_is_never_written_over_and_only_a_copy_goes_up() {
     for (id, office, name) in [
         ("drv-d", DOCX, "Notes (copy).docx"),
         ("drv-s", XLSX, "Invoices (copy).xlsx"),
-        ("drv-p", PPTX, "Pitch (copy).pptx"),
     ] {
         let path = home.open(id);
         fs::write(&path, b"PK mine").unwrap();

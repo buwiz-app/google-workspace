@@ -656,6 +656,19 @@ fn chunks(core: &Core, name: &str, mime: &str, bytes: &[u8]) -> Value {
 }
 
 #[test]
+fn an_upload_whose_last_answer_cant_be_read_is_no_failure() {
+    let google = drive();
+    let core = signed_in(&google, "upload-garbled");
+    let upload = chunks(&core, "Roof quote.pdf", "application/pdf", b"%PDF fake");
+    google.drive_garbles_the_last_answer();
+    let done = data(core.run(
+        "gws_drive_upload",
+        &json!({"upload": upload, "parent": "drv-clients"}),
+    ));
+    assert_eq!(done, json!({"files": []}), "a failure would invite a second one");
+}
+
+#[test]
 fn a_picked_file_lands_in_the_open_folder_and_its_list_at_once() {
     let google = drive();
     let core = signed_in(&google, "upload");

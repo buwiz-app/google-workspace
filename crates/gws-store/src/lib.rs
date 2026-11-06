@@ -125,17 +125,32 @@ impl Paths {
     /// `GWS_DATA_DIR`, else `~/Library/Application Support/app.buwiz.google-workspace`.
     /// A folder that isn't absolute is refused: the working folder is nobody's store.
     pub fn from_env() -> Result<Self> {
-        let data = std::env::var_os(DATA_DIR_ENV);
-        // cargo leaves this on all a test starts, so a test that names no folder
-        // stops here, not in the person's. A release never has this check.
-        let tested = cfg!(debug_assertions) && std::env::var_os("CARGO_MANIFEST_DIR").is_some();
-        if tested && data.as_ref().is_none_or(|d| d.is_empty()) {
+        // cargo leaves this on all it starts, in any profile, and an install
+        // never has it
+        let tested = std::env::var_os("CARGO_MANIFEST_DIR").is_some();
+        Self::resolved(
+            std::env::var_os(DATA_DIR_ENV),
+            std::env::var_os("HOME"),
+            tested,
+        )
+    }
+
+    /// A test stops here rather than in the person's own folder, whether it
+    /// named none or named that one.
+    fn resolved(
+        data: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+        tested: bool,
+    ) -> Result<Self> {
+        let paths = Self::from_vars(data.clone(), home.clone())?;
+        let default = Self::from_vars(None, home).ok();
+        if tested && default.is_some_and(|d| d.dir == paths.dir) {
             return Err(error(
                 "data_dir",
-                "Under cargo, GWS_DATA_DIR must name a folder.",
+                "Under cargo, GWS_DATA_DIR must name a folder of a test's own.",
             ));
         }
-        Self::from_vars(data, std::env::var_os("HOME"))
+        Ok(paths)
     }
 
     fn from_vars(
@@ -475,6 +490,22 @@ mod tests {
         let key = key();
         fs::create_dir_all(paths.db(&key)).unwrap();
         assert_eq!(Store::open(&paths, &key).err().unwrap().code, "store");
+    }
+
+    #[test]
+    fn a_test_never_gets_the_persons_own_folder() {
+        let home = || Some("/Users/u".into());
+        let own = "/Users/u/Library/Application Support/app.buwiz.google-workspace";
+        let code = |data: Option<&str>| {
+            let data = data.map(Into::into);
+            Paths::resolved(data, home(), true).err().unwrap().code
+        };
+        assert_eq!(code(None), "data_dir", "named no folder");
+        assert_eq!(code(Some("")), "data_dir");
+        assert_eq!(code(Some(own)), "data_dir", "named that one");
+        assert!(Paths::resolved(Some("/tmp/t".into()), home(), true).is_ok());
+        assert!(Paths::resolved(None, home(), false).is_ok(), "an install");
+        assert!(Paths::resolved(Some(own.into()), home(), false).is_ok());
     }
 
     #[test]

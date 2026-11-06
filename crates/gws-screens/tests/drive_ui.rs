@@ -184,6 +184,19 @@ impl Fake {
         self.hold.lock().unwrap().push(name.to_owned());
     }
 
+    /// A held call fails as it's let go, with `why`.
+    fn release_failed(&self, name: &str, why: &str) {
+        self.hold.lock().unwrap().retain(|n| n != name);
+        let mut held = self.held.lock().unwrap();
+        let at = held
+            .iter()
+            .position(|(n, _, _)| n == name)
+            .expect("that call is held");
+        let (_, _, done) = held.remove(at);
+        drop(held);
+        done(Err(BuwizError::new("tool_error", false, why)));
+    }
+
     fn release(&self, name: &str) {
         self.hold.lock().unwrap().retain(|n| n != name);
         let mut held = self.held.lock().unwrap();
@@ -3544,6 +3557,60 @@ fn assert_budget_press_is_its_own(app: &mut Headless, fake: &Fake) {
             "seen": "mark-budget",
         })
     );
+}
+
+#[test]
+fn a_late_failure_for_another_file_says_nothing_on_this_files_panel() {
+    let (mut app, fake) = start();
+    press_notes_then_stage_budget(&mut app, &fake, json!({"added": 1, "removed": 0, "files": []}));
+    fake.release_failed("write:gws_drive_share", "Notes couldn't be shared.");
+    settle(&mut app);
+    assert_budget_untouched(&app, &fake);
+    assert!(!app.screen().shows("Notes couldn't be shared."));
+}
+
+/// Cancelled and gone on: what the old name's press says is about nothing here.
+#[test]
+fn a_late_answer_to_a_rename_left_behind_says_nothing() {
+    for refused in [true, false] {
+        let (mut app, fake) = start();
+        let why = "That name couldn't be used.";
+        if refused {
+            fake.write_answers.lock().unwrap().insert(
+                "gws_drive_rename".to_owned(),
+                json!({"refused": "failed", "message": why}),
+            );
+        }
+        fake.hold("write:gws_drive_rename");
+        rename_notes(&mut app);
+        press(&mut app, "label:Cancel this");
+        if refused {
+            fake.release("write:gws_drive_rename");
+        } else {
+            fake.release_failed("write:gws_drive_rename", why);
+        }
+        settle(&mut app);
+        assert!(!app.screen().shows(why));
+    }
+}
+
+#[test]
+fn a_late_new_folder_says_nothing_over_what_came_after() {
+    let (mut app, fake) = start();
+    fake.hold("write:gws_drive_folder");
+    press(&mut app, "label:New folder");
+    app.type_text(
+        "label:Folder name, as it will show in Google Drive to others",
+        "Inner",
+    )
+    .unwrap();
+    app.submit("label:Folder name, as it will show in Google Drive to others")
+        .unwrap();
+    settle(&mut app);
+    press(&mut app, "label:Cancel this");
+    fake.release("write:gws_drive_folder");
+    settle(&mut app);
+    assert!(!app.screen().shows("Made a new folder on Google Drive."));
 }
 
 #[test]

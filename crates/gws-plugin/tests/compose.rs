@@ -454,7 +454,10 @@ fn a_forward_carries_the_files_of_the_mail_it_forwards() {
 
     let found = data(core.run("gws_search_mail", &json!({"query": "in:sent"})));
     let id = found["items"][0]["id"].clone();
-    let start = data(core.run("gws_mail_reply_start", &json!({"thread": id, "mode": "forward"})));
+    let start = data(core.run(
+        "gws_mail_reply_start",
+        &json!({"thread": id, "mode": "forward"}),
+    ));
     let files = start["attachments"].as_array().unwrap();
     assert_eq!(files.len(), 1, "{start}");
     let keep = json!([{"message": start["source"], "id": files[0]["id"], "name": files[0]["name"], "mime": files[0]["mime"]}]);

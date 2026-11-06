@@ -256,13 +256,7 @@ fn with_store<T>(
 }
 
 fn signed_in(core: &Core) -> Result<(Bearer, String), Failure> {
-    let auth = core.accounts.google().ok_or(Failure::AccountRequired)?;
-    let subject = core
-        .accounts
-        .signed_in()
-        .map(|(s, _)| s)
-        .ok_or(Failure::AccountRequired)?;
-    Ok((auth, subject))
+    core.accounts.session().ok_or(Failure::AccountRequired)
 }
 
 /// `Ana Reyes <ana@example.com>` as (name, address); a bare address is both.

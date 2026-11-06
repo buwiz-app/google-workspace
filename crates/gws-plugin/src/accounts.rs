@@ -93,6 +93,15 @@ impl Accounts {
         self.held().who.values().any(|who| who == subject)
     }
 
+    /// The live token and whose it is, read together: from two reads a switch
+    /// in between would file one account's mail under another.
+    pub fn session(&self) -> Option<(Bearer, String)> {
+        self.held()
+            .tokens
+            .get(GOOGLE)
+            .map(|a| (Bearer(a.authorization()), a.subject.clone()))
+    }
+
     /// The Google account's live token.
     pub fn google(&self) -> Option<Bearer> {
         self.held()
@@ -113,6 +122,29 @@ impl Accounts {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    #[test]
+    fn a_token_and_its_owner_are_read_together() {
+        let sign_in = |who: &str| json!({"account": "google", "label": "default", "provider": "google", "subject": who, "scopes": [], "access_token": who, "token_type": "Bearer", "expires_at": 4_000_000_000u64});
+        let accounts = Accounts::default();
+        accounts.set(&sign_in("a"));
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for n in 0..200_000 {
+                    accounts.set(&sign_in(if n % 2 == 0 { "b" } else { "a" }));
+                }
+                done.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let (auth, who) = accounts.session().expect("always signed in");
+                assert!(
+                    auth.header().ends_with(&who),
+                    "{who}'s mail under another token"
+                );
+            }
+        });
+    }
 
     use super::*;
 

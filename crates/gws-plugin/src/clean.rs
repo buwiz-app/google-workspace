@@ -144,6 +144,13 @@ fn safe_style(style: &str) -> String {
 
 /// `html` cleaned. `inline` swaps a remote image's URL for a `data:` one, once
 /// the person has asked for images.
+fn inline_ok(data: &str) -> bool {
+    INLINE_IMAGES.iter().any(|p| data.starts_with(p))
+        && data
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+/=;:,-".contains(&b))
+}
+
 pub fn clean_with(html: &str, inline: &dyn Fn(&str) -> Option<String>) -> Cleaned {
     // ammonia's filter is Send + Sync + 'static, so it reports through shared
     // cells, and the lookups in `inline` happen after it
@@ -223,7 +230,7 @@ pub fn clean_with(html: &str, inline: &dyn Fn(&str) -> Option<String>) -> Cleane
     // highest first, so one number is never found inside another
     for (n, url) in images.iter().enumerate().rev() {
         let marker = format!("\"gws-image:{n}\"");
-        match inline(url).filter(|data| INLINE_IMAGES.iter().any(|p| data.starts_with(p))) {
+        match inline(url).filter(|data| inline_ok(data)) {
             Some(data) => html = html.replace(&marker, &format!("\"{data}\"")),
             None => {
                 html = html.replace(&format!(" src={marker}"), "");
@@ -373,6 +380,14 @@ mod tests {
             "{}",
             out.html
         );
+    }
+
+    #[test]
+    fn an_inline_image_cannot_leave_its_attribute() {
+        let out = clean_with(r#"<img src="https://a.example/1.png">"#, &|_| {
+            Some(r#"data:image/png;base64,AA" onerror="alert(1)"#.to_owned())
+        });
+        assert!(!out.html.contains("onerror"), "{}", out.html);
     }
 
     #[test]

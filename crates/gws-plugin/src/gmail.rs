@@ -637,6 +637,16 @@ pub fn strip_html(html: &str) -> String {
         };
         // a line break in the source is a space; block tags end lines
         text.push_str(&html[i..lt].replace(['\n', '\r'], " "));
+        // only a letter, `/`, `!` or `?` opens a tag: `a < b` is text
+        if !html[lt + 1..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '/' | '!' | '?'))
+        {
+            text.push('<');
+            i = lt + 1;
+            continue;
+        }
         if lower[lt..].starts_with("<!--") {
             i = lower[lt..].find("-->").map_or(html.len(), |n| lt + n + 3);
             continue;
@@ -785,7 +795,11 @@ mod tests {
             strip_html("<table><tr><td>x</td><td>y</td></tr></table>"),
             "x y"
         );
-        assert_eq!(strip_html("plain < text"), "plain");
+        assert_eq!(strip_html("plain < text"), "plain < text");
+        assert_eq!(
+            strip_html("<p>if a < b and c > d</p>"),
+            "if a < b and c > d"
+        );
         assert_eq!(strip_html("one\ntwo<br>\nthree"), "one two\nthree");
         assert_eq!(strip_html("<SCRIPT>a</SCRIPT>ok<style"), "ok");
     }

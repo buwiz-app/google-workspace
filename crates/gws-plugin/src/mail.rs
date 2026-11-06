@@ -314,7 +314,10 @@ fn sync_once(core: &Core) -> Result<bool, Failure> {
             true
         }
     };
-    sync_labels(core, &auth, &account)?;
+    // counts move only with the mail, and each label costs a request
+    if changed {
+        sync_labels(core, &auth, &account)?;
+    }
     Ok(changed)
 }
 
@@ -479,7 +482,9 @@ pub fn view_of(thread: &Value) -> Value {
         .map(|m| gmail::html_body(m).map(|h| clean::clean(&h)))
         .collect();
     let text: Vec<String> = list.iter().map(gmail::body).collect();
-    let weight = |c: &Option<clean::Cleaned>, t: &str| c.as_ref().map_or(t.len(), |c| c.html.len());
+    // plain text is sent escaped, which is what counts against the limit
+    let weight =
+        |c: &Option<clean::Cleaned>, t: &str| c.as_ref().map_or(escape(t).len(), |c| c.html.len());
     let mut size: usize = cleaned.iter().zip(&text).map(|(c, t)| weight(c, t)).sum();
     // past what a result can carry, the oldest fall back to plain text
     for (c, t) in cleaned.iter_mut().zip(&text) {
@@ -488,7 +493,7 @@ pub fn view_of(thread: &Value) -> Value {
         }
         size -= weight(c, t);
         *c = None;
-        size += t.len();
+        size += weight(c, t);
     }
     let (mut page, mut links, mut images, mut attachments) = (
         format!(

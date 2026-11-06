@@ -214,6 +214,8 @@ struct Mail {
     signed_out: Signal<bool>,
     link: Signal<Option<String>>,
     loading: Signal<bool>,
+    /// Why the list didn't load, in words for the person.
+    problem: Signal<Option<String>>,
     seq: Signal<i64>,
     help: Signal<bool>,
 }
@@ -273,9 +275,10 @@ async fn load_list(b: Bridge, m: Mail, skip: usize) {
             m.more.set(v.get("more") == Some(&Value::Bool(true)));
             m.saved.set(v.get("saved") == Some(&Value::Bool(true)));
             m.signed_out.set(false);
+            m.problem.set(None);
         }
         Err(e) if e == "sign-in" => m.signed_out.set(true),
-        Err(e) => m.status.set(e),
+        Err(e) => m.problem.set(Some(e)),
     }
 }
 
@@ -328,9 +331,11 @@ async fn show(b: Bridge, m: Mail, thread: String) {
                     .to_owned(),
             ));
         }
-        Err(e) => m
-            .page
-            .set(Some(format!("<p>{}</p>", e.replace('<', "&lt;")))),
+        Err(e) if e == "sign-in" => m.signed_out.set(true),
+        Err(e) => m.page.set(Some(format!(
+            "<p>{}</p>",
+            e.replace('&', "&amp;").replace('<', "&lt;")
+        ))),
     }
 }
 
@@ -487,6 +492,7 @@ fn list_pane(b: Bridge, m: Mail) -> impl IntoElement {
     let empty = dynamic(move || {
         let line = match (m.loading.get(), m.query.with(String::is_empty)) {
             (true, _) => "Loading your mail…",
+            (false, true) if m.problem.with(Option::is_some) => "",
             (false, true) => "Nothing here",
             (false, false) => "No mail matches that.",
         };
@@ -516,7 +522,11 @@ fn list_pane(b: Bridge, m: Mail) -> impl IntoElement {
                 ),
         )
         .child(dynamic(move || {
-            match notice(&m.status.get(), m.saved.get()) {
+            let line = m
+                .problem
+                .get()
+                .or_else(|| notice(&m.status.get(), m.saved.get()).map(str::to_owned));
+            match line {
                 Some(line) => view()
                     .app_class(Some(format!("px-3 py-1 border-b {LINE}").into()))
                     .child(text(line).app_class(Some(format!("text-[11px] {MUTE}").into()))),
@@ -868,6 +878,7 @@ pub fn build(bridge: Bridge) -> Root {
         let props = b.props();
         let prop = |k: &str| props.get(k).and_then(Value::as_str).map(str::to_owned);
         let m = Mail {
+            problem: signal(None),
             list_turn: Latest::new(),
             open_turn: Latest::new(),
             labels: signal(column(&Value::Null)),

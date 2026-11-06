@@ -52,6 +52,10 @@ pub struct Core {
     pub undos: Mutex<mail::Undos>,
     /// Drafts the model wrote and the person hasn't touched.
     pub model_drafts: Mutex<std::collections::HashSet<String>>,
+    /// Files on their way into a draft: memory only, like a key.
+    pub uploads: Mutex<compose::Uploads>,
+    /// How saves too slow for their caller came out.
+    pub jobs: Mutex<std::collections::VecDeque<(String, Value)>>,
 }
 
 impl Core {
@@ -66,6 +70,8 @@ impl Core {
             tickets: Mutex::default(),
             undos: Mutex::default(),
             model_drafts: Mutex::default(),
+            uploads: Mutex::default(),
+            jobs: Mutex::default(),
             pushed: std::sync::atomic::AtomicBool::new(false),
         }
     }

@@ -19,7 +19,7 @@ use crate::clean;
 use crate::gmail::{self, Failure};
 use crate::tools::{
     MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_DRAFT_DELETE, MAIL_DRAFT_READ, MAIL_DRAFT_SAVE,
-    MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK, MAIL_REPLY_START, MAIL_SEND, MAIL_THREAD,
+    MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK, MAIL_JOB, MAIL_REPLY_START, MAIL_SEND, UPLOAD_CHUNK, UPLOAD_DROP, MAIL_THREAD,
     MAIL_TRASH, MAIL_UNDO, SEARCH_MAIL, fail, failed, ok,
 };
 use crate::{Core, compose, js};
@@ -947,10 +947,17 @@ pub fn run(core: &Core, tool: &str, args: &Value) -> Option<Value> {
         MAIL_DRAFT_DELETE => compose::delete(core, args),
         MAIL_SEND => compose::send(core, args),
         MAIL_REPLY_START => compose::reply_start(core, args),
+        MAIL_JOB => compose::job(core, args),
+        UPLOAD_CHUNK => compose::upload_chunk(core, args),
+        UPLOAD_DROP => compose::upload_drop(core, args),
         _ => return None,
     };
     core.sync.seen();
-    Some(result.unwrap_or_else(failed))
+    let answer = result.unwrap_or_else(failed);
+    if tool == MAIL_DRAFT_SAVE {
+        compose::finish_job(core, args, &answer);
+    }
+    Some(answer)
 }
 
 #[cfg(test)]

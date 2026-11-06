@@ -24,6 +24,9 @@ pub const GMAIL_API: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 pub const BODY_MAX: usize = 64 * 1024;
 pub const SNIPPET_MAX: usize = 200;
 const TIMEOUT: Duration = Duration::from_secs(30);
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+/// A 25 MB attachment as Gmail answers it, in base64 inside JSON.
+const ATTACHMENT_MAX: u64 = 40 * 1024 * 1024;
 /// Requests in flight for one search.
 const METADATA_AT_ONCE: usize = 8;
 /// A list or metadata answer.
@@ -48,6 +51,8 @@ pub enum Failure {
 #[derive(Clone)]
 pub struct Gmail {
     agent: ureq::Agent,
+    /// For what's big: a whole attachment each way.
+    slow: ureq::Agent,
     base: String,
 }
 
@@ -76,8 +81,15 @@ impl Gmail {
             .timeout_global(Some(TIMEOUT))
             .user_agent("buwiz-gws")
             .build();
+        let slow = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .timeout_global(Some(UPLOAD_TIMEOUT))
+            .user_agent("buwiz-gws")
+            .build();
         Self {
             agent: config.new_agent(),
+            slow: slow.new_agent(),
             base: base.trim_end_matches('/').to_owned(),
         }
     }
@@ -371,12 +383,18 @@ impl Gmail {
         ))
     }
 
-    fn draft_body(raw: &str, thread: Option<&str>) -> Value {
-        let mut message = serde_json::json!({"raw": raw});
-        if let Some(thread) = thread {
-            message["threadId"] = thread.into();
+    /// A draft write's JSON, without the message when that goes as a part.
+    fn draft_metadata(thread: Option<&str>) -> Value {
+        match thread {
+            Some(thread) => serde_json::json!({"message": {"threadId": thread}}),
+            None => serde_json::json!({"message": {}}),
         }
-        serde_json::json!({"message": message})
+    }
+
+    fn draft_body(raw: &str, thread: Option<&str>) -> Value {
+        let mut body = Self::draft_metadata(thread);
+        body["message"]["raw"] = raw.into();
+        body
     }
 
     pub fn draft_create(
@@ -403,6 +421,64 @@ impl Gmail {
             .header("content-type", "application/json");
         let body = Self::draft_body(raw, thread).to_string();
         Self::answer(req.send(body.as_bytes()), FULL_MAX)
+    }
+
+    /// A draft with attachments, through Gmail's upload door: the JSON one
+    /// takes a few megabytes, this one the whole message. `id` replaces a draft.
+    pub fn draft_upload(
+        &self,
+        auth: &Bearer,
+        id: Option<&str>,
+        message: &[u8],
+        thread: Option<&str>,
+    ) -> Result<Option<Value>, Failure> {
+        let boundary = "buwiz-gws-upload-boundary";
+        let metadata = Self::draft_metadata(thread);
+        let mut body = format!(
+            "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata}\r\n--{boundary}\r\nContent-Type: message/rfc822\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(message);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let base = self.base.replacen("/gmail/v1/", "/upload/gmail/v1/", 1);
+        let kind = format!("multipart/related; boundary={boundary}");
+        let url = match id {
+            Some(id) => format!("{base}/drafts/{id}"),
+            None => format!("{base}/drafts"),
+        };
+        let req = match id {
+            Some(_) => self.slow.put(&url),
+            None => self.slow.post(&url),
+        };
+        let req = req
+            .query("uploadType", "multipart")
+            .header("authorization", auth.header())
+            .header("accept", "application/json")
+            .header("content-type", &kind);
+        Self::answer(req.send(&body[..]), FULL_MAX)
+    }
+
+    /// An attachment's bytes, from the message that holds it.
+    pub fn attachment(
+        &self,
+        auth: &Bearer,
+        message: &str,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>, Failure> {
+        let url = format!("{}/messages/{message}/attachments/{id}", self.base);
+        let req = self
+            .slow
+            .get(&url)
+            .header("authorization", auth.header())
+            .header("accept", "application/json");
+        let Some(v) = Self::answer(req.call(), ATTACHMENT_MAX)? else {
+            return Ok(None);
+        };
+        let data = v.get("data").and_then(Value::as_str).unwrap_or_default();
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(data.trim_end_matches('='))
+            .map_err(|_| Failure::Plain("That attachment came back damaged.".to_owned()))?;
+        Ok(Some(bytes))
     }
 
     pub fn draft(&self, auth: &Bearer, id: &str) -> Result<Option<Value>, Failure> {

@@ -167,3 +167,138 @@ fn an_address_that_would_start_a_header_is_refused_before_anything_leaves() {
     assert_eq!(refused["isError"], true, "{refused}");
     assert_eq!(google.sent(), []);
 }
+
+/// `bytes` handed over in chunks, as a screen does: its upload id.
+fn attach(core: &Core, name: &str, bytes: &[u8]) -> Value {
+    use base64::Engine as _;
+    let mut upload = Value::Null;
+    let mut at = 0;
+    for chunk in bytes.chunks(180 * 1024) {
+        let mut args = json!({"name": name, "type": "application/pdf", "at": at, "data": base64::engine::general_purpose::STANDARD.encode(chunk)});
+        if !upload.is_null() {
+            args["upload"] = upload.clone();
+        }
+        let got = data(core.run("gws_upload_chunk", &args));
+        upload = got["upload"].clone();
+        at = got["size"].as_u64().unwrap();
+    }
+    upload
+}
+
+fn file(size: usize) -> Vec<u8> {
+    (0..size).map(|i| (i * 31 % 251) as u8).collect()
+}
+
+#[test]
+fn a_25_mb_attachment_arrives_whole() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "big");
+    let bytes = file(25 * 1024 * 1024);
+    let upload = attach(&core, "año/../report é.pdf", &bytes);
+    let mut draft = lunch();
+    draft["attachments"] = json!([upload]);
+    let saved = data(core.run("gws_mail_draft_save", &draft));
+    data(send(&core, &saved));
+    let sent = google.sent();
+    let [(name, kind, got)] = sent[0].attachments.as_slice() else {
+        panic!("one attachment: {}", sent[0].attachments.len());
+    };
+    assert_eq!(name, "report é.pdf");
+    assert_eq!(kind, "application/pdf");
+    assert!(got == &bytes, "{} of {} bytes, or changed", got.len(), bytes.len());
+    assert_eq!(sent[0].body, "Noon?\nThe usual place.");
+    assert_eq!(sent[0].to, "ana@example.com");
+    assert_eq!(core.uploads.lock().unwrap().held_bytes(), 0, "sent, so freed");
+}
+
+#[test]
+fn past_the_limit_is_refused_and_nothing_is_held() {
+    use base64::Engine as _;
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "over");
+    let bytes = file(25 * 1024 * 1024);
+    let upload = attach(&core, "a.pdf", &bytes);
+    let more = core.run(
+        "gws_upload_chunk",
+        &json!({"upload": upload, "at": bytes.len(), "data": base64::engine::general_purpose::STANDARD.encode(b"x")}),
+    );
+    assert_eq!(more["isError"], true, "{more}");
+    assert!(more.to_string().contains("25 MB"));
+    assert_eq!(core.uploads.lock().unwrap().held_bytes(), 0);
+}
+
+#[test]
+fn two_files_over_the_limit_together_are_refused_on_saving() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "both");
+    let (a, b) = (file(15 * 1024 * 1024), file(15 * 1024 * 1024));
+    let mut draft = lunch();
+    draft["attachments"] = json!([attach(&core, "a.pdf", &a), attach(&core, "b.pdf", &b)]);
+    let refused = core.run("gws_mail_draft_save", &draft);
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(refused.to_string().contains("25 MB"));
+}
+
+#[test]
+fn a_chunk_sent_twice_is_kept_once() {
+    use base64::Engine as _;
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "resend");
+    let chunk = base64::engine::general_purpose::STANDARD.encode(b"abc");
+    let first = data(core.run("gws_upload_chunk", &json!({"name": "a.txt", "at": 0, "data": chunk})));
+    let upload = first["upload"].clone();
+    let again = data(core.run("gws_upload_chunk", &json!({"upload": upload, "at": 0, "data": chunk})));
+    assert_eq!(again["size"], 3);
+    let next = data(core.run("gws_upload_chunk", &json!({"upload": upload, "at": 3, "data": chunk})));
+    assert_eq!(next["size"], 6);
+}
+
+#[test]
+fn saving_a_draft_again_keeps_the_files_it_had() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "keep");
+    let bytes = file(1024);
+    let mut draft = lunch();
+    draft["attachments"] = json!([attach(&core, "a.pdf", &bytes)]);
+    let saved = data(core.run("gws_mail_draft_save", &draft));
+    let read = data(core.run("gws_mail_draft_read", &json!({"draft": saved["draft"]})));
+    let files = read["attachments"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "{read}");
+    assert_eq!(files[0]["name"], "a.pdf");
+
+    let mut edit = lunch();
+    edit["draft"] = saved["draft"].clone();
+    edit["body"] = json!("Edited");
+    edit["keep"] = json!([{"message": read["revision"], "id": files[0]["id"], "name": files[0]["name"], "mime": files[0]["mime"]}]);
+    let saved = data(core.run("gws_mail_draft_save", &edit));
+    data(send(&core, &saved));
+    let sent = google.sent();
+    assert_eq!(sent[0].body, "Edited");
+    assert_eq!(sent[0].attachments.len(), 1);
+    assert!(sent[0].attachments[0].2 == bytes);
+}
+
+#[test]
+fn the_model_attaches_nothing() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "model-file");
+    let upload = attach(&core, "private.pdf", b"secret");
+    let mut draft = lunch();
+    draft["attachments"] = json!([upload]);
+    let refused = core.run_for_model("gws_mail_draft_save", &draft);
+    assert_eq!(refused["isError"], true, "{refused}");
+}
+
+#[test]
+fn a_save_too_slow_for_its_caller_can_be_asked_after() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "job");
+    assert_eq!(data(core.run("gws_mail_job", &json!({"job": "j1"})))["done"], false);
+    let mut draft = lunch();
+    draft["job"] = json!("j1");
+    let saved = data(core.run("gws_mail_draft_save", &draft));
+    let job = data(core.run("gws_mail_job", &json!({"job": "j1"})));
+    assert_eq!(job["done"], true);
+    assert_eq!(job["answer"]["structuredContent"]["draft"], saved["draft"]);
+    assert_eq!(data(core.run("gws_mail_job", &json!({"job": "j1"})))["done"], false, "told once");
+}

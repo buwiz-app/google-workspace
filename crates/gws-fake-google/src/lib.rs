@@ -48,6 +48,8 @@ struct Request {
     method: String,
     target: String,
     authorization: String,
+    /// The `Content-Type`.
+    kind: String,
     body: Vec<u8>,
 }
 
@@ -105,7 +107,7 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
     reader.read_line(&mut line).ok()?;
     let mut parts = line.split(' ');
     let (method, target) = (parts.next()?.to_owned(), parts.next()?.to_owned());
-    let (mut authorization, mut length) = (String::new(), 0usize);
+    let (mut authorization, mut kind, mut length) = (String::new(), String::new(), 0usize);
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
@@ -114,6 +116,8 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         if let Some((k, v)) = h.split_once(':') {
             if k.eq_ignore_ascii_case("authorization") {
                 authorization = v.trim().to_owned();
+            } else if k.eq_ignore_ascii_case("content-type") {
+                kind = v.trim().to_owned();
             } else if k.eq_ignore_ascii_case("content-length") {
                 length = v.trim().parse().unwrap_or(0);
             }
@@ -125,6 +129,7 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         method,
         target,
         authorization,
+        kind,
         body,
     })
 }
@@ -415,6 +420,58 @@ pub struct Sent {
     pub body: String,
     pub message_id: String,
     pub in_reply_to: String,
+    /// `(file name, type, bytes)`.
+    pub attachments: Vec<(String, String, Vec<u8>)>,
+}
+
+/// A header's value in a block of headers.
+fn header_in(head: &str, name: &str) -> String {
+    let wanted = format!("{}:", name.to_lowercase());
+    head.lines()
+        .find(|l| l.to_lowercase().starts_with(&wanted))
+        .map(|l| l[wanted.len()..].trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// What a base64 body holds, however it's wrapped.
+fn unwrapped(body: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    let plain: String = body.split_whitespace().collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(plain)
+        .unwrap_or_default()
+}
+
+/// A boundary named in a `Content-Type`.
+fn boundary_of(kind: &str) -> Option<String> {
+    let (_, rest) = kind.split_once("boundary=")?;
+    Some(rest.split(';').next()?.trim().trim_matches('"').to_owned())
+}
+
+/// A multipart body's parts, each with its headers still on, as bytes: a part
+/// can be a whole message.
+fn parts_of(body: &[u8], boundary: &str) -> Vec<Vec<u8>> {
+    let mark = format!("--{boundary}").into_bytes();
+    let mut parts = Vec::new();
+    let mut from = None;
+    let mut i = 0;
+    while i + mark.len() <= body.len() {
+        if body[i..].starts_with(&mark) {
+            if let Some(start) = from {
+                let end = i.saturating_sub(2).max(start);
+                parts.push(body[start..end].to_vec());
+            }
+            i += mark.len();
+            if body[i..].starts_with(b"--") {
+                return parts;
+            }
+            i += 2;
+            from = Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    parts
 }
 
 impl Sent {
@@ -442,11 +499,28 @@ impl Sent {
                 .unwrap_or(value),
             None => value,
         };
-        let text = base64::engine::general_purpose::STANDARD
-            .decode(body.replace("\r\n", ""))
-            .ok()
-            .and_then(|b| String::from_utf8(b).ok())
-            .unwrap_or_default();
+        let mut attachments = Vec::new();
+        let mut text = String::from_utf8(unwrapped(body)).unwrap_or_default();
+        if let Some(boundary) = boundary_of(&header_in(head, "Content-Type")) {
+            for (at, part) in parts_of(body.as_bytes(), &boundary).iter().enumerate() {
+                let part = String::from_utf8_lossy(part);
+                let (head, bytes) = part.split_once("\r\n\r\n").unwrap_or((&part, ""));
+                if at == 0 {
+                    text = String::from_utf8(unwrapped(bytes)).unwrap_or_default();
+                    continue;
+                }
+                let disposition = header_in(head, "Content-Disposition");
+                let name = match disposition.split_once("filename*=UTF-8''") {
+                    Some((_, name)) => decode(name),
+                    None => disposition
+                        .split_once("filename=")
+                        .map(|(_, n)| n.trim_matches('"').to_owned())
+                        .unwrap_or_default(),
+                };
+                let kind = header_in(head, "Content-Type");
+                attachments.push((name, kind, unwrapped(bytes)));
+            }
+        }
         Sent {
             to: field("To"),
             cc: field("Cc"),
@@ -455,19 +529,53 @@ impl Sent {
             body: text,
             message_id: field("Message-ID"),
             in_reply_to: field("In-Reply-To"),
+            attachments,
         }
     }
 
     fn resource(&self, id: &str, thread: Option<&str>) -> Value {
         let header = |name: &str, value: &str| json!({"name": name, "value": value});
-        json!({"id": id, "threadId": thread, "payload": {"mimeType": "text/plain", "headers": [
+        let headers = json!([
             header("To", &self.to), header("Cc", &self.cc), header("Bcc", &self.bcc),
             header("Subject", &self.subject), header("Message-ID", &self.message_id),
-        ], "body": {"data": b64(self.body.as_bytes())}}})
+        ]);
+        let text = json!({"mimeType": "text/plain", "body": {"data": b64(self.body.as_bytes())}});
+        if self.attachments.is_empty() {
+            let mut payload = text;
+            payload["headers"] = headers;
+            return json!({"id": id, "threadId": thread, "payload": payload});
+        }
+        let mut parts = vec![text];
+        for (at, (name, kind, bytes)) in self.attachments.iter().enumerate() {
+            parts.push(json!({"mimeType": kind, "filename": name, "body": {"attachmentId": format!("att-{at}"), "size": bytes.len()}}));
+        }
+        json!({"id": id, "threadId": thread, "payload": {"mimeType": "multipart/mixed", "headers": headers, "parts": parts}})
     }
 }
 
 impl Account {
+    /// Gmail's upload door: a metadata part and the message itself, handed on
+    /// as the same draft write its plain door takes.
+    fn upload(&mut self, mut r: Request, rest: &str) -> Reply {
+        use base64::Engine as _;
+        let parts = boundary_of(&r.kind)
+            .map(|b| parts_of(&r.body, &b))
+            .unwrap_or_default();
+        let [metadata, message] = parts.as_slice() else {
+            return Reply::json(400, json!({"error": {"code": 400, "message": "Bad upload."}}));
+        };
+        let after_head = |part: &[u8]| {
+            let at = part.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(0);
+            part[at + 4..].to_vec()
+        };
+        let mut body: Value = serde_json::from_slice(&after_head(metadata)).unwrap_or(json!({}));
+        body["message"]["raw"] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(after_head(message))
+            .into();
+        r.body = body.to_string().into_bytes();
+        self.gmail(&r, rest)
+    }
+
     fn lacks_modify(&self) -> bool {
         self.only_grants
             .as_deref()
@@ -643,12 +751,16 @@ impl Account {
                 None => not_found(),
             },
             ("GET", ["messages", id, "attachments", att]) => {
-                let found = self.mails.iter().find(|m| m.id == *id).and_then(|m| {
-                    att.rsplit('-')
-                        .next()
-                        .and_then(|i| i.parse::<usize>().ok())
-                        .and_then(|i| m.attachments.get(i))
-                });
+                let at = att.rsplit('-').next().and_then(|i| i.parse::<usize>().ok());
+                let held = self.drafts.iter().find(|d| d.1 == *id).map(|d| Sent::of(&d.2));
+                let found = match &held {
+                    Some(draft) => at.and_then(|i| draft.attachments.get(i)),
+                    None => self
+                        .mails
+                        .iter()
+                        .find(|m| m.id == *id)
+                        .and_then(|m| at.and_then(|i| m.attachments.get(i))),
+                };
                 match found {
                     Some((_, _, bytes)) => {
                         Reply::json(200, json!({"size": bytes.len(), "data": b64(bytes)}))
@@ -934,6 +1046,10 @@ impl Account {
         }
         if let Some(rest) = path.strip_prefix(GMAIL) {
             return self.gmail(&r, rest);
+        }
+        if let Some(rest) = path.strip_prefix("/upload").and_then(|p| p.strip_prefix(GMAIL)) {
+            let rest = rest.to_owned();
+            return self.upload(r, &rest);
         }
         Reply::json(
             404,

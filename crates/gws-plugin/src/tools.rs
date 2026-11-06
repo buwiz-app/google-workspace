@@ -65,6 +65,9 @@ pub const MAIL_DRAFT_READ: &str = "gws_mail_draft_read";
 pub const MAIL_DRAFT_DELETE: &str = "gws_mail_draft_delete";
 pub const MAIL_SEND: &str = "gws_mail_send";
 pub const MAIL_REPLY_START: &str = "gws_mail_reply_start";
+pub const MAIL_JOB: &str = "gws_mail_job";
+pub const UPLOAD_CHUNK: &str = "gws_upload_chunk";
+pub const UPLOAD_DROP: &str = "gws_upload_drop";
 
 /// A write: the person's, on a screen, and never the model's.
 fn write(name: &'static str, description: &'static str, input_schema: Value) -> Def {
@@ -177,7 +180,7 @@ pub fn defs() -> Vec<Def> {
         Def {
             name: MAIL_DRAFT_SAVE,
             description: "Write a draft, or replace one. It sends nothing: the person reads it and presses Send.",
-            input_schema: json!({"type": "object", "properties": {"draft": {"type": "string"}, "to": {"type": "array", "items": {"type": "string"}}, "cc": {"type": "array", "items": {"type": "string"}}, "bcc": {"type": "array", "items": {"type": "string"}}, "subject": {"type": "string"}, "body": {"type": "string"}, "thread": {"type": "string"}, "in_reply_to": {"type": "string"}, "references": {"type": "string"}, "message_id": {"type": "string"}}}),
+            input_schema: json!({"type": "object", "properties": {"draft": {"type": "string"}, "to": {"type": "array", "items": {"type": "string"}}, "cc": {"type": "array", "items": {"type": "string"}}, "bcc": {"type": "array", "items": {"type": "string"}}, "subject": {"type": "string"}, "body": {"type": "string"}, "thread": {"type": "string"}, "in_reply_to": {"type": "string"}, "references": {"type": "string"}, "message_id": {"type": "string"}, "attachments": {"type": "array", "items": {"type": "string"}}, "keep": {"type": "array", "items": {"type": "object"}}, "job": {"type": "string"}}}),
             read_only: false,
             audience: AGENT_AND_APP,
             open_world: true,
@@ -208,6 +211,30 @@ pub fn defs() -> Vec<Def> {
             "Send the draft the person read. A person's alone.",
             json!({"type": "object", "properties": {"draft": {"type": "string"}, "revision": {"type": "string"}, "message_id": {"type": "string"}}, "required": ["draft", "revision"]}),
         ),
+        Def {
+            name: MAIL_JOB,
+            description: "How a slow draft save came out, by the job it named.",
+            input_schema: json!({"type": "object", "properties": {"job": {"type": "string"}}, "required": ["job"]}),
+            read_only: true,
+            audience: APP_ONLY,
+            open_world: false,
+        },
+        Def {
+            name: UPLOAD_CHUNK,
+            description: "Part of a file to attach, held in memory until the draft's sent.",
+            input_schema: json!({"type": "object", "properties": {"upload": {"type": "string"}, "name": {"type": "string"}, "type": {"type": "string"}, "at": {"type": "integer"}, "data": {"type": "string"}}, "required": ["at", "data"]}),
+            read_only: false,
+            audience: APP_ONLY,
+            open_world: false,
+        },
+        Def {
+            name: UPLOAD_DROP,
+            description: "Forget a file that was to be attached.",
+            input_schema: json!({"type": "object", "properties": {"upload": {"type": "string"}}, "required": ["upload"]}),
+            read_only: false,
+            audience: APP_ONLY,
+            open_world: false,
+        },
         Def {
             name: RESOLVE,
             description: "Resolve the /gws command.",

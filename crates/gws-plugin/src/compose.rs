@@ -18,6 +18,168 @@ const RECIPIENTS_MAX: usize = 100;
 /// The longest body a draft holds, before attachments.
 const BODY_MAX: usize = 1024 * 1024;
 
+/// The most attachments one message carries: Gmail's own limit.
+pub const ATTACHMENTS_MAX: usize = 25 * 1024 * 1024;
+/// What waits in memory, across every message being written.
+const UPLOADS_MAX: usize = 2 * ATTACHMENTS_MAX;
+/// How many finished saves wait for a screen to ask.
+const JOBS_MAX: usize = 16;
+
+/// A file in a message.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Part {
+    pub name: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
+
+/// An attachment a saved draft already has, which a new save must carry over:
+/// Gmail replaces the whole message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Kept {
+    message: String,
+    id: String,
+    name: String,
+    mime: String,
+}
+
+/// Files the person chose, as they arrive, by upload id.
+#[derive(Default)]
+pub struct Uploads {
+    files: std::collections::HashMap<String, Upload>,
+    next: u64,
+}
+
+struct Upload {
+    part: Part,
+    /// The draft it went into, so sending or deleting that frees it.
+    draft: Option<String>,
+}
+
+impl Uploads {
+    pub fn held_bytes(&self) -> usize {
+        self.files.values().map(|u| u.part.bytes.len()).sum()
+    }
+
+    fn start(&mut self, name: String, mime: String) -> String {
+        self.next += 1;
+        let id = format!("up{}", self.next);
+        let part = Part {
+            name,
+            mime,
+            bytes: Vec::new(),
+        };
+        self.files.insert(id.clone(), Upload { part, draft: None });
+        id
+    }
+
+    fn free_draft(&mut self, draft: &str) {
+        self.files
+            .retain(|_, u| u.draft.as_deref() != Some(draft));
+    }
+}
+
+fn uploads(core: &Core) -> MutexGuard<'_, Uploads> {
+    core.uploads.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A file's name as a header can hold it: no path, and nothing that ends the line.
+fn file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let clean: String = base.chars().filter(|c| !c.is_control()).collect();
+    if clean.trim().is_empty() {
+        "attachment".to_owned()
+    } else {
+        js::slice_utf16(clean.trim(), 200)
+    }
+}
+
+/// `type/subtype`, or what any file is.
+fn mime_type(kind: &str) -> String {
+    let token = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"+-._".contains(&b))
+    };
+    match kind.split_once('/') {
+        Some((a, b)) if token(a) && token(b) => kind.to_owned(),
+        _ => "application/octet-stream".to_owned(),
+    }
+}
+
+/// `gws_upload_chunk`: part of a file. `at` says where it goes, and the answer
+/// where to go on from, so a chunk whose answer was lost isn't kept twice.
+pub fn upload_chunk(core: &Core, args: &Value) -> Result<Value, Failure> {
+    let Ok(data) = base64::engine::general_purpose::STANDARD
+        .decode(js::string_or_empty(args.get("data")))
+    else {
+        return Ok(fail("invalid_args", "That isn't a file's bytes."));
+    };
+    let at = args.get("at").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let mut held = uploads(core);
+    let total = held.held_bytes();
+    let mut id = js::string_or_empty(args.get("upload"));
+    if id.is_empty() {
+        let name = file_name(&js::string_or_empty(args.get("name")));
+        id = held.start(name, mime_type(&js::string_or_empty(args.get("type"))));
+    }
+    let Some(upload) = held.files.get_mut(&id) else {
+        return Ok(fail("not_found", "That upload is gone. Attach the file again."));
+    };
+    let size = upload.part.bytes.len();
+    if at == size {
+        if size + data.len() > ATTACHMENTS_MAX {
+            held.files.remove(&id);
+            return Ok(fail("too_big", "That file is over Gmail's 25 MB limit."));
+        }
+        if total + data.len() > UPLOADS_MAX {
+            held.files.remove(&id);
+            return Ok(fail(
+                "too_big",
+                "That's too much to attach at once. Send or discard a message first.",
+            ));
+        }
+        upload.part.bytes.extend_from_slice(&data);
+    }
+    let size = held.files.get(&id).map_or(0, |u| u.part.bytes.len());
+    Ok(ok(json!({"upload": id, "size": size})))
+}
+
+/// `gws_upload_drop`: a file taken off before it was sent.
+pub fn upload_drop(core: &Core, args: &Value) -> Result<Value, Failure> {
+    uploads(core)
+        .files
+        .remove(&js::string_or_empty(args.get("upload")));
+    Ok(ok(json!({"dropped": true})))
+}
+
+/// A slow save's outcome, for a caller that stopped waiting: the Bot gives a
+/// call 30 seconds, and a big attachment on a slow line takes longer.
+pub fn finish_job(core: &Core, args: &Value, answer: &Value) {
+    let job = js::string_or_empty(args.get("job"));
+    if !gmail::id_ok(&job) {
+        return;
+    }
+    let mut jobs = core.jobs.lock().unwrap_or_else(|e| e.into_inner());
+    if jobs.len() == JOBS_MAX {
+        jobs.pop_front();
+    }
+    jobs.push_back((job, answer.clone()));
+}
+
+/// `gws_mail_job`: how a save came out, or that it's still going.
+pub fn job(core: &Core, args: &Value) -> Result<Value, Failure> {
+    let job = js::string_or_empty(args.get("job"));
+    let mut jobs = core.jobs.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(match jobs.iter().position(|(id, _)| *id == job) {
+        Some(at) => {
+            let (_, answer) = jobs.remove(at).unwrap_or_default();
+            ok(json!({"done": true, "answer": answer}))
+        }
+        None => ok(json!({"done": false})),
+    })
+}
+
 /// A message being written.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Draft {
@@ -30,6 +192,73 @@ pub struct Draft {
     pub thread: Option<String>,
     pub in_reply_to: String,
     pub references: String,
+}
+
+fn kept(args: &Value) -> Vec<Kept> {
+    let text = |item: &Value, k: &str| js::string_or_empty(item.get(k));
+    args.get("keep")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|item| Kept {
+            message: text(item, "message"),
+            id: text(item, "id"),
+            name: file_name(&text(item, "name")),
+            mime: mime_type(&text(item, "mime")),
+        })
+        .collect()
+}
+
+fn upload_ids(args: &Value) -> Vec<String> {
+    args.get("attachments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|i| i.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Every file a save carries: what was uploaded, then what the draft already
+/// had. `Err` is the person's answer: a message must not lose a file quietly.
+fn gather(core: &Core, auth: &Bearer, args: &Value) -> Result<Result<Vec<Part>, Value>, Failure> {
+    let mut parts = Vec::new();
+    {
+        let held = uploads(core);
+        for id in upload_ids(args) {
+            match held.files.get(&id) {
+                Some(upload) => parts.push(upload.part.clone()),
+                None => {
+                    return Ok(Err(fail(
+                        "not_found",
+                        "An attachment is gone. Attach it again.",
+                    )));
+                }
+            }
+        }
+    }
+    for keep in kept(args) {
+        if !gmail::id_ok(&keep.message) || keep.id.is_empty() {
+            return Ok(Err(fail("invalid_args", "That isn't an attachment.")));
+        }
+        let Some(bytes) = core.gmail.attachment(auth, &keep.message, &keep.id)? else {
+            return Ok(Err(fail(
+                "not_found",
+                "An attachment is gone. Attach it again.",
+            )));
+        };
+        parts.push(Part {
+            name: keep.name,
+            mime: keep.mime,
+            bytes,
+        });
+    }
+    if parts.iter().map(|p| p.bytes.len()).sum::<usize>() > ATTACHMENTS_MAX {
+        return Ok(Err(fail(
+            "too_big",
+            "That's over Gmail's 25 MB limit for one message.",
+        )));
+    }
+    Ok(Ok(parts))
 }
 
 /// An address alone, as `a@b.c` or `Name <a@b.c>`, if it's one a header can hold.
@@ -104,9 +333,14 @@ impl Draft {
         self.to.iter().chain(&self.cc).chain(&self.bcc)
     }
 
-    /// The message, as Gmail takes it. It names no From: Gmail fills that from
-    /// the sign-in, so a draft can't claim to be from anyone else.
+    /// The message, as Gmail's JSON door takes it.
     pub fn raw(&self, message_id: &str) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.message(message_id, &[]))
+    }
+
+    /// The message itself. It names no From: Gmail fills that from the sign-in,
+    /// so a draft can't claim to be from anyone else.
+    pub fn message(&self, message_id: &str, parts: &[Part]) -> Vec<u8> {
         let mut head = String::new();
         let mut line = |name: &str, value: &str| {
             if !value.is_empty() {
@@ -120,18 +354,57 @@ impl Draft {
         line("In-Reply-To", &self.in_reply_to);
         line("References", &self.references);
         line("Message-ID", message_id);
-        let body = base64::engine::general_purpose::STANDARD.encode(&self.body);
-        let wrapped: Vec<&str> = body
-            .as_bytes()
-            .chunks(76)
-            .map(|c| std::str::from_utf8(c).unwrap_or_default())
-            .collect();
-        let message = format!(
-            "{head}MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n",
-            wrapped.join("\r\n")
+        head.push_str("MIME-Version: 1.0\r\n");
+        let text = format!(
+            "Content-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+            wrapped(self.body.as_bytes())
         );
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(message)
+        if parts.is_empty() {
+            return format!("{head}{text}").into_bytes();
+        }
+        let boundary = "buwiz-gws-part-boundary";
+        let mut out = format!(
+            "{head}Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n--{boundary}\r\n{text}"
+        );
+        for part in parts {
+            out.push_str(&format!(
+                "--{boundary}\r\nContent-Type: {}\r\nContent-Disposition: attachment; {}\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+                part.mime,
+                disposition_name(&part.name),
+                wrapped(&part.bytes),
+            ));
+        }
+        out.push_str(&format!("--{boundary}--\r\n"));
+        out.into_bytes()
     }
+}
+
+/// Base64 in the lines mail takes. Nothing in it can look like a boundary, as
+/// base64 has no `-`.
+fn wrapped(bytes: &[u8]) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let lines: Vec<&str> = encoded
+        .as_bytes()
+        .chunks(76)
+        .map(|c| std::str::from_utf8(c).unwrap_or_default())
+        .collect();
+    lines.join("\r\n")
+}
+
+/// `filename=`, with anything past plain letters percent-encoded (RFC 2231).
+fn disposition_name(name: &str) -> String {
+    let plain = |b: u8| b.is_ascii_alphanumeric() || b"-._".contains(&b);
+    let encoded: String = name
+        .bytes()
+        .map(|b| {
+            if plain(b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    format!("filename*=UTF-8''{encoded}")
 }
 
 /// The message id a draft goes out under, made here so a Send that lost its
@@ -157,6 +430,9 @@ fn model_drafts(core: &Core) -> MutexGuard<'_, HashSet<String>> {
 /// `gws_mail_draft_save` from the model: a new draft, or one it wrote and the
 /// person hasn't touched. Every other draft is the person's work.
 pub fn save_for_model(core: &Core, args: &Value) -> Value {
+    if !upload_ids(args).is_empty() || !kept(args).is_empty() {
+        return fail("not_allowed", "Only a person attaches files.");
+    }
     let held = js::string_or_empty(args.get("draft"));
     if !held.is_empty() && !model_drafts(core).contains(&held) {
         return fail(
@@ -188,18 +464,33 @@ pub fn save(core: &Core, args: &Value) -> Result<Value, Failure> {
     let message_id = Some(js::string_or_empty(args.get("message_id")))
         .filter(|m| m.starts_with('<') && m.ends_with('>') && !m.contains(['\r', '\n']))
         .unwrap_or_else(new_message_id);
-    let raw = draft.raw(&message_id);
+    let parts = match gather(core, &auth, args)? {
+        Ok(parts) => parts,
+        Err(refused) => return Ok(refused),
+    };
     let thread = draft.thread.as_deref();
-    let saved = if held.is_empty() {
-        core.gmail.draft_create(&auth, &raw, thread)?
+    let saved = if !parts.is_empty() {
+        let replaces = Some(held.as_str()).filter(|h| !h.is_empty());
+        let message = draft.message(&message_id, &parts);
+        core.gmail.draft_upload(&auth, replaces, &message, thread)?
+    } else if held.is_empty() {
+        core.gmail.draft_create(&auth, &draft.raw(&message_id), thread)?
     } else {
-        core.gmail.draft_update(&auth, &held, &raw, thread)?
+        core.gmail.draft_update(&auth, &held, &draft.raw(&message_id), thread)?
     };
     let Some(saved) = saved else {
         return Ok(fail("not_found", "That draft is gone."));
     };
     // a person's edit makes it theirs: `save_for_model` claims it back only for itself
     model_drafts(core).remove(&held);
+    let id = saved.pointer("/id").and_then(Value::as_str).unwrap_or_default();
+    let mut files = uploads(core);
+    for upload in upload_ids(args) {
+        if let Some(file) = files.files.get_mut(&upload) {
+            file.draft = Some(id.to_owned());
+        }
+    }
+    drop(files);
     Ok(ok(json!({
         "draft": saved.pointer("/id"),
         "revision": saved.pointer("/message/id"),
@@ -229,6 +520,7 @@ pub fn read(core: &Core, args: &Value) -> Result<Value, Failure> {
         "subject": h("Subject"),
         "body": gmail::body(&message),
         "thread": message.get("threadId"),
+        "attachments": gmail::attachments(&message),
     })))
 }
 
@@ -240,6 +532,7 @@ pub fn delete(core: &Core, args: &Value) -> Result<Value, Failure> {
         return Ok(fail("invalid_args", "That isn't a draft."));
     }
     core.gmail.draft_delete(&auth, &id)?;
+    uploads(core).free_draft(&id);
     Ok(ok(json!({"deleted": true})))
 }
 
@@ -299,6 +592,7 @@ pub fn send(core: &Core, args: &Value) -> Result<Value, Failure> {
         }
     }
     core.gmail.draft_send(&auth, &id)?;
+    uploads(core).free_draft(&id);
     Ok(ok(json!({"sent": true})))
 }
 

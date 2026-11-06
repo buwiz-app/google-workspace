@@ -3606,25 +3606,6 @@ fn a_late_answer_to_a_rename_left_behind_says_nothing() {
 }
 
 #[test]
-fn a_late_new_folder_says_nothing_over_what_came_after() {
-    let (mut app, fake) = start();
-    fake.hold("write:gws_drive_folder");
-    press(&mut app, "label:New folder");
-    app.type_text(
-        "label:Folder name, as it will show in Google Drive to others",
-        "Inner",
-    )
-    .unwrap();
-    app.submit("label:Folder name, as it will show in Google Drive to others")
-        .unwrap();
-    settle(&mut app);
-    press(&mut app, "label:Cancel this");
-    fake.release("write:gws_drive_folder");
-    settle(&mut app);
-    assert!(!app.screen().shows("Made a new folder on Google Drive."));
-}
-
-#[test]
 fn a_late_refusal_for_another_file_loads_nobody_under_this_files_name() {
     let (mut app, fake) = start();
     let moved = json!({"refused": "changed", "message": "Who has this file changed since you looked, so nothing changed. Check the list again."});
@@ -3809,7 +3790,10 @@ fn a_late_new_folder_leaves_a_name_being_typed_since_up() {
             .unwrap(),
         "Better notes"
     );
-    assert!(app.screen().shows("Made a new folder on Google Drive."));
+    assert!(
+        app.screen()
+            .shows("Your earlier new folder was made on Google Drive.")
+    );
 }
 
 #[test]

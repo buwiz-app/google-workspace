@@ -242,9 +242,15 @@ fn commit(b: &Bridge, m: Drive) {
             let args = owned(args, &m.chooser.who.get_untracked());
             let call = b.call("gws_drive_folder", args);
             answer_write(b, m, call, move |b, m, v| {
-                if m.opening.counts(opening) {
-                    say(m, "Made a new folder on Google Drive.");
-                }
+                // it was made either way, in words that can't be taken for what's up now
+                say(
+                    m,
+                    if m.opening.counts(opening) {
+                        "Made a new folder on Google Drive."
+                    } else {
+                        "Your earlier new folder was made on Google Drive."
+                    },
+                );
                 stop_opening(m, opening);
                 landed(b, m, v);
             });

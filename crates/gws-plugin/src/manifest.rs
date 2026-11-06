@@ -38,6 +38,11 @@ pub const APPS: [App; 3] = [
             tools::MAIL_THREAD,
             tools::MAIL_CHANGES,
             tools::MAIL_CARD,
+            tools::MAIL_MARK,
+            tools::MAIL_LABEL,
+            tools::MAIL_ARCHIVE,
+            tools::MAIL_TRASH,
+            tools::MAIL_UNDO,
         ],
         card: true,
         sites: &["https://console.cloud.google.com"],
@@ -107,6 +112,22 @@ pub fn unsigned(key_id: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool an app's screen calls has to be in its manifest entry, or the
+    /// Bot refuses the call. No write is left out of Mail's.
+    #[test]
+    fn mail_lists_every_tool_its_screen_calls() {
+        let mail = APPS
+            .iter()
+            .find(|a| a.tools.contains(&tools::MAIL_LIST))
+            .unwrap();
+        let screen = include_str!("../../gws-screens/src/mail.rs");
+        for def in tools::defs() {
+            if screen.contains(&format!("\"{}\"", def.name)) {
+                assert!(mail.tools.contains(&def.name), "{}", def.name);
+            }
+        }
+    }
 
     #[test]
     fn the_manifest_names_only_real_tools_and_every_tool_has_an_audience() {

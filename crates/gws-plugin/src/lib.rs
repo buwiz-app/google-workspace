@@ -174,7 +174,12 @@ impl Core {
     /// account nobody pushed stays: the Bot sends them one at a time, and it
     /// may be next.
     pub fn account(&self, method: &str, args: &Value) -> Value {
-        let was = self.accounts.subject_of(args);
+        // read first, as a push files its list. After a restart only the active
+        // account has been pushed, and the others are known from their filing
+        let was = self
+            .accounts
+            .subject_of(args)
+            .or_else(|| mail::filed_subject(self, args));
         let mut result = if method == "buwiz.account.set" {
             self.accounts.set(args)
         } else {

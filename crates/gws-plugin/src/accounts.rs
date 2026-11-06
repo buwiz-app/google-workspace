@@ -180,9 +180,14 @@ impl Accounts {
                 Some(who) => {
                     held.who.insert(label.to_owned(), who);
                 }
-                None if held.lists(label) => {}
+                // only this push's own list makes a clear a switch: an old one
+                // can't say this label is still signed in
+                None if args.get("accounts").is_some() && held.lists(label) => {}
                 None => {
                     held.who.remove(label);
+                    if let Some(listed) = &mut held.listed {
+                        listed.retain(|l| l.label != label);
+                    }
                 }
             }
         }

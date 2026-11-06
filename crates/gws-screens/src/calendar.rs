@@ -258,6 +258,7 @@ async fn watch(b: Bridge, m: Cal) {
         if m.chooser.check(&b).await {
             switched(&b, m);
         }
+        m.editor.adopt(&m.chooser.who.get_untracked());
         if let Ok(v) = read(&b, "gws_cal_changes", json!({})).await {
             let seq = v.get("seq").and_then(Value::as_i64).unwrap_or(0);
             let last = m.seq.get_untracked();

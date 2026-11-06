@@ -2663,6 +2663,59 @@ fn a_new_event_names_its_account() {
     );
 }
 
+/// `fake` says `who` is active, and the screen's next check has read it.
+fn active(app: &mut Headless, fake: &Fake, who: &str) {
+    *fake.status.lock().unwrap() = Some(
+        json!({"signed_in": true, "subject": who, "features": {"mail": true, "calendar": true, "drive": false}}),
+    );
+    let asked = fake.called("gws_status").len();
+    let by = std::time::Instant::now() + Duration::from_secs(20);
+    while fake.called("gws_status").len() == asked {
+        assert!(std::time::Instant::now() < by, "the check comes round");
+        settle(app);
+    }
+    settle(app);
+}
+
+/// Its calendar and its guests are that account's: the plugin refuses it there
+/// only if the save still says whose it is.
+#[test]
+fn an_event_opened_before_a_switch_stays_the_account_it_was_opened_on() {
+    let (mut app, fake) = start();
+    active(&mut app, &fake, "one@example.com");
+    write_one(&mut app, "Board dinner");
+    active(&mut app, &fake, "two@example.com");
+    press(&mut app, "label:Save this event");
+    assert_eq!(
+        last(&fake, "gws_event_save")["as_account"],
+        "one@example.com"
+    );
+}
+
+#[test]
+fn the_newer_version_of_an_event_stays_the_account_it_was_opened_on() {
+    let (mut app, fake) = start();
+    active(&mut app, &fake, "one@example.com");
+    open(&mut app, "Team review");
+    press(&mut app, "label:Edit this event");
+    app.wait_for_within(
+        "label:Title, the name guests will see on their calendars",
+        WAIT,
+    )
+    .expect("the editor opens");
+    let mut newer = fake.row("e1").unwrap();
+    newer["etag"] = json!("e2");
+    *fake.changed.lock().unwrap() = Some(newer);
+    press(&mut app, "label:Save this event");
+    active(&mut app, &fake, "two@example.com");
+    press(&mut app, "label:Use the newer one");
+    press(&mut app, "label:Save this event");
+    assert_eq!(
+        last(&fake, "gws_event_save")["as_account"],
+        "one@example.com"
+    );
+}
+
 #[test]
 fn a_draft_card_saves_to_the_account_it_was_made_on() {
     let mut draft = a_draft(1);

@@ -487,6 +487,14 @@ pub(crate) fn file_sign_ins(core: &Core, store: &Store) -> gws_store::Result<Has
     Ok(rows.into_iter().map(|(_, who)| who).collect())
 }
 
+/// Whose sign-in `args` name, as last filed.
+pub(crate) fn filed_subject(core: &Core, args: &Value) -> Option<String> {
+    let label = args.get("label").and_then(Value::as_str)?;
+    let filed = with_store(core, |store| store.sign_ins()).ok()?;
+    let row = filed.into_iter().find(|(filed, _)| filed == label)?;
+    Some(row.1)
+}
+
 /// Clears every account in the store that no sign-in holds, whether or not
 /// this process ever saw it signed in. False if it couldn't, and then a marker
 /// on disk has the next sync try again, even after a restart.
@@ -1521,6 +1529,35 @@ mod tests {
             assert!(marked(&second, B));
             let filed = with_store(&second, |s| s.sign_ins()).unwrap();
             assert_eq!(filed, vec![(B.to_owned(), B.to_owned())]);
+        }
+
+        #[test]
+        fn a_sign_out_of_an_account_nobody_pushed_since_a_restart_goes_at_once() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (first, paths) = two_accounts(&google, "two-out-restart");
+            drop(first);
+            let second = core(&google, &paths);
+            second.clock.set(AT);
+            push_listed(&second, B, &[(A, false), (B, true)]);
+            clear_listed(&second, A, &[(B, true)]);
+            assert!(!marked(&second, A), "not at the next settle: now");
+            assert!(marked(&second, B));
+        }
+
+        /// Not what B7 sends. A Bot that stopped listing can't vouch for a label.
+        #[test]
+        fn a_clear_with_no_list_is_a_sign_out_whatever_the_last_list_said() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (core, _) = two_accounts(&google, "two-no-list");
+            let out = json!({"account": "google", "label": B});
+            core.account("buwiz.account.clear", &out);
+            assert!(!marked(&core, B), "gone at once");
+            assert!(marked(&core, A));
+            let rows = core.run(crate::tools::ACCOUNTS, &json!({}));
+            assert_eq!(
+                answer(&rows)["accounts"],
+                json!([{"label": A, "address": A, "active": true}])
+            );
         }
 
         #[test]

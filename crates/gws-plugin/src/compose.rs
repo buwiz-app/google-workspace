@@ -864,8 +864,13 @@ pub(crate) fn outside<'a>(
     recipients.find(|r| !r.eq_ignore_ascii_case(allowed))
 }
 
-/// How long a press allows its send: long enough to save a big attachment.
+/// How long a press has to reach its draft: long enough to save a big attachment.
 const ARMED_FOR: Duration = Duration::from_secs(900);
+
+/// How long it stands once it knows its draft, which is the hold and the send.
+/// A screen that closes in the hold can't say so: this is what frees the draft
+/// for the AI, and the account for a switch.
+const BOUND_FOR: Duration = Duration::from_secs(60);
 
 /// Presses of Send, by what each was given. The Bot judges a call by the moment
 /// it's made, not by the press behind it: a send held five seconds could go out
@@ -879,37 +884,50 @@ pub struct Armed {
 
 struct Press {
     token: String,
-    at: Instant,
+    until: Instant,
     /// The draft and revision it sends: known at once on a card, and after the
     /// save in the panel. Nothing else goes out on it.
     sends: Option<(String, String)>,
 }
 
 impl Armed {
+    fn live(&mut self) {
+        let now = Instant::now();
+        self.presses.retain(|p| now < p.until);
+    }
+
+    /// The press now sends this. A newer press on a draft replaces any older one.
     fn bind(&mut self, token: &str, draft: &str, revision: &str) {
+        if !self.presses.iter().any(|p| p.token == token) {
+            return;
+        }
+        let older =
+            |p: &Press| p.token != token && p.sends.as_ref().is_some_and(|sends| sends.0 == draft);
+        self.presses.retain(|p| !older(p));
         if let Some(press) = self.presses.iter_mut().find(|p| p.token == token) {
             press.sends = Some((draft.to_owned(), revision.to_owned()));
+            press.until = Instant::now() + BOUND_FOR;
         }
     }
 
     /// Whether a press still in force names this draft.
     fn holds(&mut self, draft: &str) -> bool {
-        self.presses.retain(|p| p.at.elapsed() < ARMED_FOR);
+        self.live();
         let names = |sends: &(String, String)| sends.0 == draft;
         self.presses
             .iter()
             .any(|p| p.sends.as_ref().is_some_and(names))
     }
 
-    /// Spends the press, whatever comes of it: what it sends, if it's still good.
     /// Whether any Send is pressed and not yet gone or taken back.
     fn any(&mut self) -> bool {
-        self.presses.retain(|p| p.at.elapsed() < ARMED_FOR);
+        self.live();
         !self.presses.is_empty()
     }
 
+    /// Spends the press, whatever comes of it: what it sends, if it's still good.
     fn take(&mut self, token: &str) -> Option<(String, String)> {
-        self.presses.retain(|p| p.at.elapsed() < ARMED_FOR);
+        self.live();
         let at = self.presses.iter().position(|p| p.token == token)?;
         self.presses.remove(at).sends
     }
@@ -930,12 +948,15 @@ pub fn arm(core: &Core, args: &Value) -> Result<Value, Failure> {
     let mut held = armed(core);
     held.next += 1;
     let token = format!("a{}x{:x}", held.next, nonce());
-    let text = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_owned);
     held.presses.push(Press {
         token: token.clone(),
-        at: Instant::now(),
-        sends: text("draft").zip(text("revision")),
+        until: Instant::now() + ARMED_FOR,
+        sends: None,
     });
+    let text = |k: &str| args.get(k).and_then(Value::as_str);
+    if let Some((draft, revision)) = text("draft").zip(text("revision")) {
+        held.bind(&token, draft, revision);
+    }
     Ok(ok(json!({"armed": token})))
 }
 
@@ -1019,11 +1040,12 @@ fn people_json(found: Vec<(String, String)>, me: &str) -> Value {
 /// answer was lost is safe to press again: the draft has gone by then, and the
 /// message is found in Sent instead of going out twice.
 pub fn send(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let auth = session(core)?;
+    let token = js::string_or_empty(args.get("armed"));
     let id = js::string_or_empty(args.get("draft"));
     let revision = js::string_or_empty(args.get("revision"));
     let message_id = js::string_or_empty(args.get("message_id"));
     if !gmail::id_ok(&id) || revision.is_empty() {
+        armed(core).take(&token);
         return Ok(fail("invalid_args", "That isn't a draft."));
     }
     // held to the end, so what's read here is what goes. A save under way is about
@@ -1031,12 +1053,16 @@ pub fn send(core: &Core, args: &Value) -> Result<Value, Failure> {
     // refusal that says the mail stayed
     let gate = gate(core, &id);
     let Some(_turn) = try_turn(&gate) else {
-        armed(core).take(&js::string_or_empty(args.get("armed")));
+        armed(core).take(&token);
         return Ok(refusal(
             "busy",
             "This draft is being changed or sent. Read it again before sending.",
         ));
     };
+    // spent here, whatever comes of it: a refused send needs a new press, and
+    // one left standing would close the draft and every switch of account
+    let press = armed(core).take(&token);
+    let auth = session(core)?;
     let Some(held) = core.gmail.draft(&auth, &id)? else {
         return Ok(if in_sent(core, &auth, &message_id)? {
             ok(json!({"sent": true, "already": true}))
@@ -1044,8 +1070,6 @@ pub fn send(core: &Core, args: &Value) -> Result<Value, Failure> {
             refusal("not_found", "That draft is gone.")
         });
     };
-    // spent here, whatever comes of it: a refused send needs a new press
-    let press = armed(core).take(&js::string_or_empty(args.get("armed")));
     if press != Some((id.clone(), revision.clone())) {
         return Ok(refusal("not_allowed", "Only a person's press sends mail."));
     }
@@ -1175,6 +1199,43 @@ fn prefixed(prefix: &str, subject: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_press_that_knows_its_draft_stands_only_for_the_hold_and_the_send() {
+        let mut held = Armed::default();
+        let press = |token: &str| Press {
+            token: token.to_owned(),
+            until: Instant::now() + ARMED_FOR,
+            sends: None,
+        };
+        held.presses.push(press("saving"));
+        held.presses.push(press("bound"));
+        held.bind("bound", "d", "r");
+        let left = |p: &Press| p.until.saturating_duration_since(Instant::now());
+        assert!(
+            left(&held.presses[0]) > BOUND_FOR,
+            "a big save needs its time"
+        );
+        assert!(left(&held.presses[1]) <= BOUND_FOR);
+        held.presses[1].until = Instant::now();
+        assert!(
+            !held.holds("d"),
+            "a screen that closed can't lock the draft"
+        );
+        assert!(held.any(), "the one still saving stands");
+    }
+
+    #[test]
+    fn a_save_with_no_press_behind_it_leaves_the_presses_alone() {
+        let mut held = Armed::default();
+        held.presses.push(Press {
+            token: "a".to_owned(),
+            until: Instant::now() + BOUND_FOR,
+            sends: Some(("d".to_owned(), "r".to_owned())),
+        });
+        held.bind("", "d", "r2");
+        assert!(held.holds("d"));
+    }
 
     fn decoded(raw: &str) -> String {
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD

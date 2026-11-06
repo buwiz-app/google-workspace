@@ -1566,6 +1566,40 @@ fn someone_new_on_a_send_from_the_panel_takes_a_second_press() {
     );
 }
 
+/// While a press stands the AI is off the draft and no account can be switched
+/// to: not even the way back the refusal names.
+#[test]
+fn a_send_refused_at_its_save_gives_its_press_back() {
+    let (mut app, fake) = start();
+    write_one(&mut app);
+    *fake.save_refused.lock().unwrap() = Some("account_changed".to_owned());
+    app.press("label:Send").expect("Send presses");
+    settle(&mut app);
+    assert_eq!(
+        fake.called("gws_mail_send_disarm"),
+        [json!({"armed": "a1"})]
+    );
+}
+
+#[test]
+fn a_question_about_someone_new_gives_the_press_back_while_it_asks() {
+    let (mut app, fake) = start();
+    write_one(&mut app);
+    *fake.draft.lock().unwrap() = Some(draft(
+        "eve@example.com",
+        Value::Null,
+        json!(["eve@example.com"]),
+    ));
+    app.press("label:Send").expect("Send presses");
+    app.wait_for_within("text:New to you: eve@example.com. Send it?", WAIT)
+        .expect("it asks");
+    settle(&mut app);
+    assert_eq!(
+        fake.called("gws_mail_send_disarm"),
+        [json!({"armed": "a1"})]
+    );
+}
+
 #[test]
 fn a_change_after_the_question_asks_again() {
     let (mut app, fake) = start();

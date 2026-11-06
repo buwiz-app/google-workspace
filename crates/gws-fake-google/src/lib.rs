@@ -456,6 +456,7 @@ struct Account {
     writes_left: Option<usize>,
     wrote: bool,
     reads_fail_after_write: bool,
+    draft_reads_fail: bool,
     /// Reads so far, once attachment ids change with each.
     reads: Option<AtomicU64>,
     /// `(draft id, message id, raw message, thread)`.
@@ -863,6 +864,12 @@ impl Account {
             .unwrap_or(100)
             .min(500);
         if self.reads_fail_after_write && self.wrote && r.method == "GET" && format == "metadata" {
+            return Reply::json(
+                500,
+                json!({"error": {"code": 500, "message": "Backend error"}}),
+            );
+        }
+        if self.draft_reads_fail && r.method == "GET" && segs.first() == Some(&"drafts") {
             return Reply::json(
                 500,
                 json!({"error": {"code": 500, "message": "Backend error"}}),
@@ -1476,6 +1483,11 @@ impl FakeGoogle {
     /// Once something is written, reading a thread's metadata fails.
     pub fn reads_fail_after_a_write(&self) {
         self.account.lock().unwrap().reads_fail_after_write = true;
+    }
+
+    /// Whether reading a draft fails.
+    pub fn draft_reads_fail(&self, fail: bool) {
+        self.account.lock().unwrap().draft_reads_fail = fail;
     }
 
     /// From now on a token covers `scope` alone, and writes need more.

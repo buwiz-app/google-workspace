@@ -153,6 +153,9 @@ struct Fake {
     /// The files a pick gives, and the bytes behind each.
     picks: Mutex<Vec<(String, Vec<u8>)>>,
     no_picks: Mutex<bool>,
+    /// A picker left open: its answer waits here.
+    picker_stays: Mutex<bool>,
+    open_picker: Mutex<Option<Done>>,
     /// Bytes as they came, by upload.
     chunks: Mutex<HashMap<String, Vec<u8>>>,
     uploaded: Mutex<Vec<(String, Vec<u8>, String)>>,
@@ -392,6 +395,10 @@ impl Host for Fake {
                 use base64::Engine as _;
                 let data = base64::engine::general_purpose::STANDARD.encode(bytes);
                 return done(Ok(json!(data)));
+            }
+            if *self.picker_stays.lock().unwrap() {
+                *self.open_picker.lock().unwrap() = Some(done);
+                return;
             }
             let files: Vec<Value> = picks
                 .iter()
@@ -4618,6 +4625,29 @@ fn nothing_a_press_would_send_can_be_reached() {
     // or the audit is looking at nothing
     assert!(reached.contains("Search Google Drive"), "{reached:?}");
     assert!(reached.contains("Share"), "{reached:?}");
+}
+
+/// The folder it was opened on is that account's, whoever is active by the time
+/// a file is chosen.
+#[test]
+fn an_upload_stays_the_account_its_picker_opened_on() {
+    let (mut app, fake) = start();
+    open(&mut app, "Clients");
+    active(&mut app, &fake, "one@example.com");
+    *fake.picks.lock().unwrap() = vec![("Quote.txt".to_owned(), b"fake quote".to_vec())];
+    *fake.picker_stays.lock().unwrap() = true;
+    press(&mut app, "label:Upload a file to Google Drive");
+    settle(&mut app);
+    active(&mut app, &fake, "two@example.com");
+    let chosen = fake.open_picker.lock().unwrap().take().expect("it's open");
+    *fake.picker_stays.lock().unwrap() = false;
+    chosen(Ok(
+        json!([{"id": "0", "name": "Quote.txt", "size": 10, "type": "text/plain"}]),
+    ));
+    settle(&mut app);
+    let upload = last_of(&fake, "gws_drive_upload");
+    assert_eq!(upload["as_account"], "one@example.com");
+    assert_eq!(upload["parent"], "clients");
 }
 
 /// `fake` says `who` is active, and the screen's next check has read it.

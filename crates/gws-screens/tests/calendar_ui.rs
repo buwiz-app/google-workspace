@@ -474,11 +474,21 @@ fn the_week_shows_events_all_day_and_the_now_line() {
 #[test]
 fn views_switch_by_press_and_by_key_and_each_asks_for_its_days() {
     let (mut app, fake) = start();
-    for (keys, days) in [("d", 1), ("m", 0), ("a", 30), ("w", 7)] {
+    for (keys, days, span) in [
+        ("d", 1, Span::Day),
+        ("m", 0, Span::Month),
+        ("a", 30, Span::Agenda),
+        ("w", 7, Span::Week),
+    ] {
         key(&mut app, keys);
         let args = last(&fake, "gws_cal_range");
         let moment = |k: &str| DateTime::parse_from_rfc3339(args[k].as_str().unwrap()).unwrap();
         let asked = (moment("to") - moment("from")).num_days();
+        assert_eq!(
+            args["to_date"],
+            time::range(span, today()).1.to_string(),
+            "{keys} says which date it stops at"
+        );
         if days == 0 {
             assert!(asked >= 28, "{keys} asked {asked} days");
         } else {
@@ -809,6 +819,39 @@ fn a_shorter_list_after_a_longer_one_shows_only_its_own_rows() {
 }
 
 // --- Detail ------------------------------------------------------------------
+
+fn on_its_guest_list(people: Value, guests: i64) -> Vec<Value> {
+    let mut e = event("e1", "mine", "Team review", at(0, 9, 0), at(0, 10, 0));
+    e["attendees"] = people;
+    e["guests"] = json!(guests);
+    vec![e]
+}
+
+#[test]
+fn the_guest_count_leaves_out_the_person_and_the_room() {
+    let mut me = guest("owner@example.com", "accepted");
+    me["self"] = json!(true);
+    let mut room = guest("room@example.com", "accepted");
+    room["resource"] = json!(true);
+    let people = json!([me, guest("ana@example.com", "accepted"), room]);
+    let (mut app, _) = start_with(on_its_guest_list(people, 1));
+    open(&mut app, "Team review");
+    assert!(app.screen().shows("1 guest"), "{:?}", app.screen().texts());
+    assert!(!app.screen().shows("3 guests"));
+}
+
+#[test]
+fn alone_on_the_list_the_person_has_no_guests() {
+    let mut me = guest("owner@example.com", "accepted");
+    me["self"] = json!(true);
+    let (mut app, _) = start_with(on_its_guest_list(json!([me]), 0));
+    open(&mut app, "Team review");
+    assert!(
+        app.screen().shows("No other guests"),
+        "{:?}",
+        app.screen().texts()
+    );
+}
 
 #[test]
 fn detail_shows_the_event_with_replies_and_opens_meet_through_the_link_check() {
@@ -1558,7 +1601,7 @@ fn the_draft_card_shows_everything_save_would_write_and_writes_that() {
     let (mut app, fake) = draft_card(a_draft(2), 420.0);
     let when = time::when_line(
         &When::of(&at(2, 10, 0), &at(2, 11, 0), false).unwrap(),
-        &Local,
+        &Manila,
     );
     for line in [
         "Quarterly plan",

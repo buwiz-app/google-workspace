@@ -757,7 +757,10 @@ pub fn html_body(message: &Value) -> Option<String> {
     leaves.iter().find(is_html).map(|p| decode_part(p))
 }
 
-/// Attachments: `{name, mime, size, id}`.
+/// Attachments: `{name, mime, size, id, part}`. `part` is what stays the same
+/// from read to read, as Google calls a part's id immutable and promises nothing
+/// of `attachmentId`. A mail that's one attachment and nothing else has the empty
+/// id, and an empty one can't be told from none, so that's `root`.
 pub fn attachments(message: &Value) -> Vec<Value> {
     fn walk(part: &Value, out: &mut Vec<Value>) {
         let name = part
@@ -765,7 +768,11 @@ pub fn attachments(message: &Value) -> Vec<Value> {
             .and_then(Value::as_str)
             .unwrap_or_default();
         if !name.is_empty() {
-            out.push(serde_json::json!({"name": name, "mime": part.get("mimeType"), "size": part.pointer("/body/size"), "id": part.pointer("/body/attachmentId")}));
+            let id = match part.get("partId").and_then(Value::as_str) {
+                Some("") => Some("root"),
+                id => id,
+            };
+            out.push(serde_json::json!({"name": name, "mime": part.get("mimeType"), "size": part.pointer("/body/size"), "id": part.pointer("/body/attachmentId"), "part": id}));
         }
         for p in part
             .get("parts")
@@ -999,6 +1006,27 @@ mod tests {
         assert_eq!(header(&m, "subject"), "Hi");
         assert_eq!(header(&m, "Date"), "");
         assert_eq!(header(&json!({}), "From"), "");
+    }
+
+    #[test]
+    fn an_attachment_says_its_part_and_a_mail_that_is_only_one_has_a_word_for_it() {
+        let mixed = json!({"payload": {"partId": "", "mimeType": "multipart/mixed", "parts": [
+            {"partId": "0", "mimeType": "text/plain", "body": {"data": b64("Hi")}},
+            {"partId": "1", "mimeType": "text/csv", "filename": "a.csv", "body": {"attachmentId": "x"}},
+            {"partId": "2", "mimeType": "multipart/mixed", "parts": [
+                {"partId": "2.0", "mimeType": "text/csv", "filename": "b.csv", "body": {"attachmentId": "y"}},
+            ]},
+        ]}});
+        let parts: Vec<Value> = attachments(&mixed)
+            .iter()
+            .map(|a| a["part"].clone())
+            .collect();
+        assert_eq!(parts, [json!("1"), json!("2.0")]);
+        let alone = json!({"payload": {"partId": "", "mimeType": "text/csv", "filename": "a.csv", "body": {"attachmentId": "x"}}});
+        assert_eq!(attachments(&alone)[0]["part"], "root");
+        // one that doesn't say can't pass for another: it opens nothing
+        let silent = json!({"payload": {"mimeType": "text/csv", "filename": "a.csv"}});
+        assert_eq!(attachments(&silent)[0]["part"], Value::Null);
     }
 
     #[test]

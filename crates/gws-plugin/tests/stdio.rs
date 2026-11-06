@@ -5,6 +5,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -17,13 +18,36 @@ fn b64(b: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
 }
 
+/// The binary, with a data folder of its own. Every spawn here starts from this:
+/// with no folder named it would open the person's real one.
+fn plugin() -> Command {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("gws-stdio-data-{}-{n}", std::process::id()));
+    let mut c = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"));
+    c.env("GWS_DATA_DIR", dir);
+    c
+}
+
+/// The binary with no folder named, the one spawn that may have none. `HOME` is
+/// an empty stand-in, so that whatever the guard does, the person's own folder
+/// can't be what this finds. Cargo's mark is set here so the guard is on however
+/// the test was started.
+fn plugin_with_no_folder(name: &str) -> (Command, std::path::PathBuf) {
+    let home = std::env::temp_dir().join(format!("gws-stdio-home-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let mut c = plugin();
+    c.env_remove("GWS_DATA_DIR")
+        .env("HOME", &home)
+        .env("CARGO_MANIFEST_DIR", env!("CARGO_MANIFEST_DIR"));
+    (c, home)
+}
+
 /// The manifest the binary prints, in a file: what a signed one is to the plugin here.
 fn manifest_file(name: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("gws-stdio-{name}-{}.json", std::process::id()));
-    let out = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
-        .arg("manifest")
-        .output()
-        .unwrap();
+    let out = plugin().arg("manifest").output().unwrap();
     std::fs::write(&path, out.stdout).unwrap();
     path
 }
@@ -33,13 +57,9 @@ fn run(
     manifest: Option<&std::path::Path>,
     lines: &[Value],
 ) -> (std::process::ExitStatus, String, String) {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"));
+    let mut c = plugin();
     c.arg("mcp")
         .env_remove("BUWIZ_PLUGIN_MANIFEST")
-        .env(
-            "GWS_DATA_DIR",
-            std::env::temp_dir().join(format!("gws-stdio-data-{}", std::process::id())),
-        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -90,7 +110,7 @@ fn without_a_readable_signed_manifest_it_does_not_start() {
 fn the_manifest_is_read_once() {
     let manifest = manifest_file("pinned");
     let text = std::fs::read_to_string(&manifest).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+    let mut child = plugin()
         .arg("mcp")
         .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
         .stdin(Stdio::piped())
@@ -146,7 +166,7 @@ fn a_call_with_no_id_is_not_answered() {
 #[test]
 fn a_bad_byte_is_one_bad_line() {
     let manifest = manifest_file("byte");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+    let mut child = plugin()
         .arg("mcp")
         .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
         .stdin(Stdio::piped())
@@ -206,7 +226,7 @@ fn a_bad_request_with_an_id_is_answered_and_one_without_is_not() {
 #[test]
 fn a_line_with_a_bad_byte_is_refused_not_repaired() {
     let manifest = manifest_file("repair");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+    let mut child = plugin()
         .arg("mcp")
         .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
         .stdin(Stdio::piped())
@@ -228,14 +248,13 @@ fn a_line_with_a_bad_byte_is_refused_not_repaired() {
     );
 }
 
-/// With no HOME there's no store, and mail search works all the same.
+/// With no store, mail search works all the same.
 #[test]
-fn no_home_means_no_store_not_no_plugin() {
-    let manifest = manifest_file("nohome");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+fn no_store_is_not_no_plugin() {
+    let manifest = manifest_file("nostore");
+    let (mut c, _) = plugin_with_no_folder("nostore");
+    let mut child = c
         .arg("mcp")
-        .env_remove("HOME")
-        .env_remove("GWS_DATA_DIR")
         .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -254,6 +273,78 @@ fn no_home_means_no_store_not_no_plugin() {
     );
 }
 
+/// A test that forgets `GWS_DATA_DIR` gets no store, not the person's: `HOME` is
+/// a stand-in here, so what this looks for could only ever land in that. A
+/// release build has no such check.
+#[cfg(debug_assertions)]
+#[test]
+fn under_cargo_no_folder_named_means_no_store() {
+    let manifest = manifest_file("guard");
+    let (mut c, home) = plugin_with_no_folder("guard");
+    let mut child = c
+        .arg("mcp")
+        .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{}", provision()).unwrap();
+    // a push opens the store, and leaves the wipe marker where it can't
+    writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "buwiz.account.set", "arguments": {"account": "google", "label": "default", "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}}})).unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("\"id\":2"), "{text}");
+    assert!(!home.join("Library").exists(), "it reached for the folder");
+}
+
+fn rust_files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            rust_files(&path, found);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            found.push(path);
+        }
+    }
+}
+
+/// What in `text` lies inside the function that starts with `head`.
+fn body_of<'a>(text: &'a str, head: &str) -> &'a str {
+    let from = text.find(head).expect("the helper is there");
+    let end = text[from..].find("\n}\n").expect("it ends");
+    &text[from..from + end]
+}
+
+/// Every spawn goes through [`plugin`], and only [`plugin_with_no_folder`] takes
+/// the folder away. The words looked for are split so this test isn't one.
+#[test]
+fn no_spawn_gets_past_the_helpers() {
+    let raw = concat!("CARGO_BIN_", "EXE_buwiz-gws");
+    let removed = concat!("env_remove(\"GWS_", "DATA_DIR\")");
+    let cleared = concat!("env_", "clear(");
+    let mut files = Vec::new();
+    rust_files(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".."),
+        &mut files,
+    );
+    assert!(files.len() > 10, "looked in the wrong place: {files:?}");
+    let (mut raws, mut removals) = (0, 0);
+    for file in &files {
+        let text = std::fs::read_to_string(file).unwrap();
+        raws += text.matches(raw).count();
+        removals += text.matches(removed).count();
+        assert!(!text.contains(cleared), "{}", file.display());
+    }
+    let this = include_str!("stdio.rs");
+    assert_eq!(raws, 1, "a spawn outside `plugin`");
+    assert!(body_of(this, "fn plugin() -> Command {").contains(raw));
+    assert_eq!(removals, 1, "a spawn with no data folder");
+    assert!(body_of(this, "fn plugin_with_no_folder(").contains(removed));
+}
+
 /// Past the cap a call is refused at once, and the ones running still answer.
 #[cfg(feature = "stub")]
 #[test]
@@ -269,7 +360,7 @@ fn past_the_cap_a_call_is_refused_not_queued_forever() {
     });
     let base = fake.base.trim_end_matches("/gmail/v1/users/me").to_owned();
     let manifest = manifest_file("cap");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+    let mut child = plugin()
         .arg("mcp")
         .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
         .env("GWS_STUB_BASE", base)
@@ -337,7 +428,7 @@ fn a_cancelled_request_gets_no_answer() {
     });
     let base = fake.base.trim_end_matches("/gmail/v1/users/me").to_owned();
     let manifest = manifest_file("cancel");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+    let mut child = plugin()
         .arg("mcp")
         .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
         .env("GWS_STUB_BASE", base)
@@ -385,7 +476,7 @@ fn a_cancelled_request_gets_no_answer() {
 #[test]
 fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
     let manifest = manifest_file("accounts");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+    let mut child = plugin()
         .arg("mcp")
         .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
         .stdin(Stdio::piped())
@@ -455,6 +546,7 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
             "gws_mail_reply_start",
             "gws_mail_draft_delete",
             "gws_mail_send_arm",
+            "gws_mail_send_disarm",
             "gws_mail_send",
             "gws_mail_draft_of",
             "gws_people_suggest",
@@ -720,7 +812,7 @@ fn a_chats_drive_search_offers_the_files_card_through_the_real_server() {
     let manifest = manifest_file("drive-card");
     let data = std::env::temp_dir().join(format!("gws-stdio-drive-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+    let mut child = plugin()
         .arg("mcp")
         .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
         .env("GWS_STUB_BASE", google.base())
@@ -809,7 +901,7 @@ fn a_press_gets_its_document_through_the_real_server_and_the_model_gets_nothing(
     let manifest = manifest_file("drive-open");
     let data = std::env::temp_dir().join(format!("gws-stdio-open-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+    let mut child = plugin()
         .arg("mcp")
         .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
         .env("GWS_STUB_BASE", google.base())
@@ -940,7 +1032,7 @@ fn a_press_gets_its_document_through_the_real_server_and_the_model_gets_nothing(
         ("gws_file_discard", json!({"id": "drv-open"})),
         (
             "gws_mail_attachment_open",
-            json!({"message": "m1", "attachment": "a1"}),
+            json!({"message": "m1", "part": "1"}),
         ),
     ];
     for caller in [
@@ -1211,10 +1303,7 @@ fn a_test_run_shares_with_nobody_but_its_own_address() {
 
 #[test]
 fn the_manifest_command_prints_this_version_for_protocol_1_0() {
-    let out = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
-        .arg("manifest")
-        .output()
-        .unwrap();
+    let out = plugin().arg("manifest").output().unwrap();
     let m: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(m["protocol"].as_str(), Some("1.0.0"));
     assert_eq!(

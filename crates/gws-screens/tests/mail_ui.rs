@@ -13,8 +13,13 @@ use nsh_engine::EngineConfig;
 use nsh_testing::Headless;
 use serde_json::{Map, Value, json};
 
-const WAIT: Duration = Duration::from_secs(5);
+/// Room for a slow machine, and for Send's five seconds on one, which are fifty
+/// ticks that each run late there. It ends on what's looked for, so it costs a
+/// passing test nothing.
+const WAIT: Duration = Duration::from_secs(30);
 const PAGE: usize = 30;
+/// Past the next autosave, however the screen's clock falls.
+const PAST_AN_AUTOSAVE: Duration = Duration::from_millis(2500);
 
 /// What a list holds: its rows' numbers, shown as `Subject <n>`.
 fn numbers(label: &str) -> Vec<usize> {
@@ -43,7 +48,7 @@ fn list(args: &Value) -> Value {
 fn thread(id: &str) -> Value {
     let attachments = if id == "t2" {
         json!([
-            {"name": "Roof quote.docx", "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "size": 2048, "id": "att-1", "message": "m7"},
+            {"name": "Roof quote.docx", "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "size": 2048, "id": "att-1", "part": "1", "message": "m7"},
             {"name": "Inline logo.png", "mime": "image/png", "size": 80, "id": null, "message": "m7"},
         ])
     } else {
@@ -80,6 +85,8 @@ struct Fake {
     refuse_send: Mutex<Option<String>>,
     /// Sends get no answer, so no one knows if they went.
     send_lost: Mutex<bool>,
+    /// The first send gets no answer, and the second finds its press spent.
+    send_lost_then_spent: Mutex<bool>,
     /// Draft saves refused with this, as an answer: a tool's failure has no code
     /// by the time it reaches a screen.
     save_refused: Mutex<Option<String>>,
@@ -108,15 +115,22 @@ impl Fake {
         self.hold.lock().unwrap().push(name.to_owned());
     }
 
+    /// Answers a held call, once it has come: the screen's thread may be behind.
+    /// Calls after it go through: which save comes first is the autosave clock's.
     fn release(&self, name: &str) {
-        let mut held = self.held.lock().unwrap();
-        let at = held
-            .iter()
-            .position(|(n, _, _)| n == name)
-            .expect("that call is held");
-        let (_, answer, done) = held.remove(at);
-        drop(held);
-        done(Ok(answer));
+        self.hold.lock().unwrap().retain(|n| n != name);
+        let by = std::time::Instant::now() + WAIT;
+        loop {
+            let mut held = self.held.lock().unwrap();
+            if let Some(at) = held.iter().position(|(n, _, _)| n == name) {
+                let (_, answer, done) = held.remove(at);
+                drop(held);
+                return done(Ok(answer));
+            }
+            drop(held);
+            assert!(std::time::Instant::now() < by, "that call is held");
+            std::thread::yield_now();
+        }
     }
 }
 
@@ -216,6 +230,7 @@ impl Host for Fake {
                 return done(Err(BuwizError::new("denied", false, why)));
             }
             "gws_mail_send_arm" => (tool.to_owned(), json!({"armed": "a1"})),
+            "gws_mail_send_disarm" => (tool.to_owned(), json!({"disarmed": true})),
             "gws_mail_job_start" => (tool.to_owned(), json!({"job": "job1"})),
             "gws_mail_job" => (tool.to_owned(), json!({"done": false, "gone": true})),
             "gws_mail_draft_save" if self.save_timeout.lock().unwrap().to_owned() => {
@@ -243,7 +258,18 @@ impl Host for Fake {
                     json!({"refused": "changed", "message": why}),
                 )
             }
-            "gws_mail_send" if *self.send_lost.lock().unwrap() => {
+            "gws_mail_send"
+                if *self.send_lost_then_spent.lock().unwrap() && self.called(tool).len() > 1 =>
+            {
+                (
+                    tool.to_owned(),
+                    json!({"refused": "not_allowed", "message": "Only a person's press sends mail."}),
+                )
+            }
+            "gws_mail_send"
+                if *self.send_lost.lock().unwrap()
+                    || *self.send_lost_then_spent.lock().unwrap() =>
+            {
                 return done(Err(BuwizError::new("timeout", true, "no answer")));
             }
             "gws_mail_send" => (tool.to_owned(), json!({"sent": true})),
@@ -949,7 +975,7 @@ fn write_one(app: &mut Headless) {
 }
 
 fn wait_for_send(app: &mut Headless, fake: &Fake) {
-    let by = std::time::Instant::now() + Duration::from_secs(12);
+    let by = std::time::Instant::now() + WAIT;
     while fake.called("gws_mail_send").is_empty() {
         assert!(std::time::Instant::now() < by, "nothing sent");
         settle(app);
@@ -1083,7 +1109,7 @@ fn a_reply_starts_from_the_conversation_and_stays_in_it() {
 fn typing_saves_a_draft_when_it_rests() {
     let (mut app, fake) = start();
     write_one(&mut app);
-    let by = std::time::Instant::now() + Duration::from_secs(8);
+    let by = std::time::Instant::now() + WAIT;
     while fake.called("gws_mail_draft_save").is_empty() {
         assert!(std::time::Instant::now() < by, "no save came");
         settle(&mut app);
@@ -1245,11 +1271,8 @@ fn a_draft_changed_after_it_showed_waits_for_a_fresh_read() {
     changed["revision"] = json!("r8");
     *fake.draft.lock().unwrap() = Some(changed);
     app.press("label:Send").expect("Send presses");
-    app.wait_for_within(
-        "text:This draft changed after you read it.",
-        Duration::from_secs(9),
-    )
-    .expect("it says so");
+    app.wait_for_within("text:This draft changed after you read it.", WAIT)
+        .expect("it says so");
     assert!(
         app.screen().shows("eve@example.com"),
         "what it says now shows"
@@ -1340,14 +1363,16 @@ fn a_screen_opened_on_a_view_shows_that_view() {
     assert_eq!(fake.called("gws_mail_list")[0]["label"], "STARRED");
 }
 
+const UNSURE: &str =
+    "text:There's no word on whether this went. Look in Sent before sending it again.";
+
 #[test]
 fn a_send_with_no_answer_is_never_written_and_sent_again() {
     let (mut app, fake) = start();
     write_one(&mut app);
     *fake.send_lost.lock().unwrap() = true;
     app.press("label:Send").expect("Send presses");
-    app.wait_for_within("text:no answer", Duration::from_secs(9))
-        .expect("it says so");
+    app.wait_for_within(UNSURE, WAIT).expect("it says so");
     assert_eq!(
         fake.called("gws_mail_send").len(),
         2,
@@ -1483,11 +1508,8 @@ fn a_slow_save_the_plugin_lost_says_so_and_stops_waiting() {
     open_a_draft(&mut app);
     *fake.save_timeout.lock().unwrap() = true;
     app.press("label:Send").expect("Send presses");
-    app.wait_for_within(
-        "text:That save was lost. Try again.",
-        Duration::from_secs(9),
-    )
-    .expect("it says so");
+    app.wait_for_within("text:That save was lost. Try again.", WAIT)
+        .expect("it says so");
     assert!(fake.called("gws_mail_send").is_empty());
 }
 
@@ -1566,9 +1588,7 @@ fn an_attachment_row_opens_with_a_press_and_says_what_it_needs_to() {
     settle(&mut app);
     assert_eq!(
         fake.called("gws_mail_attachment_open"),
-        [
-            json!({"message": "m7", "attachment": "att-1", "name": "Roof quote.docx", "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"})
-        ]
+        [json!({"message": "m7", "part": "1"})]
     );
     assert!(!app.screen().shows("Opening…"), "the answer put it away");
 }
@@ -1677,4 +1697,145 @@ fn the_open_press_stays_whole_as_the_reader_narrows() {
             "at {width} it runs from {left} to {right}"
         );
     }
+}
+
+/// The first try may still be going, so a spent press says nothing about the mail.
+#[test]
+fn a_second_try_that_finds_its_press_spent_stays_unsure() {
+    let (mut app, fake) = start();
+    write_one(&mut app);
+    *fake.send_lost_then_spent.lock().unwrap() = true;
+    app.press("label:Send").expect("Send presses");
+    app.wait_for_within(UNSURE, WAIT).expect("it says so");
+    assert!(!app.screen().shows("Only a person's press sends mail."));
+    assert_eq!(fake.called("gws_mail_send").len(), 2);
+
+    *fake.send_lost_then_spent.lock().unwrap() = false;
+    *fake.save_refused.lock().unwrap() = Some("not_found".to_owned());
+    app.press("label:Send").expect("Send presses");
+    app.wait_for_within(
+        "text:That draft is gone, and the message may have gone out. Look in Sent, and press Send again only if it isn't there.",
+        WAIT,
+    )
+    .expect("the letter came back as unsure");
+}
+
+#[test]
+fn undo_gives_the_press_back_so_the_draft_is_free_again() {
+    let (mut app, fake) = start_card(draft("ana@example.com", Value::Null, json!([])));
+    app.press("label:Send").expect("Send presses");
+    app.wait_for_within("label:Take this back", WAIT)
+        .expect("the hold shows");
+    assert!(fake.called("gws_mail_send_disarm").is_empty());
+    app.press("label:Take this back").expect("Undo presses");
+    app.wait_for_within("label:Keep draft", WAIT)
+        .expect("the card's back");
+    assert_eq!(
+        fake.called("gws_mail_send_disarm"),
+        [json!({"armed": "a1"})]
+    );
+}
+
+#[test]
+fn a_double_click_on_a_cards_send_is_one_press() {
+    let (mut app, fake) = start_card(draft("ana@example.com", Value::Null, json!([])));
+    fake.hold("gws_mail_send_arm");
+    app.press("label:Send").expect("Send presses");
+    settle(&mut app);
+    let _ = app.press("label:Send");
+    settle(&mut app);
+    assert_eq!(fake.called("gws_mail_send_arm").len(), 1, "one press");
+    fake.release("gws_mail_send_arm");
+    wait_for_send(&mut app, &fake);
+    app.wait_for_within("text:Message sent.", WAIT)
+        .expect("the bar says so");
+    settle(&mut app);
+    assert_eq!(fake.called("gws_mail_send").len(), 1);
+    assert!(app.screen().shows("Message sent."), "nothing came after it");
+}
+
+#[test]
+fn a_card_whose_press_failed_can_be_pressed_again() {
+    let (mut app, fake) = start_card(draft("ana@example.com", Value::Null, json!([])));
+    *fake.refuse_press.lock().unwrap() = Some("Only a person can do this.".to_owned());
+    app.press("label:Send").expect("Send presses");
+    app.wait_for_within("text:Only a person can do this.", WAIT)
+        .expect("it says so");
+    *fake.refuse_press.lock().unwrap() = None;
+    app.press("label:Send").expect("Send presses");
+    app.wait_for_within("label:Take this back", WAIT)
+        .expect("the hold shows");
+}
+
+/// The tick that used to queue a save behind Send, whose save then waited for an
+/// answer that never comes: the panel never came back.
+#[test]
+fn no_autosave_is_left_behind_a_send() {
+    let (mut app, fake) = start();
+    write_one(&mut app);
+    fake.hold("gws_mail_draft_save");
+    app.press("label:Send").expect("Send presses");
+    app.wait(PAST_AN_AUTOSAVE).expect("time passes");
+    fake.release("gws_mail_draft_save");
+    app.wait_for_within("label:Take this back", WAIT)
+        .expect("the hold shows");
+    app.press("label:Take this back").expect("Undo presses");
+    app.wait_for_within("label:Message", WAIT)
+        .expect("the panel's back");
+    assert_eq!(fake.called("gws_mail_draft_save").len(), 1);
+}
+
+/// One queued before the letter left: the check that counts is when it runs.
+#[test]
+fn an_autosave_queued_behind_keep_draft_saves_no_blank_draft() {
+    let (mut app, fake) = start();
+    write_one(&mut app);
+    fake.hold("gws_mail_draft_save");
+    app.press("label:Keep draft").expect("it presses");
+    app.wait(PAST_AN_AUTOSAVE).expect("time passes");
+    fake.release("gws_mail_draft_save");
+    app.wait_for_gone("label:Message", WAIT)
+        .expect("the panel closes");
+    settle(&mut app);
+    let saved = fake.called("gws_mail_draft_save");
+    assert_eq!(saved.len(), 1, "{saved:?}");
+}
+
+/// One queued ahead of Send: the letter is Send's by the time it runs.
+#[test]
+fn an_autosave_queued_before_send_leaves_the_letter_to_it() {
+    let (mut app, fake) = start();
+    write_one(&mut app);
+    *fake.save_refused.lock().unwrap() = Some("failed".to_owned());
+    fake.hold("gws_mail_draft_save");
+    app.press("label:Keep draft").expect("it presses");
+    app.wait(PAST_AN_AUTOSAVE).expect("time passes");
+    app.press("label:Send").expect("Send presses");
+    *fake.save_refused.lock().unwrap() = None;
+    fake.release("gws_mail_draft_save");
+    app.wait_for_within("label:Take this back", WAIT)
+        .expect("the hold shows");
+    let saved = fake.called("gws_mail_draft_save");
+    assert_eq!(saved.len(), 2, "{saved:?}");
+    assert_eq!(saved[1]["armed"], "a1", "the next save was Send's own");
+}
+
+/// Send pressed with an autosave out: its own save follows, with the press on it.
+#[test]
+fn a_send_pressed_during_an_autosave_saves_after_it() {
+    let (mut app, fake) = start();
+    write_one(&mut app);
+    fake.hold("gws_mail_draft_save");
+    let by = std::time::Instant::now() + WAIT;
+    while fake.called("gws_mail_draft_save").is_empty() {
+        assert!(std::time::Instant::now() < by, "no save came");
+        settle(&mut app);
+    }
+    app.press("label:Send").expect("Send presses");
+    fake.release("gws_mail_draft_save");
+    app.wait_for_within("label:Take this back", WAIT)
+        .expect("the hold shows");
+    let saved = fake.called("gws_mail_draft_save");
+    assert_eq!(saved.len(), 2, "{saved:?}");
+    assert_eq!(saved[1]["armed"], "a1");
 }

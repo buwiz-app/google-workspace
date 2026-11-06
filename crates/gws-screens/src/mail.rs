@@ -234,6 +234,8 @@ struct Attachment {
     /// The message that holds it. One that's inline in its mail has no id of
     /// its own, and so no way to open.
     message: String,
+    /// Which part of the message: what opens it, as `id` can change between reads.
+    part: String,
     id: String,
     name: String,
     mime: String,
@@ -252,6 +254,7 @@ fn attachments_in(v: &Value) -> Vec<Attachment> {
         .flatten()
         .map(|a| Attachment {
             message: text(a, "message"),
+            part: text(a, "part"),
             id: text(a, "id"),
             name: text(a, "name"),
             mime: text(a, "mime"),
@@ -1058,7 +1061,7 @@ fn reader_pane(b: Bridge, m: Mail) -> impl IntoElement {
 fn open_attachment(b: &Bridge, m: Mail, a: &Attachment) {
     let call = b.call(
         "gws_mail_attachment_open",
-        json!({"message": a.message, "attachment": a.id, "name": a.name, "mime": a.mime}),
+        json!({"message": a.message, "part": a.part}),
     );
     m.attachment_said.set(Some("Opening…".to_owned()));
     let job = Box::pin(async move {

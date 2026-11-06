@@ -1067,7 +1067,8 @@ fn file_offers_stored_names_as_tickets_and_opens_drive_on_the_search() {
         assert_eq!(got["result"], "choices");
         let choices = got["choices"].as_array().unwrap();
         assert_eq!(choices.len(), 1, "{got}");
-        assert_eq!(choices[0]["label"], "Meeting notes");
+        assert_eq!(choices[0]["label"], "Drive file", "a name is no label");
+        assert_eq!(choices[0]["detail"], "Meeting notes");
         let value = choices[0]["value"].as_str().unwrap();
         assert!(
             !value.to_lowercase().contains("meeting"),

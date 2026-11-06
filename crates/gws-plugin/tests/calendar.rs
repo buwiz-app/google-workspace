@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 const TEAM: &str = "team@group.example.com";
 const NY: &str = "America/New_York";
+const ROOM: &str = "room@example.com";
 
 fn signed_in_at(base: &str, name: &str, fresh: bool) -> Core {
     let dir = std::env::temp_dir().join(format!("gws-calendar-{name}-{}", std::process::id()));
@@ -234,6 +235,75 @@ mod attendee_changes {
         let write = google.calendar_writes().pop().unwrap();
         assert_eq!(write.send_updates.as_deref(), Some("none"));
         assert_eq!(write.body.get("attendees"), None);
+    }
+
+    /// A person signed in to an event with a room on it, as Google holds it.
+    fn with_a_room(google: &FakeGoogle, name: &str, guests: &[&str]) -> Core {
+        let mut people = vec![
+            json!({"email": FAKE_EMAIL, "self": true, "organizer": true, "responseStatus": "accepted"}),
+            json!({"email": ROOM, "resource": true, "responseStatus": "accepted"}),
+        ];
+        people.extend(
+            guests
+                .iter()
+                .map(|g| json!({"email": g, "responseStatus": "accepted"})),
+        );
+        google.add_event(
+            FAKE_EMAIL,
+            json!({"id": "booked", "summary": "Roof call", "organizer": {"email": FAKE_EMAIL, "self": true}, "start": {"dateTime": at(10, "09:00:00", "Z")}, "end": {"dateTime": at(10, "10:00:00", "Z")}, "attendees": people}),
+        );
+        let core = signed_in(google, name);
+        sync(&core);
+        core
+    }
+
+    #[test]
+    fn a_room_read_back_on_a_form_changes_nothing_and_tells_nobody() {
+        let google = account();
+        let core = with_a_room(&google, "room-same", &["ana@example.com"]);
+        let read = data(core.run(
+            "gws_event_read",
+            &json!({"calendar": FAKE_EMAIL, "id": "booked"}),
+        ));
+        let room = read["attendees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["email"] == ROOM);
+        assert_eq!(
+            room.unwrap()["resource"],
+            true,
+            "the screen is told what it is"
+        );
+        let writes = google.calendar_writes().len();
+        saved_event(&core, form_of(&core, FAKE_EMAIL, "booked"));
+        assert_eq!(google.calendar_writes().len(), writes, "nothing to write");
+    }
+
+    #[test]
+    fn a_guest_added_beside_a_room_leaves_one_room_marked_as_a_room() {
+        let google = account();
+        let core = with_a_room(&google, "room-add", &["ana@example.com"]);
+        let form = form_of(&core, FAKE_EMAIL, "booked");
+        let guests = json!(["ana@example.com", ROOM, "ben@example.com"]);
+        saved_event(&core, with(form, json!({"guests": guests})));
+        let write = google.calendar_writes().pop().unwrap();
+        let list = write.body["attendees"].as_array().unwrap();
+        let rooms: Vec<&Value> = list.iter().filter(|a| a["email"] == ROOM).collect();
+        assert_eq!(rooms.len(), 1, "{list:?}");
+        assert_eq!(rooms[0]["resource"], true);
+        assert_eq!(write.send_updates.as_deref(), Some("all"));
+    }
+
+    #[test]
+    fn with_only_a_room_on_it_a_change_tells_nobody() {
+        let google = account();
+        let core = with_a_room(&google, "room-alone", &[]);
+        let form = form_of(&core, FAKE_EMAIL, "booked");
+        saved_event(&core, with(form, json!({"title": "Moved on"})));
+        let write = google.calendar_writes().pop().unwrap();
+        assert_eq!(write.send_updates.as_deref(), Some("none"));
+        assert!(write.body.get("attendees").is_none(), "{}", write.body);
     }
 
     #[test]
@@ -606,6 +676,91 @@ mod zones {
                 format!("{monday}T10:00:00-05:00")
             ]
         );
+    }
+
+    /// A weekly 09:00 New York series on Saturdays, from `first`, read back.
+    fn saturdays(core: &Core, first: NaiveDate, count: i64) -> (Vec<Value>, String, String) {
+        assert_eq!(first.weekday(), Weekday::Sat);
+        saved_event(
+            core,
+            json!({"calendar": FAKE_EMAIL, "title": "Standup", "start": format!("{first}T09:00:00-04:00"), "end": format!("{first}T10:00:00-04:00"), "time_zone": NY, "repeat": format!("RRULE:FREQ=WEEKLY;COUNT={count}"), "guests": [], "where": "", "notes": ""}),
+        );
+        let (from, to) = (
+            format!("{}T00:00:00Z", first - Duration::days(1)),
+            format!("{}T00:00:00Z", first + Duration::days(7 * count + 2)),
+        );
+        (range(core, &from, &to), from, to)
+    }
+
+    /// Saturday to Sunday over the change is 25 hours and one day on the wall:
+    /// it's the day that goes to the series, not the hours.
+    #[test]
+    fn an_instance_moved_over_the_change_moves_the_series_by_the_wall_clock() {
+        let google = account();
+        let core = signed_in(&google, "dst-over");
+        let change = autumn_change();
+        let saturday = change - Duration::days(1);
+        let first = saturday - Duration::days(14);
+        let (held, from, to) = saturdays(&core, first, 3);
+        let form = form_of(&core, FAKE_EMAIL, held[2]["id"].as_str().unwrap());
+        let moved = json!({"scope": "all", "start": format!("{change}T09:00:00-05:00"), "end": format!("{change}T10:00:00-05:00")});
+        saved_event(&core, with(form, moved));
+        let sunday = |weeks: i64| first + Duration::days(7 * weeks + 1);
+        assert_eq!(
+            starts(&range(&core, &from, &to)),
+            [
+                format!("{}T09:00:00-04:00", sunday(0)),
+                format!("{}T09:00:00-04:00", sunday(1)),
+                format!("{}T09:00:00-05:00", sunday(2)),
+            ]
+        );
+    }
+
+    /// The series starts the day before the change and a day's move takes its
+    /// first date over it: the same clock now has another offset.
+    #[test]
+    fn a_series_whose_first_date_moves_over_the_change_keeps_its_time_of_day() {
+        let google = account();
+        let core = signed_in(&google, "dst-first");
+        let change = autumn_change();
+        let first = change - Duration::days(1);
+        let (held, from, to) = saturdays(&core, first, 2);
+        let form = form_of(&core, FAKE_EMAIL, held[1]["id"].as_str().unwrap());
+        let next = change + Duration::days(7);
+        let moved = json!({"scope": "all", "start": format!("{next}T09:00:00-05:00"), "end": format!("{next}T10:00:00-05:00")});
+        saved_event(&core, with(form, moved));
+        assert_eq!(
+            starts(&range(&core, &from, &to)),
+            [
+                format!("{change}T09:00:00-05:00"),
+                format!("{next}T09:00:00-05:00"),
+            ]
+        );
+    }
+
+    /// Only the caller knows a range is whole days, and says so: from the
+    /// times alone, the 01:00 that starts Havana's March 8 is a day half in.
+    #[test]
+    fn a_range_ending_where_midnight_is_skipped_leaves_out_the_next_day() {
+        let google = account();
+        let core = signed_in(&google, "skipped");
+        let day = NaiveDate::from_ymd_opt(Utc::now().year() + 1, 3, 8).unwrap();
+        saved_event(
+            &core,
+            json!({"calendar": FAKE_EMAIL, "title": "Holiday", "all_day": true, "start": day.to_string(), "end": (day + Duration::days(1)).to_string(), "guests": [], "where": "", "notes": ""}),
+        );
+        let args = json!({
+            "from": format!("{}T00:00:00-05:00", day - Duration::days(1)),
+            "to": format!("{day}T01:00:00-04:00"),
+            "to_date": day.to_string(),
+        });
+        assert_eq!(data(core.run("gws_cal_range", &args))["events"], json!([]));
+        let next = with(
+            args,
+            json!({"to_date": (day + Duration::days(1)).to_string()}),
+        );
+        let got = data(core.run("gws_cal_range", &next));
+        assert_eq!(got["events"].as_array().unwrap().len(), 1, "{got}");
     }
 
     #[test]
@@ -1286,7 +1441,7 @@ mod reads {
         assert_eq!(e["attendees"].as_array().unwrap().len(), 3);
         assert_eq!(
             e["attendees"][1],
-            json!({"email": "ana@example.com", "name": "Ana Reyes", "response": "accepted", "optional": false, "organizer": false, "self": false})
+            json!({"email": "ana@example.com", "name": "Ana Reyes", "response": "accepted", "optional": false, "organizer": false, "self": false, "resource": false})
         );
         assert_eq!(e["attendees"][0]["self"], true);
         let none = core.run(

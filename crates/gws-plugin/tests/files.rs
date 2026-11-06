@@ -9,9 +9,10 @@ use std::path::{Path, PathBuf};
 
 use gws::Core;
 use gws::apis::Apis;
-use gws::files::LIFE_MS;
+use gws::files::{LIFE_MS, SETTLE_MS};
 use gws_fake_google::{
-    FAKE_EMAIL, FakeFile, FakeGoogle, GOOGLE_DOC, GOOGLE_SHEET, GOOGLE_SLIDES, Mail, Seed,
+    DRIVE_ROOT, FAKE_EMAIL, FakeFile, FakeGoogle, GOOGLE_DOC, GOOGLE_SHEET, GOOGLE_SLIDES, Mail,
+    Seed,
 };
 use serde_json::{Value, json};
 
@@ -428,7 +429,7 @@ fn an_unedited_file_isnt_listed_and_an_edit_is_found_by_its_hash() {
     assert_eq!(
         home.edits(),
         [
-            json!({"id": "drv-a", "name": "Roof quote.docx", "state": "edited", "google": false, "changed_on_drive": false, "working": false})
+            json!({"id": "drv-a", "name": "Roof quote.docx", "state": "edited", "google": false, "attachment": false, "changed_on_drive": false, "working": false})
         ]
     );
     fs::write(&path, b"PK as it came").unwrap();
@@ -437,6 +438,74 @@ fn an_unedited_file_isnt_listed_and_an_edit_is_found_by_its_hash() {
         Vec::<Value>::new(),
         "put back, there's no edit"
     );
+}
+
+/// The clock where `path`'s stamps count as settled, or `at`, if that's later.
+fn settle(home: &Home, path: &Path, at: i64) {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = fs::metadata(path).unwrap();
+    let ms = |s: i64, ns: i64| s * 1000 + ns / 1_000_000;
+    let latest = ms(meta.mtime(), meta.mtime_nsec()).max(ms(meta.ctime(), meta.ctime_nsec()));
+    home.core.clock.set(at.max(latest + SETTLE_MS));
+}
+
+#[test]
+fn a_poll_reads_a_settled_file_once() {
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(a_docx("drv-a"));
+    let home = Home::new(&google.base(), "pollonce");
+    let path = home.open("drv-a");
+    fs::write(&path, b"PK mine").unwrap();
+    settle(&home, &path, 0);
+    assert_eq!(home.edits().len(), 1);
+    let runs = home.core.hashes.runs();
+    for _ in 0..3 {
+        assert_eq!(home.edits().len(), 1);
+    }
+    assert_eq!(home.core.hashes.runs(), runs, "read once, not on each poll");
+    // and past its 24 hours, when the sweep each poll runs asks as well
+    settle(&home, &path, NOON + LIFE_MS);
+    assert_eq!(home.edits().len(), 1);
+    assert_eq!(home.core.hashes.runs(), runs);
+}
+
+#[test]
+fn a_save_that_keeps_the_size_and_puts_the_time_back_is_still_found() {
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(a_docx("drv-a"));
+    let home = Home::new(&google.base(), "polltime");
+    let path = home.open("drv-a");
+    fs::write(&path, b"PK as it wen!").unwrap();
+    settle(&home, &path, 0);
+    assert_eq!(home.edits().len(), 1);
+    let was = fs::metadata(&path).unwrap();
+    fs::write(&path, b"PK as it came").unwrap();
+    let file = fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(was.modified().unwrap()).unwrap();
+    drop(file);
+    let now = fs::metadata(&path).unwrap();
+    assert_eq!(now.len(), was.len());
+    assert_eq!(now.modified().unwrap(), was.modified().unwrap());
+    assert_eq!(home.edits(), Vec::<Value>::new(), "put back, and seen");
+}
+
+/// A stamp from this very moment could be shared by the next save, so it's
+/// never kept. The clock stands at the moment of the save, which no sleep could
+/// promise.
+#[test]
+fn a_file_saved_this_moment_is_read_on_every_poll() {
+    use std::os::unix::fs::MetadataExt as _;
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(a_docx("drv-a"));
+    let home = Home::new(&google.base(), "pollnow");
+    let path = home.open("drv-a");
+    fs::write(&path, b"PK mine").unwrap();
+    let meta = fs::metadata(&path).unwrap();
+    home.core.clock.set(meta.ctime() * 1000 + 1000);
+    home.edits();
+    let runs = home.core.hashes.runs();
+    home.edits();
+    assert_eq!(home.core.hashes.runs(), runs + 1);
 }
 
 #[test]
@@ -506,6 +575,94 @@ fn a_big_edit_goes_up_in_pieces_and_arrives_whole() {
     data(home.upload("drv-a", "update"));
     assert!(google.drive_file("drv-a").unwrap().content == bytes);
     assert_eq!(google.log().iter().filter(|s| s.method == "PUT").count(), 3);
+}
+
+#[test]
+fn a_piece_kept_short_goes_on_from_where_drive_says() {
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(a_docx("drv-a"));
+    let home = Home::new(&google.base(), "short");
+    let path = home.open("drv-a");
+    let bytes: Vec<u8> = (0..20 * 1024 * 1024).map(|n| (n % 251) as u8).collect();
+    fs::write(&path, &bytes).unwrap();
+    google.drive_keeps_short(5 * 1024 * 1024 + 7);
+    data(home.upload("drv-a", "update"));
+    assert!(google.drive_file("drv-a").unwrap().content == bytes);
+}
+
+/// The last piece has nothing after it to carry what was dropped.
+#[test]
+fn a_last_piece_kept_short_is_sent_again_and_not_called_done() {
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(a_docx("drv-a"));
+    let home = Home::new(&google.base(), "shortlast");
+    let path = home.open("drv-a");
+    fs::write(&path, b"PK edited here").unwrap();
+    google.drive_keeps_short(3);
+    data(home.upload("drv-a", "update"));
+    assert_eq!(
+        google.drive_file("drv-a").unwrap().content,
+        b"PK edited here"
+    );
+}
+
+/// A 308 that keeps nothing can't be sent past, and mustn't be sent forever.
+#[test]
+fn a_piece_with_nothing_kept_stops_and_the_file_stays() {
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(a_docx("drv-a"));
+    let home = Home::new(&google.base(), "shortnone");
+    let path = home.open("drv-a");
+    fs::write(&path, b"PK edited here").unwrap();
+    google.drive_keeps_short(0);
+    assert_eq!(home.upload("drv-a", "update")["isError"], true);
+    assert_eq!(fs::read(&path).unwrap(), b"PK edited here");
+    assert_eq!(google.log().iter().filter(|s| s.method == "PUT").count(), 1);
+    data(home.upload("drv-a", "update"));
+}
+
+fn puts(google: &FakeGoogle) -> usize {
+    google.log().iter().filter(|s| s.method == "PUT").count()
+}
+
+#[test]
+fn an_answer_that_cant_be_read_after_the_last_piece_is_still_uploaded() {
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(a_docx("drv-a"));
+    let home = Home::new(&google.base(), "garbled");
+    let path = home.open("drv-a");
+    fs::write(&path, b"PK mine").unwrap();
+    google.drive_garbles_the_last_answer();
+    let answer = data(home.upload("drv-a", "copy"));
+    assert_eq!(answer["uploaded"], true);
+    assert_eq!(google.drive_file("drv-copy-1").unwrap().content, b"PK mine");
+    assert!(!home.folder("drv-a").exists());
+    assert_eq!(home.edits(), Vec::<Value>::new());
+    assert_eq!(refusal(&home.upload("drv-a", "copy")), "not_found");
+    assert_eq!(puts(&google), 1, "no second copy");
+}
+
+#[test]
+fn a_folder_that_wont_go_after_an_upload_is_no_failure_and_cant_be_sent_twice() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(a_docx("drv-a"));
+    let home = Home::new(&google.base(), "stuck");
+    let path = home.open("drv-a");
+    fs::write(&path, b"PK mine").unwrap();
+    let folder = home.folder("drv-a");
+    let mode = |bits| fs::set_permissions(&folder, fs::Permissions::from_mode(bits)).unwrap();
+    mode(0o500);
+    let answer = home.upload("drv-a", "copy");
+    assert_eq!(data(answer)["uploaded"], true, "Drive has it");
+    assert!(path.exists(), "this is the case being tested");
+    assert_eq!(home.edits(), Vec::<Value>::new(), "nothing left to answer");
+    assert_eq!(refusal(&home.upload("drv-a", "copy")), "not_found");
+    assert_eq!(puts(&google), 1, "no second copy");
+    assert!(google.drive_file("drv-copy-2").is_none());
+    mode(0o700);
+    gws::files::sweep(&home.core);
+    assert!(!folder.exists(), "the sweep finishes it");
 }
 
 /// Each of what can move: the bytes, or only the version, as a rename does.
@@ -836,6 +993,26 @@ fn discard_takes_the_file_and_tells_drive_nothing() {
 }
 
 #[test]
+fn only_its_own_account_can_discard_a_file() {
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(a_docx("drv-a"));
+    let home = Home::new(&google.base(), "discardwho");
+    let path = home.open("drv-a");
+    fs::write(&path, b"PK mine").unwrap();
+    let discard = || home.core.run("gws_file_discard", &json!({"id": "drv-a"}));
+    home.core
+        .account("buwiz.account.set", &push("second@example.com"));
+    assert_eq!(refusal(&discard()), "not_found", "as an upload says");
+    assert_eq!(fs::read(&path).unwrap(), b"PK mine");
+    home.sign_out();
+    assert_eq!(discard()["structuredContent"]["code"], "account_required");
+    assert_eq!(fs::read(&path).unwrap(), b"PK mine");
+    home.core.account("buwiz.account.set", &push(FAKE_EMAIL));
+    data(discard());
+    assert!(!home.folder("drv-a").exists());
+}
+
+#[test]
 fn a_file_goes_at_24_hours_and_not_before() {
     let google = FakeGoogle::start(Seed::default());
     google.seed_file(a_docx("drv-a"));
@@ -1033,7 +1210,7 @@ fn mail_with(attachments: Vec<(&str, &str, &[u8])>) -> Mail {
 fn open_attachment(home: &Home, n: usize) -> Value {
     home.core.run(
         "gws_mail_attachment_open",
-        &json!({"message": "18f1aa", "attachment": format!("att-18f1aa-{n}")}),
+        &json!({"message": "18f1aa", "part": (n + 1).to_string()}),
     )
 }
 
@@ -1080,7 +1257,7 @@ fn a_thread_says_which_message_each_attachment_is_on() {
     assert_eq!(listed["message"], "18f1aa", "{thread}");
     let answer = home.core.run(
         "gws_mail_attachment_open",
-        &json!({"message": listed["message"], "attachment": listed["id"]}),
+        &json!({"message": listed["message"], "part": listed["part"]}),
     );
     assert_eq!(fs::read(path_in(&answer)).unwrap(), b"PK report");
 }
@@ -1102,41 +1279,170 @@ fn an_attachments_hostile_name_stays_in_its_folder() {
     }
 }
 
-#[test]
-fn gmails_long_changing_ids_still_open() {
-    let google = FakeGoogle::start(Seed::default());
-    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK fake")]));
-    let home = Home::new(&google.base(), "attid");
-    // not what a fresh read lists, and past what a folder's name can hold
-    let long = format!("{}-0", "A".repeat(700));
-    let answer = home.core.run(
-        "gws_mail_attachment_open",
-        &json!({"message": "18f1aa", "attachment": long, "name": "report.docx", "mime": DOCX}),
-    );
-    assert_eq!(fs::read(path_in(&answer)).unwrap(), b"PK fake");
+/// What a fresh read of the mail says of its first attachment. The thread tool
+/// keeps what it showed, so it's Gmail that's asked here.
+fn read_again(home: &Home) -> Value {
+    let auth = home.core.accounts.google().unwrap();
+    let mail = home.core.gmail.full(&auth, "18f1aa").unwrap().unwrap();
+    gws::gmail::attachments(&mail)[0].clone()
 }
 
 #[test]
-fn an_attachment_has_no_way_back_and_isnt_listed_as_an_edit() {
+fn an_id_that_changes_between_reads_is_still_the_same_attachment() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK report")]));
+    google.attachment_ids_change();
+    let home = Home::new(&google.base(), "attid");
+    let first = read_again(&home);
+    let path = path_in(&open_attachment(&home, 0));
+    fs::write(&path, b"PK mine").unwrap();
+    let second = read_again(&home);
+    assert_ne!(first["id"], second["id"], "this is the case being tested");
+    assert_eq!(first["part"], second["part"]);
+    assert_eq!(first["part"], "1");
+    assert_eq!(
+        path_in(&open_attachment(&home, 0)),
+        path,
+        "the edit, not a second folder"
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"PK mine");
+    assert_eq!(fs::read_dir(home.open_dir()).unwrap().count(), 1);
+    assert_eq!(home.edits().len(), 1);
+}
+
+/// Both signed in, and the second is the one in use.
+fn second_account_in_use(home: &Home) {
+    let mut second = push("second@example.com");
+    second["label"] = json!("work");
+    home.core.account("buwiz.account.set", &second);
+    home.core.accounts.set(&json!({"account": "google", "label": "default", "provider": "google", "subject": FAKE_EMAIL, "scopes": [], "access_token": TOKEN, "token_type": "Bearer", "expires_at": 1000}));
+}
+
+#[test]
+fn another_accounts_edited_attachment_isnt_opened_over() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK report")]));
+    let home = Home::new(&google.base(), "attaccounts");
+    let path = path_in(&open_attachment(&home, 0));
+    fs::write(&path, b"PK mine").unwrap();
+    second_account_in_use(&home);
+    let answer = open_attachment(&home, 0);
+    assert_eq!(refusal(&answer), "in_use", "{answer}");
+    assert_eq!(answer.get("_meta"), None);
+    assert_eq!(fs::read(&path).unwrap(), b"PK mine");
+}
+
+#[test]
+fn another_accounts_clean_attachment_is_fetched_for_this_one() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK report")]));
+    let home = Home::new(&google.base(), "attclean");
+    let path = path_in(&open_attachment(&home, 0));
+    second_account_in_use(&home);
+    assert_eq!(path_in(&open_attachment(&home, 0)), path);
+    assert_eq!(
+        google
+            .log()
+            .iter()
+            .filter(|s| s.target.contains("/attachments/"))
+            .count(),
+        2,
+        "it was the other's, so it's fetched"
+    );
+}
+
+/// Opens the first attachment and edits it, and says what its folder's called.
+fn edited_attachment(home: &Home) -> (PathBuf, String) {
+    let path = path_in(&open_attachment(home, 0));
+    fs::write(&path, b"PK mine").unwrap();
+    let id = path.parent().unwrap().file_name().unwrap();
+    let id = id.to_str().unwrap().to_owned();
+    (path, id)
+}
+
+#[test]
+fn an_edited_attachment_is_listed_and_saves_as_a_new_file_in_my_drive() {
     let google = FakeGoogle::start(Seed::default());
     google.deliver(mail_with(vec![("report.docx", DOCX, b"PK report")]));
     let home = Home::new(&google.base(), "attedit");
-    let path = path_in(&open_attachment(&home, 0));
-    fs::write(&path, b"PK mine").unwrap();
-    assert_eq!(home.edits(), Vec::<Value>::new());
-    let id = path
-        .parent()
-        .unwrap()
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap();
-    assert_eq!(refusal(&home.upload(id, "copy")), "unsupported");
+    let (path, id) = edited_attachment(&home);
+    let edits = home.edits();
+    assert_eq!(
+        edits,
+        [
+            json!({"id": id, "name": "report.docx", "state": "edited", "google": false, "attachment": true, "changed_on_drive": false, "working": false})
+        ]
+    );
+    for mode in ["update", "replace"] {
+        assert_eq!(refusal(&home.upload(&id, mode)), "unsupported", "{mode}");
+    }
     assert_eq!(drive_writes(&google), Vec::<String>::new());
+    assert_eq!(fs::read(&path).unwrap(), b"PK mine");
+    let answer = data(home.upload(&id, "copy"));
+    let copy = google.drive_file(answer["id"].as_str().unwrap()).unwrap();
+    assert_eq!(copy.name, "report (copy).docx");
+    assert_eq!(copy.content, b"PK mine");
+    assert_eq!(copy.parents, [DRIVE_ROOT], "there's no folder it came from");
+    assert!(!home.folder(&id).exists());
+    assert!(
+        !google
+            .log()
+            .iter()
+            .any(|s| s.target.contains(&format!("files/{id}"))),
+        "Drive was never asked about a folder's name"
+    );
 }
 
 #[test]
-fn an_attachment_goes_at_24_hours_edited_or_not_and_at_sign_out() {
+fn an_edited_attachment_goes_only_when_it_is_discarded() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK report")]));
+    let home = Home::new(&google.base(), "attdiscard");
+    let (path, id) = edited_attachment(&home);
+    data(home.core.run("gws_file_discard", &json!({"id": id})));
+    assert!(!path.exists());
+    assert_eq!(home.edits(), Vec::<Value>::new());
+}
+
+#[test]
+fn an_edited_attachment_outlasts_its_24_hours_and_a_sign_out() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK report")]));
+    let home = Home::new(&google.base(), "attstays");
+    let (path, _) = edited_attachment(&home);
+    home.later(LIFE_MS * 3);
+    gws::files::sweep(&home.core);
+    assert_eq!(fs::read(&path).unwrap(), b"PK mine", "past its time");
+    home.sign_out();
+    assert_eq!(fs::read(&path).unwrap(), b"PK mine", "through a sign-out");
+    home.later(LIFE_MS * 6);
+    gws::files::sweep(&home.core);
+    assert_eq!(fs::read(&path).unwrap(), b"PK mine", "and a sweep after it");
+    home.core.account("buwiz.account.set", &push(FAKE_EMAIL));
+    assert_eq!(home.edits().len(), 1, "back for the person to answer");
+}
+
+/// What can't be read can't be shown to be unedited, so it stays.
+#[test]
+fn a_file_that_cant_be_read_is_kept_and_not_taken_for_unedited() {
+    use std::os::unix::fs::PermissionsExt;
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(a_docx("drv-a"));
+    let home = Home::new(&google.base(), "unreadable");
+    let path = home.open("drv-a");
+    fs::write(&path, b"PK mine").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    home.later(LIFE_MS * 3);
+    gws::files::sweep(&home.core);
+    assert!(path.exists(), "through a sweep past its time");
+    home.sign_out();
+    assert!(path.exists(), "and through a sign-out");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"PK mine");
+}
+
+#[test]
+fn an_attachment_with_no_edit_goes_at_24_hours_and_at_sign_out() {
     let google = FakeGoogle::start(Seed::default());
     google.deliver(mail_with(vec![
         ("a.docx", DOCX, b"PK a"),
@@ -1144,10 +1450,9 @@ fn an_attachment_goes_at_24_hours_edited_or_not_and_at_sign_out() {
     ]));
     let home = Home::new(&google.base(), "attgone");
     let path = path_in(&open_attachment(&home, 0));
-    fs::write(&path, b"PK mine").unwrap();
     home.later(LIFE_MS);
     gws::files::sweep(&home.core);
-    assert!(!path.exists(), "nothing to answer, so nothing keeps it");
+    assert!(!path.exists(), "it can be fetched again");
     let path = path_in(&open_attachment(&home, 1));
     home.sign_out();
     assert!(!path.exists());
@@ -1165,19 +1470,19 @@ fn what_cant_be_viewed_or_found_on_a_mail_is_refused() {
     assert_eq!(refusal(&open_attachment(&home, 0)), "unsupported");
     assert_eq!(
         refusal(&open_attachment(&home, 5)),
-        "unsupported",
-        "nothing to go by"
+        "not_found",
+        "no such part on the mail"
     );
-    for (message, attachment) in [("../x", "a"), ("18f1aa", "../x"), ("18f1aa", ""), ("", "a")] {
+    for (message, part) in [("../x", "1"), ("18f1aa", "../x"), ("18f1aa", ""), ("", "1")] {
         let answer = home.core.run(
             "gws_mail_attachment_open",
-            &json!({"message": message, "attachment": attachment}),
+            &json!({"message": message, "part": part}),
         );
-        assert_eq!(refusal(&answer), "invalid_args", "{message} {attachment}");
+        assert_eq!(refusal(&answer), "invalid_args", "{message} {part}");
     }
     let missing = home.core.run(
         "gws_mail_attachment_open",
-        &json!({"message": "18f1ff", "attachment": "att-18f1ff-0"}),
+        &json!({"message": "18f1ff", "part": "1"}),
     );
     assert_eq!(refusal(&missing), "not_found");
     assert!(!home.open_dir().exists());

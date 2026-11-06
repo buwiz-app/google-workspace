@@ -393,6 +393,7 @@ mod tests {
             "gws_mail_undo",
             "gws_mail_draft_delete",
             "gws_mail_send_arm",
+            "gws_mail_send_disarm",
             "gws_mail_send",
             "gws_event_save",
             "gws_event_delete",

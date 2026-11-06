@@ -72,6 +72,8 @@ pub struct Core {
     pub uploads: Mutex<compose::Uploads>,
     /// Sends a person's press has allowed, each good for one.
     pub armed: Mutex<compose::Armed>,
+    /// One write or send at a time on a draft, by its id.
+    pub gates: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
     /// Google's asked-for warm-up of its contact search is done.
     pub warm: std::sync::atomic::AtomicBool,
     /// How saves too slow for their caller came out.
@@ -80,6 +82,8 @@ pub struct Core {
     pub transfers: files::Transfers,
     /// Which files are on their way, each way.
     pub working: files::Working,
+    /// The last hash of each open file.
+    pub hashes: files::Hashes,
     /// What an open file's 24 hours are counted by.
     pub clock: files::Clock,
 }
@@ -104,10 +108,12 @@ impl Core {
             model_drafts: Mutex::default(),
             uploads: Mutex::default(),
             armed: Mutex::default(),
+            gates: Mutex::default(),
             warm: std::sync::atomic::AtomicBool::new(false),
             jobs: Mutex::default(),
             transfers: files::Transfers::new(&apis.drive),
             working: files::Working::default(),
+            hashes: files::Hashes::default(),
             clock: files::Clock::default(),
             pushed: std::sync::atomic::AtomicBool::new(false),
         }

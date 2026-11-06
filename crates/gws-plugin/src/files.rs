@@ -362,7 +362,7 @@ impl Transfers {
     pub(crate) fn send(
         &self,
         place: &str,
-        file: &mut impl std::io::Read,
+        file: &mut (impl std::io::Read + Seek),
         length: u64,
     ) -> Result<Sent, Failure> {
         let mut buffer = vec![0; PIECE];

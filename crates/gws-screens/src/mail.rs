@@ -5,6 +5,7 @@
 //! which `ui_look` never sends. What a mail says lives in the web view, which
 //! no tree shows.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use buwiz_app::{Bridge, Placement};
@@ -162,9 +163,41 @@ pub fn notice(status: &str, saved: bool) -> Option<&'static str> {
     }
 }
 
+/// Which of several answers out at once still counts: the latest asked for.
+#[derive(Clone, Copy)]
+struct Latest(Signal<u64>);
+
+impl Latest {
+    fn new() -> Self {
+        Self(signal(0))
+    }
+
+    /// A new question: every earlier one stops counting.
+    fn ask(self) -> u64 {
+        let turn = self.0.get_untracked() + 1;
+        self.0.set(turn);
+        turn
+    }
+
+    fn counts(self, turn: u64) -> bool {
+        self.0.get_untracked() == turn
+    }
+}
+
+/// A page's rows the list doesn't hold yet: mail moving between pages can
+/// bring one back, and each row's id must stay unique.
+fn new_rows(have: &[Row], page: Vec<Row>) -> Vec<Row> {
+    let have: HashSet<&str> = have.iter().map(|r| r.id.as_str()).collect();
+    page.into_iter()
+        .filter(|r| !have.contains(r.id.as_str()))
+        .collect()
+}
+
 /// What the screen is showing right now.
 #[derive(Clone, Copy)]
 struct Mail {
+    list_turn: Latest,
+    open_turn: Latest,
     labels: Signal<Vec<LabelRow>>,
     label: Signal<String>,
     rows: Signal<Vec<Row>>,
@@ -198,15 +231,31 @@ async fn read(b: &Bridge, tool: &str, args: Value) -> Result<Value, String> {
     Err("That didn't work. Try again.".to_owned())
 }
 
-async fn load_list(b: Bridge, m: Mail, skip: usize) {
-    m.loading.set(true);
-    let query = m.query.get_untracked();
-    let args = match m.search.get_untracked() {
+/// What the list shows now, as `gws_mail_list` asks for it.
+fn list_args(query: &str, search: Option<String>, label: String, skip: usize) -> Value {
+    match search {
         Some(ticket) if query.is_empty() => json!({"search": ticket}),
-        _ if query.is_empty() => json!({"label": m.label.get_untracked(), "skip": skip}),
+        _ if query.is_empty() => json!({"label": label, "skip": skip}),
         _ => json!({"query": query}),
-    };
-    match read(&b, "gws_mail_list", args).await {
+    }
+}
+
+async fn load_list(b: Bridge, m: Mail, skip: usize) {
+    let turn = m.list_turn.ask();
+    let args = list_args(
+        &m.query.get_untracked(),
+        m.search.get_untracked(),
+        m.label.get_untracked(),
+        skip,
+    );
+    m.loading.set(true);
+    let answer = read(&b, "gws_mail_list", args).await;
+    // a later load owns the list and the flag now
+    if !m.list_turn.counts(turn) {
+        return;
+    }
+    m.loading.set(false);
+    match answer {
         Ok(v) => {
             let mut rows: Vec<Row> = v
                 .get("threads")
@@ -217,7 +266,7 @@ async fn load_list(b: Bridge, m: Mail, skip: usize) {
                 .collect();
             if skip > 0 {
                 let mut all = m.rows.get_untracked();
-                all.append(&mut rows);
+                all.append(&mut new_rows(&all, rows));
                 rows = all;
             }
             m.rows.set(rows);
@@ -228,7 +277,6 @@ async fn load_list(b: Bridge, m: Mail, skip: usize) {
         Err(e) if e == "sign-in" => m.signed_out.set(true),
         Err(e) => m.status.set(e),
     }
-    m.loading.set(false);
 }
 
 async fn load_labels(b: Bridge, m: Mail) {
@@ -254,8 +302,14 @@ async fn open_ticket(b: Bridge, m: Mail, ticket: String) {
 }
 
 async fn show(b: Bridge, m: Mail, thread: String) {
+    let turn = m.open_turn.ask();
     m.page.set(None);
-    match read(&b, "gws_mail_thread", json!({"thread": thread})).await {
+    let answer = read(&b, "gws_mail_thread", json!({"thread": thread})).await;
+    // the person opened another, or left: this one must not replace it
+    if !m.open_turn.counts(turn) {
+        return;
+    }
+    match answer {
         Ok(v) => {
             m.links.set(
                 v.get("links")
@@ -340,6 +394,7 @@ fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
                             m.query.set(String::new());
                             m.search.set(None);
                             m.chosen.set(None);
+                            m.open_turn.ask();
                             m.page.set(None);
                             b.spawn(load_list(b.clone(), m, 0));
                         })
@@ -472,6 +527,12 @@ fn list_pane(b: Bridge, m: Mail) -> impl IntoElement {
                 move || m.rows.with(Vec::len),
                 move |at| row_view(row_bridge.clone(), m, at.index()),
             )
+            // cells are recycled: without identities a list that changes keeps
+            // each cell where the last list left it, out of order on screen
+            .keys(move || {
+                m.rows
+                    .with(|r| r.iter().map(|r| r.id.clone()).collect::<Vec<_>>())
+            })
             .estimated_item_size(px(ROW_HEIGHT))
             .empty(empty)
             .on_load_more(move || {
@@ -806,6 +867,8 @@ pub fn build(bridge: Bridge) -> Root {
         let props = b.props();
         let prop = |k: &str| props.get(k).and_then(Value::as_str).map(str::to_owned);
         let m = Mail {
+            list_turn: Latest::new(),
+            open_turn: Latest::new(),
             labels: signal(column(&Value::Null)),
             label: signal("INBOX".to_owned()),
             rows: signal(Vec::new()),
@@ -932,6 +995,29 @@ mod tests {
             notice("needs_access", false)
                 .unwrap()
                 .contains("Sign in again")
+        );
+    }
+
+    #[test]
+    fn a_search_outranks_a_label_and_a_query_outranks_a_card() {
+        let card = || Some("tkt".to_owned());
+        assert_eq!(
+            list_args("", card(), "INBOX".into(), 40),
+            json!({"search": "tkt"})
+        );
+        assert_eq!(
+            list_args("q", card(), "INBOX".into(), 40),
+            json!({"query": "q"})
+        );
+    }
+
+    #[test]
+    fn a_page_adds_only_rows_the_list_lacks() {
+        let row = |id: &str| Row::of(&json!({"id": id})).expect("a row");
+        let page = new_rows(&[row("a"), row("b")], vec![row("b"), row("c")]);
+        assert_eq!(
+            page.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["c"]
         );
     }
 }

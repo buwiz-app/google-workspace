@@ -214,10 +214,11 @@ impl Gmail {
                 if status == 403 && why.contains("insufficient") {
                     return Err(Failure::NeedsAccess);
                 }
-                Err(Failure::Plain(format!(
-                    "Gmail answered {status}: {}",
-                    js::slice_utf16(why, 300)
-                )))
+                Err(Failure::Plain(match status {
+                    429 => "Gmail is busy right now. Try again in a moment.".to_owned(),
+                    500.. => "Gmail had a problem just now. Try again.".to_owned(),
+                    _ => format!("Gmail didn't accept that: {}", js::slice_utf16(why, 300)),
+                }))
             }
         }
     }
@@ -378,7 +379,7 @@ impl Gmail {
         auth: &Bearer,
         ids: &[String],
     ) -> Result<Vec<Option<Value>>, Failure> {
-        let headers = ["From", "Subject", "Date"].map(|h| ("metadataHeaders", h.to_owned()));
+        let headers = ["From", "To", "Subject", "Date"].map(|h| ("metadataHeaders", h.to_owned()));
         let mut out = Vec::with_capacity(ids.len());
         for batch in ids.chunks(METADATA_AT_ONCE) {
             let done: Result<Vec<_>, Failure> = std::thread::scope(|scope| {

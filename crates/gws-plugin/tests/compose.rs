@@ -659,6 +659,10 @@ fn a_chats_draft_comes_with_its_card_and_a_review_names_who_is_new() {
     let open = &result["_meta"]["buwiz/open"];
     assert_eq!(open["app"], "mail");
     assert_eq!(open["placement"], "inline");
+    assert_eq!(
+        open["title"], "Mail",
+        "its full screen is the whole of Mail"
+    );
     let ticket = open["props"]["draft"].clone();
     assert!(
         !result["_meta"].to_string().contains("Noon?"),
@@ -702,4 +706,22 @@ fn a_forward_carries_the_files_of_the_mail_it_forwards() {
     let sent = google.sent();
     assert_eq!(sent.len(), 2);
     assert!(sent[1].attachments[0].2 == bytes);
+}
+
+#[test]
+fn sent_and_drafts_name_who_the_mail_is_for() {
+    let google = FakeGoogle::start(Seed::demo(3));
+    let core = signed_in(&google, "addressed");
+    core.unlock("a-seed");
+    let rows =
+        |label: &str| data(core.run("gws_mail_list", &json!({"label": label})))["threads"].clone();
+
+    let draft = data(core.run("gws_mail_draft_save", &lunch()));
+    assert_eq!(rows("DRAFT")[0]["sender"], "To: ana@example.com");
+    data(send(&core, &draft));
+    assert_eq!(rows("SENT")[0]["sender"], "To: ana@example.com");
+    assert!(
+        !rows("INBOX").to_string().contains("To: "),
+        "the inbox still names who wrote"
+    );
 }

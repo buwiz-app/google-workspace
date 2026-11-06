@@ -27,6 +27,8 @@ pub struct Thread {
     /// The display name of the latest sender, else the address.
     pub sender: String,
     pub address: String,
+    /// Who the person's latest message here went to; empty if they wrote none.
+    pub recipient: String,
     /// Unix milliseconds of the latest message.
     pub at: i64,
     pub unread: bool,
@@ -43,6 +45,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Thread> {
         snippet: r.get("snippet")?,
         sender: r.get("sender")?,
         address: r.get("address")?,
+        recipient: r.get("recipient")?,
         at: r.get("at")?,
         unread: r.get("unread")?,
         starred: r.get("starred")?,
@@ -82,8 +85,8 @@ impl Store {
     pub fn put_thread(&self, account: &str, t: &Thread) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO threads(account, id, subject, snippet, sender, address, at, unread, starred, messages, attachment) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![account, t.id, t.subject, t.snippet, t.sender, t.address, t.at, t.unread, t.starred, t.messages, t.attachment],
+            "INSERT OR REPLACE INTO threads(account, id, subject, snippet, sender, address, recipient, at, unread, starred, messages, attachment) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![account, t.id, t.subject, t.snippet, t.sender, t.address, t.recipient, t.at, t.unread, t.starred, t.messages, t.attachment],
         )?;
         tx.execute(
             "DELETE FROM thread_labels WHERE account = ? AND thread = ?",

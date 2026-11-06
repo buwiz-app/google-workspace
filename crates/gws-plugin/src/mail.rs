@@ -73,7 +73,7 @@ pub fn offer_card(core: &Core, tool: &str, args: &Value, result: &mut Value) {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .issue(&Subject::Draft(draft.to_owned()));
-            result["_meta"] = json!({"buwiz/open": {"app": "mail", "props": {"draft": ticket}, "title": "Draft", "placement": "inline"}});
+            result["_meta"] = json!({"buwiz/open": {"app": "mail", "props": {"draft": ticket}, "title": "Mail", "placement": "inline"}});
         }
         return;
     }
@@ -506,6 +506,23 @@ fn millis(message: &Value) -> i64 {
         .unwrap_or(0)
 }
 
+/// Who the person's latest message in a thread went to: "Ana Reyes", or "Ana
+/// Reyes and 2 more". Empty when the person wrote nothing there.
+fn recipient_of(messages: &[Value]) -> String {
+    let theirs = messages.iter().rev().find(|m| {
+        m.get("labelIds")
+            .and_then(Value::as_array)
+            .is_some_and(|l| l.iter().any(|l| l == "SENT" || l == "DRAFT"))
+    });
+    let to = theirs.map(|m| gmail::header(m, "To")).unwrap_or_default();
+    let people = compose::split_list(&to);
+    match people.as_slice() {
+        [] => String::new(),
+        [one] => sender_of(one).0,
+        [first, rest @ ..] => format!("{} and {} more", sender_of(first).0, rest.len()),
+    }
+}
+
 /// A thread's list row from Gmail's answer.
 pub fn row_of(thread: &Value) -> Option<Thread> {
     let messages = thread
@@ -532,6 +549,7 @@ pub fn row_of(thread: &Value) -> Option<Thread> {
         snippet: gmail::snippet(last),
         sender,
         address,
+        recipient: recipient_of(messages),
         at: millis(last),
         unread: labels.iter().any(|l| l == "UNREAD"),
         starred: labels.iter().any(|l| l == "STARRED"),
@@ -710,6 +728,7 @@ fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
         }
     }
     let rows = with_store(core, |store| store.threads(&account, &label, skip, PAGE))?;
+    let rows: Vec<Thread> = rows.into_iter().map(|t| addressed(t, &label)).collect();
     let total = with_store(core, |store| store.thread_count(&account, &label))?;
     // no token on record yet is not the end: only an empty one is
     let more =
@@ -717,6 +736,14 @@ fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
     Ok(ok(
         json!({"threads": rows.iter().map(row_json).collect::<Vec<_>>(), "more": more || skip + PAGE < total, "saved": false}),
     ))
+}
+
+/// In Sent and Drafts a row names who it's for: the sender there is the person.
+fn addressed(mut t: Thread, label: &str) -> Thread {
+    if matches!(label, "SENT" | "DRAFT") && !t.recipient.is_empty() {
+        t.sender = format!("To: {}", t.recipient);
+    }
+    t
 }
 
 /// Where a label's next page token is kept; empty means no more pages.
@@ -981,6 +1008,20 @@ pub fn run(core: &Core, tool: &str, args: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_names_who_the_persons_last_message_went_to() {
+        let message = |labels: Value, to: &str| json!({"labelIds": labels, "payload": {"headers": [{"name": "To", "value": to}]}});
+        let them = message(json!(["INBOX"]), "me@example.com");
+        let one = message(json!(["SENT"]), "\"Reyes, Ana\" <ana@example.com>");
+        let three = message(
+            json!(["DRAFT"]),
+            "Ana <a@example.com>, b@example.com, c@example.com",
+        );
+        assert_eq!(recipient_of(std::slice::from_ref(&them)), "");
+        assert_eq!(recipient_of(&[one.clone(), them]), "Reyes, Ana");
+        assert_eq!(recipient_of(&[one, three]), "Ana and 2 more");
+    }
 
     mod signing_out {
         use super::*;

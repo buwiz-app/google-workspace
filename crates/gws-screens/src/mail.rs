@@ -918,7 +918,7 @@ fn toolbar(b: Bridge, m: Mail) -> impl IntoElement {
     };
     view()
         .app_class(Some(
-            format!("flex-row gap-1 px-2 py-1 border-b {LINE}").into(),
+            format!("flex-row flex-wrap gap-1 px-2 py-1 border-b {LINE}").into(),
         ))
         .child(tool("Reply to this", "Reply", answer("reply")))
         .child(tool("Reply to everyone", "Reply all", answer("all")))

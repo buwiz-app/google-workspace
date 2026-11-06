@@ -35,6 +35,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
          CREATE INDEX threads_of_label ON thread_labels(account, label);
          CREATE TABLE bodies(account TEXT NOT NULL, thread TEXT NOT NULL, view TEXT NOT NULL, size INTEGER NOT NULL, used INTEGER NOT NULL, PRIMARY KEY(account, thread));",
     ),
+    (
+        3,
+        "ALTER TABLE threads ADD COLUMN recipient TEXT NOT NULL DEFAULT '';",
+    ),
 ];
 
 /// Why the store didn't open or answer: a stable `code` and a message for people.

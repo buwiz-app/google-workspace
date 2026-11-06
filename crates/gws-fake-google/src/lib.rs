@@ -361,7 +361,12 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 fn headers(m: &Mail) -> Value {
-    json!([{"name": "From", "value": m.from}, {"name": "To", "value": m.to}, {"name": "Subject", "value": m.subject}, {"name": "Date", "value": rfc2822(m.at)}])
+    let id = if m.message_id.is_empty() {
+        format!("<{}@stub.example.com>", m.id)
+    } else {
+        m.message_id.clone()
+    };
+    json!([{"name": "From", "value": m.from}, {"name": "To", "value": m.to}, {"name": "Subject", "value": m.subject}, {"name": "Date", "value": rfc2822(m.at)}, {"name": "Message-ID", "value": id}])
 }
 
 fn snippet(m: &Mail) -> String {
@@ -616,6 +621,34 @@ impl Account {
         )
     }
 
+    /// The thread a draft sits in: Gmail gives a new draft one of its own.
+    fn draft_thread(id: &str, thread: &Option<String>) -> String {
+        thread.clone().unwrap_or_else(|| format!("draft-{id}"))
+    }
+
+    /// Each draft as Gmail lists it: a message in a thread, labelled DRAFT.
+    fn draft_mails(&self) -> Vec<Mail> {
+        self.drafts
+            .iter()
+            .map(|(id, message, raw, thread)| {
+                let sent = Sent::of(raw);
+                Mail {
+                    id: message.clone(),
+                    thread: Self::draft_thread(id, thread),
+                    labels: vec!["DRAFT".to_owned()],
+                    from: FAKE_EMAIL.to_owned(),
+                    to: sent.to,
+                    subject: sent.subject,
+                    at: 1_793_955_600_000,
+                    text: sent.body,
+                    html: None,
+                    attachments: sent.attachments,
+                    message_id: sent.message_id,
+                }
+            })
+            .collect()
+    }
+
     fn resource(&self, m: &Mail, format: &str, wanted: &[String]) -> Value {
         let mut v = json!({"id": m.id, "threadId": m.thread, "labelIds": m.labels, "snippet": snippet(m), "historyId": self.history.to_string(), "internalDate": m.at.to_string(), "sizeEstimate": m.text.len()});
         match format {
@@ -821,7 +854,11 @@ impl Account {
             ("GET", ["threads"]) => {
                 let mut seen = Vec::new();
                 let mut found = Vec::new();
-                for m in self.mails.iter().filter(|m| Self::matches(m, &q, &labels)) {
+                let drafts = self.draft_mails();
+                let held = drafts
+                    .iter()
+                    .filter(|_| labels.iter().any(|l| l == "DRAFT"));
+                for m in held.chain(self.mails.iter().filter(|m| Self::matches(m, &q, &labels))) {
                     if !seen.contains(&m.thread) {
                         seen.push(m.thread.clone());
                         found.push(json!({"id": m.thread, "snippet": snippet(m), "historyId": self.history.to_string()}));
@@ -830,7 +867,13 @@ impl Account {
                 Reply::json(200, Self::page(found, "threads", start, max))
             }
             ("GET", ["threads", id]) => {
-                let mut mails: Vec<&Mail> = self.mails.iter().filter(|m| m.thread == *id).collect();
+                let drafts = self.draft_mails();
+                let mut mails: Vec<&Mail> = self
+                    .mails
+                    .iter()
+                    .chain(&drafts)
+                    .filter(|m| m.thread == *id)
+                    .collect();
                 if mails.is_empty() {
                     return not_found();
                 }
@@ -882,7 +925,7 @@ impl Account {
                 let listed: Vec<Value> = self
                     .drafts
                     .iter()
-                    .map(|(id, message, _, thread)| json!({"id": id, "message": {"id": message, "threadId": thread}}))
+                    .map(|(id, message, _, thread)| json!({"id": id, "message": {"id": message, "threadId": Self::draft_thread(id, thread)}}))
                     .collect();
                 Reply::json(200, json!({"drafts": listed}))
             }

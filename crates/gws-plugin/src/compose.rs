@@ -381,7 +381,7 @@ fn message_id_ok(id: &str) -> bool {
 
 /// A header's list, split where a comma really separates two: a name in quotes
 /// or an address in brackets can hold one.
-fn split_list(list: &str) -> Vec<&str> {
+pub(crate) fn split_list(list: &str) -> Vec<&str> {
     let (mut parts, mut from) = (Vec::new(), 0);
     let (mut quoted, mut bracket, mut escaped) = (false, false, false);
     for (at, c) in list.char_indices() {

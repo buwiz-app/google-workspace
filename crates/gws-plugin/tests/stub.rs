@@ -163,6 +163,24 @@ fn first_two(core: &Core) -> (Value, Value) {
 }
 
 #[test]
+fn a_gmail_failure_is_said_in_plain_words() {
+    let google = FakeGoogle::start(Seed::demo(12));
+    let core = signed_in(&google, "plain-words");
+    core.unlock("a-seed");
+    gws::mail::sync(&core).unwrap();
+    let (one, _) = first_two(&core);
+    google.writes_fail_after(0);
+    let done = core.run("gws_mail_archive", &json!({"threads": [one]}));
+    assert_eq!(done["isError"], true, "{done}");
+    let said = done.to_string();
+    assert!(
+        said.contains("Gmail had a problem just now. Try again."),
+        "{said}"
+    );
+    assert!(!said.contains("answered"), "{said}");
+}
+
+#[test]
 fn a_failed_read_after_the_write_keeps_the_way_back() {
     let google = FakeGoogle::start(Seed::demo(12));
     let core = signed_in(&google, "stale-row");

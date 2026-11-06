@@ -111,6 +111,13 @@ struct Fake {
     fail_from: Mutex<Option<(usize, String)>>,
     /// A first page fails this way, until taken out.
     refuse_list: Mutex<bool>,
+    /// What's edited here, as `gws_file_edits` answers.
+    edits: Mutex<Vec<Value>>,
+    /// In place of a good answer, by file id: to an open, to an upload.
+    opens: Mutex<HashMap<String, Value>>,
+    uploads: Mutex<HashMap<String, Value>>,
+    /// An open's failure, as the Bot reports it.
+    open_fails: Mutex<Option<BuwizError>>,
     calls: Mutex<Vec<(String, Value)>>,
     host: Mutex<Vec<(String, Value)>>,
     hold: Mutex<Vec<String>>,
@@ -281,6 +288,35 @@ impl Host for Fake {
                 String::new(),
                 self.card.lock().unwrap().clone().unwrap_or_else(a_card),
             ),
+            "gws_file_open" => {
+                if let Some(e) = self.open_fails.lock().unwrap().clone() {
+                    return done(Err(e));
+                }
+                let id = args["id"].as_str().unwrap();
+                let answer = self.opens.lock().unwrap().get(id).cloned();
+                (
+                    format!("open:{id}"),
+                    answer.unwrap_or_else(|| json!({"opened": true, "name": id, "kind": "word"})),
+                )
+            }
+            "gws_file_edits" => (
+                "edits".to_owned(),
+                json!({"files": *self.edits.lock().unwrap()}),
+            ),
+            "gws_file_upload" => {
+                let id = args["id"].as_str().unwrap();
+                let refused = self.uploads.lock().unwrap().get(id).cloned();
+                let answer = refused.unwrap_or_else(|| {
+                    self.edits.lock().unwrap().retain(|e| e["id"] != id);
+                    json!({"uploaded": true, "mode": args["mode"], "id": id})
+                });
+                (format!("upload:{id}"), answer)
+            }
+            "gws_file_discard" => {
+                let id = args["id"].as_str().unwrap();
+                self.edits.lock().unwrap().retain(|e| e["id"] != id);
+                (format!("discard:{id}"), json!({"discarded": true}))
+            }
             other => {
                 return done(Err(BuwizError::new(
                     "invalid",
@@ -441,6 +477,13 @@ fn key(app: &mut Headless, keys: &str) {
 /// Presses the row showing `name`.
 fn open(app: &mut Headless, name: &str) {
     press(app, &format!("label:Open this item >> text:{name}"));
+}
+
+/// Shows the details of the row showing `name`: a press picks it, and `i` is
+/// the same as its Details press, which has its own test.
+fn details(app: &mut Headless, name: &str) {
+    open(app, name);
+    key(app, "i");
 }
 
 fn crumb(app: &mut Headless, name: &str) {
@@ -708,8 +751,8 @@ fn a_late_details_answer_does_not_replace_the_open_file() {
     let (mut app, fake) = start();
     fake.hold("file:notes");
     fake.hold("preview:notes");
-    open(&mut app, "Notes");
-    open(&mut app, "Budget.xlsx");
+    details(&mut app, "Notes");
+    details(&mut app, "Budget.xlsx");
     assert!(app.screen().shows("About budget"));
 
     fake.release("file:notes");
@@ -725,7 +768,7 @@ fn a_late_details_answer_does_not_replace_the_open_file() {
 fn a_details_answer_after_closing_opens_nothing() {
     let (mut app, fake) = start();
     fake.hold("file:notes");
-    open(&mut app, "Notes");
+    details(&mut app, "Notes");
     press(&mut app, "label:Close these details");
     fake.release("file:notes");
     settle(&mut app);
@@ -763,7 +806,7 @@ fn a_press_after_a_scroll_opens_the_row_it_shows() {
     settle(&mut app);
     let n = *shown(&app).iter().nth(3).expect("rows on screen");
     press(&mut app, &format!("text:Item {n}"));
-    assert_eq!(last_of(&fake, "gws_drive_file")["id"], format!("n{n}"));
+    assert_eq!(last_of(&fake, "gws_file_open")["id"], format!("n{n}"));
     assert_eq!(selected(&app).len(), 1);
 }
 
@@ -785,8 +828,7 @@ fn a_switch_to_grid_and_back_keeps_the_place_and_the_right_rows() {
     );
     let n = *cards.iter().nth(3).expect("cards on screen");
     press(&mut app, &format!("text:Item {n}"));
-    assert_eq!(last_of(&fake, "gws_drive_file")["id"], format!("n{n}"));
-    press(&mut app, "label:Close these details");
+    assert_eq!(last_of(&fake, "gws_file_open")["id"], format!("n{n}"));
 
     press(&mut app, "label:List");
     assert_unbroken(&app);
@@ -830,7 +872,7 @@ fn a_5000_item_folder_pages_with_nothing_skipped_or_doubled() {
         "the top of that last screenful of cards, not the top of the list: {n}"
     );
     press(&mut app, &format!("text:Item {n}"));
-    assert_eq!(last_of(&fake, "gws_drive_file")["id"], format!("n{n}"));
+    assert_eq!(last_of(&fake, "gws_file_open")["id"], format!("n{n}"));
 }
 
 #[test]
@@ -845,7 +887,7 @@ fn a_row_read_from_a_later_page_opens_itself() {
     let n = *shown(&app).iter().nth(2).expect("rows on screen");
     assert!(n >= 100, "row {n} is from the second page or later");
     press(&mut app, &format!("text:Item {n}"));
-    assert_eq!(last_of(&fake, "gws_drive_file")["id"], format!("n{n}"));
+    assert_eq!(last_of(&fake, "gws_file_open")["id"], format!("n{n}"));
 }
 
 #[test]
@@ -862,7 +904,7 @@ fn a_doubled_row_between_pages_shows_once() {
     settle(&mut app);
     key(&mut app, "enter");
     assert_eq!(
-        last_of(&fake, "gws_drive_file")["id"],
+        last_of(&fake, "gws_file_open")["id"],
         "n100",
         "the 101st row"
     );
@@ -891,8 +933,7 @@ fn a_failure_on_a_later_page_keeps_the_rows_and_says_so() {
     // the press still works on what stayed
     let n = *before.iter().nth(1).unwrap();
     press(&mut app, &format!("text:Item {n}"));
-    assert_eq!(last_of(&fake, "gws_drive_file")["id"], format!("n{n}"));
-    press(&mut app, "label:Close these details");
+    assert_eq!(last_of(&fake, "gws_file_open")["id"], format!("n{n}"));
 
     *fake.fail_from.lock().unwrap() = None;
     press(&mut app, "label:Try again");
@@ -1024,7 +1065,7 @@ fn keys_do_nothing_on_a_screen_with_no_drive() {
 #[test]
 fn a_file_shows_its_details_beside_the_list() {
     let (mut app, fake) = start();
-    open(&mut app, "Budget.xlsx");
+    details(&mut app, "Budget.xlsx");
     for line in [
         "Kind",
         "Owner",
@@ -1060,7 +1101,7 @@ fn a_text_preview_is_selectable_plain_text() {
         "notes".to_owned(),
         json!({"kind": "text", "text": "<b>not bold</b> <img src=https://example.com/x>"}),
     );
-    open(&mut app, "Notes");
+    details(&mut app, "Notes");
     let line = "text:<b>not bold</b> <img src=https://example.com/x>";
     assert!(app.screen().matches(line).unwrap(), "word for word");
     assert!(app.screen().in_selectable_view(line).unwrap());
@@ -1069,7 +1110,7 @@ fn a_text_preview_is_selectable_plain_text() {
 #[test]
 fn an_image_preview_shows_through_its_data_url_and_only_that() {
     let (mut app, _, frames) = start_sized(1000.0, 600.0);
-    open(&mut app, "Photo.png");
+    details(&mut app, "Photo.png");
     assert!(app.screen().matches("label:Preview of this file").unwrap());
     let images = frames.images.lock().unwrap().clone();
     assert_eq!(images.len(), 1, "{images:?}");
@@ -1079,7 +1120,7 @@ fn an_image_preview_shows_through_its_data_url_and_only_that() {
 #[test]
 fn no_preview_says_why() {
     let (mut app, _) = start();
-    open(&mut app, "Film.mp4");
+    details(&mut app, "Film.mp4");
     assert!(app.screen().shows("This kind of file has no preview."));
     assert!(!app.screen().matches("label:Preview of this file").unwrap());
 }
@@ -1101,7 +1142,7 @@ fn a_data_url_that_isnt_an_allowed_image_shows_nothing() {
             "photo".to_owned(),
             json!({"kind": "image", "data_url": bad.clone()}),
         );
-        open(&mut app, "Photo.png");
+        details(&mut app, "Photo.png");
         assert!(app.screen().shows("About photo"), "the rest still shows");
         assert!(
             !app.screen().matches("label:Preview of this file").unwrap(),
@@ -1119,7 +1160,7 @@ fn a_preview_that_fails_says_why_and_the_details_stay() {
         "notes".to_owned(),
         json!({"refused": "too_big", "message": "This file is too big to preview."}),
     );
-    open(&mut app, "Notes");
+    details(&mut app, "Notes");
     assert!(app.screen().shows("This file is too big to preview."));
     assert!(app.screen().shows("About notes"));
 }
@@ -1145,7 +1186,7 @@ fn the_grid_shows_cards_with_their_kind_and_opens_like_the_list() {
     open(&mut app, "Clients");
     assert!(app.screen().shows("Plan 2026.docx"));
     assert!(app.screen().shows("Word"));
-    open(&mut app, "Plan 2026.docx");
+    details(&mut app, "Plan 2026.docx");
     assert_eq!(last_of(&fake, "gws_drive_file")["id"], "plan");
 }
 
@@ -1270,7 +1311,7 @@ fn arrows_move_the_selection_and_shift_arrows_grow_it() {
 }
 
 #[test]
-fn enter_opens_a_folder_and_shows_a_file() {
+fn enter_opens_a_folder_and_opens_a_file() {
     let (mut app, fake) = start();
     key(&mut app, "down");
     key(&mut app, "enter");
@@ -1280,6 +1321,8 @@ fn enter_opens_a_folder_and_shows_a_file() {
     key(&mut app, "down");
     key(&mut app, "down");
     key(&mut app, "enter");
+    assert_eq!(last_of(&fake, "gws_file_open")["id"], "plan");
+    key(&mut app, "i");
     assert_eq!(last_of(&fake, "gws_drive_file")["id"], "plan");
     assert!(app.screen().shows("About plan"));
 }
@@ -1295,7 +1338,7 @@ fn enter_with_nothing_picked_does_nothing() {
 #[test]
 fn a_press_moves_the_selection_so_keys_go_on_from_it() {
     let (mut app, _) = start();
-    open(&mut app, "Notes");
+    details(&mut app, "Notes");
     assert_eq!(selected(&app), [3]);
     press(&mut app, "label:Close these details");
     key(&mut app, "down");
@@ -1352,7 +1395,7 @@ fn a_key_move_past_the_screen_keeps_the_row_in_view_and_pages() {
         "the next page came before the end"
     );
     key(&mut app, "enter");
-    assert_eq!(last_of(&fake, "gws_drive_file")["id"], "n89");
+    assert_eq!(last_of(&fake, "gws_file_open")["id"], "n89");
 }
 
 #[test]
@@ -1415,7 +1458,7 @@ fn sweep(app: &mut Headless, frames: &Frames, selectors: &[&str]) {
     }
 }
 
-const SCREEN_PRESSES: [&str; 9] = [
+const SCREEN_PRESSES: [&str; 10] = [
     "label:My Drive",
     "label:Shared",
     "label:Recent",
@@ -1425,6 +1468,7 @@ const SCREEN_PRESSES: [&str; 9] = [
     "label:Grid",
     "label:Open this folder >> nth=0",
     "label:Open this item >> nth=0",
+    "label:Show details >> nth=0",
 ];
 
 fn long_rows() -> Vec<Value> {
@@ -1515,6 +1559,7 @@ fn a_long_path_leaves_every_crumb_whole_and_the_rows_their_room() {
 fn details_keep_their_press_at_every_width_and_cover_the_rows_when_they_must() {
     let (mut app, _, frames) = start_long();
     press(&mut app, "text:Short");
+    key(&mut app, "i");
     assert!(app.screen().shows("About short"));
     assert!(
         app.screen().matches("label:Open this item").unwrap(),
@@ -1533,7 +1578,7 @@ fn details_keep_their_press_at_every_width_and_cover_the_rows_when_they_must() {
 #[test]
 fn the_keys_leave_rows_alone_while_details_cover_them() {
     let (mut app, _, _) = start_sized(500.0, 600.0);
-    open(&mut app, "Notes");
+    details(&mut app, "Notes");
     key(&mut app, "down");
     key(&mut app, "enter");
     press(&mut app, "label:Close these details");
@@ -1549,6 +1594,7 @@ fn a_look_at_a_file_over_the_rows_keeps_the_place_in_the_list() {
     let before = shown(&app);
     let n = *before.iter().nth(2).unwrap();
     press(&mut app, &format!("text:Item {n}"));
+    key(&mut app, "i");
     assert!(
         !app.screen().matches("label:Open this item").unwrap(),
         "the rows are covered"
@@ -1601,6 +1647,416 @@ fn the_widest_values_fit_their_columns() {
         let (text, column) = frames.width_in_parent(line);
         assert!(text < column - 4.0, "{line} takes {text} of {column}");
     }
+}
+
+// --- Opening files and editing back ------------------------------------------
+
+fn edit(id: &str, name: &str, google: bool, changed: bool) -> Value {
+    json!({"id": id, "name": name, "state": "edited", "google": google, "changed_on_drive": changed, "working": false})
+}
+
+/// A screen that finds `edits` on its first look.
+fn start_edited(width: f32, edits: Vec<Value>) -> (Headless, Arc<Fake>, Frames) {
+    let fake = Arc::new(Fake::default());
+    *fake.edits.lock().unwrap() = edits;
+    let (mut app, frames) = open_app(fake.clone(), width, 700.0);
+    app.wait_for_within("text:Notes", WAIT).expect("My Drive");
+    settle(&mut app);
+    (app, fake, frames)
+}
+
+const BUTTONS: [&str; 5] = [
+    "Upload to Google Drive",
+    "Save as a copy",
+    "Replace the one on Drive",
+    "Save a copy to Google Drive",
+    "Discard",
+];
+
+/// Exactly these of the bar's presses are on screen.
+fn assert_buttons(app: &Headless, want: &[&str]) {
+    for name in BUTTONS {
+        let selector = format!("label:{name}");
+        assert_eq!(
+            app.screen().matches(&selector).unwrap(),
+            want.contains(&name),
+            "{name}: {:?}",
+            app.screen().texts()
+        );
+    }
+}
+
+#[test]
+fn a_press_on_a_file_opens_it_and_details_stay_a_press_away() {
+    let (mut app, fake) = start();
+    open(&mut app, "Budget.xlsx");
+    assert_eq!(fake.called("gws_file_open"), [json!({"id": "budget"})]);
+    assert!(fake.called("gws_drive_file").is_empty(), "no details yet");
+    assert!(!app.screen().shows("Kind"));
+    assert_eq!(selected(&app), [4]);
+
+    press(&mut app, "label:Show details >> nth=4");
+    assert_eq!(last_of(&fake, "gws_drive_file")["id"], "budget");
+    assert!(app.screen().shows("About budget"));
+    assert_eq!(fake.called("gws_file_open").len(), 1, "that opens nothing");
+    press(&mut app, "label:Close these details");
+
+    // the same in the grid, for a file and for a folder's own details
+    press(&mut app, "label:Grid");
+    press(&mut app, "label:Open this item >> text:Notes");
+    assert_eq!(last_of(&fake, "gws_file_open")["id"], "notes");
+    press(&mut app, "label:Show details >> nth=0");
+    assert_eq!(last_of(&fake, "gws_drive_file")["id"], "clients");
+    assert_eq!(
+        fake.called("gws_drive_list").len(),
+        1,
+        "a folder's details don't go in"
+    );
+}
+
+#[test]
+fn a_folder_goes_in_and_opens_nothing() {
+    let (mut app, fake) = start();
+    open(&mut app, "Clients");
+    assert!(app.screen().shows("Plan 2026.docx"));
+    assert!(fake.called("gws_file_open").is_empty());
+}
+
+#[test]
+fn a_file_in_the_trash_shows_its_details_and_opens_nothing() {
+    let (mut app, fake) = start();
+    let mut gone = file("gone-file", "Old file.docx", "word", "me");
+    gone["trashed"] = json!(true);
+    *fake.rows.lock().unwrap() = Some(vec![gone]);
+    press(&mut app, "label:Trash");
+    open(&mut app, "Old file.docx");
+    assert!(fake.called("gws_file_open").is_empty());
+    assert_eq!(last_of(&fake, "gws_drive_file")["id"], "gone-file");
+}
+
+#[test]
+fn opening_says_so_until_the_answer_and_a_late_one_changes_nothing() {
+    let (mut app, fake) = start();
+    fake.hold("open:budget");
+    open(&mut app, "Budget.xlsx");
+    assert!(app.screen().shows("Opening…"));
+    fake.release("open:budget");
+    settle(&mut app);
+    assert!(!app.screen().shows("Opening…"));
+
+    // a refusal for a file left behind doesn't speak over the next press
+    fake.opens.lock().unwrap().insert(
+        "budget".to_owned(),
+        json!({"refused": "no_access", "message": "An old refusal."}),
+    );
+    fake.hold("open:budget");
+    open(&mut app, "Budget.xlsx");
+    open(&mut app, "Notes");
+    fake.release("open:budget");
+    settle(&mut app);
+    assert!(!app.screen().shows("An old refusal."));
+}
+
+#[test]
+fn what_no_viewer_takes_shows_its_details_instead() {
+    let (mut app, fake) = start();
+    fake.opens.lock().unwrap().insert(
+        "film".to_owned(),
+        json!({"refused": "unsupported", "message": "This kind of file can't be opened here."}),
+    );
+    open(&mut app, "Film.mp4");
+    assert_eq!(last_of(&fake, "gws_drive_file")["id"], "film");
+    assert!(app.screen().shows("This kind of file has no preview."));
+}
+
+#[test]
+fn too_big_says_why_and_offers_the_browser() {
+    let (mut app, fake) = start();
+    let link = "https://docs.google.com/document/d/notes/edit";
+    fake.opens.lock().unwrap().insert(
+        "notes".to_owned(),
+        json!({"refused": "too_big", "message": "Google won't export a file over 10 MB.", "link": link}),
+    );
+    open(&mut app, "Notes");
+    assert!(app.screen().shows("Google won't export a file over 10 MB."));
+    assert!(fake.host.lock().unwrap().is_empty(), "not without a press");
+    press(&mut app, "label:Open in the browser");
+    let host = fake.host.lock().unwrap().clone();
+    assert_eq!(host, [("buwiz.open".to_owned(), json!({"url": link}))]);
+    press(&mut app, "label:Dismiss");
+    assert!(!app.screen().shows("Google won't export a file over 10 MB."));
+}
+
+#[test]
+fn a_refusal_or_a_call_the_bot_gave_up_on_says_so_in_plain_words() {
+    let (mut app, fake) = start();
+    fake.opens.lock().unwrap().insert(
+        "notes".to_owned(),
+        json!({"refused": "not_found", "message": "That's gone from Google Drive."}),
+    );
+    open(&mut app, "Notes");
+    assert!(app.screen().shows("That's gone from Google Drive."));
+    *fake.open_fails.lock().unwrap() = Some(BuwizError::new("timeout", false, "timed out"));
+    open(&mut app, "Budget.xlsx");
+    assert!(
+        app.screen()
+            .shows("Google Drive is taking a while. It's still going, so try again in a moment.")
+    );
+    assert!(!app.screen().shows("timed out"));
+}
+
+#[test]
+fn an_edited_file_shows_edited_and_the_table_s_first_buttons() {
+    let (mut app, fake, _) =
+        start_edited(1000.0, vec![edit("budget", "Budget.xlsx", false, false)]);
+    assert!(app.screen().shows("Budget.xlsx has changes here"));
+    assert_buttons(&app, &["Upload to Google Drive", "Discard"]);
+    assert!(app.screen().shows("edited"), "{:?}", app.screen().texts());
+    assert_eq!(
+        app.screen().count("text:edited").unwrap(),
+        1,
+        "on its own row and no other"
+    );
+    assert!(
+        app.screen()
+            .matches("label:Open this item >> text:edited")
+            .unwrap()
+    );
+    press(&mut app, "label:Grid");
+    assert_eq!(app.screen().count("text:edited").unwrap(), 1);
+    assert!(
+        fake.called("gws_file_upload").is_empty(),
+        "nothing goes by itself"
+    );
+}
+
+#[test]
+fn an_edit_made_since_shows_with_the_next_look() {
+    let (mut app, fake) = start();
+    assert_buttons(&app, &[]);
+    fake.edits
+        .lock()
+        .unwrap()
+        .push(edit("budget", "Budget.xlsx", false, false));
+    app.wait_for_within("label:Discard", Duration::from_secs(20))
+        .expect("the bar comes");
+    assert!(fake.called("gws_file_upload").is_empty(), "and only offers");
+}
+
+#[test]
+fn a_file_changed_on_drive_too_offers_a_copy_or_a_replace_and_never_a_plain_upload() {
+    let (app, _, _) = start_edited(1000.0, vec![edit("budget", "Budget.xlsx", false, true)]);
+    assert!(
+        app.screen()
+            .shows("Google Drive also changed since you opened it.")
+    );
+    assert_buttons(
+        &app,
+        &["Save as a copy", "Replace the one on Drive", "Discard"],
+    );
+}
+
+#[test]
+fn a_google_file_offers_a_copy_and_nothing_that_writes_over_it() {
+    // Drive moving makes no difference: nothing writes over one, ever
+    for changed in [false, true] {
+        let (app, _, _) = start_edited(1000.0, vec![edit("notes", "Notes.docx", true, changed)]);
+        assert_buttons(&app, &["Save a copy to Google Drive", "Discard"]);
+    }
+}
+
+#[test]
+fn each_button_makes_its_own_call_and_the_bar_goes_with_the_file() {
+    for (edited, button, tool, args) in [
+        (
+            edit("budget", "Budget.xlsx", false, false),
+            "Upload to Google Drive",
+            "gws_file_upload",
+            json!({"id": "budget", "mode": "update"}),
+        ),
+        (
+            edit("budget", "Budget.xlsx", false, true),
+            "Save as a copy",
+            "gws_file_upload",
+            json!({"id": "budget", "mode": "copy"}),
+        ),
+        (
+            edit("budget", "Budget.xlsx", false, true),
+            "Replace the one on Drive",
+            "gws_file_upload",
+            json!({"id": "budget", "mode": "replace"}),
+        ),
+        (
+            edit("notes", "Notes.docx", true, false),
+            "Save a copy to Google Drive",
+            "gws_file_upload",
+            json!({"id": "notes", "mode": "copy"}),
+        ),
+        (
+            edit("budget", "Budget.xlsx", false, false),
+            "Discard",
+            "gws_file_discard",
+            json!({"id": "budget"}),
+        ),
+    ] {
+        let (mut app, fake, _) = start_edited(1000.0, vec![edited]);
+        press(&mut app, &format!("label:{button}"));
+        if button == "Discard" {
+            assert!(fake.called(tool).is_empty(), "the edits exist nowhere else");
+            press(&mut app, "label:Discard my edits");
+        }
+        assert_eq!(fake.called(tool), [args], "{button}");
+        assert_buttons(&app, &[]);
+        assert!(!app.screen().shows("edited"), "{button}");
+    }
+}
+
+#[test]
+fn keeping_the_edits_after_discard_asks_changes_nothing() {
+    let (mut app, fake, _) =
+        start_edited(1000.0, vec![edit("budget", "Budget.xlsx", false, false)]);
+    press(&mut app, "label:Discard");
+    press(&mut app, "label:Keep my edits");
+    assert!(fake.called("gws_file_discard").is_empty());
+    assert_buttons(&app, &["Upload to Google Drive", "Discard"]);
+}
+
+#[test]
+fn a_press_can_t_go_twice_while_the_first_is_on_its_way() {
+    let (mut app, fake, _) =
+        start_edited(1000.0, vec![edit("budget", "Budget.xlsx", false, false)]);
+    fake.hold("upload:budget");
+    press(&mut app, "label:Upload to Google Drive");
+    assert_buttons(&app, &[]);
+    assert!(app.screen().shows("Working on it…"));
+    fake.release("upload:budget");
+    settle(&mut app);
+    assert_eq!(fake.called("gws_file_upload").len(), 1);
+    assert!(app.screen().shows("Uploaded to Google Drive."));
+}
+
+#[test]
+fn an_upload_still_going_past_its_call_shows_as_under_way() {
+    let mut going = edit("budget", "Budget.xlsx", false, false);
+    going["working"] = json!(true);
+    let (app, _, _) = start_edited(1000.0, vec![going]);
+    assert_buttons(&app, &[]);
+    assert!(app.screen().shows("Working on it…"));
+}
+
+/// A conflict found at the press: nothing went, and the buttons change to fit.
+#[test]
+fn a_conflict_at_the_press_says_so_and_brings_the_other_buttons() {
+    let (mut app, fake, _) =
+        start_edited(1000.0, vec![edit("budget", "Budget.xlsx", false, false)]);
+    fake.uploads.lock().unwrap().insert(
+        "budget".to_owned(),
+        json!({"refused": "changed", "message": "Google Drive changed this file since you opened it, so nothing was uploaded."}),
+    );
+    *fake.edits.lock().unwrap() = vec![edit("budget", "Budget.xlsx", false, true)];
+    press(&mut app, "label:Upload to Google Drive");
+    assert!(
+        app.screen()
+            .shows("Google Drive changed this file since you opened it, so nothing was uploaded.")
+    );
+    assert_buttons(
+        &app,
+        &["Save as a copy", "Replace the one on Drive", "Discard"],
+    );
+}
+
+#[test]
+fn a_bar_for_each_file_and_each_press_names_its_own() {
+    let (mut app, fake, _) = start_edited(
+        1000.0,
+        vec![
+            edit("budget", "Budget.xlsx", false, false),
+            edit("elsewhere", "In another folder.docx", false, false),
+        ],
+    );
+    assert_eq!(app.screen().count("label:Discard").unwrap(), 2);
+    assert!(
+        app.screen()
+            .shows("In another folder.docx has changes here")
+    );
+    press(&mut app, "label:Discard >> nth=1");
+    assert!(fake.called("gws_file_discard").is_empty(), "it asks first");
+    press(&mut app, "label:Discard my edits");
+    assert_eq!(
+        fake.called("gws_file_discard"),
+        [json!({"id": "elsewhere"})]
+    );
+    assert_eq!(app.screen().count("label:Discard").unwrap(), 1);
+}
+
+fn sweep_a_bar(edited: Value, presses: &[&str]) {
+    let (mut app, _, frames) = start_edited(1000.0, vec![edited]);
+    assert_whole(&app, &frames, presses, 1000.0);
+    sweep(&mut app, &frames, presses);
+    // and the rows' own presses, which the bar mustn't push out
+    assert_whole(
+        &app,
+        &frames,
+        &[
+            "label:Open this item >> nth=0",
+            "label:Show details >> nth=0",
+        ],
+        100.0,
+    );
+}
+
+#[test]
+fn the_bar_keeps_every_press_whole_at_every_width() {
+    sweep_a_bar(
+        edit("long", LONG_NAME, false, false),
+        &["label:Upload to Google Drive", "label:Discard"],
+    );
+    sweep_a_bar(
+        edit("long", LONG_NAME, false, true),
+        &[
+            "label:Save as a copy",
+            "label:Replace the one on Drive",
+            "label:Discard",
+        ],
+    );
+    sweep_a_bar(
+        edit("long", LONG_NAME, true, false),
+        &["label:Save a copy to Google Drive", "label:Discard"],
+    );
+}
+
+#[test]
+fn what_a_press_said_keeps_its_presses_whole_at_every_width() {
+    let (mut app, fake, frames) = start_sized(1000.0, 700.0);
+    fake.opens.lock().unwrap().insert(
+        "notes".to_owned(),
+        json!({"refused": "too_big", "message": "Google won't export a file over 10 MB. You can open it in the browser.", "link": "https://docs.google.com/document/d/notes/edit"}),
+    );
+    open(&mut app, "Notes");
+    sweep(
+        &mut app,
+        &frames,
+        &["label:Open in the browser", "label:Dismiss"],
+    );
+}
+
+#[test]
+fn a_narrow_bar_and_a_long_name_leave_the_rows_on_screen() {
+    let (mut app, fake, _) = start_edited(1000.0, vec![edit("long", LONG_NAME, false, true)]);
+    app.set_viewport(size(px(240.0), px(600.0)))
+        .expect("it sets");
+    settle(&mut app);
+    assert!(
+        app.screen()
+            .matches("label:Open this item >> nth=0")
+            .unwrap()
+    );
+    press(&mut app, "label:Replace the one on Drive");
+    assert_eq!(
+        fake.called("gws_file_upload").len(),
+        1,
+        "a press that's seen is one that works"
+    );
 }
 
 // --- The label rule ----------------------------------------------------------
@@ -1664,13 +2120,13 @@ fn no_label_on_the_screen_holds_a_name_an_owner_an_address_or_a_path() {
     assert!(app.screen().shows("Deep notes"));
     assert_no_label_holds(&app, &SECRETS, "breadcrumb");
 
-    open(&mut app, "Deep notes");
+    details(&mut app, "Deep notes");
     assert!(app.screen().shows("Ana Reyes <ana@example.com>"));
     assert!(app.screen().shows("Clients / Acme"));
     assert_no_label_holds(&app, &SECRETS, "details");
 
     press(&mut app, "label:My Drive");
-    open(&mut app, "Photo.png");
+    details(&mut app, "Photo.png");
     assert!(app.screen().matches("label:Preview of this file").unwrap());
     assert_no_label_holds(&app, &SECRETS, "image preview");
 
@@ -1684,6 +2140,31 @@ fn no_label_on_the_screen_holds_a_name_an_owner_an_address_or_a_path() {
         .expect("the viewport sets");
     settle(&mut app);
     assert_no_label_holds(&app, &SECRETS, "narrow");
+}
+
+#[test]
+fn no_label_on_a_bar_or_a_refusal_holds_a_file_name() {
+    for (google, changed) in [(false, false), (false, true), (true, false)] {
+        let (mut app, fake, _) =
+            start_edited(1000.0, vec![edit("budget", "Budget.xlsx", google, changed)]);
+        assert!(app.screen().shows("Budget.xlsx has changes here"));
+        assert_no_label_holds(&app, &SECRETS, "the bar");
+        fake.opens.lock().unwrap().insert(
+            "notes".to_owned(),
+            json!({"refused": "too_big", "message": "Notes is too big.", "link": "https://docs.google.com/document/d/notes/edit"}),
+        );
+        open(&mut app, "Notes");
+        assert!(app.screen().shows("Notes is too big."));
+        assert_no_label_holds(&app, &SECRETS, "what a press said");
+    }
+}
+
+#[test]
+fn an_edited_row_keeps_its_two_fixed_labels() {
+    let (app, _, _) = start_edited(1000.0, vec![edit("budget", "Budget.xlsx", false, false)]);
+    assert_eq!(app.screen().count("label:Open this item").unwrap(), 7);
+    assert_eq!(app.screen().count("label:Show details").unwrap(), 7);
+    assert!(!app.screen().matches("label:/edited/").unwrap());
 }
 
 #[test]

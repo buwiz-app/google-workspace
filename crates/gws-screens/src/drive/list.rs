@@ -7,11 +7,11 @@ use nsh_core::AccessibilityValue;
 use nsh_core::prelude::*;
 
 use super::file::Row;
-use super::{Drive, Layout, next_page, open_at};
+use super::{Drive, Layout, details_at, next_page, open_at};
 use crate::shell::{CHOSEN, DIM, INK, LINE, MUTE};
 
 const ROW_HEIGHT: f32 = 48.0;
-const CARD_HEIGHT: f32 = 112.0;
+const CARD_HEIGHT: f32 = 136.0;
 /// The narrowest a card gets before a column goes.
 const CARD_WIDTH: f32 = 172.0;
 /// How wide the list must be for the columns to fit beside a readable name.
@@ -45,13 +45,45 @@ fn empty(m: Drive) -> impl IntoElement {
     })
 }
 
+fn edited(m: Drive, at: Position) -> bool {
+    m.edits.with(|e| {
+        m.rows.with(|r| {
+            r.get(at.index())
+                .is_some_and(|r| e.iter().any(|e| e.id == r.id))
+        })
+    })
+}
+
 fn spoken(m: Drive, at: Position) -> Option<AccessibilityValue> {
+    let mark = if edited(m, at) { ", edited here" } else { "" };
     m.rows.with(|r| {
         r.get(at.index()).map(|r| AccessibilityValue {
-            text: Some(r.spoken().into()),
+            text: Some(format!("{}{mark}", r.spoken()).into()),
             ..AccessibilityValue::default()
         })
     })
+}
+
+/// "edited" beside a file with changes here, and nothing beside the rest.
+fn edited_mark(m: Drive, at: Position) -> Text {
+    text(move || if edited(m, at) { "edited" } else { "" })
+        .number_of_lines(1)
+        .app_class(Some(format!("text-[11px] {MUTE}").into()))
+}
+
+/// The way to a file's details, now a press on it opens it. Beside the row's
+/// own press and not inside it, so each is plainly one thing to a screen reader.
+fn details_press(b: Bridge, m: Drive, at: Position, place: &'static str) -> View {
+    view()
+        .app_class(Some(place.into()))
+        .label("Show details")
+        .accessibility_value(move || spoken(m, at))
+        .on_press(move || details_at(&b, m, at.index()))
+        .child(
+            text("Details")
+                .number_of_lines(1)
+                .app_class(Some(format!("text-[11px] {MUTE}").into())),
+        )
 }
 
 fn picked(m: Drive, at: Position) -> bool {
@@ -113,44 +145,59 @@ fn row_view(b: Bridge, m: Drive, at: Position) -> impl IntoElement {
                 .with(|r| r.get(at.index()).map(f).unwrap_or_default())
         }
     };
+    let details = b.clone();
     view()
         .app_class(move || {
             Some(
                 format!(
-                    "h-[{ROW_HEIGHT}px] flex-row items-center gap-3 px-3 border-b {LINE} {}",
+                    "h-[{ROW_HEIGHT}px] flex-row items-center border-b {LINE} {}",
                     shade(m, at)
                 )
                 .into(),
             )
         })
-        .label("Open this item")
-        .accessibility_value(move || spoken(m, at))
-        .accessibility_state(move || state(m, at))
-        .on_press(move || open_at(&b, m, at.index()))
         .child(
             view()
-                .app_class(Some("flex-1 min-w-0".into()))
+                .app_class(Some(
+                    "flex-1 min-w-0 flex-row items-center gap-3 pl-3".into(),
+                ))
+                .label("Open this item")
+                .accessibility_value(move || spoken(m, at))
+                .accessibility_state(move || state(m, at))
+                .on_press(move || open_at(&b, m, at.index()))
                 .child(
-                    text(field(|r| r.name.clone()))
-                        .number_of_lines(1)
-                        .app_class(Some(format!("text-[13px] {INK}").into())),
+                    view()
+                        .app_class(Some("flex-1 min-w-0".into()))
+                        .child(
+                            view()
+                                .app_class(Some("flex-row items-center gap-1".into()))
+                                .child(
+                                    text(field(|r| r.name.clone()))
+                                        .number_of_lines(1)
+                                        .app_class(Some(
+                                            format!("flex-1 min-w-0 text-[13px] {INK}").into(),
+                                        )),
+                                )
+                                .child(edited_mark(m, at)),
+                        )
+                        .child(
+                            text(move || {
+                                let wide = wide(m);
+                                m.rows.with(|r| {
+                                    r.get(at.index())
+                                        .map(|r| under_name(r, wide))
+                                        .unwrap_or_default()
+                                })
+                            })
+                            .number_of_lines(1)
+                            .app_class(Some(format!("text-[11px] {DIM}").into())),
+                        ),
                 )
-                .child(
-                    text(move || {
-                        let wide = wide(m);
-                        m.rows.with(|r| {
-                            r.get(at.index())
-                                .map(|r| under_name(r, wide))
-                                .unwrap_or_default()
-                        })
-                    })
-                    .number_of_lines(1)
-                    .app_class(Some(format!("text-[11px] {DIM}").into())),
-                ),
+                .child(column(m, OWNER, false, field(Row::owner_line)))
+                .child(column(m, CHANGED, false, field(Row::changed_line)))
+                .child(column(m, SIZE, true, field(Row::size_line))),
         )
-        .child(column(m, OWNER, false, field(Row::owner_line)))
-        .child(column(m, CHANGED, false, field(Row::changed_line)))
-        .child(column(m, SIZE, true, field(Row::size_line)))
+        .child(details_press(details, m, at, "px-3 py-3"))
 }
 
 fn heading(m: Drive) -> impl IntoElement {
@@ -188,6 +235,7 @@ fn card_view(b: Bridge, m: Drive, at: Position) -> impl IntoElement {
                 .with(|r| r.get(at.index()).map(f).unwrap_or_default())
         }
     };
+    let details = b.clone();
     view()
         .app_class(Some(format!("h-[{CARD_HEIGHT}px] p-1").into()))
         .child(
@@ -206,9 +254,16 @@ fn card_view(b: Bridge, m: Drive, at: Position) -> impl IntoElement {
                 .accessibility_state(move || state(m, at))
                 .on_press(move || open_at(&b, m, at.index()))
                 .child(
-                    text(field(|r| r.tag().to_owned()))
-                        .number_of_lines(1)
-                        .app_class(Some(format!("text-[10px] font-semibold {MUTE}").into())),
+                    view()
+                        .app_class(Some("flex-row items-center gap-1".into()))
+                        .child(
+                            text(field(|r| r.tag().to_owned()))
+                                .number_of_lines(1)
+                                .app_class(Some(
+                                    format!("text-[10px] font-semibold {MUTE}").into(),
+                                )),
+                        )
+                        .child(edited_mark(m, at)),
                 )
                 .child(
                     text(field(|r| r.name.clone()))
@@ -226,6 +281,7 @@ fn card_view(b: Bridge, m: Drive, at: Position) -> impl IntoElement {
                         .app_class(Some(format!("text-[11px] {DIM}").into())),
                 ),
         )
+        .child(details_press(details, m, at, "px-2 py-[2px] items-end"))
 }
 
 fn ids(m: Drive) -> Vec<String> {

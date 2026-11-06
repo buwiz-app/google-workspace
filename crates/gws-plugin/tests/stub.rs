@@ -64,7 +64,7 @@ fn a_mail_is_read_as_the_person_sees_it_and_marked_as_the_senders() {
 }
 
 #[test]
-fn signing_out_clears_the_accounts_mail_and_leaves_open_files() {
+fn signing_out_clears_the_accounts_mail_and_its_open_files() {
     let google = FakeGoogle::start(Seed::demo(10));
     let dir = std::env::temp_dir().join(format!("gws-stub-forget-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -81,8 +81,8 @@ fn signing_out_clears_the_accounts_mail_and_leaves_open_files() {
     let thread = rows[0]["id"].as_str().unwrap().to_owned();
     core.run("gws_mail_thread", &json!({"thread": thread}));
 
-    let key = gws_store::key_from_seed("seed");
-    let unsaved = paths.open_dir(&key).join("draft.docx");
+    // an open file sits unencrypted, so sign-out takes it, edited or not
+    let unsaved = paths.open_dir().join("drv-1").join("draft.docx");
     std::fs::create_dir_all(unsaved.parent().unwrap()).unwrap();
     std::fs::write(&unsaved, "work").unwrap();
 
@@ -105,11 +105,7 @@ fn signing_out_clears_the_accounts_mail_and_leaves_open_files() {
         store.state("owner@example.com", "mail_history").unwrap(),
         None
     );
-    assert_eq!(
-        std::fs::read_to_string(&unsaved).unwrap(),
-        "work",
-        "unsaved work stays"
-    );
+    assert!(!paths.open_dir().exists(), "nothing stays unencrypted");
 }
 
 /// Every message's labels at the stub, by asking it as the plugin does.

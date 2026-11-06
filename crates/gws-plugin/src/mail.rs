@@ -405,6 +405,7 @@ pub fn start(core: Arc<Core>) -> JoinHandle<()> {
             }
             if core.provisioned() {
                 let _ = sync(&core);
+                crate::files::sweep(&core);
             }
         }
     })
@@ -414,9 +415,11 @@ pub fn start(core: Arc<Core>) -> JoinHandle<()> {
 /// this process ever saw it signed in. False if it couldn't, and then a marker
 /// on disk has the next sync try again, even after a restart.
 pub fn reconcile(core: &Core) -> bool {
+    crate::files::clear_when_signed_out(core);
     let cleared = with_store(core, |store| {
         for account in store.accounts()? {
             if !core.accounts.holds(&account) {
+                crate::files::forget_account(core, store, &account)?;
                 store.forget_account(&account)?;
             }
         }
@@ -846,7 +849,16 @@ pub fn view_of(thread: &Value) -> Value {
         "<h2 style=\"font-size:18px;margin:0 0 12px\">{}</h2>",
         escape(&gmail::cap_bytes(&subject, gmail::HEADER_MAX))
     );
-    let attachments: Vec<Value> = list.iter().flat_map(gmail::attachments).collect();
+    // an attachment is fetched from its own message, so it says which that is
+    let attachments: Vec<Value> = list
+        .iter()
+        .flat_map(|m| {
+            gmail::attachments(m).into_iter().map(|mut a| {
+                a["message"] = m.get("id").cloned().unwrap_or(Value::Null);
+                a
+            })
+        })
+        .collect();
     let mut parts: Vec<Part> = list
         .iter()
         .map(|m| match gmail::html_body(m) {

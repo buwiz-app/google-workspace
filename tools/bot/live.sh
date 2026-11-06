@@ -104,7 +104,7 @@ up() {
   for _ in $(seq 1 100); do [ -s "$INST/broker/host-token" ] && curl -s "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 0.1; done
   install
   [ -n "${GWS_NO_SIGN_IN:-}" ] || signin
-  "$BOT/scripts/buwiz-test" --name gws "$app" "$INST" "$AGENT_PORT" "BUWIZ_BACKEND=http://127.0.0.1:$PORT" "BUWIZ_HOST_TOKEN_FILE=$INST/broker/host-token"
+  "$BOT/scripts/buwiz-test" --name gws "$app" "$INST" "$AGENT_PORT" "BUWIZ_BACKEND=http://127.0.0.1:$PORT" "BUWIZ_HOST_TOKEN_FILE=$INST/broker/host-token" "HOME=$INST/home"
 }
 
 # The reviewed hash from an inspect, then the install, as the Bot's card does it.
@@ -113,7 +113,7 @@ install() {
   body="$(python3 - "$INST" "$STUB_PORT" <<'PY'
 import json,sys
 inst,stub=sys.argv[1:]
-print(json.dumps({"package":f"{inst}/pkg","env":{"GWS_STUB_BASE":f"http://127.0.0.1:{stub}","GWS_DATA_DIR":f"{inst}/gws-data"}}))
+print(json.dumps({"package":f"{inst}/pkg","env":{"GWS_STUB_BASE":f"http://127.0.0.1:{stub}","GWS_DATA_DIR":f"{inst}/home/Library/Application Support/app.buwiz.google-workspace"}}))
 PY
 )"
   sha="$(host POST /v1/host/plugins/inspect "$body" | python3 -c 'import json,sys; a=json.load(sys.stdin); print(a.get("manifest_sha256") or a.get("review",{}).get("manifest_sha256") or sys.exit("inspect: "+json.dumps(a)[:400]))')"

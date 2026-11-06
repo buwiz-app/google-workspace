@@ -14,6 +14,7 @@ pub mod calendar;
 pub mod clean;
 pub mod compose;
 pub mod drive;
+pub mod files;
 pub mod gmail;
 pub mod js;
 pub mod mail;
@@ -73,6 +74,12 @@ pub struct Core {
     pub warm: std::sync::atomic::AtomicBool,
     /// How saves too slow for their caller came out.
     pub jobs: Mutex<compose::Jobs>,
+    /// Drive's long calls: an open file's bytes, each way.
+    pub transfers: files::Transfers,
+    /// Which files are on their way, each way.
+    pub working: files::Working,
+    /// What an open file's 24 hours are counted by.
+    pub clock: files::Clock,
 }
 
 impl Core {
@@ -96,6 +103,9 @@ impl Core {
             armed: Mutex::default(),
             warm: std::sync::atomic::AtomicBool::new(false),
             jobs: Mutex::default(),
+            transfers: files::Transfers::new(&apis.drive),
+            working: files::Working::default(),
+            clock: files::Clock::default(),
             pushed: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -119,6 +129,7 @@ impl Core {
         mail::run(self, tool, args)
             .or_else(|| calendar::run(self, tool, args))
             .or_else(|| drive::run(self, tool, args))
+            .or_else(|| files::run(self, tool, args))
             .unwrap_or_else(|| tools::run(&self.gmail, &self.accounts, tool, args))
     }
 

@@ -60,6 +60,9 @@ struct Request {
     kind: String,
     /// The `If-Match`.
     if_match: String,
+    /// `X-Upload-Content-Type`, `X-Upload-Content-Length` and `Content-Range`,
+    /// by their lower-case names: Drive's resumable upload reads them.
+    upload: BTreeMap<String, String>,
     body: Vec<u8>,
 }
 
@@ -119,6 +122,7 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
     let (method, target) = (parts.next()?.to_owned(), parts.next()?.to_owned());
     let (mut authorization, mut kind, mut if_match, mut length) =
         (String::new(), String::new(), String::new(), 0usize);
+    let mut upload = BTreeMap::new();
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
@@ -133,6 +137,14 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
                 if_match = v.trim().to_owned();
             } else if k.eq_ignore_ascii_case("content-length") {
                 length = v.trim().parse().unwrap_or(0);
+            } else if [
+                "x-upload-content-type",
+                "x-upload-content-length",
+                "content-range",
+            ]
+            .contains(&k.to_lowercase().as_str())
+            {
+                upload.insert(k.to_lowercase(), v.trim().to_owned());
             }
         }
     }
@@ -144,6 +156,7 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         authorization,
         kind,
         if_match,
+        upload,
         body,
     })
 }
@@ -1223,7 +1236,9 @@ impl Account {
         }
         // a live run's way to force Drive's failures: `?list=<status>&after=<n>`
         // lets n more pages of a list through and fails the rest, `?changes=`
-        // does the same to the changes feed, and `?works` ends both
+        // and `?uploads=` do the same to the changes feed and to writes, and
+        // `?works` ends all three. `?touch=<id>` changes a file behind the
+        // plugin's back, for a conflict
         if path == "/__drive" {
             let after = r.param("after").and_then(|n| n.parse().ok()).unwrap_or(0);
             if let Some(status) = r.param("list").and_then(|s| s.parse().ok()) {
@@ -1232,8 +1247,15 @@ impl Account {
             if let Some(status) = r.param("changes").and_then(|s| s.parse().ok()) {
                 self.drive.fail_changes(after, status);
             }
+            if let Some(status) = r.param("uploads").and_then(|s| s.parse().ok()) {
+                self.drive.fail_uploads(after, status);
+            }
             if r.param("works").is_some() {
                 self.drive.works();
+            }
+            if let Some(id) = r.param("touch") {
+                self.drive
+                    .edit(&id, |f| f.content.extend_from_slice(b" changed elsewhere"));
             }
             return Reply::json(200, json!({}));
         }
@@ -1242,6 +1264,12 @@ impl Account {
         }
         if path == "/token" {
             return self.token(&r);
+        }
+        // an upload's address is its own ticket: it takes bytes with no token
+        if r.method == "PUT"
+            && let Some(rest) = path.strip_prefix("/upload/drive/v3/")
+        {
+            return self.drive.upload(&r, rest);
         }
         if !r.authorization.starts_with("Bearer fake-") {
             return Reply::json(
@@ -1260,6 +1288,9 @@ impl Account {
         }
         if path.starts_with("/people/v1/") {
             return self.people(&r);
+        }
+        if let Some(rest) = path.strip_prefix("/upload/drive/v3/") {
+            return self.drive.upload(&r, rest);
         }
         if let Some(rest) = path
             .strip_prefix("/upload")
@@ -1298,6 +1329,7 @@ impl FakeGoogle {
         }));
         let shared = account.clone();
         let port = listen(port, move |r| shared.lock().unwrap().handle(r));
+        account.lock().unwrap().drive.base = format!("http://127.0.0.1:{port}");
         Self { port, account }
     }
 
@@ -1420,6 +1452,31 @@ impl FakeGoogle {
     pub fn remove_file(&self, id: &str) {
         let done = self.account.lock().unwrap().drive.remove(id);
         assert!(done, "no file {id}");
+    }
+
+    /// A file as Drive holds it now.
+    pub fn drive_file(&self, id: &str) -> Option<FakeFile> {
+        self.account.lock().unwrap().drive.held(id)
+    }
+
+    /// Every file on the fake Drive.
+    pub fn drive_files(&self) -> Vec<FakeFile> {
+        self.account.lock().unwrap().drive.all()
+    }
+
+    /// Someone else's edit, behind the plugin's back: the words change, and
+    /// `version` and `md5Checksum` move with them.
+    pub fn change_on_drive(&self, id: &str, content: &[u8]) {
+        self.edit_file(id, |f| f.content = content.to_vec());
+    }
+
+    /// `left` more upload sessions start, and then each gets `status`.
+    pub fn drive_uploads_fail_after(&self, left: usize, status: u16) {
+        self.account
+            .lock()
+            .unwrap()
+            .drive
+            .fail_uploads(left, status);
     }
 
     /// Rows in a page of a Drive list, whatever was asked for: Google may

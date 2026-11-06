@@ -57,6 +57,7 @@ pub const APPS: [App; 3] = [
             tools::MAIL_DRAFT_OF,
             tools::UPLOAD_CHUNK,
             tools::UPLOAD_DROP,
+            tools::MAIL_ATTACHMENT_OPEN,
         ],
         card: true,
         files: true,
@@ -103,10 +104,15 @@ pub const APPS: [App; 3] = [
             tools::DRIVE_CARD,
             tools::SEARCH_DRIVE,
             tools::READ_DOC_TEXT,
+            tools::FILE_OPEN,
+            tools::FILE_EDITS,
+            tools::FILE_UPLOAD,
+            tools::FILE_DISCARD,
         ],
         card: true,
         files: false,
-        sites: &[],
+        // where a file too big to open here goes instead
+        sites: &["https://docs.google.com", "https://drive.google.com"],
     },
 ];
 
@@ -216,6 +222,7 @@ mod tests {
             include_str!("../../gws-screens/src/drive.rs"),
             include_str!("../../gws-screens/src/drive/card.rs"),
             include_str!("../../gws-screens/src/drive/detail.rs"),
+            include_str!("../../gws-screens/src/drive/edits.rs"),
             include_str!("../../gws-screens/src/drive/file.rs"),
             include_str!("../../gws-screens/src/drive/list.rs"),
         ];
@@ -225,6 +232,52 @@ mod tests {
                 assert!(drive.tools.contains(&def.name), "{}", def.name);
             }
         }
+        // the tie only means something while the screen makes these calls
+        let edits = include_str!("../../gws-screens/src/drive/edits.rs");
+        for name in [
+            tools::FILE_OPEN,
+            tools::FILE_EDITS,
+            tools::FILE_UPLOAD,
+            tools::FILE_DISCARD,
+        ] {
+            assert!(edits.contains(&format!("\"{name}\"")), "{name}");
+        }
+        let mail = include_str!("../../gws-screens/src/mail.rs");
+        assert!(mail.contains(&format!("\"{}\"", tools::MAIL_ATTACHMENT_OPEN)));
+    }
+
+    #[test]
+    fn opening_and_uploading_are_a_persons_and_say_they_write() {
+        for name in [
+            tools::FILE_OPEN,
+            tools::FILE_UPLOAD,
+            tools::FILE_DISCARD,
+            tools::MAIL_ATTACHMENT_OPEN,
+        ] {
+            let def = tools::defs().into_iter().find(|d| d.name == name).unwrap();
+            assert_eq!(def.audience, tools::APP_ONLY, "{name}");
+            assert!(!def.read_only, "{name}");
+        }
+        let edits = tools::defs()
+            .into_iter()
+            .find(|d| d.name == tools::FILE_EDITS)
+            .unwrap();
+        assert_eq!(edits.audience, tools::APP_ONLY);
+    }
+
+    #[test]
+    fn a_link_to_a_file_too_big_to_open_is_one_drive_may_send_the_person_to() {
+        let m = unsigned(RELEASE_KEY_ID);
+        let drive = m["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "drive")
+            .unwrap();
+        assert_eq!(
+            drive["permissions"]["open"]["external"],
+            json!(["https://docs.google.com", "https://drive.google.com"])
+        );
     }
 
     #[test]
@@ -305,7 +358,7 @@ mod tests {
         assert!(
             !drive.iter().any(|t| {
                 let t = t.as_str().unwrap();
-                ["mail", "cal_", "event", "people", "upload"]
+                ["mail", "cal_", "event", "people", "gws_upload"]
                     .iter()
                     .any(|other| t.contains(other))
             }),

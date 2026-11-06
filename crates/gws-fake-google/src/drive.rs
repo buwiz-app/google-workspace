@@ -1,6 +1,7 @@
 //! Google Drive, faked: `files.list` with `q`, `orderBy`, paging and `fields`,
-//! `files.get`, `alt=media`, `files.export`, `about.get`, and the changes feed.
-//! It's read only, as the plugin's Drive is in S5: a write gets a 405.
+//! `files.get`, `alt=media`, `files.export`, `about.get`, the changes feed, and
+//! `files.update` and `files.create` through a resumable upload. Any other write
+//! gets a 405, and an upload it doesn't know a 400.
 //!
 //! `q` is really parsed, quotes and backslashes as Google says they work, so a
 //! query that breaks out of its string does here what it would there. `fields`
@@ -24,6 +25,7 @@ pub const GOOGLE_SHEET: &str = "application/vnd.google-apps.spreadsheet";
 pub const GOOGLE_SLIDES: &str = "application/vnd.google-apps.presentation";
 const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const XLSX: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const PPTX: &str = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 const OWNER_NAME: &str = "Owner Fake";
 /// Past this an export is refused, as Google's is.
 const EXPORT_MAX: usize = 10 * 1024 * 1024;
@@ -59,6 +61,8 @@ pub struct FakeFile {
     pub can_download: bool,
     /// `(name, address, role)`, beside the owner.
     pub people: Vec<(String, String, String)>,
+    /// Moves with every change to the file, its name included, as Drive's does.
+    pub version: i64,
 }
 
 impl FakeFile {
@@ -81,6 +85,7 @@ impl FakeFile {
             trashed: false,
             can_download: true,
             people: Vec::new(),
+            version: 1,
         }
     }
 
@@ -118,6 +123,17 @@ impl FakeFile {
 
     fn mine(&self) -> bool {
         self.owner.1 == FAKE_EMAIL
+    }
+
+    /// `md5Checksum`, as far as anyone here can tell: 32 hex digits that move
+    /// with the bytes. Not a real MD5, and the plugin only ever compares it.
+    fn checksum(&self) -> String {
+        let hash = |seed: u8| {
+            self.content.iter().fold(tag(&seed.to_string()), |h, b| {
+                (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+            })
+        };
+        format!("{:016x}{:016x}", hash(1), hash(2))
     }
 }
 
@@ -237,13 +253,15 @@ fn resource(f: &FakeFile) -> Value {
         "lastModifyingUser": person(&f.owner.0, &f.owner.1),
         "permissions": permissions,
         "capabilities": {"canDownload": f.can_download},
+        "version": f.version.to_string(),
     });
     if !f.parents.is_empty() {
         v["parents"] = json!(f.parents);
     }
-    // Google's own files have no size
+    // Google's own files have no size and no checksum
     if !f.google() {
         v["size"] = json!(size.to_string());
+        v["md5Checksum"] = json!(f.checksum());
     }
     if !f.description.is_empty() {
         v["description"] = json!(f.description);
@@ -254,7 +272,7 @@ fn resource(f: &FakeFile) -> Value {
     v
 }
 
-const FILE_FIELDS: [&str; 18] = [
+const FILE_FIELDS: [&str; 20] = [
     "kind",
     "id",
     "name",
@@ -273,6 +291,8 @@ const FILE_FIELDS: [&str; 18] = [
     "size",
     "description",
     "sharedWithMeTime",
+    "version",
+    "md5Checksum",
 ];
 
 /// A parsed `fields`: names, each with what's picked inside it.
@@ -619,6 +639,26 @@ impl Failing {
     }
 }
 
+/// What an upload session will do with its bytes.
+enum Write {
+    /// `files.update`: a new revision of this file.
+    Update(String),
+    /// `files.create`: a new file.
+    Create {
+        name: String,
+        mime: String,
+        parents: Vec<String>,
+    },
+}
+
+/// A resumable upload under way.
+struct Session {
+    write: Write,
+    total: usize,
+    got: Vec<u8>,
+    fields: Option<Fields>,
+}
+
 /// A fake account's Drive.
 #[derive(Default)]
 pub(crate) struct Drive {
@@ -634,6 +674,12 @@ pub(crate) struct Drive {
     /// Rows a page of changes holds.
     pub(crate) changes_page: Option<usize>,
     used: i64,
+    /// Where this stub is, for the address of an upload.
+    pub(crate) base: String,
+    sessions: BTreeMap<u64, Session>,
+    next_session: u64,
+    next_copy: u64,
+    fail_uploads: Option<Failing>,
 }
 
 impl Drive {
@@ -660,8 +706,17 @@ impl Drive {
             return false;
         };
         change(file);
+        file.version += 1;
         self.changes.push(id.to_owned());
         true
+    }
+
+    pub(crate) fn held(&self, id: &str) -> Option<FakeFile> {
+        self.files.get(id).cloned()
+    }
+
+    pub(crate) fn all(&self) -> Vec<FakeFile> {
+        self.files.values().cloned().collect()
     }
 
     pub(crate) fn remove(&mut self, id: &str) -> bool {
@@ -683,14 +738,228 @@ impl Drive {
         self.fail_changes = Some(Failing { left, status });
     }
 
+    /// After `left` more upload sessions start, each gets `status`.
+    pub(crate) fn fail_uploads(&mut self, left: usize, status: u16) {
+        self.fail_uploads = Some(Failing { left, status });
+    }
+
     pub(crate) fn works(&mut self) {
         self.fail_list = None;
         self.fail_changes = None;
+        self.fail_uploads = None;
+    }
+
+    /// `/upload/drive/v3/…`. Opening a session is `POST files` for a new file or
+    /// `PATCH files/<id>` for a revision; each piece then goes by `PUT` to the
+    /// address that answered, and only the last one writes anything.
+    pub(crate) fn upload(&mut self, r: &Request, rest: &str) -> Reply {
+        if r.param("uploadType").as_deref() != Some("resumable") {
+            return invalid("uploadType");
+        }
+        if let Some(session) = r.param("upload_id") {
+            return self.piece(r, &session);
+        }
+        if let Some(reply) = Failing::due(&mut self.fail_uploads) {
+            return reply;
+        }
+        let parts: Vec<&str> = rest.split('/').collect();
+        match (r.method.as_str(), parts.as_slice()) {
+            ("POST", ["files"]) => self.start_create(r),
+            ("PATCH", ["files", id]) => self.start_update(r, id),
+            _ => error(405, "methodNotAllowed", "The stub has no such upload."),
+        }
+    }
+
+    fn opened_session(&mut self, r: &Request, write: Write, rest: &str) -> Reply {
+        let Some(total) = r
+            .upload
+            .get("x-upload-content-length")
+            .and_then(|n| n.parse().ok())
+        else {
+            return invalid("X-Upload-Content-Length");
+        };
+        let fields = match Self::fields_of(r) {
+            Ok(fields) => fields,
+            Err(reply) => return reply,
+        };
+        self.next_session += 1;
+        let id = self.next_session;
+        self.sessions.insert(
+            id,
+            Session {
+                write,
+                total,
+                got: Vec::new(),
+                fields,
+            },
+        );
+        let address = format!(
+            "{}/upload/drive/v3/{rest}?uploadType=resumable&upload_id={id}",
+            self.base
+        );
+        Reply(
+            200,
+            "application/json",
+            Vec::new(),
+            vec![("location".to_owned(), address)],
+        )
+    }
+
+    fn start_update(&mut self, r: &Request, id: &str) -> Reply {
+        if !r.body.is_empty() && Self::metadata(r).is_none_or(|m| !m.is_empty()) {
+            return invalid("metadata");
+        }
+        let file = match self.file(id) {
+            Ok(file) => file,
+            Err(reply) => return reply,
+        };
+        if file.mime == FOLDER {
+            return error(403, "fileNotWritable", "A folder has no content.");
+        }
+        let write = Write::Update(file.id.clone());
+        self.opened_session(r, write, &format!("files/{id}"))
+    }
+
+    fn start_create(&mut self, r: &Request) -> Reply {
+        let Some(metadata) = Self::metadata(r) else {
+            return invalid("metadata");
+        };
+        if metadata
+            .keys()
+            .any(|k| !["name", "mimeType", "parents"].contains(&k.as_str()))
+        {
+            return invalid("metadata");
+        }
+        let text = |key: &str| {
+            metadata
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        };
+        let (name, mime) = (text("name").to_owned(), text("mimeType").to_owned());
+        // a Google type here would turn the upload into a Google file
+        if name.is_empty() || mime.is_empty() || mime.starts_with("application/vnd.google-apps.") {
+            return invalid("metadata");
+        }
+        let parents: Vec<String> = metadata
+            .get("parents")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.as_str().map(str::to_owned))
+            .collect();
+        for parent in &parents {
+            if parent != DRIVE_ROOT && !self.files.contains_key(parent) {
+                return error(404, "notFound", &format!("File not found: {parent}."));
+            }
+        }
+        let write = Write::Create {
+            name,
+            mime,
+            parents,
+        };
+        self.opened_session(r, write, "files")
+    }
+
+    fn metadata(r: &Request) -> Option<Map<String, Value>> {
+        match serde_json::from_slice(&r.body) {
+            Ok(Value::Object(map)) if r.kind.starts_with("application/json") => Some(map),
+            _ => None,
+        }
+    }
+
+    /// One piece of a session. It has to start where the last one stopped, and
+    /// say so; what's missing gets a 308 saying how far it got.
+    fn piece(&mut self, r: &Request, id: &str) -> Reply {
+        let Some(session) = id
+            .parse()
+            .ok()
+            .and_then(|id: u64| self.sessions.get_mut(&id))
+        else {
+            return error(404, "notFound", "No such upload.");
+        };
+        let range = r
+            .upload
+            .get("content-range")
+            .and_then(|range| range.strip_prefix("bytes "))
+            .and_then(|range| range.split_once('/'))
+            .and_then(|(span, total)| Some((span.split_once('-')?, total)))
+            .and_then(|((from, to), total)| {
+                Some((
+                    from.parse::<usize>().ok()?,
+                    to.parse::<usize>().ok()?,
+                    total.parse::<usize>().ok()?,
+                ))
+            });
+        let Some((from, to, total)) = range else {
+            return invalid("Content-Range");
+        };
+        if from != session.got.len() || to + 1 != from + r.body.len() || total != session.total {
+            return invalid("Content-Range");
+        }
+        session.got.extend_from_slice(&r.body);
+        if session.got.len() < session.total {
+            let held = format!("bytes=0-{}", session.got.len() - 1);
+            return Reply(
+                308,
+                "text/plain",
+                Vec::new(),
+                vec![("range".to_owned(), held)],
+            );
+        }
+        let session = id
+            .parse()
+            .ok()
+            .and_then(|id: u64| self.sessions.remove(&id))
+            .expect("the session was just read");
+        self.write(session)
+    }
+
+    fn write(&mut self, session: Session) -> Reply {
+        self.used += session.got.len() as i64;
+        let id = match session.write {
+            Write::Update(id) => {
+                let found = self.edit(&id, |file| {
+                    file.content = session.got;
+                    file.modified_ms += 1000;
+                });
+                if !found {
+                    return error(404, "notFound", &format!("File not found: {id}."));
+                }
+                id
+            }
+            Write::Create {
+                name,
+                mime,
+                parents,
+            } => {
+                self.next_copy += 1;
+                let id = format!("drv-copy-{}", self.next_copy);
+                let mut file = FakeFile::new(&id, &name, &mime);
+                file.content = session.got;
+                file.parents = if parents.is_empty() {
+                    vec![DRIVE_ROOT.to_owned()]
+                } else {
+                    parents
+                };
+                self.add(file);
+                id
+            }
+        };
+        let v = resource(&self.files[&id]);
+        match session.fields {
+            Some(fields) if !fields.known_on_file() => invalid("fields"),
+            Some(fields) => Reply::json(200, fields.pick(&v)),
+            None => {
+                let plain = Fields::parse("kind,id,name,mimeType").expect("a good field list");
+                Reply::json(200, plain.pick(&v))
+            }
+        }
     }
 
     pub(crate) fn handle(&mut self, r: &Request, rest: &str) -> Reply {
         if r.method != "GET" {
-            return error(405, "methodNotAllowed", "S5 writes nothing to Drive.");
+            return error(405, "methodNotAllowed", "The stub has no such write.");
         }
         let parts: Vec<&str> = rest.split('/').collect();
         match parts.as_slice() {
@@ -896,6 +1165,20 @@ impl Drive {
             );
             return Reply(200, "text/html", page.into_bytes(), Vec::new());
         }
+        let office = match file.mime.as_str() {
+            GOOGLE_DOC => DOCX,
+            GOOGLE_SHEET => XLSX,
+            GOOGLE_SLIDES => PPTX,
+            _ => "",
+        };
+        if wanted == office {
+            return Reply(
+                200,
+                "application/octet-stream",
+                file.content.clone(),
+                Vec::new(),
+            );
+        }
         let fits = match file.mime.as_str() {
             GOOGLE_DOC | GOOGLE_SLIDES => wanted == "text/plain",
             GOOGLE_SHEET => wanted == "text/csv",
@@ -1014,6 +1297,88 @@ mod tests {
             json!({"a": 1, "b": [{"c": 2}]})
         );
         assert_eq!(Fields::parse("a,(b"), None);
+    }
+
+    fn request(method: &str, target: &str, body: &[u8], upload: &[(&str, String)]) -> Request {
+        Request {
+            method: method.to_owned(),
+            target: target.to_owned(),
+            authorization: String::new(),
+            kind: "application/json; charset=UTF-8".to_owned(),
+            if_match: String::new(),
+            upload: upload
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect(),
+            body: body.to_vec(),
+        }
+    }
+
+    fn start(drive: &mut Drive, method: &str, rest: &str, body: &[u8], total: usize) -> String {
+        let r = request(
+            method,
+            &format!("/upload/drive/v3/{rest}?uploadType=resumable"),
+            body,
+            &[("x-upload-content-length", total.to_string())],
+        );
+        let Reply(status, _, _, headers) = drive.upload(&r, rest);
+        assert_eq!(status, 200);
+        let at = headers[0].1.split("/upload/drive/v3/").nth(1).unwrap();
+        format!("/upload/drive/v3/{at}")
+    }
+
+    fn put(drive: &mut Drive, at: &str, from: usize, bytes: &[u8], total: usize) -> Reply {
+        let range = format!("bytes {from}-{}/{total}", from + bytes.len() - 1);
+        let r = request("PUT", at, bytes, &[("content-range", range)]);
+        drive.upload(&r, "files")
+    }
+
+    #[test]
+    fn a_write_moves_version_and_checksum_only_at_its_last_piece() {
+        let mut drive = Drive::new(vec![
+            FakeFile::new("a", "a.txt", "text/plain").holding(b"x"),
+        ]);
+        let before = drive.held("a").unwrap();
+        let at = start(&mut drive, "PATCH", "files/a", b"{}", 4);
+        assert_eq!(put(&mut drive, &at, 0, b"ab", 4).0, 308);
+        assert_eq!(drive.held("a").unwrap(), before, "nothing written yet");
+        assert_eq!(
+            put(&mut drive, &at, 0, b"ab", 4).0,
+            400,
+            "not where it stopped"
+        );
+        assert_eq!(put(&mut drive, &at, 2, b"cd", 4).0, 200);
+        let after = drive.held("a").unwrap();
+        assert_eq!((after.content.as_slice(), after.version), (&b"abcd"[..], 2));
+        assert_ne!(after.checksum(), before.checksum());
+    }
+
+    #[test]
+    fn an_upload_it_doesnt_know_is_refused() {
+        let mut drive = Drive::new(vec![FakeFile::new("a", "a.txt", "text/plain")]);
+        let plain = request(
+            "PATCH",
+            "/upload/drive/v3/files/a?uploadType=media",
+            b"x",
+            &[],
+        );
+        assert_eq!(drive.upload(&plain, "files/a").0, 400);
+        let length = [("x-upload-content-length", "1".to_owned())];
+        for body in [
+            r#"{"name": "x"}"#,
+            r#"{"name": "x", "mimeType": "application/vnd.google-apps.document"}"#,
+            r#"{"name": "x", "mimeType": "text/plain", "writersCanShare": true}"#,
+            r#"{"name": "x", "mimeType": "text/plain", "parents": ["nowhere"]}"#,
+        ] {
+            let r = request(
+                "POST",
+                "/upload/drive/v3/files?uploadType=resumable",
+                body.as_bytes(),
+                &length,
+            );
+            assert!(drive.upload(&r, "files").0 >= 400, "{body}");
+        }
+        assert_eq!(drive.all().len(), 1);
     }
 
     #[test]

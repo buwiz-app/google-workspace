@@ -112,7 +112,8 @@ impl Store {
             "SELECT account FROM state UNION SELECT account FROM labels \
              UNION SELECT account FROM threads UNION SELECT account FROM bodies \
              UNION SELECT account FROM calendars UNION SELECT account FROM events \
-             UNION SELECT account FROM drive_files UNION SELECT account FROM drive_views",
+             UNION SELECT account FROM drive_files UNION SELECT account FROM drive_views \
+             UNION SELECT account FROM opened",
         )?;
         let accounts = q
             .query_map([], |r| r.get(0))?
@@ -121,8 +122,7 @@ impl Store {
     }
 
     /// Everything held for `account`: it can all be fetched again after a
-    /// sign-in. The `open-<id>` folders are no part of this: they can hold
-    /// unsaved work.
+    /// sign-in. What's in the `open/` folder is the plugin's to remove first.
     pub fn forget_account(&self, account: &str) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for table in [
@@ -135,6 +135,7 @@ impl Store {
             "drive_listed",
             "drive_views",
             "drive_files",
+            "opened",
             "state",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE account = ?"), [account])?;

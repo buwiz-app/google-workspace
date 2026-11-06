@@ -20,6 +20,7 @@ use sha2::{Digest as _, Sha256};
 pub mod calendar;
 pub mod drive;
 pub mod mail;
+pub mod open;
 
 pub const DATA_DIR_ENV: &str = "GWS_DATA_DIR";
 /// How long a locked store is waited for.
@@ -55,6 +56,12 @@ const MIGRATIONS: &[(i64, &str)] = &[
          CREATE TABLE drive_listed(account TEXT NOT NULL, view TEXT NOT NULL, file TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(account, view, file));
          CREATE INDEX drive_listed_in_order ON drive_listed(account, view, at);
          CREATE INDEX drive_listed_by_file ON drive_listed(account, file);",
+    ),
+    // a stored mail view has no message id on its attachments: fetched again, it does
+    (
+        6,
+        "CREATE TABLE opened(id TEXT PRIMARY KEY, account TEXT NOT NULL, name TEXT NOT NULL, mime TEXT NOT NULL, google INTEGER NOT NULL, attachment INTEGER NOT NULL, hash TEXT NOT NULL, version TEXT NOT NULL, md5 TEXT NOT NULL, opened_ms INTEGER NOT NULL);
+         DELETE FROM bodies;",
     ),
 ];
 
@@ -147,10 +154,11 @@ impl Paths {
         self.dir.join("wipe-pending")
     }
 
-    /// Where this install keeps open Drive files and attachments. Their edits
-    /// can't be fetched again, so only an uninstall ever removes them.
-    pub fn open_dir(&self, key: &str) -> PathBuf {
-        self.dir.join(format!("open-{}", install_id(key)))
+    /// Where open Drive files and attachments are: `open/<id>/<name>`. They sit
+    /// unencrypted while the viewer has them, so they go after upload or
+    /// discard, after 24 hours, and at sign-out.
+    pub fn open_dir(&self) -> PathBuf {
+        self.dir.join("open")
     }
 }
 
@@ -285,7 +293,7 @@ pub fn wipe(paths: &Paths, key: &str) -> Result<()> {
         gone(fs::remove_file(side))?;
     }
     gone(fs::remove_file(&db))?;
-    gone(fs::remove_dir_all(paths.open_dir(key)))?;
+    gone(fs::remove_dir_all(paths.open_dir()))?;
     let _ = fs::remove_dir(&paths.dir);
     Ok(())
 }
@@ -477,8 +485,8 @@ mod tests {
         let paths = Paths::in_dir(&dir.0);
         let key = key();
         drop(Store::open(&paths, &key).unwrap());
-        fs::create_dir_all(paths.open_dir(&key)).unwrap();
-        fs::write(paths.open_dir(&key).join("a.docx"), b"x").unwrap();
+        fs::create_dir_all(paths.open_dir()).unwrap();
+        fs::write(paths.open_dir().join("a.docx"), b"x").unwrap();
         let sides: Vec<String> = ["-journal", "-wal", "-shm"]
             .iter()
             .map(|s| format!("{}{s}", paths.db(&key).display()))
@@ -489,7 +497,7 @@ mod tests {
         let other = paths.dir.join("someone-elses.txt");
         fs::write(&other, b"keep me").unwrap();
         wipe(&paths, &key).unwrap();
-        assert!(other.exists() && !paths.db(&key).exists() && !paths.open_dir(&key).exists());
+        assert!(other.exists() && !paths.db(&key).exists() && !paths.open_dir().exists());
         assert!(
             sides.iter().all(|s| !std::path::Path::new(s).exists()),
             "no stale journal for a later store"

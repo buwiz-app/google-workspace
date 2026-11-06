@@ -102,6 +102,37 @@ pub(super) fn rows_in(v: &Value, key: &str) -> Vec<Row> {
         .collect()
 }
 
+/// A file open here and edited, as `gws_file_edits` says.
+#[derive(Clone, PartialEq, Debug)]
+pub(super) struct Edit {
+    pub(super) id: String,
+    pub(super) name: String,
+    /// A Google Doc, Sheet or Slides, which only ever takes a copy.
+    pub(super) google: bool,
+    /// Drive moved too since it was opened.
+    pub(super) changed: bool,
+    /// An upload is still going, past what its call waited for.
+    pub(super) working: bool,
+}
+
+pub(super) fn edits_in(v: &Value) -> Vec<Edit> {
+    v.get("files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let flag = |k: &str| e.get(k).and_then(Value::as_bool).unwrap_or(false);
+            Some(Edit {
+                id: e.get("id")?.as_str()?.to_owned(),
+                name: text(e, "name"),
+                google: flag("google"),
+                changed: flag("changed_on_drive"),
+                working: flag("working"),
+            })
+        })
+        .collect()
+}
+
 /// One step of the way to a folder.
 #[derive(Clone, PartialEq, Debug)]
 pub(super) struct Crumb {

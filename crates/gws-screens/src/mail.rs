@@ -416,12 +416,17 @@ fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
         .child(list)
 }
 
-fn row_view(b: Bridge, m: Mail, index: usize) -> impl IntoElement {
-    let at = move |f: fn(&Row) -> String| {
-        move || m.rows.with(|r| r.get(index).map(f).unwrap_or_default())
+/// One cell of the list. Cells are recycled, so every read goes through
+/// `at`: a position read once would keep showing, and opening, its first row.
+fn row_view(b: Bridge, m: Mail, at: Position) -> impl IntoElement {
+    let field = move |f: fn(&Row) -> String| {
+        move || {
+            m.rows
+                .with(|r| r.get(at.index()).map(f).unwrap_or_default())
+        }
     };
-    let chosen = move || m.chosen.get() == Some(index);
-    let weight = move || m.rows.with(|r| r.get(index).is_some_and(|r| r.unread));
+    let chosen = move || m.chosen.get() == Some(at.index());
+    let weight = move || m.rows.with(|r| r.get(at.index()).is_some_and(|r| r.unread));
     view()
         .app_class(move || {
             Some(
@@ -435,20 +440,20 @@ fn row_view(b: Bridge, m: Mail, index: usize) -> impl IntoElement {
         .label("Open conversation")
         .accessibility_value(move || {
             m.rows.with(|r| {
-                r.get(index).map(|r| AccessibilityValue {
+                r.get(at.index()).map(|r| AccessibilityValue {
                     text: Some(format!("{}, {}", r.sender, r.subject).into()),
                     ..AccessibilityValue::default()
                 })
             })
         })
         .on_press(move || {
-            b.spawn(open(b.clone(), m, index));
+            b.spawn(open(b.clone(), m, at.index()));
         })
         .child(
             view()
                 .app_class(Some("flex-row justify-between gap-2".into()))
                 .child(
-                    text(at(|r| r.sender.clone()))
+                    text(field(|r| r.sender.clone()))
                         .number_of_lines(1)
                         .app_class(move || {
                             Some(
@@ -461,12 +466,12 @@ fn row_view(b: Bridge, m: Mail, index: usize) -> impl IntoElement {
                         }),
                 )
                 .child(
-                    text(at(|r| short_time(r.at, now_ms())))
+                    text(field(|r| short_time(r.at, now_ms())))
                         .app_class(Some(format!("text-[11px] {DIM}").into())),
                 ),
         )
         .child(
-            text(at(|r| {
+            text(field(|r| {
                 if r.messages > 1 {
                     format!("{} ({})", r.subject, r.messages)
                 } else {
@@ -477,7 +482,7 @@ fn row_view(b: Bridge, m: Mail, index: usize) -> impl IntoElement {
             .app_class(Some(format!("text-[12px] {INK}").into())),
         )
         .child(
-            text(at(|r| r.snippet.clone()))
+            text(field(|r| r.snippet.clone()))
                 .number_of_lines(1)
                 .app_class(Some(format!("text-[11px] {MUTE}").into())),
         )
@@ -536,10 +541,9 @@ fn list_pane(b: Bridge, m: Mail) -> impl IntoElement {
         .child(
             virtual_list(
                 move || m.rows.with(Vec::len),
-                move |at| row_view(row_bridge.clone(), m, at.index()),
+                move |at| row_view(row_bridge.clone(), m, at),
             )
-            // cells are recycled: without identities a list that changes keeps
-            // each cell where the last list left it, out of order on screen
+            // rows come and go anywhere when the list changes, not just at its end
             .keys(move || {
                 m.rows
                     .with(|r| r.iter().map(|r| r.id.clone()).collect::<Vec<_>>())

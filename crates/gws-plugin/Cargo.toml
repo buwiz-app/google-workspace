@@ -23,6 +23,8 @@ stub = []
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# a series keeps its wall clock, and only a zone's rules say what that is
+chrono-tz = { version = "0.10", default-features = false }
 # the SDK's server: provision, session certificates, tickets, caller checks
 buwiz-plugin = { git = "https://github.com/buwiz-app/buwiz-sdk", rev = "79883a820597c623c9259cc0fac0c4166bdde093" }
 gws-store = { path = "../gws-store" }

@@ -326,8 +326,8 @@ pub fn defs() -> Vec<Def> {
         },
         Def {
             name: CAL_RANGE,
-            description: "The events between two RFC 3339 times on the calendars shown, from what's stored.",
-            input_schema: json!({"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}}, "required": ["from", "to"]}),
+            description: "The events between two RFC 3339 times on the calendars shown, from what's stored. For whole days, to_date is the first date left out.",
+            input_schema: json!({"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "to_date": {"type": "string"}}, "required": ["from", "to"]}),
             read_only: true,
             audience: APP_ONLY,
             open_world: true,

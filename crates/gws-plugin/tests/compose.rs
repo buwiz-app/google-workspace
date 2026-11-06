@@ -441,3 +441,27 @@ fn a_chats_draft_comes_with_its_card_and_a_review_names_who_is_new() {
     let stale = core.run("gws_mail_draft_read", &json!({"ticket": "nonsense"}));
     assert_eq!(stale["isError"], true, "{stale}");
 }
+
+#[test]
+fn a_forward_carries_the_files_of_the_mail_it_forwards() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "forward");
+    let bytes = file(4096);
+    let mut first = lunch();
+    first["attachments"] = json!([attach(&core, "a.pdf", &bytes)]);
+    let saved = data(core.run("gws_mail_draft_save", &first));
+    data(send(&core, &saved));
+
+    let found = data(core.run("gws_search_mail", &json!({"query": "in:sent"})));
+    let id = found["items"][0]["id"].clone();
+    let start = data(core.run("gws_mail_reply_start", &json!({"thread": id, "mode": "forward"})));
+    let files = start["attachments"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "{start}");
+    let keep = json!([{"message": start["source"], "id": files[0]["id"], "name": files[0]["name"], "mime": files[0]["mime"]}]);
+    let forward = json!({"to": ["ben@example.com"], "subject": start["subject"], "body": start["body"], "keep": keep});
+    let saved = data(core.run("gws_mail_draft_save", &forward));
+    data(send(&core, &saved));
+    let sent = google.sent();
+    assert_eq!(sent.len(), 2);
+    assert!(sent[1].attachments[0].2 == bytes);
+}

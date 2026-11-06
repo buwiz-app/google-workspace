@@ -779,6 +779,8 @@ pub fn reply_start(core: &Core, args: &Value) -> Result<Value, Failure> {
     let answer = match mode.as_str() {
         "forward" => json!({
             "to": [], "cc": [],
+            "source": last.get("id"),
+            "attachments": gmail::attachments(last),
             "subject": prefixed("Fwd: ", &subject),
             "body": format!("\n\n---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {subject}\nTo: {}\n\n{}", h("From"), h("Date"), h("To"), gmail::body(last)),
         }),

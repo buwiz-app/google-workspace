@@ -122,6 +122,8 @@ impl Letter {
         };
         let some = |k: &str| Some(text(k).to_owned()).filter(|t| !t.is_empty());
         let revision = some("revision");
+        // a forward's files are still on the mail it came from
+        let holder = some("source").or_else(|| revision.clone());
         let files = v
             .get("attachments")
             .and_then(Value::as_array)
@@ -133,7 +135,7 @@ impl Letter {
                 let size = a.get("size").and_then(Value::as_u64).unwrap_or(0);
                 File {
                     key: key as u64,
-                    keep: Some(json!({"message": revision, "id": a.get("id"), "name": name, "mime": a.get("mime")})),
+                    keep: Some(json!({"message": holder, "id": a.get("id"), "name": name, "mime": a.get("mime")})),
                     name: name.to_owned(),
                     size,
                     arrived: size,

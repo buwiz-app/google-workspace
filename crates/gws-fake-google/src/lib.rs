@@ -916,7 +916,7 @@ impl Account {
                         at: 1_793_955_600_000,
                         text: sent.body.clone(),
                         html: None,
-                        attachments: Vec::new(),
+                        attachments: sent.attachments.clone(),
                         message_id: sent.message_id.clone(),
                     },
                 );

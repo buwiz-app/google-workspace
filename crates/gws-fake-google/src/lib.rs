@@ -959,7 +959,10 @@ impl Account {
                 let (_, message, raw, thread) = self.drafts.remove(at);
                 let sent = Sent::of(&raw);
                 self.history += 1;
-                let thread = thread.unwrap_or_else(|| message.clone());
+                // it stays in its thread, and the change shows in history, as with Gmail
+                let thread = Self::draft_thread(id, &thread);
+                let history = self.history;
+                self.changes.push((history, json!({"id": history.to_string(), "messagesAdded": [{"message": {"id": message, "threadId": thread, "labelIds": ["SENT"]}}]})));
                 self.mails.insert(
                     0,
                     Mail {

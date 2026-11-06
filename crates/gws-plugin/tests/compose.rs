@@ -554,8 +554,9 @@ fn reply_all_keeps_everyone_on_a_long_list() {
         .collect();
     let saved = data(core.run("gws_mail_draft_save", &json!({"to": many, "body": "Hi"})));
     data(send(&core, &saved));
-    let found = data(core.run("gws_search_mail", &json!({"query": "in:sent"})));
-    let id = found["items"][0]["id"].clone();
+    core.unlock("a-seed");
+    let sent = data(core.run("gws_mail_list", &json!({"label": "SENT"})));
+    let id = sent["threads"][0]["id"].clone();
     let all = data(core.run(
         "gws_mail_reply_start",
         &json!({"thread": id, "mode": "all"}),
@@ -691,8 +692,9 @@ fn a_forward_carries_the_files_of_the_mail_it_forwards() {
     let saved = data(core.run("gws_mail_draft_save", &first));
     data(send(&core, &saved));
 
-    let found = data(core.run("gws_search_mail", &json!({"query": "in:sent"})));
-    let id = found["items"][0]["id"].clone();
+    core.unlock("a-seed");
+    let sent = data(core.run("gws_mail_list", &json!({"label": "SENT"})));
+    let id = sent["threads"][0]["id"].clone();
     let start = data(core.run(
         "gws_mail_reply_start",
         &json!({"thread": id, "mode": "forward"}),
@@ -724,4 +726,19 @@ fn sent_and_drafts_name_who_the_mail_is_for() {
         !rows("INBOX").to_string().contains("To: "),
         "the inbox still names who wrote"
     );
+}
+
+#[test]
+fn a_sent_draft_leaves_drafts_at_the_next_check() {
+    let google = FakeGoogle::start(Seed::demo(3));
+    let core = signed_in(&google, "sent-draft");
+    core.unlock("a-seed");
+    gws::mail::sync(&core).unwrap();
+    let drafts = || data(core.run("gws_mail_list", &json!({"label": "DRAFT"})))["threads"].clone();
+
+    let draft = data(core.run("gws_mail_draft_save", &lunch()));
+    assert_eq!(drafts().as_array().unwrap().len(), 1);
+    data(send(&core, &draft));
+    gws::mail::sync(&core).unwrap();
+    assert_eq!(drafts(), json!([]));
 }

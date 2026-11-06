@@ -547,10 +547,11 @@ async fn open(b: Bridge, m: Mail, index: usize) {
     else {
         return;
     };
-    m.chosen.set(Some(id.clone()));
+    // a draft goes to the panel: the reader has nothing of it to open
     if m.label.with_untracked(|l| l == "DRAFT") {
         return compose::resume(b, m.compose, id);
     }
+    m.chosen.set(Some(id.clone()));
     let unread = m
         .rows
         .with_untracked(|r| r.get(index).is_some_and(|r| r.unread));

@@ -1435,6 +1435,16 @@ fn open_a_draft(app: &mut Headless) {
 }
 
 #[test]
+fn a_draft_put_away_leaves_the_reader_empty_not_opening() {
+    let (mut app, _fake) = start();
+    open_a_draft(&mut app);
+    app.press("label:Keep draft").expect("it presses");
+    app.wait_for_within("text:Pick a conversation to read it", WAIT)
+        .expect("nothing is opening");
+    assert!(!app.screen().shows("Opening…"));
+}
+
+#[test]
 fn a_slow_save_the_plugin_lost_says_so_and_stops_waiting() {
     let (mut app, fake) = start();
     open_a_draft(&mut app);

@@ -59,6 +59,8 @@ pub enum Subject {
     Draft(String),
     /// An event draft's fields, as JSON: it's nowhere else until it's saved.
     EventDraft(String),
+    /// The words of a search of Drive.
+    DriveSearch(String),
 }
 
 /// How many rows a card shows.
@@ -674,8 +676,10 @@ pub fn sync(core: &Core) -> Result<(), Failure> {
     if matches!(result, Ok(true)) {
         bump(core, &account)?;
     }
-    // the same check covers events; how that goes is Calendar's to report
+    // the same check covers events and files; how those go is Calendar's and
+    // Drive's to report
     let _ = crate::calendar::sync(core, &auth, &account);
+    let _ = crate::drive::sync(core, &auth, &account);
     result.map(drop)
 }
 

@@ -111,7 +111,8 @@ impl Store {
         let mut q = self.conn.prepare(
             "SELECT account FROM state UNION SELECT account FROM labels \
              UNION SELECT account FROM threads UNION SELECT account FROM bodies \
-             UNION SELECT account FROM calendars UNION SELECT account FROM events",
+             UNION SELECT account FROM calendars UNION SELECT account FROM events \
+             UNION SELECT account FROM drive_files UNION SELECT account FROM drive_views",
         )?;
         let accounts = q
             .query_map([], |r| r.get(0))?
@@ -131,6 +132,9 @@ impl Store {
             "labels",
             "events",
             "calendars",
+            "drive_listed",
+            "drive_views",
+            "drive_files",
             "state",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE account = ?"), [account])?;

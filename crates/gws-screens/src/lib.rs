@@ -4,6 +4,7 @@
 
 pub mod calendar;
 mod compose;
+mod drive;
 mod mail;
 pub mod reader;
 mod shell;
@@ -40,5 +41,5 @@ fn calendar(bridge: Bridge) -> Root {
 }
 
 fn drive(bridge: Bridge) -> Root {
-    shell::build(bridge, "Drive")
+    drive::build(bridge)
 }

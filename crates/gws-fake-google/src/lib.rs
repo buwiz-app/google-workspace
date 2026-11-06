@@ -1,5 +1,5 @@
-//! A stub Google on 127.0.0.1, for tests and test Bots: sign-in, Gmail and
-//! Calendar, with fake people, fake mail and fake events. It keeps a log of every request, so a
+//! A stub Google on 127.0.0.1, for tests and test Bots: sign-in, Gmail, Calendar
+//! and Drive, with fake people, fake mail, events and files. It keeps a log of every request, so a
 //! test can prove what reached "Google" and, as importantly, what didn't.
 //! Two ways in:
 //!
@@ -9,6 +9,7 @@
 //! Nothing here is ever part of a release.
 
 mod calendar;
+mod drive;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -19,11 +20,13 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 pub use calendar::{CalendarWrite, FakeCalendar};
+pub use drive::{DRIVE_ROOT, FOLDER, FakeFile, GOOGLE_DOC, GOOGLE_SHEET, GOOGLE_SLIDES, TINY_PNG};
 
 /// The account every fake sign-in is.
 pub const FAKE_EMAIL: &str = "owner@example.com";
 const GMAIL: &str = "/gmail/v1/users/me";
 const CALENDAR: &str = "/calendar/v3/";
+const DRIVE: &str = "/drive/v3/";
 
 /// A request the stub saw.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +241,7 @@ pub struct Seed {
     /// signed in before an update asked for more.
     pub only_grants: Option<String>,
     pub calendars: Vec<FakeCalendar>,
+    pub files: Vec<FakeFile>,
 }
 
 const PEOPLE: [(&str, &str); 8] = [
@@ -304,6 +308,20 @@ impl Seed {
     /// guests and a Meet link, and an invite awaiting a reply.
     pub fn with_calendar_around(mut self, now: i64) -> Self {
         self.calendars = calendar::around(now);
+        self
+    }
+
+    /// A Drive with every kind of file a live run has to show: nested folders,
+    /// a docx, an xlsx, a PDF, a Google Doc, Sheet and Slides, a png, a shared
+    /// file, a starred one and a trashed one.
+    pub fn with_drive(mut self) -> Self {
+        self.files.extend(drive::demo());
+        self
+    }
+
+    /// A folder in My Drive holding `n` items, folders among them.
+    pub fn with_big_folder(mut self, id: &str, name: &str, n: usize) -> Self {
+        self.files.extend(drive::big_folder(id, name, n));
         self
     }
 }
@@ -434,6 +452,7 @@ struct Account {
     only_grants: Option<String>,
     log: Vec<Seen>,
     calendars: calendar::Calendars,
+    drive: drive::Drive,
 }
 
 /// A message sent through the stub, as it arrived.
@@ -624,6 +643,17 @@ impl Account {
             }
         }
         self.calendars.handle(r, rest)
+    }
+
+    fn drive(&mut self, r: &Request, rest: &str) -> Reply {
+        if self
+            .only_grants
+            .as_deref()
+            .is_some_and(|g| !g.contains("drive"))
+        {
+            return Self::insufficient();
+        }
+        self.drive.handle(r, rest)
     }
 
     /// Gmail's upload door: a metadata part and the message itself, handed on
@@ -1158,7 +1188,7 @@ impl Account {
 
     fn handle(&mut self, r: Request) -> Reply {
         let path = r.path().to_owned();
-        if !["/__log", "/__writes", "/__calendar"].contains(&path.as_str()) {
+        if !["/__log", "/__writes", "/__calendar", "/__drive"].contains(&path.as_str()) {
             self.log.push(Seen {
                 method: r.method.clone(),
                 target: r.target.clone(),
@@ -1191,6 +1221,22 @@ impl Account {
             }
             return Reply::json(200, json!({}));
         }
+        // a live run's way to force Drive's failures: `?list=<status>&after=<n>`
+        // lets n more pages of a list through and fails the rest, `?changes=`
+        // does the same to the changes feed, and `?works` ends both
+        if path == "/__drive" {
+            let after = r.param("after").and_then(|n| n.parse().ok()).unwrap_or(0);
+            if let Some(status) = r.param("list").and_then(|s| s.parse().ok()) {
+                self.drive.fail_list(after, status);
+            }
+            if let Some(status) = r.param("changes").and_then(|s| s.parse().ok()) {
+                self.drive.fail_changes(after, status);
+            }
+            if r.param("works").is_some() {
+                self.drive.works();
+            }
+            return Reply::json(200, json!({}));
+        }
         if path == "/o/oauth2/v2/auth" {
             return self.authorize(&r);
         }
@@ -1208,6 +1254,9 @@ impl Account {
         }
         if let Some(rest) = path.strip_prefix(CALENDAR) {
             return self.calendar(&r, rest);
+        }
+        if let Some(rest) = path.strip_prefix(DRIVE) {
+            return self.drive(&r, rest);
         }
         if path.starts_with("/people/v1/") {
             return self.people(&r);
@@ -1244,6 +1293,7 @@ impl FakeGoogle {
             oldest_history: 0,
             only_grants: seed.only_grants,
             calendars: calendar::Calendars::new(seed.calendars),
+            drive: drive::Drive::new(seed.files),
             ..Account::default()
         }));
         let shared = account.clone();
@@ -1348,6 +1398,64 @@ impl FakeGoogle {
     /// An event or instance as Google now holds it.
     pub fn event(&self, calendar: &str, id: &str) -> Option<Value> {
         self.account.lock().unwrap().calendars.read(calendar, id)
+    }
+
+    /// A file someone added: the changes feed says so.
+    pub fn add_file(&self, file: FakeFile) {
+        self.account.lock().unwrap().drive.add(file);
+    }
+
+    /// A file that was there all along: the changes feed says nothing.
+    pub fn seed_file(&self, file: FakeFile) {
+        self.account.lock().unwrap().drive.add_quietly(file);
+    }
+
+    /// A change to a file, which the changes feed reports.
+    pub fn edit_file(&self, id: &str, change: impl FnOnce(&mut FakeFile)) {
+        let done = self.account.lock().unwrap().drive.edit(id, change);
+        assert!(done, "no file {id}");
+    }
+
+    /// A file gone for good, or that the person lost access to.
+    pub fn remove_file(&self, id: &str) {
+        let done = self.account.lock().unwrap().drive.remove(id);
+        assert!(done, "no file {id}");
+    }
+
+    /// Rows in a page of a Drive list, whatever was asked for: Google may
+    /// give fewer than it was asked.
+    pub fn drive_page(&self, n: usize) {
+        self.account.lock().unwrap().drive.page = Some(n);
+    }
+
+    /// Rows in a page of Drive's changes.
+    pub fn drive_changes_page(&self, n: usize) {
+        self.account.lock().unwrap().drive.changes_page = Some(n);
+    }
+
+    /// `left` more pages of a Drive list go through, and then each gets
+    /// `status`: a 403 or a 401 partway down a list.
+    pub fn drive_list_fails_after(&self, left: usize, status: u16) {
+        self.account.lock().unwrap().drive.fail_list(left, status);
+    }
+
+    /// The same for the changes feed.
+    pub fn drive_changes_fail_after(&self, left: usize, status: u16) {
+        self.account
+            .lock()
+            .unwrap()
+            .drive
+            .fail_changes(left, status);
+    }
+
+    /// Ends the failures above.
+    pub fn drive_works(&self) {
+        self.account.lock().unwrap().drive.works();
+    }
+
+    /// Every list page token given out so far goes bad.
+    pub fn drive_expire_pages(&self) {
+        self.account.lock().unwrap().drive.expire_pages();
     }
 
     /// Every sync token of `calendar` goes bad: its next sync gets a 410.

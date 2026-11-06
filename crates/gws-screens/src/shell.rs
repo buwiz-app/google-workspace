@@ -1,15 +1,13 @@
 //! What every screen starts from: it says whether this feature works with the
-//! signed-in account, which is more than being signed in. Each screen's own
-//! content comes in its slice.
+//! signed-in account, which is more than being signed in.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 use buwiz_app::Bridge;
-use nsh_core::element::Root;
 use nsh_core::prelude::*;
-use serde_json::{Value, json};
+use serde_json::Value;
 use url::Url;
 
 pub(crate) const BG: &str = "bg-[#f6f6f4] dark:bg-[#151515]";
@@ -188,33 +186,10 @@ pub(crate) fn line_of(account: Account, name: &str) -> String {
     }
 }
 
-pub fn build(bridge: Bridge, name: &'static str) -> Root {
-    buwiz_app::root(bridge, move |b| {
-        let account = signal(Account::Loading);
-        let reader = b.clone();
-        b.spawn(async move {
-            for attempt in 0.. {
-                match reader.call("gws_status", json!({})).await {
-                    Ok(v) => return account.set(account_of(&v, name)),
-                    Err(e) if e.retryable && attempt < RETRIES => sleep(backoff(attempt)).await,
-                    Err(e) => return account.set(Account::Failed(e.message)),
-                }
-            }
-        });
-        let body = dynamic(move || {
-            let line = line_of(account.get(), name);
-            view()
-                .app_class(Some("flex-1 items-center justify-center".into()))
-                .child(text(line).app_class(Some(format!("text-[14px] {MUTE}").into())))
-        });
-        view()
-            .app_class(Some(format!("flex-1 {BG}").into()))
-            .child(body)
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]

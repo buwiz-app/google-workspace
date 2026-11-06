@@ -1,5 +1,5 @@
-//! `gws-fake-google [--port <n>] [--mails <n>] [--hostile]`: the stub Google on 127.0.0.1
-//! for a test Bot. Prints `base=http://127.0.0.1:<port>`, then serves until killed.
+//! `gws-fake-google [--port <n>] [--mails <n>] [--files <n>] [--hostile]`: the stub
+//! Google on 127.0.0.1 for a test Bot. `--files` adds a folder of that many. Prints `base=http://127.0.0.1:<port>`, then serves until killed.
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -14,7 +14,12 @@ fn main() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
-    let mut seed = gws_fake_google::Seed::demo(mails).with_calendar_around(now);
+    let mut seed = gws_fake_google::Seed::demo(mails)
+        .with_calendar_around(now)
+        .with_drive();
+    if let Some(files) = value("--files") {
+        seed = seed.with_big_folder("drv-big", "Big folder", files);
+    }
     if args.iter().any(|a| a == "--hostile") {
         seed = seed.with_hostile(&format!("http://127.0.0.1:{port}"));
     }

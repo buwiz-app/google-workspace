@@ -383,6 +383,22 @@ fn calendar_and_drive_opens_cant_reach_mail() {
         }
         assert!(h.app(app, "gws_status", json!({})).is_ok());
     }
+    // approving Drive reaches no Calendar either
+    for tool in [
+        "gws_cal_range",
+        "gws_event_read",
+        "gws_search_events",
+        "gws_people_suggest",
+    ] {
+        let refused = h
+            .app(
+                "drive",
+                tool,
+                json!({"calendar": "c", "id": "x", "query": "x"}),
+            )
+            .unwrap_err();
+        assert_eq!(refused["code"], "permission_denied", "{tool}: {refused}");
+    }
     assert!(
         h.app("mail", "gws_search_mail", json!({"query": "fake"}))
             .is_ok()

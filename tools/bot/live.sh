@@ -13,6 +13,7 @@
 #      GWS_PORT       the test broker's port (default 8821; never 8787)
 #      GWS_STUB_PORT  the stub's (default 8822); GWS_AGENT_PORT gpui-agent's (default 17481)
 #      GWS_MAILS      how many fake mails (default 200)
+#      GWS_FILES      add a Drive folder of this many files
 #      GWS_HOSTILE=1  add the stub's hostile mail
 #      GWS_GRANT      the one scope the stub grants, as for an older sign-in
 #      GWS_NO_SIGN_IN=1  stop before sign-in, to see the setup guide
@@ -83,6 +84,7 @@ up() {
   # older brokers ignore BUWIZ_NO_KEYCHAIN, and an install replaces the owner's seed
   local hostile=(); [ -z "${GWS_HOSTILE:-}" ] || hostile=(--hostile)
   [ -z "${GWS_GRANT:-}" ] || hostile+=(--grant "$GWS_GRANT")
+  [ -z "${GWS_FILES:-}" ] || hostile+=(--files "$GWS_FILES")
   nohup "$stub" --port "$STUB_PORT" --mails "${GWS_MAILS:-200}" ${hostile[@]+"${hostile[@]}"} > "$INST/stub.log" 2>&1 & echo $! > "$INST/stub.pid"
   local model=(MOCK=1 ANTHROPIC_BASE_URL=http://127.0.0.1:1)
   if [ -n "${GWS_MODEL_PORT:-}" ]; then

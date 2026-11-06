@@ -28,9 +28,6 @@ const PANEL: &str = "bg-white dark:bg-[#1d1d1d]";
 const LINE: &str = "border-black/10 dark:border-[#2b2b2b]";
 const CHOSEN: &str = "bg-[#e1ebfb] dark:bg-[#15253f]";
 const DIM: &str = "text-[#8a8a8a] dark:text-[#6e6e6e]";
-/// The owner hasn't decided what a card shows without a click (G11). This is
-/// the one switch: `false` leaves senders and times only.
-const CARD_SUBJECTS: bool = true;
 const ROW_HEIGHT: f32 = 52.0;
 /// How often an open screen asks whether the store changed.
 const POLL: Duration = Duration::from_secs(15);
@@ -1492,13 +1489,11 @@ fn card(b: Bridge) -> View {
                                             )),
                                         ),
                                 )
-                                .child(if CARD_SUBJECTS {
+                                .child(
                                     text(subject)
                                         .number_of_lines(1)
-                                        .app_class(Some(format!("text-[12px] {MUTE}").into()))
-                                } else {
-                                    text(String::new())
-                                }),
+                                        .app_class(Some(format!("text-[12px] {MUTE}").into())),
+                                ),
                         )
                     });
                 if saved {

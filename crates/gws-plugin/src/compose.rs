@@ -902,6 +902,12 @@ impl Armed {
     }
 
     /// Spends the press, whatever comes of it: what it sends, if it's still good.
+    /// Whether any Send is pressed and not yet gone or taken back.
+    fn any(&mut self) -> bool {
+        self.presses.retain(|p| p.at.elapsed() < ARMED_FOR);
+        !self.presses.is_empty()
+    }
+
     fn take(&mut self, token: &str) -> Option<(String, String)> {
         self.presses.retain(|p| p.at.elapsed() < ARMED_FOR);
         let at = self.presses.iter().position(|p| p.token == token)?;
@@ -911,6 +917,11 @@ impl Armed {
 
 fn armed(core: &Core) -> MutexGuard<'_, Armed> {
     core.armed.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether a Send is in its hold.
+pub(crate) fn in_hold(core: &Core) -> bool {
+    armed(core).any()
 }
 
 /// `gws_mail_send_arm`: the person pressed Send. The model's call never gets

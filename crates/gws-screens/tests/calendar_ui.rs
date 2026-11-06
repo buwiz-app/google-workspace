@@ -2641,3 +2641,36 @@ fn a_new_event_starts_on_the_next_hour_today_and_at_nine_on_another_day() {
     assert_eq!(start, date(2026, 11, 7).and_hms_opt(0, 0, 0).unwrap());
     assert_eq!(end, date(2026, 11, 7).and_hms_opt(1, 0, 0).unwrap());
 }
+
+#[test]
+fn a_new_event_names_its_account() {
+    let (mut app, fake) = start();
+    *fake.status.lock().unwrap() = Some(
+        json!({"signed_in": true, "subject": "one@example.com", "features": {"mail": true, "calendar": true, "drive": false}}),
+    );
+    let asked = fake.called("gws_status").len();
+    let by = std::time::Instant::now() + Duration::from_secs(20);
+    while fake.called("gws_status").len() == asked {
+        assert!(std::time::Instant::now() < by, "the check comes round");
+        settle(&mut app);
+    }
+    settle(&mut app);
+    write_one(&mut app, "Board dinner");
+    press(&mut app, "label:Save this event");
+    assert_eq!(
+        last(&fake, "gws_event_save")["as_account"],
+        "one@example.com"
+    );
+}
+
+#[test]
+fn a_draft_card_saves_to_the_account_it_was_made_on() {
+    let mut draft = a_draft(1);
+    draft["as_account"] = json!("one@example.com");
+    let (mut app, fake) = draft_card(draft, 420.0);
+    press(&mut app, "label:Save this event");
+    assert_eq!(
+        last(&fake, "gws_event_save")["as_account"],
+        "one@example.com"
+    );
+}

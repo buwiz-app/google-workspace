@@ -4619,3 +4619,45 @@ fn nothing_a_press_would_send_can_be_reached() {
     assert!(reached.contains("Search Google Drive"), "{reached:?}");
     assert!(reached.contains("Share"), "{reached:?}");
 }
+
+/// `fake` says `who` is active, and the screen's next check has read it.
+fn active(app: &mut Headless, fake: &Fake, who: &str) {
+    *fake.status.lock().unwrap() = Some(
+        json!({"signed_in": true, "subject": who, "features": {"mail": true, "calendar": true, "drive": true}}),
+    );
+    let asked = fake.called("gws_status").len();
+    let by = std::time::Instant::now() + Duration::from_secs(20);
+    while fake.called("gws_status").len() == asked {
+        assert!(std::time::Instant::now() < by, "the check comes round");
+        settle(app);
+    }
+    settle(app);
+}
+
+#[test]
+fn a_new_folder_names_its_account_and_a_switch_starts_over_on_my_drive() {
+    let (mut app, fake) = start();
+    open(&mut app, "Clients");
+    active(&mut app, &fake, "one@example.com");
+    press(&mut app, "label:New folder");
+    app.type_text(
+        "label:Folder name, as it will show in Google Drive to others",
+        "Inner",
+    )
+    .unwrap();
+    app.submit("label:Folder name, as it will show in Google Drive to others")
+        .unwrap();
+    settle(&mut app);
+    assert_eq!(
+        last_of(&fake, "gws_drive_folder"),
+        json!({"parent": "clients", "name": "Inner", "as_account": "one@example.com"})
+    );
+    active(&mut app, &fake, "two@example.com");
+    let lists = fake.called("gws_drive_list");
+    let list = lists.last().unwrap();
+    assert_eq!(list["view"], "my");
+    assert!(
+        list["folder"].is_null(),
+        "that folder is the other account's"
+    );
+}

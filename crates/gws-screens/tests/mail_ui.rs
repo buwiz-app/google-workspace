@@ -63,6 +63,9 @@ fn thread(id: &str) -> Value {
 
 #[derive(Default)]
 struct Fake {
+    /// The active account and every label on the list. Empty is a plugin with
+    /// no list, as with one account from an older Bot.
+    accounts: Mutex<Vec<(String, bool)>>,
     /// What the sync says of itself.
     status: Mutex<String>,
     /// In place of the person's own labels.
@@ -129,6 +132,12 @@ impl Fake {
         self.hold.lock().unwrap().push(name.to_owned());
     }
 
+    fn switch_to(&self, label: &str) {
+        for row in self.accounts.lock().unwrap().iter_mut() {
+            row.1 = row.0 == label;
+        }
+    }
+
     /// Answers a held call, once it has come: the screen's thread may be behind.
     /// Calls after it go through: which save comes first is the autosave clock's.
     fn release(&self, name: &str) {
@@ -181,6 +190,22 @@ impl Host for Fake {
             .unwrap()
             .push((tool.to_owned(), args.clone()));
         let (name, answer) = match tool {
+            "gws_status" => {
+                let rows = self.accounts.lock().unwrap();
+                let who = rows.iter().find(|r| r.1).map(|r| r.0.clone());
+                (String::new(), json!({"signed_in": true, "subject": who}))
+            }
+            "gws_accounts" => {
+                let rows = self.accounts.lock().unwrap();
+                let view =
+                    |r: &(String, bool)| json!({"label": r.0, "address": r.0, "active": r.1});
+                let rows: Vec<Value> = rows.iter().map(view).collect();
+                (String::new(), json!({"accounts": rows}))
+            }
+            "gws_account_use" => {
+                self.switch_to(args["label"].as_str().unwrap());
+                (tool.to_owned(), json!({"switched": true}))
+            }
             "gws_mail_labels" => (
                 String::new(),
                 self.labels.lock().unwrap().clone().unwrap_or_else(
@@ -2275,4 +2300,106 @@ fn a_send_pressed_during_an_autosave_saves_after_it() {
     let saved = fake.called("gws_mail_draft_save");
     assert_eq!(saved.len(), 2, "{saved:?}");
     assert_eq!(saved[1]["armed"], "a1");
+}
+
+const ONE: &str = "one@example.com";
+const TWO: &str = "two@example.com";
+
+/// Mail on two accounts, with the first active and its address read.
+fn two_accounts() -> (Headless, Arc<Fake>) {
+    let (mut app, fake) = start();
+    *fake.accounts.lock().unwrap() = vec![(ONE.to_owned(), true), (TWO.to_owned(), false)];
+    app.wait_for_within(&format!("text:{ONE}"), Duration::from_secs(20))
+        .expect("the next check finds the list");
+    (app, fake)
+}
+
+#[test]
+fn one_account_has_nothing_to_choose() {
+    let (mut app, fake) = start();
+    *fake.accounts.lock().unwrap() = vec![(ONE.to_owned(), true)];
+    let by = std::time::Instant::now() + Duration::from_secs(20);
+    while fake.called("gws_accounts").len() < 2 && std::time::Instant::now() < by {
+        settle(&mut app);
+    }
+    assert!(fake.called("gws_accounts").len() >= 2, "it was asked");
+    assert!(!app.screen().matches("label:Switch account").unwrap());
+}
+
+#[test]
+fn pressing_another_account_switches_and_starts_over_on_its_inbox() {
+    let (mut app, fake) = two_accounts();
+    pick_label(&mut app, "Work");
+    settle(&mut app);
+    assert!(!app.screen().shows(TWO), "not until the row is pressed");
+    let before = fake.called("gws_mail_list").len();
+    app.press(&format!("text:{ONE}"))
+        .expect("the account row opens");
+    app.wait_for_within(&format!("text:{TWO}"), WAIT)
+        .expect("the other account shows");
+    app.press(&format!("text:{TWO}")).expect("it presses");
+    app.wait_for_gone(&format!("text:{ONE}"), WAIT)
+        .expect("the row names the new one");
+    assert_eq!(fake.called("gws_account_use"), vec![json!({"label": TWO})]);
+    settle(&mut app);
+    let lists = fake.called("gws_mail_list");
+    assert!(lists.len() > before, "the list is read again");
+    assert_eq!(lists.last().unwrap()["label"], "INBOX");
+}
+
+#[test]
+fn the_ai_can_neither_read_nor_press_an_account_row() {
+    let (mut app, _fake) = two_accounts();
+    let filter = Filter::watch(&mut app);
+    app.press(&format!("text:{ONE}"))
+        .expect("the account row opens");
+    app.wait_for_within(&format!("text:{TWO}"), WAIT)
+        .expect("the other account shows");
+    filter.assert_no_data_in_labels(&[ONE, TWO], "the account rows");
+    assert!(
+        !filter
+            .reachable()
+            .iter()
+            .any(|(_, name)| name == "Switch account"),
+        "the row's text isn't its label, so the Bot leaves it unnamed"
+    );
+}
+
+#[test]
+fn a_letter_names_its_account_and_a_switch_waits_for_it() {
+    let (mut app, fake) = two_accounts();
+    write_one(&mut app);
+    assert!(
+        !app.screen().matches("label:Switch account").unwrap(),
+        "a letter stays on its account"
+    );
+    app.press("label:Keep draft").expect("it keeps");
+    settle(&mut app);
+    let saves = fake.called("gws_mail_draft_save");
+    assert_eq!(saves.last().unwrap()["as_account"], ONE);
+    assert!(app.screen().matches("label:Switch account").unwrap());
+}
+
+#[test]
+fn a_switch_made_elsewhere_reaches_an_open_letter_as_nothing_but_its_account() {
+    let (mut app, fake) = two_accounts();
+    write_one(&mut app);
+    fake.switch_to(TWO);
+    let by = std::time::Instant::now() + Duration::from_secs(20);
+    let lists = fake.called("gws_mail_list").len();
+    while fake.called("gws_mail_list").len() == lists && std::time::Instant::now() < by {
+        settle(&mut app);
+    }
+    assert!(
+        fake.called("gws_mail_list").len() > lists,
+        "the list moved on"
+    );
+    app.press("label:Keep draft").expect("it keeps");
+    settle(&mut app);
+    let saves = fake.called("gws_mail_draft_save");
+    assert_eq!(
+        saves.last().unwrap()["as_account"],
+        ONE,
+        "the plugin refuses this one, so it can't land on the other account"
+    );
 }

@@ -531,6 +531,8 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
             "gws_search_mail",
             "gws_read_mail",
             "gws_status",
+            "gws_accounts",
+            "gws_account_use",
             "gws_mail_labels",
             "gws_mail_list",
             "gws_mail_thread",

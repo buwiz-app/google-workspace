@@ -580,11 +580,10 @@ fn calendar_rows(b: Bridge, m: Cal) -> impl IntoElement {
 /// New, the small month and the calendars.
 pub(super) fn side(b: Bridge, m: Cal) -> impl IntoElement {
     let days = b.clone();
+    let accounts = b.clone();
     let rows = b;
-    scroll()
-        .app_class(Some(
-            format!("w-[256px] h-full pt-2 border-r {LINE} {RAIL}").into(),
-        ))
+    let column = scroll()
+        .app_class(Some("flex-1 pt-2".into()))
         .child(
             view()
                 .app_class(Some("flex-row px-3 py-1".into()))
@@ -593,7 +592,18 @@ pub(super) fn side(b: Bridge, m: Cal) -> impl IntoElement {
                 })),
         )
         .child(small_month(days, m))
-        .child(calendar_rows(rows, m))
+        .child(calendar_rows(rows, m));
+    view()
+        .app_class(Some(
+            format!("w-[256px] h-full border-r {LINE} {RAIL}").into(),
+        ))
+        .child(column)
+        .child(crate::shell::chooser(
+            accounts,
+            m.chooser,
+            move |job| super::fetch(m, job),
+            move |b| super::switched(b, m),
+        ))
 }
 
 #[cfg(test)]

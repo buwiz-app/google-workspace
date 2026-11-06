@@ -31,8 +31,8 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::compose::press_text;
 use crate::shell::{
-    Account, BG, CHOSEN, DIM, INK, Job, LINE, Latest, MUTE, PANEL, POLL, RAIL, account_of, line_of,
-    read, sleep,
+    Account, BG, CHOSEN, Chooser, DIM, INK, Job, LINE, Latest, MUTE, PANEL, POLL, RAIL, account_of,
+    line_of, read, sleep,
 };
 use edits::{Said, load_edits};
 use file::{Crumb, Edit, Facts, Preview, Row, path_in, rows_in, storage_line};
@@ -81,6 +81,7 @@ enum FactsState {
 /// What the screen is showing right now.
 #[derive(Clone, Copy)]
 struct Drive {
+    chooser: Chooser,
     view: Signal<&'static str>,
     folder: Signal<Option<String>>,
     search: Signal<Option<Search>>,
@@ -353,8 +354,20 @@ async fn load_about(b: Bridge, m: Drive) {
     }
 }
 
+/// The account changed under this screen: what's on it is the old one's, down
+/// to the folder it's in.
+fn switched(b: &Bridge, m: Drive) {
+    m.undo.set(None);
+    m.seq.set(-1);
+    go_to(b, m, "my", None, Vec::new());
+    fetch(m, load_about(b.clone(), m));
+}
+
 async fn watch(b: Bridge, m: Drive) {
     loop {
+        if m.chooser.check(&b).await {
+            switched(&b, m);
+        }
         if let Ok(v) = read(&b, "gws_drive_changes", json!({})).await {
             m.status.set(
                 v.get("status")
@@ -677,6 +690,12 @@ fn side(b: Bridge, m: Drive) -> View {
     view()
         .app_class(Some(format!("w-[224px] border-r {LINE} {RAIL}").into()))
         .child(scroll().app_class(Some("flex-1".into())).child(list))
+        .child(crate::shell::chooser(
+            b,
+            m.chooser,
+            move |job| fetch(m, job),
+            move |b| switched(b, m),
+        ))
         .child(
             view()
                 .app_class(Some(format!("px-4 py-2 border-t {LINE}").into()))
@@ -942,6 +961,7 @@ pub fn build(bridge: Bridge) -> Root {
             .find(|(id, _)| Some(*id) == opened.as_deref())
             .map_or("my", |(id, _)| id);
         let m = Drive {
+            chooser: Chooser::new(),
             view: signal(start),
             folder: signal(prop("folder")),
             search: signal(prop("search").map(Search::Ticket)),

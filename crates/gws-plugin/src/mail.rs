@@ -3,7 +3,7 @@
 //! shows as old mail, not as a blank window. Google is asked only by the sync,
 //! by a search, and for a thread not yet opened.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -467,13 +467,34 @@ pub fn start(core: Arc<Core>) -> JoinHandle<()> {
     })
 }
 
+/// Writes down whose each label on the Bot's list is, and → those accounts: a
+/// listed account keeps its mail, though after a restart only the active one is
+/// pushed. A label off the list goes from the record too. With no list, as from
+/// an older Bot, nothing is written and nobody is kept by it.
+pub(crate) fn file_sign_ins(core: &Core, store: &Store) -> gws_store::Result<HashSet<String>> {
+    let Some(roster) = core.accounts.roster() else {
+        return Ok(HashSet::new());
+    };
+    let filed: HashMap<String, String> = store.sign_ins()?.into_iter().collect();
+    let rows: Vec<(String, String)> = roster
+        .into_iter()
+        .filter_map(|(listed, who)| {
+            let who = who.or_else(|| filed.get(&listed.label).cloned())?;
+            Some((listed.label, who))
+        })
+        .collect();
+    store.set_sign_ins(&rows)?;
+    Ok(rows.into_iter().map(|(_, who)| who).collect())
+}
+
 /// Clears every account in the store that no sign-in holds, whether or not
 /// this process ever saw it signed in. False if it couldn't, and then a marker
 /// on disk has the next sync try again, even after a restart.
 pub fn reconcile(core: &Core) -> bool {
     let cleared = with_store(core, |store| {
+        let listed = file_sign_ins(core, store)?;
         for account in store.accounts()? {
-            if !core.accounts.holds(&account) {
+            if !core.accounts.holds(&account) && !listed.contains(&account) {
                 crate::files::forget_account(core, store, &account)?;
                 store.forget_account(&account)?;
             }
@@ -503,7 +524,8 @@ pub fn reconcile(core: &Core) -> bool {
 /// couldn't, and then the marker has it cleared with the rest.
 pub(crate) fn forget(core: &Core, account: &str) -> bool {
     let cleared = with_store(core, |store| {
-        if !core.accounts.holds(account) {
+        let listed = file_sign_ins(core, store)?;
+        if !core.accounts.holds(account) && !listed.contains(account) {
             crate::files::forget_account(core, store, account)?;
             store.forget_account(account)?;
         }
@@ -1399,6 +1421,171 @@ mod tests {
             second.account("buwiz.account.clear", &out());
             pushes_stop(&second);
             assert_eq!(rows(&second), 0);
+        }
+
+        /// A push as the Bot sends one, with its list: `(label, active)`.
+        fn with_list(mut args: Value, list: &[(&str, bool)]) -> Value {
+            let rows: Vec<Value> = list
+                .iter()
+                .map(|(label, active)| json!({"account": "google", "label": label, "active": active}))
+                .collect();
+            args["accounts"] = json!(rows);
+            args
+        }
+
+        fn push_listed(core: &Core, who: &str, list: &[(&str, bool)]) {
+            let mut args = sign_in(who);
+            args["label"] = json!(who);
+            let said = core.account("buwiz.account.set", &with_list(args, list));
+            assert_eq!(said["structuredContent"], json!({"ok": true}), "{said}");
+        }
+
+        fn clear_listed(core: &Core, who: &str, list: &[(&str, bool)]) {
+            let args = json!({"account": "google", "label": who});
+            core.account("buwiz.account.clear", &with_list(args, list));
+        }
+
+        /// The Bot's switch from `from` to `to`: the old one cleared, the new
+        /// one pushed, both with the list as it is by then.
+        fn switch(core: &Core, from: &str, to: &str) {
+            let list = [(from, false), (to, true)];
+            clear_listed(core, from, &list);
+            push_listed(core, to, &list);
+        }
+
+        const A: &str = "a@example.com";
+        const B: &str = "b@example.com";
+
+        /// Both signed in and a on top, on a store holding both.
+        fn two_accounts(google: &FakeGoogle, tag: &str) -> (Core, gws_store::Paths) {
+            let paths = dir(tag);
+            left_with(&paths, &[A, B]);
+            let core = core(google, &paths);
+            core.clock.set(AT);
+            push_listed(&core, B, &[(A, true), (B, false)]);
+            switch(&core, B, A);
+            (core, paths)
+        }
+
+        fn answer(result: &Value) -> &Value {
+            &result["structuredContent"]
+        }
+
+        #[test]
+        fn a_switch_keeps_both_accounts_and_a_sign_out_still_takes_its_own() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (core, _) = two_accounts(&google, "two-switch");
+            switch(&core, A, B);
+            let _ = sync(&core);
+            pushes_stop(&core);
+            assert!(marked(&core, A), "a switch is no sign-out");
+            assert!(marked(&core, B));
+            assert_eq!(core.accounts.session().unwrap().1, B);
+            clear_listed(&core, A, &[(B, true)]);
+            assert!(!marked(&core, A), "off the list, so it's gone at once");
+            assert!(marked(&core, B));
+        }
+
+        #[test]
+        fn an_account_nobody_pushed_since_a_restart_is_still_kept_and_named() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (first, paths) = two_accounts(&google, "two-restart");
+            drop(first);
+            let second = core(&google, &paths);
+            second.clock.set(AT);
+            push_listed(&second, B, &[(A, false), (B, true)]);
+            let _ = sync(&second);
+            pushes_stop(&second);
+            assert!(marked(&second, A), "only the active one is pushed");
+            assert!(marked(&second, B));
+            let rows = second.run(crate::tools::ACCOUNTS, &json!({}));
+            assert_eq!(
+                answer(&rows)["accounts"],
+                json!([
+                    {"label": A, "address": A, "active": false},
+                    {"label": B, "address": B, "active": true},
+                ])
+            );
+        }
+
+        #[test]
+        fn a_label_off_the_list_after_a_restart_goes_with_its_record() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (first, paths) = two_accounts(&google, "two-off-list");
+            drop(first);
+            let second = core(&google, &paths);
+            second.clock.set(AT);
+            push_listed(&second, B, &[(B, true)]);
+            pushes_stop(&second);
+            assert!(!marked(&second, A));
+            assert!(marked(&second, B));
+            let filed = with_store(&second, |s| s.sign_ins()).unwrap();
+            assert_eq!(filed, vec![(B.to_owned(), B.to_owned())]);
+        }
+
+        #[test]
+        fn only_a_listed_other_account_asks_the_bot_to_switch() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (core, _) = two_accounts(&google, "two-use");
+            let ask = |label: &str| core.run(crate::tools::ACCOUNT_USE, &json!({"label": label}));
+            let asked = ask(B);
+            assert_eq!(
+                asked["_meta"],
+                json!({"buwiz/account_use": {"account": "google", "label": B}})
+            );
+            assert_eq!(core.accounts.session().unwrap().1, A, "the Bot switches");
+            let same = ask(A);
+            assert_eq!(same.get("_meta"), None);
+            assert_eq!(answer(&same)["switched"], false);
+            let nobody = ask("nobody");
+            assert_eq!(nobody.get("_meta"), None);
+            assert_eq!(answer(&nobody)["code"], "not_found");
+        }
+
+        #[test]
+        fn a_send_in_its_hold_keeps_the_account_until_it_goes() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (core, _) = two_accounts(&google, "two-hold");
+            let press = core.run(crate::tools::MAIL_SEND_ARM, &json!({}));
+            let ask = || core.run(crate::tools::ACCOUNT_USE, &json!({"label": B}));
+            let held = ask();
+            assert_eq!(held.get("_meta"), None);
+            assert_eq!(answer(&held)["code"], "busy");
+            let armed = answer(&press)["armed"].clone();
+            core.run(crate::tools::MAIL_SEND_DISARM, &json!({"armed": armed}));
+            assert!(ask().get("_meta").is_some(), "Undo frees it");
+        }
+
+        #[test]
+        fn a_write_for_the_account_before_a_switch_is_refused_before_google() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (core, _) = two_accounts(&google, "two-stale");
+            let save = |who: &str| {
+                let args = json!({"as_account": who, "to": "ana@example.com", "subject": "Hi", "body": "x"});
+                core.run(crate::tools::MAIL_DRAFT_SAVE, &args)
+            };
+            assert!(answer(&save(A)).get("draft").is_some(), "its own account");
+            switch(&core, A, B);
+            let refused = save(A);
+            assert_eq!(answer(&refused)["code"], "account_changed");
+            assert!(answer(&save(B)).get("draft").is_some());
+        }
+
+        #[test]
+        fn an_event_draft_stays_on_the_account_it_was_made_on() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (core, _) = two_accounts(&google, "two-event");
+            let args = json!({"title": "Lunch", "start": "2026-11-09T12:00:00+08:00", "end": "2026-11-09T13:00:00+08:00"});
+            let made = core.run(crate::tools::EVENT_DRAFT, &args);
+            let read = |ticket: &Value| {
+                core.run(crate::tools::EVENT_DRAFT_READ, &json!({"ticket": ticket}))
+            };
+            let ticket = answer(&made)["ticket"].clone();
+            assert_eq!(answer(&read(&ticket))["as_account"], A);
+            switch(&core, A, B);
+            assert_eq!(answer(&read(&ticket))["refused"], "not_found");
+            switch(&core, B, A);
+            assert_eq!(answer(&read(&ticket))["title"], "Lunch");
         }
 
         #[test]

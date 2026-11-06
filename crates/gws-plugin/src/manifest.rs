@@ -33,6 +33,8 @@ pub const APPS: [App; 3] = [
         description: "Your Google mail.",
         tools: &[
             tools::STATUS,
+            tools::ACCOUNTS,
+            tools::ACCOUNT_USE,
             tools::SEARCH_MAIL,
             tools::READ_MAIL,
             tools::MAIL_LABELS,
@@ -71,6 +73,8 @@ pub const APPS: [App; 3] = [
         description: "Your Google calendar.",
         tools: &[
             tools::STATUS,
+            tools::ACCOUNTS,
+            tools::ACCOUNT_USE,
             tools::CAL_LIST,
             tools::CAL_SHOW,
             tools::CAL_RANGE,
@@ -97,6 +101,8 @@ pub const APPS: [App; 3] = [
         description: "Your files in Google Drive.",
         tools: &[
             tools::STATUS,
+            tools::ACCOUNTS,
+            tools::ACCOUNT_USE,
             tools::DRIVE_LIST,
             tools::DRIVE_ABOUT,
             tools::DRIVE_CHANGES,

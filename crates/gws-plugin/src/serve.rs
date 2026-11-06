@@ -475,6 +475,11 @@ mod tests {
         );
         assert!(!audience_allows(tools::STATUS, Origin::Routine));
         assert!(audience_allows(tools::STATUS, Origin::App));
+        for tool in [tools::ACCOUNTS, tools::ACCOUNT_USE] {
+            assert!(!audience_allows(tool, Origin::Agent), "{tool}");
+            assert!(!audience_allows(tool, Origin::Routine), "{tool}");
+            assert!(audience_allows(tool, Origin::App), "{tool}");
+        }
         assert!(audience_allows(tools::RESOLVE, Origin::Resolve));
         assert!(
             !audience_allows(tools::STATUS, Origin::Resolve),

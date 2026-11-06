@@ -19,7 +19,8 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use crate::compose::{self, Compose};
 use crate::reader;
 use crate::shell::{
-    BG, CHOSEN, DIM, INK, Job, LINE, Latest, MUTE, PANEL, POLL, RAIL, link_bar, once, read, sleep,
+    BG, CHOSEN, Chooser, DIM, INK, Job, LINE, Latest, MUTE, PANEL, POLL, RAIL, link_bar, once,
+    read, sleep,
 };
 
 const ROW_HEIGHT: f32 = 52.0;
@@ -205,6 +206,7 @@ fn new_rows(have: &[Row], page: Vec<Row>) -> Vec<Row> {
 /// What the screen is showing right now.
 #[derive(Clone, Copy)]
 struct Mail {
+    chooser: Chooser,
     list_turn: Latest,
     open_turn: Latest,
     labels: Signal<Vec<LabelRow>>,
@@ -641,8 +643,37 @@ async fn show(b: Bridge, m: Mail, thread: String) {
     }
 }
 
+/// The account changed under this screen: what's on it is the old one's. A
+/// letter being written stays, on the account it was started on.
+fn switched(b: &Bridge, m: Mail) {
+    m.label.set("INBOX".to_owned());
+    m.query.set(String::new());
+    m.search.set(None);
+    m.chosen.set(None);
+    m.picked.set(Vec::new());
+    m.undo.set(None);
+    m.open_turn.ask();
+    m.page.set(None);
+    m.seq.set(-1);
+    b.spawn(load_list(b.clone(), m, 0));
+    b.spawn(load_labels(b.clone(), m));
+}
+
+/// [`Chooser::check`], and the account a new letter starts on.
+async fn check_account(b: &Bridge, m: Mail) {
+    let changed = m.chooser.check(b).await;
+    // one opened before the first answer is on the account that answer names
+    if !m.compose.open.get_untracked() || m.compose.who.with_untracked(String::is_empty) {
+        m.compose.who.set(m.chooser.who.get_untracked());
+    }
+    if changed {
+        switched(b, m);
+    }
+}
+
 async fn watch(b: Bridge, m: Mail) {
     loop {
+        check_account(&b, m).await;
         if let Ok(v) = read(
             &b,
             "gws_mail_changes",
@@ -677,6 +708,7 @@ fn press_class(on: bool) -> String {
 
 fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
     let writes = b.clone();
+    let chooses = b.clone();
     // the highlight is a binding on each row, not read here: a rebuild on the
     // chosen label would drop the pressed row, and the load it started with it
     let list = dynamic(move || {
@@ -713,10 +745,24 @@ fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
                 )
             })
     });
-    scroll()
-        .app_class(Some(
-            format!("w-[190px] pt-3 border-r {LINE} {RAIL}").into(),
+    let accounts = dynamic(move || {
+        // a letter stays on its account, so a switch waits for it to close
+        if m.compose.open.get() {
+            return view();
+        }
+        let b = chooses.clone();
+        view().child(crate::shell::chooser(
+            b,
+            m.chooser,
+            move |job| m.beside.with_untracked(|beside| drop(beside.send(job))),
+            move |b| {
+                m.compose.who.set(m.chooser.who.get_untracked());
+                switched(b, m);
+            },
         ))
+    });
+    let column = scroll()
+        .app_class(Some("flex-1 pt-3".into()))
         .child(
             view().app_class(Some("px-2 py-2".into())).child(
                 view()
@@ -731,7 +777,11 @@ fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
                     ),
             ),
         )
-        .child(list)
+        .child(list);
+    view()
+        .app_class(Some(format!("w-[190px] border-r {LINE} {RAIL}").into()))
+        .child(column)
+        .child(accounts)
 }
 
 /// One cell of the list. Cells are recycled, so every read goes through
@@ -1620,6 +1670,7 @@ pub fn build(bridge: Bridge) -> Root {
         let (beside, mut alongside) = unbounded_channel::<Job>();
         let (writer, writing) = Compose::new();
         let m = Mail {
+            chooser: Chooser::new(),
             compose: writer,
             problem: signal(None),
             told: signal(None),

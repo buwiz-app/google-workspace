@@ -22,7 +22,7 @@ use super::edits::{failed_line, press, press_as, say};
 use super::file::{Row, rows_in};
 use super::{Drive, close_details, fetch, mover, refused, reload, share, show_details, value};
 use crate::compose::{ATTACHMENTS_MAX, CHUNK, chunk};
-use crate::shell::{BG, INK, LINE, MUTE, RAIL};
+use crate::shell::{BG, INK, LINE, MUTE, RAIL, owned};
 
 /// The most rows one press takes, as the tool does.
 const TRASH_MAX: usize = 100;
@@ -233,6 +233,7 @@ fn commit(b: &Bridge, m: Drive) {
         }
         Some(Acting::NewFolder) => {
             let args = json!({"parent": open_parent(m), "name": name});
+            let args = owned(args, &m.chooser.who.get_untracked());
             let call = b.call("gws_drive_folder", args);
             answer_write(b, m, call, move |b, m, v| {
                 stop_opening(m, opening);
@@ -317,6 +318,8 @@ pub(super) struct Sending {
     key: u64,
     file: PickedFile,
     parent: String,
+    /// The account it was picked on: a switch mustn't send it to the other.
+    who: String,
     arrived: u64,
     why: Option<String>,
     /// The same file could still go.
@@ -408,6 +411,7 @@ async fn send(b: Bridge, m: Drive, key: u64) {
         Err(e) => return send_failed(m, key, failed_line(&e), true),
     };
     let args = json!({"upload": upload, "parent": item.parent});
+    let args = owned(args, &item.who);
     match b.call("gws_drive_upload", args).await {
         Ok(v) => match refused(&v) {
             Some(why) => send_failed(m, key, why, true),
@@ -453,6 +457,7 @@ fn pick(b: &Bridge, m: Drive) {
                     key,
                     file,
                     parent: parent.clone(),
+                    who: m.chooser.who.get_untracked(),
                     arrived: 0,
                     why: None,
                     again: false,

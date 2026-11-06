@@ -137,6 +137,9 @@ pub(super) fn save_now(b: &Bridge, m: Cal, scope: Option<&'static str>) {
     if let Some(scope) = scope {
         args["scope"] = scope.into();
     }
+    if args.get("as_account").is_none() {
+        args = crate::shell::owned(args, &m.chooser.who.get_untracked());
+    }
     e.saving.set(true);
     m.ask.set(None);
     m.told.set(None);

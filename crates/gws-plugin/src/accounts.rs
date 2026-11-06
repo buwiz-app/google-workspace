@@ -2,11 +2,19 @@
 //! shared with every tool's thread. The Bot pushes the access token with
 //! `buwiz.account.set` and takes it back with `buwiz.account.clear`. The
 //! token lives in memory only: never logged, written or echoed.
+//!
+//! A push from a Bot that has it also lists every signed-in label. One on that
+//! list is still the person's after a clear: that's a switch, not a sign-out, so
+//! its mail and its unsaved work stay. The Bot does the switching:
+//! `gws_account_use` only asks, in `_meta["buwiz/account_use"]`.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use serde_json::Value;
+use serde_json::{Value, json};
+
+use crate::tools::{ACCOUNT_USE, ACCOUNTS, fail, ok};
+use crate::{Core, compose, js, mail};
 
 /// The account the tools use (plugin.json's `buwiz.accounts[0].id`).
 pub const GOOGLE: &str = "google";
@@ -22,6 +30,99 @@ pub struct Accounts(Mutex<Held>);
 struct Held {
     tokens: buwiz_plugin::Accounts,
     who: BTreeMap<String, String>,
+    /// The Bot's list, as its last push had it. `None` from a Bot with no list.
+    listed: Option<Vec<Listed>>,
+}
+
+/// A signed-in label on the Bot's list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Listed {
+    pub label: String,
+    pub active: bool,
+}
+
+/// What a push's `accounts` say of the Google account.
+fn listed_in(args: &Value) -> Option<Vec<Listed>> {
+    let rows = args.get("accounts")?.as_array()?;
+    let google = rows
+        .iter()
+        .filter(|r| r.get("account").and_then(Value::as_str) == Some(GOOGLE));
+    Some(
+        google
+            .filter_map(|r| {
+                Some(Listed {
+                    label: r.get("label")?.as_str()?.to_owned(),
+                    active: r.get("active") == Some(&Value::Bool(true)),
+                })
+            })
+            .collect(),
+    )
+}
+
+impl Held {
+    fn lists(&self, label: &str) -> bool {
+        self.listed
+            .as_ref()
+            .is_some_and(|l| l.iter().any(|l| l.label == label))
+    }
+}
+
+/// `gws_accounts`: the labels to choose from. The addresses are for the person,
+/// so this tool, like `gws_status`, is never the model's.
+fn list(core: &Core) -> Value {
+    let filed: BTreeMap<String, String> = mail::with_store(core, |s| s.sign_ins())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let rows = core.accounts.roster().unwrap_or_default();
+    let view = |(l, who): (Listed, Option<String>)| {
+        let address = who.or_else(|| filed.get(&l.label).cloned());
+        json!({"label": l.label, "address": address, "active": l.active})
+    };
+    ok(json!({"accounts": rows.into_iter().map(view).collect::<Vec<_>>()}))
+}
+
+/// `gws_account_use`: asks the Bot to make a listed label the active one. It
+/// changes nothing here, and the Bot takes it only from the person's own press.
+fn use_one(core: &Core, args: &Value) -> Value {
+    let label = js::string_or_empty(args.get("label"));
+    let rows = core.accounts.roster().unwrap_or_default();
+    let Some((listed, _)) = rows.iter().find(|(l, _)| l.label == label) else {
+        return fail("not_found", "That account isn't signed in here.");
+    };
+    if listed.active {
+        return ok(json!({"switched": false}));
+    }
+    // a Send in its hold goes out on the account it was pressed on, or not at all
+    if compose::in_hold(core) {
+        return fail("busy", "A message is still sending. Try again in a moment.");
+    }
+    let mut answer = ok(json!({"switched": true}));
+    answer["_meta"] = json!({"buwiz/account_use": {"account": GOOGLE, "label": label}});
+    answer
+}
+
+/// Runs an account tool; `None` for any other tool.
+pub fn run(core: &Core, tool: &str, args: &Value) -> Option<Value> {
+    match tool {
+        ACCOUNTS => Some(list(core)),
+        ACCOUNT_USE => Some(use_one(core, args)),
+        _ => None,
+    }
+}
+
+/// The refusal of a write a screen made for an account that's no longer the
+/// active one: it would land on the wrong person's Google account. A write that
+/// names no account, and any with nobody signed in, goes on to its own answer.
+pub fn stale(core: &Core, args: &Value) -> Option<Value> {
+    let wanted = args.get("as_account").and_then(Value::as_str)?;
+    let (now, _) = core.accounts.signed_in()?;
+    (now != wanted).then(|| {
+        fail(
+            "account_changed",
+            "You switched Google accounts, so this wasn't saved. Switch back to save it.",
+        )
+    })
 }
 
 /// The `Authorization` value for a request.
@@ -64,15 +165,26 @@ impl Accounts {
             &mut held.tokens,
             args.as_object().unwrap_or(&serde_json::Map::new()),
         );
+        // a refused push says nothing about who is signed in
+        if result["isError"] != Value::Bool(true)
+            && let Some(listed) = listed_in(args)
+        {
+            held.listed = Some(listed);
+        }
         if let Some(label) = args.get("label").and_then(Value::as_str) {
             let now = held
                 .tokens
                 .labelled(GOOGLE, label)
                 .map(|a| a.subject.clone());
             match now {
-                Some(who) => held.who.insert(label.to_owned(), who),
-                None => held.who.remove(label),
-            };
+                Some(who) => {
+                    held.who.insert(label.to_owned(), who);
+                }
+                None if held.lists(label) => {}
+                None => {
+                    held.who.remove(label);
+                }
+            }
         }
         result
     }
@@ -82,6 +194,16 @@ impl Accounts {
         let mut held = self.held();
         held.tokens.forget();
         held.who.clear();
+        held.listed = None;
+    }
+
+    /// The Bot's list, each label with whose it is if this run has seen that.
+    /// `None` from a Bot with no list.
+    pub fn roster(&self) -> Option<Vec<(Listed, Option<String>)>> {
+        let held = self.held();
+        let listed = held.listed.as_ref()?;
+        let known = |l: &Listed| held.who.get(&l.label).cloned();
+        Some(listed.iter().map(|l| (l.clone(), known(l))).collect())
     }
 
     /// Whether any sign-in is `subject`'s, live or expired.

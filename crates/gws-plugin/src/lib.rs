@@ -146,7 +146,11 @@ impl Core {
 
     /// Runs one of the plugin's tools. `args` were checked as an object.
     pub fn run(&self, tool: &str, args: &Value) -> Value {
-        mail::run(self, tool, args)
+        if let Some(refused) = accounts::stale(self, args) {
+            return refused;
+        }
+        accounts::run(self, tool, args)
+            .or_else(|| mail::run(self, tool, args))
             .or_else(|| calendar::run(self, tool, args))
             .or_else(|| drive::run(self, tool, args))
             .or_else(|| drive::write::run(self, tool, args))
@@ -182,6 +186,9 @@ impl Core {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             self.sync
                 .wake_after(self.settle.pushed(self.clock.now_ms()));
+            // an unfiled sign-in is only found again on the next push: the store
+            // may not be open yet, and nothing below needs this to have worked
+            let _ = mail::with_store(self, |store| mail::file_sign_ins(self, store));
             if was.is_some_and(|who| !mail::forget(self, &who)) {
                 // the caller hears, and a later sync tries again
                 result["structuredContent"]["mail_kept"] = Value::Bool(true);

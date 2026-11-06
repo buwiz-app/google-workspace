@@ -182,6 +182,10 @@ enum Stage {
 #[derive(Clone, Copy)]
 pub struct Compose {
     pub open: Signal<bool>,
+    /// The account this letter is on. A draft that isn't found is written anew,
+    /// so with nothing to stop it a letter would follow a switch to the other
+    /// account. Empty until the screen knows.
+    pub who: Signal<String>,
     letter: Signal<Letter>,
     /// Cc and Bcc are showing.
     extra: Signal<bool>,
@@ -220,6 +224,7 @@ impl Compose {
         let (jobs, waiting) = unbounded_channel::<Job>();
         let c = Compose {
             open: signal(false),
+            who: signal(String::new()),
             letter: signal(Letter::default()),
             extra: signal(false),
             edits: signal(0),
@@ -358,8 +363,8 @@ async fn wait_for(b: &Bridge, job: &str) -> Result<Value, BuwizError> {
 
 /// One save. Only a message with files can outlast its call, so only that gets
 /// a job to ask after.
-async fn write(b: &Bridge, letter: &Letter, armed: &Value) -> Result<Value, BuwizError> {
-    let mut args = letter.args();
+async fn write(b: &Bridge, letter: &Letter, armed: &Value, who: &str) -> Result<Value, BuwizError> {
+    let mut args = crate::shell::owned(letter.args(), who);
     if !armed.is_null() {
         args["armed"] = armed.clone();
     }
@@ -392,7 +397,8 @@ fn refused(answer: &Result<Value, BuwizError>) -> Option<&str> {
 async fn save(b: &Bridge, c: Compose, armed: &Value) -> Result<bool, String> {
     let seen = c.edits.get_untracked();
     let mut letter = c.letter.get_untracked();
-    let mut answer = write(b, &letter, armed).await;
+    let who = c.who.get_untracked();
+    let mut answer = write(b, &letter, armed, &who).await;
     if refused(&answer) == Some("not_found") && letter.draft.is_some() {
         if letter.unsure {
             c.letter.update(|l| {
@@ -407,7 +413,7 @@ async fn save(b: &Bridge, c: Compose, armed: &Value) -> Result<bool, String> {
             );
         }
         letter.draft = None;
-        answer = write(b, &letter, armed).await;
+        answer = write(b, &letter, armed, &who).await;
     }
     if refused(&answer) == Some("already_sent") {
         c.close();
@@ -1230,12 +1236,15 @@ async fn read_card(
         .map_err(|e| e.message)?;
     c.fill(Letter::of(&v));
     let new = v.get("new").and_then(Value::as_array).into_iter().flatten();
+    let from = v
+        .get("from")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    // what the card says it's from, so it can't go from anyone else
+    c.who.set(from.clone());
     review.set(Some(Review {
-        from: v
-            .get("from")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
+        from,
         new: new.filter_map(|n| n.as_str().map(str::to_owned)).collect(),
     }));
     Ok(())

@@ -1,6 +1,6 @@
 //! The guard for a test run on a real account. Alone in this binary, as what
-//! it sets is the whole process's.
-#![cfg(feature = "stub")]
+//! it sets is the whole process's. No `stub` feature here: a real account means
+//! a build without it, so this has to pass in both.
 
 use gws::Core;
 use gws::apis::Apis;

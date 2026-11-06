@@ -2,7 +2,8 @@
 //! record: the next event and the two after it, and an event the AI drafted.
 
 use buwiz_app::Bridge;
-use chrono::Local;
+use chrono::{Local, TimeZone};
+use chrono_tz::Tz;
 use nsh_core::prelude::*;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::unbounded_channel;
@@ -108,12 +109,16 @@ pub(super) fn next(b: Bridge) -> View {
     }))
 }
 
-/// What Save would write, as moments read back: the same words as the event
-/// will have, or the fields as typed if they can't go yet.
-fn when_of(form: &Form, args: &Value) -> String {
+/// What Save would write, as moments read back on the clock of the zone beside
+/// them on the card, or the fields as typed if they can't go yet. `local` is
+/// for a form naming no zone, which Save reads on this Mac's clock.
+fn when_of<Z: TimeZone>(form: &Form, args: &Value, local: &Z) -> String {
     let text = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default();
     match When::of(text("start"), text("end"), form.all_day) {
-        Some(when) => time::when_line(&when, &Local),
+        Some(when) => match form.time_zone.trim().parse::<Tz>() {
+            Ok(zone) => time::when_line(&when, &zone),
+            Err(_) => time::when_line(&when, local),
+        },
         None => format!("{} {}", form.start_date, form.start_time),
     }
 }
@@ -126,7 +131,7 @@ fn review(form: &Form, calendars: &[Calendar]) -> View {
         .map_or_else(|| form.calendar.clone(), |c| c.name.clone());
     let lines = [
         ("Title", form.title.clone()),
-        ("When", when_of(form, &args)),
+        ("When", when_of(form, &args, &Local)),
         ("Zone", form.time_zone.clone()),
         ("Repeats", repeat_line(&form.repeat)),
         ("Guests", form.invites().join(", ")),
@@ -305,4 +310,53 @@ pub(super) fn decide(b: Bridge, ticket: String) -> View {
             }
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono_tz::America::New_York;
+    use chrono_tz::Asia::Manila;
+
+    use super::*;
+
+    fn nine_oclock(zone: &str) -> Form {
+        Form {
+            calendar: "mine".to_owned(),
+            start_date: "2026-11-10".to_owned(),
+            end_date: "2026-11-10".to_owned(),
+            start_time: "09:00".to_owned(),
+            end_time: "10:00".to_owned(),
+            time_zone: zone.to_owned(),
+            ..Form::default()
+        }
+    }
+
+    #[test]
+    fn the_card_reads_on_the_clock_of_the_zone_it_names_not_the_macs() {
+        let form = nine_oclock("America/New_York");
+        let args = form.save_args().unwrap();
+        assert_eq!(args["start"], "2026-11-10T09:00:00-05:00");
+        assert_eq!(
+            when_of(&form, &args, &Manila),
+            "Tue Nov 10, 09:00 - 10:00",
+            "this Mac is in Manila, where that's 22:00"
+        );
+    }
+
+    #[test]
+    fn a_form_naming_no_zone_reads_on_the_macs_clock_as_save_does() {
+        let form = nine_oclock("");
+        let args = form.args(&New_York).unwrap();
+        assert_eq!(
+            when_of(&form, &args, &Manila),
+            "Tue Nov 10, 22:00 - 23:00",
+            "the moment, on the clock it's shown on"
+        );
+    }
+
+    #[test]
+    fn a_form_that_cant_go_shows_what_was_typed() {
+        let form = nine_oclock("Not/AZone");
+        assert_eq!(when_of(&form, &Value::Null, &Manila), "2026-11-10 09:00");
+    }
 }

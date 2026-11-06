@@ -139,6 +139,8 @@ pub struct Guest {
     pub response: String,
     pub organizer: bool,
     pub me: bool,
+    /// A room: on the event, but nobody to invite.
+    pub room: bool,
 }
 
 impl Guest {
@@ -180,6 +182,7 @@ impl Detail {
                 response: text(a, "response"),
                 organizer: flag(a, "organizer"),
                 me: flag(a, "self"),
+                room: flag(a, "resource"),
             })
             .collect();
         Some(Detail {
@@ -328,7 +331,8 @@ impl Form {
     }
 
     pub fn of_detail<Z: TimeZone>(d: &Detail, zone: &Z) -> Form {
-        let (own, guests): (Vec<_>, Vec<_>) = d.attendees.iter().partition(|a| a.me);
+        let people = d.attendees.iter().filter(|a| !a.room);
+        let (own, guests): (Vec<_>, Vec<_>) = people.partition(|a| a.me);
         let address = |a: &&Guest| a.email.clone();
         let mut form = Form {
             event: Some(d.row.key()),
@@ -593,6 +597,27 @@ mod tests {
             "all_day": all_day, "etag": "x", "time_zone": "Asia/Manila",
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_room_is_no_chip_and_nobody_to_tell() {
+        let d = Detail::of(&json!({
+            "id": "e", "calendar": "mine", "title": "T", "all_day": false, "etag": "x",
+            "start": "2026-11-05T23:30:00Z", "end": "2026-11-06T00:30:00Z",
+            "attendees": [
+                {"email": "me@example.com", "self": true},
+                {"email": "ana@example.com"},
+                {"email": "room@example.com", "resource": true},
+            ],
+        }))
+        .unwrap();
+        let form = Form::of_detail(&d, &New_York);
+        assert_eq!(form.guests, ["ana@example.com"]);
+        assert_eq!(form.save_line(), "Save and update 1");
+        assert_eq!(
+            form.args(&New_York).unwrap()["guests"],
+            json!(["me@example.com", "ana@example.com"])
+        );
     }
 
     #[test]

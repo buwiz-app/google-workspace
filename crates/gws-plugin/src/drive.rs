@@ -1155,7 +1155,7 @@ fn resolve_file(core: &Core, args: &Value) -> Value {
         let mut tickets = core.tickets.lock().unwrap_or_else(|e| e.into_inner());
         let choices: Vec<Value> = found
             .iter()
-            .map(|f| json!({"label": f.name, "value": tickets.issue(&Subject::DriveSearch(f.name.clone()))}))
+            .map(|f| json!({"label": "Drive file", "detail": f.name, "value": tickets.issue(&Subject::DriveSearch(f.name.clone()))}))
             .collect();
         return ok(json!({"result": "choices", "choices": choices}));
     }

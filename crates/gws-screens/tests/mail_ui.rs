@@ -107,6 +107,8 @@ struct Fake {
     /// Draft saves refused with this, as an answer: a tool's failure has no code
     /// by the time it reaches a screen.
     save_refused: Mutex<Option<String>>,
+    /// The plugin asks for a switch and the Bot can't make it.
+    switch_fails: Mutex<bool>,
     save_timeout: Mutex<bool>,
     /// What a save says it now holds as uploads.
     kept: Mutex<Value>,
@@ -202,6 +204,10 @@ impl Host for Fake {
                 let rows: Vec<Value> = rows.iter().map(view).collect();
                 (String::new(), json!({"accounts": rows}))
             }
+            "gws_account_use" if *self.switch_fails.lock().unwrap() => (
+                tool.to_owned(),
+                json!({"switched": true, "account_use": {"code": "needs_signin", "message": "Buwiz Bot couldn't switch to that account."}}),
+            ),
             "gws_account_use" => {
                 self.switch_to(args["label"].as_str().unwrap());
                 (tool.to_owned(), json!({"switched": true}))
@@ -2397,6 +2403,20 @@ fn the_ai_can_neither_read_nor_press_an_account_row() {
             .any(|(_, name)| name == "Switch account"),
         "the row's text isn't its label, so the Bot leaves it unnamed"
     );
+}
+
+#[test]
+fn a_switch_the_bot_could_not_make_says_so_and_stays_where_it_was() {
+    let (mut app, fake) = two_accounts();
+    *fake.switch_fails.lock().unwrap() = true;
+    app.press(&format!("text:{ONE}"))
+        .expect("the account row opens");
+    app.wait_for_within(&format!("text:{TWO}"), WAIT)
+        .expect("the other account shows");
+    app.press(&format!("text:{TWO}")).expect("it presses");
+    app.wait_for_within("text:Buwiz Bot couldn't switch to that account.", WAIT)
+        .expect("it says so");
+    assert!(app.screen().shows(ONE), "still this one");
 }
 
 #[test]

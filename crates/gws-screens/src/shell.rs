@@ -297,7 +297,13 @@ pub(crate) fn chooser(
                     run(Box::pin(async move {
                         let answer = call.await;
                         c.busy.set(false);
+                        // the plugin asked and the Bot couldn't: that's an answer too
+                        let failed = |v: &Value| {
+                            let why = v.pointer("/account_use/message")?.as_str()?;
+                            Some(why.to_owned())
+                        };
                         match answer {
+                            Ok(v) if failed(&v).is_some() => c.said.set(failed(&v)),
                             Ok(_) => {
                                 c.open.set(false);
                                 if c.check(&b).await {

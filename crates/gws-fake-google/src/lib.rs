@@ -468,6 +468,8 @@ struct Account {
     /// History ids below this are gone, as an old one is at Google.
     oldest_history: i64,
     token_count: u64,
+    /// Who the next sign-ins are, in place of [`FAKE_EMAIL`].
+    signs_in: Option<String>,
     granted: String,
     only_grants: Option<String>,
     log: Vec<Seen>,
@@ -1174,7 +1176,8 @@ impl Account {
                 .find_map(|p| p.strip_prefix(&format!("{k}=")).map(decode))
         };
         self.token_count += 1;
-        let claims = b64(json!({"email": FAKE_EMAIL, "sub": "1000"})
+        let email = self.signs_in.as_deref().unwrap_or(FAKE_EMAIL);
+        let claims = b64(json!({"email": email, "sub": "1000"})
             .to_string()
             .as_bytes());
         let scope = self.only_grants.clone().unwrap_or_else(|| {
@@ -1212,7 +1215,15 @@ impl Account {
 
     fn handle(&mut self, r: Request) -> Reply {
         let path = r.path().to_owned();
-        if !["/__log", "/__writes", "/__calendar", "/__drive"].contains(&path.as_str()) {
+        if ![
+            "/__log",
+            "/__writes",
+            "/__calendar",
+            "/__drive",
+            "/__signin",
+        ]
+        .contains(&path.as_str())
+        {
             self.log.push(Seen {
                 method: r.method.clone(),
                 target: r.target.clone(),
@@ -1227,6 +1238,11 @@ impl Account {
                 .map(|s| json!({"method": s.method, "target": s.target, "body": s.body}))
                 .collect();
             return Reply::json(200, json!({"log": log}));
+        }
+        // a live run's way to sign in a second account: `?email=<address>`
+        if path == "/__signin" {
+            self.signs_in = r.param("email");
+            return Reply::json(200, json!({"email": self.signs_in}));
         }
         // a live run's way to make writes fail: `?left=<n>`, or no value for none
         if path == "/__writes" {

@@ -538,6 +538,7 @@ mod tests {
             .conn()
             .execute_batch(
                 "INSERT INTO bodies(account, thread, view, size, used) VALUES('a', 't', '{}', 2, 1);
+                 DROP TABLE sign_ins;
                  ALTER TABLE drive_files DROP COLUMN can;
                  PRAGMA user_version = 6;",
             )

@@ -821,6 +821,21 @@ fn a_send_that_never_reached_the_draft_still_spends_its_press() {
     assert_ne!(again["isError"], true, "the AI has it back: {again}");
 }
 
+/// The panel's press knows only the draft until its own save comes back.
+#[test]
+fn a_newer_press_stops_the_older_one_before_its_own_save() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "newest");
+    let (shown, older) = armed_card(&core);
+    data(core.run("gws_mail_send_arm", &json!({"draft": shown["draft"]})));
+    let refused = core.run("gws_mail_send", &send_args(&shown, &older));
+    assert_eq!(
+        refused["structuredContent"]["refused"], "not_allowed",
+        "{refused}"
+    );
+    assert_eq!(google.sent(), []);
+}
+
 #[test]
 fn a_newer_press_on_a_draft_replaces_the_one_before() {
     let google = FakeGoogle::start(Seed::demo(2));

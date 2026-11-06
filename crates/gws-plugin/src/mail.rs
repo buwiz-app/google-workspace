@@ -1561,6 +1561,15 @@ mod tests {
         }
 
         #[test]
+        fn a_clear_whose_list_is_null_has_no_list() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (core, _) = two_accounts(&google, "two-null-list");
+            let out = json!({"account": "google", "label": B, "accounts": null});
+            core.account("buwiz.account.clear", &out);
+            assert!(!marked(&core, B), "gone at once");
+        }
+
+        #[test]
         fn only_a_listed_other_account_asks_the_bot_to_switch() {
             let google = FakeGoogle::start(Seed::demo(1));
             let (core, _) = two_accounts(&google, "two-use");

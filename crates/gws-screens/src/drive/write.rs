@@ -459,7 +459,10 @@ fn pick(b: &Bridge, m: Drive) {
                     key,
                     file,
                     parent: parent.clone(),
-                    who: who.clone(),
+                    // none yet is the first check not back: it's whoever that says
+                    who: Some(who.clone())
+                        .filter(|who| !who.is_empty())
+                        .unwrap_or_else(|| m.chooser.who.get_untracked()),
                     arrived: 0,
                     why: None,
                     again: false,

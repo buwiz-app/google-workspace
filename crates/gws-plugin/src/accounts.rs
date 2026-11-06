@@ -182,7 +182,7 @@ impl Accounts {
                 }
                 // only this push's own list makes a clear a switch: an old one
                 // can't say this label is still signed in
-                None if args.get("accounts").is_some() && held.lists(label) => {}
+                None if listed_in(args).is_some() && held.lists(label) => {}
                 None => {
                     held.who.remove(label);
                     if let Some(listed) = &mut held.listed {

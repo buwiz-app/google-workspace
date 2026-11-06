@@ -1606,6 +1606,19 @@ fn a_question_about_someone_new_gives_the_press_back_while_it_asks() {
     );
 }
 
+/// Its press stops any older one on that draft before its own save comes back.
+#[test]
+fn a_send_of_a_saved_letter_names_its_draft_as_it_arms() {
+    let (mut app, fake) = start();
+    write_one(&mut app);
+    app.wait(PAST_AN_AUTOSAVE).expect("time passes");
+    settle(&mut app);
+    assert!(!fake.called("gws_mail_draft_save").is_empty(), "it's saved");
+    app.press("label:Send").expect("Send presses");
+    settle(&mut app);
+    assert_eq!(fake.called("gws_mail_send_arm")[0]["draft"], "d1");
+}
+
 #[test]
 fn a_change_after_the_question_asks_again() {
     let (mut app, fake) = start();

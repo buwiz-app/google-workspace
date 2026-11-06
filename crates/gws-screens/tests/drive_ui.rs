@@ -4650,6 +4650,47 @@ fn an_upload_stays_the_account_its_picker_opened_on() {
     assert_eq!(upload["parent"], "clients");
 }
 
+/// The name was for a folder on the other account: Enter can't land it here.
+#[test]
+fn a_switch_closes_a_new_folder_being_named() {
+    let (mut app, fake) = start();
+    open(&mut app, "Clients");
+    active(&mut app, &fake, "one@example.com");
+    press(&mut app, "label:New folder");
+    let name = "label:Folder name, as it will show in Google Drive to others";
+    app.type_text(name, "Inner").unwrap();
+    active(&mut app, &fake, "two@example.com");
+    assert!(!app.screen().matches(name).unwrap(), "the box went");
+    assert!(
+        app.submit(name).is_err(),
+        "there's nothing to press Enter in"
+    );
+    settle(&mut app);
+    assert!(fake.called("gws_drive_folder").is_empty());
+}
+
+/// The picker opened before the first check had said who's signed in.
+#[test]
+fn an_upload_opened_before_the_account_was_known_takes_the_first_it_hears_of() {
+    let (mut app, fake) = start();
+    open(&mut app, "Clients");
+    *fake.picks.lock().unwrap() = vec![("Quote.txt".to_owned(), b"fake quote".to_vec())];
+    *fake.picker_stays.lock().unwrap() = true;
+    press(&mut app, "label:Upload a file to Google Drive");
+    settle(&mut app);
+    active(&mut app, &fake, "one@example.com");
+    let chosen = fake.open_picker.lock().unwrap().take().expect("it's open");
+    *fake.picker_stays.lock().unwrap() = false;
+    chosen(Ok(
+        json!([{"id": "0", "name": "Quote.txt", "size": 10, "type": "text/plain"}]),
+    ));
+    settle(&mut app);
+    assert_eq!(
+        last_of(&fake, "gws_drive_upload")["as_account"],
+        "one@example.com"
+    );
+}
+
 /// `fake` says `who` is active, and the screen's next check has read it.
 fn active(app: &mut Headless, fake: &Fake, who: &str) {
     *fake.status.lock().unwrap() = Some(

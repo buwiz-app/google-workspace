@@ -13,6 +13,10 @@ use nsh_engine::EngineConfig;
 use nsh_testing::Headless;
 use serde_json::{Map, Value, json};
 
+mod bot_filter;
+
+use bot_filter::Filter;
+
 /// Room for a slow machine, and for Send's five seconds on one, which are fifty
 /// ticks that each run late there. It ends on what's looked for, so it costs a
 /// passing test nothing.
@@ -59,6 +63,19 @@ fn thread(id: &str) -> Value {
 
 #[derive(Default)]
 struct Fake {
+    /// The active account and every label on the list. Empty is a plugin with
+    /// no list, as with one account from an older Bot.
+    accounts: Mutex<Vec<(String, bool)>>,
+    /// What the sync says of itself.
+    status: Mutex<String>,
+    /// In place of the person's own labels.
+    labels: Mutex<Option<Value>>,
+    /// A search finds nothing.
+    no_match: Mutex<bool>,
+    /// What a mail card reads.
+    card: Mutex<Value>,
+    /// Google's sign-in went: lists fail as the plugin says so.
+    signed_out: Mutex<bool>,
     /// In place of an attachment opening.
     attachment_answer: Mutex<Option<Value>>,
     /// What the screen opens with, and where: a card is `inline`.
@@ -90,6 +107,8 @@ struct Fake {
     /// Draft saves refused with this, as an answer: a tool's failure has no code
     /// by the time it reaches a screen.
     save_refused: Mutex<Option<String>>,
+    /// The plugin asks for a switch and the Bot can't make it.
+    switch_fails: Mutex<bool>,
     save_timeout: Mutex<bool>,
     /// What a save says it now holds as uploads.
     kept: Mutex<Value>,
@@ -113,6 +132,12 @@ impl Fake {
 
     fn hold(&self, name: &str) {
         self.hold.lock().unwrap().push(name.to_owned());
+    }
+
+    fn switch_to(&self, label: &str) {
+        for row in self.accounts.lock().unwrap().iter_mut() {
+            row.1 = row.0 == label;
+        }
     }
 
     /// Answers a held call, once it has come: the screen's thread may be behind.
@@ -167,17 +192,51 @@ impl Host for Fake {
             .unwrap()
             .push((tool.to_owned(), args.clone()));
         let (name, answer) = match tool {
+            "gws_status" => {
+                let rows = self.accounts.lock().unwrap();
+                let who = rows.iter().find(|r| r.1).map(|r| r.0.clone());
+                (String::new(), json!({"signed_in": true, "subject": who}))
+            }
+            "gws_accounts" => {
+                let rows = self.accounts.lock().unwrap();
+                let view =
+                    |r: &(String, bool)| json!({"label": r.0, "address": r.0, "active": r.1});
+                let rows: Vec<Value> = rows.iter().map(view).collect();
+                (String::new(), json!({"accounts": rows}))
+            }
+            "gws_account_use" if *self.switch_fails.lock().unwrap() => (
+                tool.to_owned(),
+                json!({"switched": true, "account_use": {"code": "needs_signin", "message": "Buwiz Bot couldn't switch to that account."}}),
+            ),
+            "gws_account_use" => {
+                self.switch_to(args["label"].as_str().unwrap());
+                (tool.to_owned(), json!({"switched": true}))
+            }
             "gws_mail_labels" => (
                 String::new(),
-                json!({"labels": [{"id": "Label_1", "name": "Work", "kind": "user"}]}),
+                self.labels.lock().unwrap().clone().unwrap_or_else(
+                    || json!({"labels": [{"id": "Label_1", "name": "Work", "kind": "user"}]}),
+                ),
             ),
             "gws_mail_changes" => {
                 let changed = std::mem::take(&mut *self.changed.lock().unwrap());
                 (
                     String::new(),
-                    json!({"status": "", "seq": 0, "changed": changed}),
+                    json!({"status": *self.status.lock().unwrap(), "seq": 0, "changed": changed}),
                 )
             }
+            "gws_mail_list" if *self.signed_out.lock().unwrap() => {
+                return done(Err(BuwizError::new(
+                    "tool_error",
+                    false,
+                    "Sign in to Google first.",
+                )));
+            }
+            "gws_mail_list" if args["query"].is_string() && *self.no_match.lock().unwrap() => (
+                String::new(),
+                json!({"threads": [], "more": false, "saved": false}),
+            ),
+            "gws_mail_card" => (String::new(), self.card.lock().unwrap().clone()),
             "gws_mail_list" => {
                 let mut answer = list(args);
                 let gone = self.gone.lock().unwrap();
@@ -966,12 +1025,18 @@ fn write_one(app: &mut Headless) {
     app.press("label:Write a message")
         .expect("the rail offers it");
     settle(app);
-    app.type_text("label:To", "ana@example.com")
+    app.type_text("label:To, like name@company.com", "ana@example.com")
         .expect("To takes text");
-    app.type_text("label:Subject", "Lunch")
-        .expect("Subject takes text");
-    app.type_text("label:Message", "Noon?")
-        .expect("Message takes text");
+    app.type_text(
+        "label:Subject, the line people see first in their inbox",
+        "Lunch",
+    )
+    .expect("Subject takes text");
+    app.type_text(
+        "label:Message, the words of this mail as they will be sent",
+        "Noon?",
+    )
+    .expect("Message takes text");
 }
 
 fn wait_for_send(app: &mut Headless, fake: &Fake) {
@@ -1011,7 +1076,9 @@ fn send_saves_what_was_written_holds_five_seconds_and_sends_that() {
     app.wait_for_within("text:Message sent.", WAIT)
         .expect("the bar says so");
     assert!(
-        !app.screen().matches("label:Message").unwrap(),
+        !app.screen()
+            .matches("label:Message, the words of this mail as they will be sent")
+            .unwrap(),
         "the panel's gone"
     );
 }
@@ -1024,16 +1091,25 @@ fn undo_inside_the_hold_sends_nothing_and_brings_the_message_back() {
     app.wait_for_within("label:Take this back", WAIT)
         .expect("the bar offers it");
     app.press("label:Take this back").expect("Undo presses");
-    app.wait_for_within("label:Message", WAIT)
-        .expect("the panel's back");
+    app.wait_for_within(
+        "label:Message, the words of this mail as they will be sent",
+        WAIT,
+    )
+    .expect("the panel's back");
     app.wait(Duration::from_secs(6)).expect("time passes");
     assert!(fake.called("gws_mail_send").is_empty(), "nothing went");
     assert_eq!(
-        app.screen().input_text("label:To").unwrap().unwrap(),
+        app.screen()
+            .input_text("label:To, like name@company.com")
+            .unwrap()
+            .unwrap(),
         "ana@example.com"
     );
     assert_eq!(
-        app.screen().input_text("label:Message").unwrap().unwrap(),
+        app.screen()
+            .input_text("label:Message, the words of this mail as they will be sent")
+            .unwrap()
+            .unwrap(),
         "Noon?"
     );
 }
@@ -1050,7 +1126,9 @@ fn a_press_refused_at_send_is_never_held_and_nothing_goes() {
     app.wait(Duration::from_secs(6)).expect("time passes");
     assert!(fake.called("gws_mail_send").is_empty());
     assert!(
-        app.screen().matches("label:Message").unwrap(),
+        app.screen()
+            .matches("label:Message, the words of this mail as they will be sent")
+            .unwrap(),
         "it stays to be read"
     );
 }
@@ -1073,8 +1151,11 @@ fn send_with_nobody_to_send_to_says_so() {
     app.press("label:Write a message")
         .expect("the rail offers it");
     settle(&mut app);
-    app.type_text("label:Message", "Hello")
-        .expect("Message takes text");
+    app.type_text(
+        "label:Message, the words of this mail as they will be sent",
+        "Hello",
+    )
+    .expect("Message takes text");
     app.press("label:Send").expect("Send presses");
     settle(&mut app);
     assert!(app.screen().shows("Add someone to send this to."));
@@ -1088,14 +1169,23 @@ fn a_reply_starts_from_the_conversation_and_stays_in_it() {
     settle(&mut app);
     app.press("label:Reply to this")
         .expect("the toolbar offers it");
-    app.wait_for_within("label:Message", WAIT)
-        .expect("the panel opens");
+    app.wait_for_within(
+        "label:Message, the words of this mail as they will be sent",
+        WAIT,
+    )
+    .expect("the panel opens");
     assert_eq!(
-        app.screen().input_text("label:To").unwrap().unwrap(),
+        app.screen()
+            .input_text("label:To, like name@company.com")
+            .unwrap()
+            .unwrap(),
         "ana@example.com"
     );
     assert_eq!(
-        app.screen().input_text("label:Subject").unwrap().unwrap(),
+        app.screen()
+            .input_text("label:Subject, the line people see first in their inbox")
+            .unwrap()
+            .unwrap(),
         "Re: Lunch"
     );
     app.press("label:Send").expect("Send presses");
@@ -1123,8 +1213,11 @@ fn keep_draft_saves_and_delete_asks_first() {
     let (mut app, fake) = start();
     write_one(&mut app);
     app.press("label:Keep draft").expect("it presses");
-    app.wait_for_gone("label:Message", WAIT)
-        .expect("the panel closes");
+    app.wait_for_gone(
+        "label:Message, the words of this mail as they will be sent",
+        WAIT,
+    )
+    .expect("the panel closes");
     assert!(!fake.called("gws_mail_draft_save").is_empty());
 
     write_one(&mut app);
@@ -1134,8 +1227,11 @@ fn keep_draft_saves_and_delete_asks_first() {
     app.press("label:Keep writing").expect("it presses");
     settle(&mut app);
     app.press("label:Keep draft").expect("it presses");
-    app.wait_for_gone("label:Message", WAIT)
-        .expect("the panel closes");
+    app.wait_for_gone(
+        "label:Message, the words of this mail as they will be sent",
+        WAIT,
+    )
+    .expect("the panel closes");
     assert!(fake.called("gws_mail_draft_delete").is_empty());
 }
 
@@ -1147,18 +1243,30 @@ fn a_row_in_drafts_goes_on_from_the_draft_with_its_files() {
     let n = *shown(&app).first().expect("rows show");
     app.press(&format!("text:Subject {n}"))
         .expect("the row presses");
-    app.wait_for_within("label:Message", WAIT)
-        .expect("the panel opens");
+    app.wait_for_within(
+        "label:Message, the words of this mail as they will be sent",
+        WAIT,
+    )
+    .expect("the panel opens");
     assert_eq!(
-        app.screen().input_text("label:Message").unwrap().unwrap(),
+        app.screen()
+            .input_text("label:Message, the words of this mail as they will be sent")
+            .unwrap()
+            .unwrap(),
         "Half written"
     );
     assert!(app.screen().shows("a.pdf"));
-    app.type_text("label:Message", " and more")
-        .expect("Message takes text");
+    app.type_text(
+        "label:Message, the words of this mail as they will be sent",
+        " and more",
+    )
+    .expect("Message takes text");
     app.press("label:Keep draft").expect("it presses");
-    app.wait_for_gone("label:Message", WAIT)
-        .expect("the panel closes");
+    app.wait_for_gone(
+        "label:Message, the words of this mail as they will be sent",
+        WAIT,
+    )
+    .expect("the panel closes");
     let saved = fake.called("gws_mail_draft_save");
     let last = saved.last().expect("a save");
     assert_eq!(last["draft"], "d9");
@@ -1172,7 +1280,7 @@ fn a_suggestion_finishes_the_address_being_typed_and_keeps_the_rest() {
     app.press("label:Write a message")
         .expect("the rail offers it");
     settle(&mut app);
-    app.type_text("label:To", "ben@example.com, an")
+    app.type_text("label:To, like name@company.com", "ben@example.com, an")
         .expect("To takes text");
     app.wait_for_within("label:Use this address", WAIT)
         .expect("it suggests");
@@ -1185,7 +1293,10 @@ fn a_suggestion_finishes_the_address_being_typed_and_keeps_the_rest() {
     app.press("label:Use this address").expect("it presses");
     settle(&mut app);
     assert_eq!(
-        app.screen().input_text("label:To").unwrap().unwrap(),
+        app.screen()
+            .input_text("label:To, like name@company.com")
+            .unwrap()
+            .unwrap(),
         "ben@example.com, ana@example.com, "
     );
     assert!(!app.screen().matches("label:Use this address").unwrap());
@@ -1414,16 +1525,25 @@ fn what_is_typed_after_send_is_pressed_is_not_shown_as_sent() {
     fake.hold("gws_mail_draft_save");
     app.press("label:Send").expect("Send presses");
     settle(&mut app);
-    let _ = app.type_text("label:Message", " and more");
+    let _ = app.type_text(
+        "label:Message, the words of this mail as they will be sent",
+        " and more",
+    );
     settle(&mut app);
     fake.release("gws_mail_draft_save");
     app.wait_for_within("label:Take this back", WAIT)
         .expect("the hold shows");
     app.press("label:Take this back").expect("Undo presses");
-    app.wait_for_within("label:Message", WAIT)
-        .expect("the panel's back");
+    app.wait_for_within(
+        "label:Message, the words of this mail as they will be sent",
+        WAIT,
+    )
+    .expect("the panel's back");
     assert_eq!(
-        app.screen().input_text("label:Message").unwrap().unwrap(),
+        app.screen()
+            .input_text("label:Message, the words of this mail as they will be sent")
+            .unwrap()
+            .unwrap(),
         "Noon?",
         "what's held is what went to the draft"
     );
@@ -1452,6 +1572,53 @@ fn someone_new_on_a_send_from_the_panel_takes_a_second_press() {
     );
 }
 
+/// While a press stands the AI is off the draft and no account can be switched
+/// to: not even the way back the refusal names.
+#[test]
+fn a_send_refused_at_its_save_gives_its_press_back() {
+    let (mut app, fake) = start();
+    write_one(&mut app);
+    *fake.save_refused.lock().unwrap() = Some("account_changed".to_owned());
+    app.press("label:Send").expect("Send presses");
+    settle(&mut app);
+    assert_eq!(
+        fake.called("gws_mail_send_disarm"),
+        [json!({"armed": "a1"})]
+    );
+}
+
+#[test]
+fn a_question_about_someone_new_gives_the_press_back_while_it_asks() {
+    let (mut app, fake) = start();
+    write_one(&mut app);
+    *fake.draft.lock().unwrap() = Some(draft(
+        "eve@example.com",
+        Value::Null,
+        json!(["eve@example.com"]),
+    ));
+    app.press("label:Send").expect("Send presses");
+    app.wait_for_within("text:New to you: eve@example.com. Send it?", WAIT)
+        .expect("it asks");
+    settle(&mut app);
+    assert_eq!(
+        fake.called("gws_mail_send_disarm"),
+        [json!({"armed": "a1"})]
+    );
+}
+
+/// Its press stops any older one on that draft before its own save comes back.
+#[test]
+fn a_send_of_a_saved_letter_names_its_draft_as_it_arms() {
+    let (mut app, fake) = start();
+    write_one(&mut app);
+    app.wait(PAST_AN_AUTOSAVE).expect("time passes");
+    settle(&mut app);
+    assert!(!fake.called("gws_mail_draft_save").is_empty(), "it's saved");
+    app.press("label:Send").expect("Send presses");
+    settle(&mut app);
+    assert_eq!(fake.called("gws_mail_send_arm")[0]["draft"], "d1");
+}
+
 #[test]
 fn a_change_after_the_question_asks_again() {
     let (mut app, fake) = start();
@@ -1463,7 +1630,7 @@ fn a_change_after_the_question_asks_again() {
     ));
     app.press("label:Send").expect("Send presses");
     app.wait_for_within("label:Send it", WAIT).expect("it asks");
-    app.type_text("label:To", ", mallory@example.com")
+    app.type_text("label:To, like name@company.com", ", mallory@example.com")
         .expect("To takes text");
     settle(&mut app);
     assert!(!app.screen().matches("label:Send it").unwrap());
@@ -1488,8 +1655,11 @@ fn open_a_draft(app: &mut Headless) {
     let n = *shown(app).first().expect("rows show");
     app.press(&format!("text:Subject {n}"))
         .expect("the row presses");
-    app.wait_for_within("label:Message", WAIT)
-        .expect("the panel opens");
+    app.wait_for_within(
+        "label:Message, the words of this mail as they will be sent",
+        WAIT,
+    )
+    .expect("the panel opens");
 }
 
 #[test]
@@ -1518,19 +1688,31 @@ fn a_kept_file_is_an_upload_after_the_save_that_moved_it() {
     let (mut app, fake) = start();
     open_a_draft(&mut app);
     *fake.kept.lock().unwrap() = json!([{"id": "att-0", "upload": "up7"}]);
-    app.type_text("label:Message", " one")
-        .expect("Message takes text");
+    app.type_text(
+        "label:Message, the words of this mail as they will be sent",
+        " one",
+    )
+    .expect("Message takes text");
     app.press("label:Send").expect("Send presses");
     app.wait_for_within("label:Take this back", WAIT)
         .expect("the hold shows");
     app.press("label:Take this back").expect("Undo presses");
-    app.wait_for_within("label:Message", WAIT)
-        .expect("the panel's back");
-    app.type_text("label:Message", " two")
-        .expect("Message takes text");
+    app.wait_for_within(
+        "label:Message, the words of this mail as they will be sent",
+        WAIT,
+    )
+    .expect("the panel's back");
+    app.type_text(
+        "label:Message, the words of this mail as they will be sent",
+        " two",
+    )
+    .expect("Message takes text");
     app.press("label:Keep draft").expect("it presses");
-    app.wait_for_gone("label:Message", WAIT)
-        .expect("the panel closes");
+    app.wait_for_gone(
+        "label:Message, the words of this mail as they will be sent",
+        WAIT,
+    )
+    .expect("the panel closes");
     let saved = fake.called("gws_mail_draft_save");
     let last = saved.last().unwrap();
     assert_eq!(last["attachments"], json!(["up7"]));
@@ -1699,6 +1881,333 @@ fn the_open_press_stays_whole_as_the_reader_narrows() {
     }
 }
 
+// --- Empty states ------------------------------------------------------------
+
+fn start_ok() -> (Headless, Arc<Fake>) {
+    let (mut app, fake) = start();
+    *fake.status.lock().unwrap() = "ok".to_owned();
+    *fake.changed.lock().unwrap() = true;
+    app.wait(Duration::from_secs(16)).expect("the watch looks");
+    (app, fake)
+}
+
+#[test]
+fn every_empty_list_says_which_it_is_and_the_reader_asks_for_nothing() {
+    let (mut app, _) = start_ok();
+    assert!(app.screen().shows("Pick a conversation to read it"));
+    for (name, line) in [
+        ("Trash", "Trash is empty."),
+        ("Sent", "Nothing sent yet. Press Write to start a message."),
+        ("Important", "Nothing marked important."),
+        ("Work", "No conversations have this label."),
+    ] {
+        pick_label(&mut app, name);
+        assert!(
+            app.screen().shows(line),
+            "{name}: {:?}",
+            app.screen().texts()
+        );
+        assert!(
+            !app.screen().shows("Pick a conversation to read it"),
+            "{name} has nothing to pick"
+        );
+        assert!(app.screen().shows("Nothing to read here."), "{name}");
+    }
+    pick_label(&mut app, "Inbox");
+    app.wait_for_within("text:Subject 0", WAIT).expect("back");
+    settle(&mut app);
+    assert!(app.screen().shows("Pick a conversation to read it"));
+}
+
+#[test]
+fn an_empty_list_before_the_first_sync_says_it_is_coming() {
+    let (mut app, _) = start();
+    pick_label(&mut app, "Trash");
+    assert!(app.screen().shows("Your mail is on its way from Google…"));
+    assert!(!app.screen().shows("Trash is empty."));
+}
+
+#[test]
+fn a_search_that_finds_nothing_says_so_and_offers_nothing_to_pick() {
+    let (mut app, fake) = start();
+    *fake.no_match.lock().unwrap() = true;
+    app.type_text("text:Search mail", "zzz").expect("it types");
+    app.submit("text:zzz").expect("it submits");
+    settle(&mut app);
+    assert!(app.screen().shows("No mail matches that. Try other words."));
+    assert!(app.screen().shows("Nothing to read here."));
+}
+
+#[test]
+fn a_person_with_no_labels_of_their_own_is_told_so() {
+    let (mut app, fake) = start();
+    *fake.labels.lock().unwrap() = Some(json!({"labels": []}));
+    *fake.changed.lock().unwrap() = true;
+    app.wait(Duration::from_secs(16)).expect("the watch looks");
+    press_row(&mut app);
+    app.press("label:Choose a label").expect("it presses");
+    settle(&mut app);
+    assert!(
+        app.screen()
+            .shows("No labels of your own yet. Make one in Gmail and it shows here.")
+    );
+}
+
+fn press_row(app: &mut Headless) {
+    app.press("text:Subject 2").expect("the row presses");
+    settle(app);
+}
+
+fn card_of(fake: Arc<Fake>) -> (Headless, Filter) {
+    *fake.inline.lock().unwrap() = true;
+    *fake.props.lock().unwrap() = json!({"search": "tk1"});
+    audited(&fake, 420.0, 400.0)
+}
+
+#[test]
+fn a_card_with_nothing_left_in_it_says_so() {
+    let fake = Arc::new(Fake::default());
+    *fake.card.lock().unwrap() = json!({"rows": [], "more": false, "saved": false});
+    let (mut app, _) = card_of(fake);
+    app.wait_for_within("text:No mail matches this now.", WAIT)
+        .expect("it says so");
+}
+
+/// Nothing new is wider than the reader's room: Mail has no narrow form, so
+/// this goes as far as its reader does.
+#[test]
+fn the_empty_lines_stay_in_their_columns_as_the_reader_narrows() {
+    let fake = Arc::new(Fake::default());
+    *fake.status.lock().unwrap() = "ok".to_owned();
+    let (mut app, filter) = audited(&fake, 1000.0, 600.0);
+    app.wait_for_within("text:Subject 2", WAIT)
+        .expect("the inbox");
+    pick_label(&mut app, "Sent");
+    app.wait(Duration::from_secs(16)).expect("the watch looks");
+    let lines = [
+        "Nothing sent yet. Press Write to start a message.",
+        "Nothing to read here.",
+    ];
+    for width in [1000.0, 900.0, 800.0, 700.0, 640.0, 620.0] {
+        app.set_viewport(size(px(width), px(600.0)))
+            .expect("the viewport sets");
+        settle(&mut app);
+        for line in lines {
+            filter.assert_inside(line, width);
+        }
+    }
+}
+
+// --- What the AI can reach, and what labels hold ------------------------------
+
+/// What the Bot's filter names on any Mail screen, and why each is safe. Everything
+/// else, and every field, stays unnamed: a new control has to be added here, and
+/// so has to say why.
+const MAY_REACH: [&str; 5] = [
+    // the first thing it does is `gws_mail_send_arm`, which the Bot refuses the AI
+    "Send",
+    "Send it",
+    // puts the person's letter away as it stands
+    "Keep draft",
+    // takes back a question and changes nothing in the letter
+    "Keep writing",
+    "Not yet",
+];
+
+const SECRETS: [&str; 13] = [
+    "Sender 2",
+    "Subject 2",
+    "Sender 0",
+    "Subject 0",
+    "Work",
+    "Roof quote",
+    "a.pdf",
+    "ana@example.com",
+    "Ana Reyes",
+    "ben@example.com",
+    "Half written",
+    "Saved one",
+    "Noon?",
+];
+
+fn audited(fake: &Arc<Fake>, width: f32, height: f32) -> (Headless, Filter) {
+    let def = gws_screens::screens()
+        .iter()
+        .find(|s| s.id == "gws.mail")
+        .expect("Mail");
+    let root = (def.build)(Bridge::new(fake.clone()));
+    let mut app = Headless::start(EngineConfig::new(root)).expect("the engine starts");
+    let filter = Filter::watch(&mut app);
+    app.set_viewport(size(px(width), px(height)))
+        .expect("the viewport sets");
+    (app, filter)
+}
+
+fn card_with(reads: Value) -> (Headless, Filter) {
+    let fake = Arc::new(Fake::default());
+    *fake.inline.lock().unwrap() = true;
+    *fake.props.lock().unwrap() = json!({"draft": "tk1"});
+    *fake.draft.lock().unwrap() = Some(reads);
+    let (mut app, filter) = audited(&fake, 420.0, 400.0);
+    app.wait_for_within("label:Keep draft", WAIT)
+        .expect("the card shows");
+    (app, filter)
+}
+
+/// Every state of every Mail screen and card, each handed to `look`.
+fn every_state(mut look: impl FnMut(&Headless, &Filter, &str)) {
+    let fake = Arc::new(Fake::default());
+    let (mut app, filter) = audited(&fake, 1000.0, 600.0);
+    app.wait_for_within("text:Subject 0", WAIT)
+        .expect("the inbox");
+    settle(&mut app);
+    look(&app, &filter, "the inbox");
+
+    press_row(&mut app);
+    app.wait_for_within("text:Roof quote.docx", WAIT)
+        .expect("its files");
+    look(&app, &filter, "a conversation");
+    app.press("label:Choose a label").expect("it presses");
+    settle(&mut app);
+    assert!(app.screen().shows("Work"), "the audit sees the labels");
+    look(&app, &filter, "the label picker");
+    app.press("label:Archive this").expect("it presses");
+    app.wait_for_within("label:Undo that", WAIT).expect("undo");
+    look(&app, &filter, "what was done, and its undo");
+    app.press_key("shift+/").expect("the key presses");
+    settle(&mut app);
+    look(&app, &filter, "the keys");
+    app.press_key("shift+/").expect("the key presses");
+
+    app.press("label:Write a message").expect("it presses");
+    settle(&mut app);
+    assert!(filter.unnamed_fields() >= 4, "the audit sees the fields");
+    look(&app, &filter, "a new message");
+    app.press("label:Add Cc or Bcc").expect("it presses");
+    settle(&mut app);
+    app.type_text("label:To, like name@company.com", "an")
+        .expect("it types");
+    app.wait_for_within("label:Use this address", WAIT)
+        .expect("it suggests");
+    assert!(filter.unnamed_fields() >= 6, "the audit sees the fields");
+    look(&app, &filter, "a new message, with suggestions");
+    app.press("label:Use this address").expect("it presses");
+    app.type_text(
+        "label:Subject, the line people see first in their inbox",
+        "Lunch",
+    )
+    .expect("it types");
+    app.type_text(
+        "label:Message, the words of this mail as they will be sent",
+        "Noon?",
+    )
+    .expect("it types");
+    settle(&mut app);
+    app.press("label:Delete this draft").expect("it presses");
+    settle(&mut app);
+    assert!(app.screen().shows("Delete this draft for good?"));
+    look(&app, &filter, "asked to delete");
+    app.press("label:Keep writing").expect("it presses");
+    settle(&mut app);
+
+    *fake.draft.lock().unwrap() = Some(draft(
+        "ana@example.com",
+        Value::Null,
+        json!(["ana@example.com"]),
+    ));
+    app.press("label:Send").expect("it presses");
+    app.wait_for_within("label:Send it", WAIT).expect("it asks");
+    look(&app, &filter, "asked about someone new");
+    app.press("label:Send it").expect("it presses");
+    app.wait_for_within("label:Take this back", WAIT)
+        .expect("the hold");
+    look(&app, &filter, "the hold");
+    app.press("label:Take this back").expect("it presses");
+    settle(&mut app);
+    look(&app, &filter, "taken back");
+    app.press("label:Keep draft").expect("it presses");
+    settle(&mut app);
+    *fake.draft.lock().unwrap() = None;
+
+    open_a_draft(&mut app);
+    assert!(app.screen().shows("a.pdf"), "the audit sees the attachment");
+    look(&app, &filter, "a saved draft");
+    app.press("label:Keep draft").expect("it presses");
+    settle(&mut app);
+
+    for name in ["Trash", "Sent", "Starred", "Important", "Work"] {
+        pick_label(&mut app, name);
+        look(&app, &filter, name);
+    }
+    *fake.no_match.lock().unwrap() = true;
+    app.type_text("text:Search mail", "zzz").expect("it types");
+    app.submit("text:zzz").expect("it submits");
+    settle(&mut app);
+    look(&app, &filter, "a search with nothing");
+
+    *fake.signed_out.lock().unwrap() = true;
+    pick_label(&mut app, "Drafts");
+    app.wait_for_within("text:Connect your Google account", WAIT)
+        .expect("the way in");
+    look(&app, &filter, "signed out");
+
+    let fake = Arc::new(Fake::default());
+    *fake.card.lock().unwrap() = json!({"rows": [{"sender": "Sender 2", "subject": "Subject 2", "at": 0, "ticket": "tk2"}], "more": false, "saved": true});
+    let (mut app, filter) = card_of(fake);
+    app.wait_for_within("text:Sender 2", WAIT)
+        .expect("the card");
+    look(&app, &filter, "a mail card");
+    let fake = Arc::new(Fake::default());
+    *fake.card.lock().unwrap() = json!({"rows": [], "more": false, "saved": false});
+    let (mut app, filter) = card_of(fake);
+    app.wait_for_within("text:No mail matches this now.", WAIT)
+        .expect("the card");
+    look(&app, &filter, "an empty mail card");
+
+    let (app, filter) = card_with(draft("ana@example.com", Value::Null, json!([])));
+    look(&app, &filter, "a draft card");
+    let (mut app, filter) = card_with(draft(
+        "ana@example.com",
+        Value::Null,
+        json!(["ana@example.com"]),
+    ));
+    app.press("label:Send").expect("it presses");
+    app.wait_for_within("label:Send it", WAIT).expect("it asks");
+    look(&app, &filter, "a draft card that asks");
+    let (app, filter) = card_with(draft(
+        "ana@example.com",
+        json!("t1"),
+        json!(["ana@example.com"]),
+    ));
+    assert!(app.screen().shows("Open full review"));
+    look(&app, &filter, "a draft card to a stranger");
+}
+
+#[test]
+fn no_label_in_any_state_holds_a_persons_data() {
+    let mut states = 0;
+    every_state(|_, filter, at| {
+        filter.assert_no_data_in_labels(&SECRETS, at);
+        states += 1;
+    });
+    assert!(states >= 20, "{states}");
+}
+
+/// The AI's way in is the draft: `gws_mail_draft_save`, which the person reads
+/// before Send. Nothing on a screen may be its way in as well.
+#[test]
+fn nothing_a_press_would_send_can_be_reached() {
+    bot_filter::assert_the_copy_works();
+    let mut reached = BTreeSet::new();
+    every_state(|_, filter, at| {
+        filter.assert_stages_nothing(&MAY_REACH, at);
+        reached.extend(filter.reachable().into_iter().map(|(_, name)| name));
+    });
+    // or the audit is looking at nothing
+    assert!(reached.contains("Send"), "{reached:?}");
+    assert!(reached.contains("Keep draft"), "{reached:?}");
+}
+
 /// The first try may still be going, so a spent press says nothing about the mail.
 #[test]
 fn a_second_try_that_finds_its_press_spent_stays_unsure() {
@@ -1780,8 +2289,11 @@ fn no_autosave_is_left_behind_a_send() {
     app.wait_for_within("label:Take this back", WAIT)
         .expect("the hold shows");
     app.press("label:Take this back").expect("Undo presses");
-    app.wait_for_within("label:Message", WAIT)
-        .expect("the panel's back");
+    app.wait_for_within(
+        "label:Message, the words of this mail as they will be sent",
+        WAIT,
+    )
+    .expect("the panel's back");
     assert_eq!(fake.called("gws_mail_draft_save").len(), 1);
 }
 
@@ -1794,8 +2306,11 @@ fn an_autosave_queued_behind_keep_draft_saves_no_blank_draft() {
     app.press("label:Keep draft").expect("it presses");
     app.wait(PAST_AN_AUTOSAVE).expect("time passes");
     fake.release("gws_mail_draft_save");
-    app.wait_for_gone("label:Message", WAIT)
-        .expect("the panel closes");
+    app.wait_for_gone(
+        "label:Message, the words of this mail as they will be sent",
+        WAIT,
+    )
+    .expect("the panel closes");
     settle(&mut app);
     let saved = fake.called("gws_mail_draft_save");
     assert_eq!(saved.len(), 1, "{saved:?}");
@@ -1838,4 +2353,140 @@ fn a_send_pressed_during_an_autosave_saves_after_it() {
     let saved = fake.called("gws_mail_draft_save");
     assert_eq!(saved.len(), 2, "{saved:?}");
     assert_eq!(saved[1]["armed"], "a1");
+}
+
+const ONE: &str = "one@example.com";
+const TWO: &str = "two@example.com";
+
+/// Mail on two accounts, with the first active and its address read.
+fn two_accounts() -> (Headless, Arc<Fake>) {
+    let (mut app, fake) = start();
+    *fake.accounts.lock().unwrap() = vec![(ONE.to_owned(), true), (TWO.to_owned(), false)];
+    app.wait_for_within(&format!("text:{ONE}"), Duration::from_secs(20))
+        .expect("the next check finds the list");
+    (app, fake)
+}
+
+#[test]
+fn one_account_has_nothing_to_choose() {
+    let (mut app, fake) = start();
+    *fake.accounts.lock().unwrap() = vec![(ONE.to_owned(), true)];
+    let by = std::time::Instant::now() + Duration::from_secs(20);
+    while fake.called("gws_accounts").len() < 2 && std::time::Instant::now() < by {
+        settle(&mut app);
+    }
+    assert!(fake.called("gws_accounts").len() >= 2, "it was asked");
+    assert!(!app.screen().matches("label:Switch account").unwrap());
+}
+
+#[test]
+fn pressing_another_account_switches_and_starts_over_on_its_inbox() {
+    let (mut app, fake) = two_accounts();
+    pick_label(&mut app, "Work");
+    settle(&mut app);
+    assert!(!app.screen().shows(TWO), "not until the row is pressed");
+    let before = fake.called("gws_mail_list").len();
+    app.press(&format!("text:{ONE}"))
+        .expect("the account row opens");
+    app.wait_for_within(&format!("text:{TWO}"), WAIT)
+        .expect("the other account shows");
+    app.press(&format!("text:{TWO}")).expect("it presses");
+    app.wait_for_gone(&format!("text:{ONE}"), WAIT)
+        .expect("the row names the new one");
+    assert_eq!(fake.called("gws_account_use"), vec![json!({"label": TWO})]);
+    settle(&mut app);
+    let lists = fake.called("gws_mail_list");
+    assert!(lists.len() > before, "the list is read again");
+    assert_eq!(lists.last().unwrap()["label"], "INBOX");
+}
+
+#[test]
+fn the_ai_can_neither_read_nor_press_an_account_row() {
+    let (mut app, _fake) = two_accounts();
+    let filter = Filter::watch(&mut app);
+    app.press(&format!("text:{ONE}"))
+        .expect("the account row opens");
+    app.wait_for_within(&format!("text:{TWO}"), WAIT)
+        .expect("the other account shows");
+    filter.assert_no_data_in_labels(&[ONE, TWO], "the account rows");
+    assert!(
+        !filter
+            .reachable()
+            .iter()
+            .any(|(_, name)| name == "Switch account"),
+        "the row's text isn't its label, so the Bot leaves it unnamed"
+    );
+}
+
+#[test]
+fn a_switch_the_bot_could_not_make_says_so_and_stays_where_it_was() {
+    let (mut app, fake) = two_accounts();
+    *fake.switch_fails.lock().unwrap() = true;
+    app.press(&format!("text:{ONE}"))
+        .expect("the account row opens");
+    app.wait_for_within(&format!("text:{TWO}"), WAIT)
+        .expect("the other account shows");
+    app.press(&format!("text:{TWO}")).expect("it presses");
+    app.wait_for_within("text:Buwiz Bot couldn't switch to that account.", WAIT)
+        .expect("it says so");
+    assert!(app.screen().shows(ONE), "still this one");
+}
+
+#[test]
+fn a_letter_names_its_account_and_a_switch_waits_for_it() {
+    let (mut app, fake) = two_accounts();
+    write_one(&mut app);
+    assert!(
+        !app.screen().matches("label:Switch account").unwrap(),
+        "a letter stays on its account"
+    );
+    app.press("label:Keep draft").expect("it keeps");
+    settle(&mut app);
+    let saves = fake.called("gws_mail_draft_save");
+    assert_eq!(saves.last().unwrap()["as_account"], ONE);
+    assert!(app.screen().matches("label:Switch account").unwrap());
+}
+
+#[test]
+fn a_switch_made_elsewhere_reaches_an_open_letter_as_nothing_but_its_account() {
+    let (mut app, fake) = two_accounts();
+    write_one(&mut app);
+    fake.switch_to(TWO);
+    let by = std::time::Instant::now() + Duration::from_secs(20);
+    let lists = fake.called("gws_mail_list").len();
+    while fake.called("gws_mail_list").len() == lists && std::time::Instant::now() < by {
+        settle(&mut app);
+    }
+    assert!(
+        fake.called("gws_mail_list").len() > lists,
+        "the list moved on"
+    );
+    app.press("label:Keep draft").expect("it keeps");
+    settle(&mut app);
+    let saves = fake.called("gws_mail_draft_save");
+    assert_eq!(
+        saves.last().unwrap()["as_account"],
+        ONE,
+        "the plugin refuses this one, so it can't land on the other account"
+    );
+}
+
+#[test]
+fn a_letter_left_on_the_other_account_can_switch_back_and_stays_its_own() {
+    let (mut app, fake) = two_accounts();
+    write_one(&mut app);
+    fake.switch_to(TWO);
+    app.wait_for_within("label:Switch account", Duration::from_secs(20))
+        .expect("the way back shows");
+    app.press(&format!("text:{TWO}")).expect("the row opens");
+    app.wait_for_within(&format!("text:{ONE}"), WAIT)
+        .expect("the letter's account shows");
+    app.press(&format!("text:{ONE}")).expect("it presses");
+    app.wait_for_gone("label:Switch account", WAIT)
+        .expect("back on its account, the chooser waits for the letter");
+    assert_eq!(fake.called("gws_account_use"), vec![json!({"label": ONE})]);
+    app.press("label:Keep draft").expect("it keeps");
+    settle(&mut app);
+    let saves = fake.called("gws_mail_draft_save");
+    assert_eq!(saves.last().unwrap()["as_account"], ONE);
 }

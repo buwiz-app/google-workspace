@@ -1598,6 +1598,8 @@ fn draft(core: &Core, args: &Value) -> Value {
         "notes": form.notes.unwrap_or_default(),
         "repeat": form.repeat,
         "meet": form.meet,
+        // a card saves to the account it was drafted on, or not at all
+        "as_account": core.accounts.signed_in().map(|(who, _)| who),
     });
     let ticket = core
         .tickets
@@ -1614,6 +1616,11 @@ fn draft_read(core: &Core, args: &Value) -> Value {
         Some(Subject::EventDraft(fields)) => serde_json::from_str::<Value>(fields).ok(),
         _ => None,
     };
+    let now = core.accounts.signed_in().map(|(who, _)| who);
+    let fields = fields.filter(|f| {
+        let drafted = f["as_account"].as_str();
+        drafted.is_none() || drafted == now.as_deref()
+    });
     fields.map_or_else(|| refusal("not_found", "This card is out of date."), ok)
 }
 

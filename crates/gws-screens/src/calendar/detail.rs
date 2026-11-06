@@ -57,7 +57,9 @@ fn guests(d: &Detail) -> View {
 
 /// Yes, Maybe or No. A series asks which first, and that's the press it goes on.
 fn replies(b: &Bridge, m: Cal, d: &Detail) -> View {
-    let press = |name: &'static str, response: &'static str| {
+    // more words than it shows: for a series a press only asks which events, and
+    // the AI's would leave its answer behind the person's press on the question
+    let press = |label: &'static str, name: &'static str, response: &'static str| {
         let (b, key, series) = (b.clone(), d.row.key(), d.in_series());
         let on = if d.row.response == response {
             CHOSEN
@@ -66,7 +68,7 @@ fn replies(b: &Bridge, m: Cal, d: &Detail) -> View {
         };
         view()
             .app_class(Some(format!("px-3 py-1 rounded-md {on}").into()))
-            .label(name)
+            .label(label)
             .on_press(move || {
                 if series {
                     m.ask
@@ -86,9 +88,9 @@ fn replies(b: &Bridge, m: Cal, d: &Detail) -> View {
                 .app_class(Some("px-2".into()))
                 .child(text("Going?").app_class(Some(format!("text-[12px] {MUTE}").into()))),
         )
-        .child(press("Yes", "accepted"))
-        .child(press("Maybe", "tentative"))
-        .child(press("No", "declined"))
+        .child(press("Answer yes", "Yes", "accepted"))
+        .child(press("Answer maybe", "Maybe", "tentative"))
+        .child(press("Answer no", "No", "declined"))
 }
 
 pub(super) fn panel(b: Bridge, m: Cal) -> impl IntoElement {
@@ -143,13 +145,9 @@ pub(super) fn panel(b: Bridge, m: Cal) -> impl IntoElement {
             body = body.child(
                 view()
                     .app_class(Some("flex-row px-1".into()))
-                    .child(press_text(
-                        "Open the Meet link",
-                        "Open the Meet link",
-                        move || {
-                            m.link.set(Some(url.clone()));
-                        },
-                    )),
+                    .child(press_text("Open the Meet link", "Open Meet", move || {
+                        m.link.set(Some(url.clone()));
+                    })),
             );
         }
         if !d.notes.is_empty() {

@@ -182,6 +182,10 @@ enum Stage {
 #[derive(Clone, Copy)]
 pub struct Compose {
     pub open: Signal<bool>,
+    /// The account this letter is on. A draft that isn't found is written anew,
+    /// so with nothing to stop it a letter would follow a switch to the other
+    /// account. Empty until the screen knows.
+    pub who: Signal<String>,
     letter: Signal<Letter>,
     /// Cc and Bcc are showing.
     extra: Signal<bool>,
@@ -220,6 +224,7 @@ impl Compose {
         let (jobs, waiting) = unbounded_channel::<Job>();
         let c = Compose {
             open: signal(false),
+            who: signal(String::new()),
             letter: signal(Letter::default()),
             extra: signal(false),
             edits: signal(0),
@@ -358,8 +363,8 @@ async fn wait_for(b: &Bridge, job: &str) -> Result<Value, BuwizError> {
 
 /// One save. Only a message with files can outlast its call, so only that gets
 /// a job to ask after.
-async fn write(b: &Bridge, letter: &Letter, armed: &Value) -> Result<Value, BuwizError> {
-    let mut args = letter.args();
+async fn write(b: &Bridge, letter: &Letter, armed: &Value, who: &str) -> Result<Value, BuwizError> {
+    let mut args = crate::shell::owned(letter.args(), who);
     if !armed.is_null() {
         args["armed"] = armed.clone();
     }
@@ -392,7 +397,8 @@ fn refused(answer: &Result<Value, BuwizError>) -> Option<&str> {
 async fn save(b: &Bridge, c: Compose, armed: &Value) -> Result<bool, String> {
     let seen = c.edits.get_untracked();
     let mut letter = c.letter.get_untracked();
-    let mut answer = write(b, &letter, armed).await;
+    let who = c.who.get_untracked();
+    let mut answer = write(b, &letter, armed, &who).await;
     if refused(&answer) == Some("not_found") && letter.draft.is_some() {
         if letter.unsure {
             c.letter.update(|l| {
@@ -407,7 +413,7 @@ async fn save(b: &Bridge, c: Compose, armed: &Value) -> Result<bool, String> {
             );
         }
         letter.draft = None;
-        answer = write(b, &letter, armed).await;
+        answer = write(b, &letter, armed, &who).await;
     }
     if refused(&answer) == Some("already_sent") {
         c.close();
@@ -717,7 +723,12 @@ fn press_send(b: Bridge, c: Compose, confirmed: bool) {
     c.said.set(None);
     c.confirming.set(None);
     c.frozen.set(true);
-    let press = b.call("gws_mail_send_arm", json!({}));
+    // a saved letter names its draft now: this press stops any older one on it
+    let on = c.letter.with_untracked(|l| l.draft.clone());
+    let press = b.call(
+        "gws_mail_send_arm",
+        on.map_or_else(|| json!({}), |draft| json!({"draft": draft})),
+    );
     c.run(async move {
         if let Err(why) = send_pressed(&b, c, press, confirmed).await {
             c.said.set(Some(why));
@@ -734,8 +745,32 @@ async fn send_pressed(
 ) -> Result<(), String> {
     let press = press.await.map_err(|e| e.message)?;
     let armed = press.get("armed").cloned().unwrap_or(Value::Null);
-    if !save(b, c, &armed).await? {
-        return Ok(());
+    let ready = ready_to_hold(b, c, &armed, confirmed).await;
+    if !matches!(ready, Ok(true)) {
+        // no send will spend it, and while it stands the AI is off this draft
+        // and no account can be switched to: not even the way back from a
+        // refusal. "Send it" is a press of its own
+        let _ = b
+            .call("gws_mail_send_disarm", json!({"armed": armed}))
+            .await;
+    }
+    if ready? {
+        hold_and_send(b, c, armed).await
+    } else {
+        Ok(())
+    }
+}
+
+/// The letter saved under this press, and nothing left to ask. `false` stops
+/// there: it had gone already, or there's someone new to ask about.
+async fn ready_to_hold(
+    b: &Bridge,
+    c: Compose,
+    armed: &Value,
+    confirmed: bool,
+) -> Result<bool, String> {
+    if !save(b, c, armed).await? {
+        return Ok(false);
     }
     if !confirmed {
         let draft = c.letter.with_untracked(|l| l.draft.clone());
@@ -744,10 +779,10 @@ async fn send_pressed(
         let new = people_new(&read.map_err(|e| e.message)?);
         if !new.is_empty() {
             c.confirming.set(Some(new));
-            return Ok(());
+            return Ok(false);
         }
     }
-    hold_and_send(b, c, armed).await
+    Ok(true)
 }
 
 fn people_new(review: &Value) -> Vec<String> {
@@ -886,9 +921,18 @@ async fn suggest(b: Bridge, c: Compose, word: String) {
     );
 }
 
-fn line(c: Compose, name: &'static str, at: Place) -> Input {
+// The Bot's filter leaves a field unnamed, and refuses the AI, when its label
+// holds an @ or runs past 48 characters. The AI writes a mail only as a draft,
+// which the person reads before Send, and never in a panel they're about to send.
+const TO: &str = "To, like name@company.com";
+const CC: &str = "Cc, like name@company.com";
+const BCC: &str = "Bcc, like name@company.com";
+const SUBJECT: &str = "Subject, the line people see first in their inbox";
+const MESSAGE: &str = "Message, the words of this mail as they will be sent";
+
+fn line(c: Compose, label: &'static str, name: &'static str, at: Place) -> Input {
     input()
-        .label(name)
+        .label(label)
         .value(move || {
             let mut letter = c.letter.get();
             at(&mut letter).clone()
@@ -910,15 +954,21 @@ fn typed(c: Compose, at: Place, value: &str) -> bool {
     true
 }
 
-fn field(c: Compose, name: &'static str, at: Place) -> Input {
-    line(c, name, at).on_change(move |value: &str| {
+fn field(c: Compose, label: &'static str, name: &'static str, at: Place) -> Input {
+    line(c, label, name, at).on_change(move |value: &str| {
         typed(c, at, value);
     })
 }
 
 /// A field that takes people, with suggestions as they're typed.
-fn people_field(b: Bridge, c: Compose, name: &'static str, at: Place) -> impl IntoElement {
-    line(c, name, at).on_change(move |value: &str| {
+fn people_field(
+    b: Bridge,
+    c: Compose,
+    label: &'static str,
+    name: &'static str,
+    at: Place,
+) -> impl IntoElement {
+    line(c, label, name, at).on_change(move |value: &str| {
         if typed(c, at, value) {
             c.naming.set(Some(at));
             b.spawn(suggest(b.clone(), c, last_word(value).to_owned()));
@@ -1034,12 +1084,12 @@ pub fn panel(b: Bridge, c: Compose) -> impl IntoElement {
     );
     view()
         .app_class(Some("flex-1".into()))
-        .child(people_field(b, c, "To", |l| &mut l.to))
+        .child(people_field(b, c, TO, "To", |l| &mut l.to))
         .child(dynamic(move || {
             if c.extra.get() {
                 view()
-                    .child(people_field(naming.clone(), c, "Cc", |l| &mut l.cc))
-                    .child(people_field(naming.clone(), c, "Bcc", |l| &mut l.bcc))
+                    .child(people_field(naming.clone(), c, CC, "Cc", |l| &mut l.cc))
+                    .child(people_field(naming.clone(), c, BCC, "Bcc", |l| &mut l.bcc))
             } else {
                 view().app_class(Some("flex-row".into())).child(press_text(
                     "Add Cc or Bcc",
@@ -1049,11 +1099,11 @@ pub fn panel(b: Bridge, c: Compose) -> impl IntoElement {
             }
         }))
         .child(suggestions(c))
-        .child(field(c, "Subject", |l| &mut l.subject))
+        .child(field(c, SUBJECT, "Subject", |l| &mut l.subject))
         .child(
             view().app_class(Some("flex-1".into())).child(
                 input()
-                    .label("Message")
+                    .label(MESSAGE)
                     .multiline(true)
                     .readonly(move || c.frozen.get())
                     .value(move || c.letter.with(|l| l.body.clone()))
@@ -1215,12 +1265,15 @@ async fn read_card(
         .map_err(|e| e.message)?;
     c.fill(Letter::of(&v));
     let new = v.get("new").and_then(Value::as_array).into_iter().flatten();
+    let from = v
+        .get("from")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    // what the card says it's from, so it can't go from anyone else
+    c.who.set(from.clone());
     review.set(Some(Review {
-        from: v
-            .get("from")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
+        from,
         new: new.filter_map(|n| n.as_str().map(str::to_owned)).collect(),
     }));
     Ok(())

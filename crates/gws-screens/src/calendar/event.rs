@@ -247,6 +247,8 @@ pub fn is_address(word: &str) -> bool {
 /// own zone, as text: a half typed time mustn't be lost or corrected.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Form {
+    /// The account a draft was made on: its save goes there or nowhere.
+    pub as_account: String,
     pub event: Option<Key>,
     pub in_series: bool,
     pub etag: String,
@@ -360,6 +362,7 @@ impl Form {
         let some = |k: &str, or: String| Some(text(v, k)).filter(|t| !t.is_empty()).unwrap_or(or);
         let guests = v.get("guests").and_then(Value::as_array);
         let mut form = Form {
+            as_account: text(v, "as_account"),
             title: text(v, "title"),
             time_zone: some("time_zone", base.time_zone.clone()),
             calendar: some("calendar", base.calendar.clone()),
@@ -430,13 +433,15 @@ impl Form {
 
     /// What `gws_event_save` takes, read in the zone the form says.
     pub fn save_args(&self) -> Result<Value, String> {
-        if self.time_zone.trim().is_empty() {
-            return self.args(&Local);
-        }
-        match self.time_zone.trim().parse::<Tz>() {
-            Ok(zone) => self.args(&zone),
-            Err(_) => Err("That isn't a time zone. Type one like Asia/Manila.".to_owned()),
-        }
+        let args = if self.time_zone.trim().is_empty() {
+            self.args(&Local)
+        } else {
+            match self.time_zone.trim().parse::<Tz>() {
+                Ok(zone) => self.args(&zone),
+                Err(_) => Err("That isn't a time zone. Type one like Asia/Manila.".to_owned()),
+            }
+        };
+        args.map(|args| crate::shell::owned(args, &self.as_account))
     }
 
     /// What `gws_event_save` takes, or why it can't go yet. `zone` is the one

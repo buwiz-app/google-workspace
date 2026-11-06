@@ -6,8 +6,9 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use buwiz_app::Bridge;
+use nsh_core::AccessibilityValue;
 use nsh_core::prelude::*;
-use serde_json::Value;
+use serde_json::{Value, json};
 use url::Url;
 
 pub(crate) const BG: &str = "bg-[#f6f6f4] dark:bg-[#151515]";
@@ -158,6 +159,171 @@ pub(crate) fn link_bar(link: Signal<Option<String>>) -> impl IntoElement {
                         .child(text("Cancel").app_class(Some(format!("text-[12px] {INK}").into()))),
                 )
         }
+    })
+}
+
+/// `args` for a write that makes something new, which would otherwise land on
+/// whichever account is active by the time it goes. The plugin refuses it when
+/// that's no longer `who`.
+pub(crate) fn owned(mut args: Value, who: &str) -> Value {
+    if !who.is_empty() {
+        args["as_account"] = who.into();
+    }
+    args
+}
+
+/// A signed-in account to choose from.
+#[derive(Clone, PartialEq)]
+pub(crate) struct Choice {
+    label: String,
+    /// What's shown. Only a label this install has never seen pushed has no
+    /// address, and then it's the label.
+    name: String,
+    active: bool,
+}
+
+fn choices_in(v: &Value) -> Vec<Choice> {
+    let rows = v.get("accounts").and_then(Value::as_array);
+    let text = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).map(str::to_owned);
+    rows.into_iter()
+        .flatten()
+        .filter_map(|r| {
+            let label = text(r, "label")?;
+            Some(Choice {
+                name: text(r, "address").unwrap_or_else(|| label.clone()),
+                active: r.get("active") == Some(&Value::Bool(true)),
+                label,
+            })
+        })
+        .collect()
+}
+
+/// Who a screen is showing, and who else it could show.
+#[derive(Clone, Copy)]
+pub(crate) struct Chooser {
+    pub(crate) who: Signal<String>,
+    rows: Signal<Vec<Choice>>,
+    open: Signal<bool>,
+    busy: Signal<bool>,
+    said: Signal<Option<String>>,
+}
+
+impl Chooser {
+    pub(crate) fn new() -> Self {
+        Self {
+            who: signal(String::new()),
+            rows: signal(Vec::new()),
+            open: signal(false),
+            busy: signal(false),
+            said: signal(None),
+        }
+    }
+
+    /// Reads who's active. True when that's somebody else now, and the screen
+    /// has another account's rows. Nobody active says nothing: a switch passes
+    /// through that, and a sign-out shows on the screen's own reads.
+    pub(crate) async fn check(self, b: &Bridge) -> bool {
+        let Ok(status) = read(b, "gws_status", json!({})).await else {
+            return false;
+        };
+        if let Ok(v) = read(b, "gws_accounts", json!({})).await {
+            self.rows.set(choices_in(&v));
+        }
+        let now = status.get("subject").and_then(Value::as_str);
+        let Some(now) = now.filter(|now| !now.is_empty()) else {
+            return false;
+        };
+        let was = self.who.get_untracked();
+        self.who.set(now.to_owned());
+        !was.is_empty() && was != now
+    }
+}
+
+fn account_press(name: String, on: impl Fn() + 'static) -> View {
+    // the name isn't the label, so the Bot's filter leaves this row unnamed and
+    // the AI can't press it. The Bot refuses it a switch anyway.
+    view()
+        .app_class(Some("px-2 py-1 rounded-md".into()))
+        .label("Switch account")
+        .accessibility_value(Some(AccessibilityValue {
+            text: Some(name.clone().into()),
+            ..AccessibilityValue::default()
+        }))
+        .on_press(on)
+        .child(
+            text(name)
+                .number_of_lines(1)
+                .app_class(Some(format!("text-[12px] {INK}").into())),
+        )
+}
+
+/// The account this screen shows, with the others under it once pressed. With
+/// one account there's nothing to choose, so nothing shows. `changed` starts the
+/// screen over on the account it switched to.
+///
+/// The call is made in the press, or the Bot can't tell it's the person's, and
+/// what follows goes through `run`, the screen's own queue: a task started here
+/// would go when this redraws, which the press itself sets off.
+pub(crate) fn chooser(
+    b: Bridge,
+    c: Chooser,
+    run: impl Fn(Job) + Clone + 'static,
+    changed: impl Fn(&Bridge) + Clone + 'static,
+) -> impl IntoElement {
+    dynamic(move || {
+        let rows = c.rows.get();
+        if rows.len() < 2 {
+            return view();
+        }
+        let toggle = move || {
+            c.said.set(None);
+            c.open.update(|open| *open = !*open);
+        };
+        let mut column = view()
+            .app_class(Some(format!("gap-[1px] px-2 py-2 border-t {LINE}").into()))
+            .child(account_press(c.who.get(), toggle));
+        if c.open.get() {
+            for choice in rows.into_iter().filter(|r| !r.active) {
+                let (b, run, changed) = (b.clone(), run.clone(), changed.clone());
+                let label = choice.label;
+                column = column.child(account_press(choice.name, move || {
+                    if c.busy.get_untracked() {
+                        return;
+                    }
+                    c.busy.set(true);
+                    c.said.set(None);
+                    let call = b.call("gws_account_use", json!({"label": label}));
+                    let (b, changed) = (b.clone(), changed.clone());
+                    run(Box::pin(async move {
+                        let answer = call.await;
+                        c.busy.set(false);
+                        // the plugin asked and the Bot couldn't: that's an answer too
+                        let failed = |v: &Value| {
+                            let why = v.pointer("/account_use/message")?.as_str()?;
+                            Some(why.to_owned())
+                        };
+                        match answer {
+                            Ok(v) if failed(&v).is_some() => c.said.set(failed(&v)),
+                            Ok(_) => {
+                                c.open.set(false);
+                                if c.check(&b).await {
+                                    changed(&b);
+                                }
+                            }
+                            Err(e) => c.said.set(Some(e.message)),
+                        }
+                    }));
+                }));
+            }
+        }
+        if let Some(why) = c.said.get() {
+            column = column.child(
+                text(why)
+                    .number_of_lines(3)
+                    .app_class(Some(format!("px-2 text-[12px] {MUTE}").into())),
+            );
+        }
+        column
     })
 }
 

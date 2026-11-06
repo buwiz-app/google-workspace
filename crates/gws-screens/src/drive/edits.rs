@@ -192,9 +192,16 @@ fn buttons(b: &Bridge, m: Drive, e: &Edit) -> View {
         }))
     };
     let id = e.id.clone();
-    row.child(press("Discard", &e.name, move || {
-        m.discarding.set(Some(id.clone()));
-    }))
+    // fewer words than it shows: the AI mustn't raise a question whose yes can't
+    // be taken back, for the person to press
+    row.child(press_as(
+        "Discard",
+        "Discard edits".to_owned(),
+        &e.name,
+        move || {
+            m.discarding.set(Some(id.clone()));
+        },
+    ))
 }
 
 /// Discard can't be undone: the edits exist nowhere else, so it asks once.

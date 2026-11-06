@@ -73,6 +73,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
          DELETE FROM drive_listed;
          DELETE FROM drive_views;",
     ),
+    (
+        9,
+        "CREATE TABLE sign_ins(label TEXT NOT NULL PRIMARY KEY, subject TEXT NOT NULL) WITHOUT ROWID;",
+    ),
 ];
 
 /// Why the store didn't open or answer: a stable `code` and a message for people.
@@ -534,6 +538,7 @@ mod tests {
             .conn()
             .execute_batch(
                 "INSERT INTO bodies(account, thread, view, size, used) VALUES('a', 't', '{}', 2, 1);
+                 DROP TABLE sign_ins;
                  ALTER TABLE drive_files DROP COLUMN can;
                  PRAGMA user_version = 6;",
             )

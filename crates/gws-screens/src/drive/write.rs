@@ -22,7 +22,7 @@ use super::edits::{failed_line, press, press_as, say};
 use super::file::{Row, rows_in};
 use super::{Drive, close_details, fetch, mover, refused, reload, share, show_details, value};
 use crate::compose::{ATTACHMENTS_MAX, CHUNK, chunk};
-use crate::shell::{BG, INK, LINE, MUTE, RAIL};
+use crate::shell::{BG, INK, LINE, MUTE, RAIL, owned};
 
 /// The most rows one press takes, as the tool does.
 const TRASH_MAX: usize = 100;
@@ -233,6 +233,7 @@ fn commit(b: &Bridge, m: Drive) {
         }
         Some(Acting::NewFolder) => {
             let args = json!({"parent": open_parent(m), "name": name});
+            let args = owned(args, &m.chooser.who.get_untracked());
             let call = b.call("gws_drive_folder", args);
             answer_write(b, m, call, move |b, m, v| {
                 stop_opening(m, opening);
@@ -246,10 +247,19 @@ fn commit(b: &Bridge, m: Drive) {
 
 /// A name to type, under the bar. It stays through a refusal, to be tried again.
 fn name_bar(b: Bridge, m: Drive, renaming: bool) -> View {
-    let (field, word, press_label, shows) = if renaming {
-        ("New name", "Rename", "Save this name", "Rename")
+    // past 48 characters on purpose: the Bot's filter leaves such a field unnamed
+    // and refuses the AI, whose name would go at the person's press
+    let (label, field, word, press_label, shows) = if renaming {
+        (
+            "New name, as it will show in Google Drive to others",
+            "New name",
+            "Rename",
+            "Save this name",
+            "Rename",
+        )
     } else {
         (
+            "Folder name, as it will show in Google Drive to others",
             "Folder name",
             "New folder",
             "Make this folder",
@@ -265,7 +275,7 @@ fn name_bar(b: Bridge, m: Drive, renaming: bool) -> View {
         .child(text(word).app_class(Some(format!("text-[12px] {MUTE}").into())))
         .child(
             input()
-                .label(field)
+                .label(label)
                 .value(move || m.typed.get())
                 .placeholder(field.to_owned())
                 .auto_focus(true)
@@ -308,6 +318,8 @@ pub(super) struct Sending {
     key: u64,
     file: PickedFile,
     parent: String,
+    /// The account it was picked on: a switch mustn't send it to the other.
+    who: String,
     arrived: u64,
     why: Option<String>,
     /// The same file could still go.
@@ -399,6 +411,7 @@ async fn send(b: Bridge, m: Drive, key: u64) {
         Err(e) => return send_failed(m, key, failed_line(&e), true),
     };
     let args = json!({"upload": upload, "parent": item.parent});
+    let args = owned(args, &item.who);
     match b.call("gws_drive_upload", args).await {
         Ok(v) => match refused(&v) {
             Some(why) => send_failed(m, key, why, true),
@@ -424,6 +437,8 @@ fn pick(b: &Bridge, m: Drive) {
         extensions: Vec::new(),
         multiple: true,
     };
+    // as `parent` is: the picker can stay open through a switch
+    let who = m.chooser.who.get_untracked();
     let Some(pick) = b.pick_file(options) else {
         say(m, "This screen can't reach your files.");
         return;
@@ -444,6 +459,10 @@ fn pick(b: &Bridge, m: Drive) {
                     key,
                     file,
                     parent: parent.clone(),
+                    // none yet is the first check not back: it's whoever that says
+                    who: Some(who.clone())
+                        .filter(|who| !who.is_empty())
+                        .unwrap_or_else(|| m.chooser.who.get_untracked()),
                     arrived: 0,
                     why: None,
                     again: false,
@@ -494,9 +513,14 @@ fn sending_row(b: &Bridge, m: Drive, item: &Sending) -> View {
         return row;
     }
     let b = b.clone();
-    row.child(press("Try this upload again", &name, move || {
-        fetch(m, send(b.clone(), m, key));
-    }))
+    // fewer words than its label: its calls come after the press, where the Bot
+    // can't tell them from a person's, so the AI must never make this one
+    row.child(press_as(
+        "Try this upload again",
+        "Try again".to_owned(),
+        &name,
+        move || fetch(m, send(b.clone(), m, key)),
+    ))
 }
 
 /// A row for each file on its way. Past a few it scrolls, so the rows keep
@@ -611,9 +635,14 @@ fn action_bar(b: Bridge, m: Drive) -> impl IntoElement {
                     m.said.set(None);
                     start_acting(m, Acting::NewFolder);
                 }))
-                .child(press("Upload a file to Google Drive", "", move || {
-                    pick(&file, m);
-                }));
+                // fewer words than its label: the AI mustn't open the picker, as
+                // what's chosen there goes up at the person's press
+                .child(press_as(
+                    "Upload a file to Google Drive",
+                    "Upload".to_owned(),
+                    "",
+                    move || pick(&file, m),
+                ));
         }
         if offered.rename {
             bar = bar.child(press("Rename", &name, move || start_rename(m)));

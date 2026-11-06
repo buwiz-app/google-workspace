@@ -121,6 +121,31 @@ impl Store {
         Ok(accounts)
     }
 
+    /// Whose each sign-in is, by its label. The Bot's list names labels and no
+    /// addresses, and it pushes only the active one's token, so this is how an
+    /// account nobody pushed since a restart is still known.
+    pub fn sign_ins(&self) -> Result<Vec<(String, String)>> {
+        let mut q = self.conn.prepare("SELECT label, subject FROM sign_ins")?;
+        let rows = q
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// `rows` become the whole of [`Self::sign_ins`].
+    pub fn set_sign_ins(&self, rows: &[(String, String)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM sign_ins", [])?;
+        for (label, subject) in rows {
+            tx.execute(
+                "INSERT INTO sign_ins(label, subject) VALUES (?, ?)",
+                [label, subject],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Everything held for `account`: it can all be fetched again after a
     /// sign-in. What's in the `open/` folder is the plugin's to remove first.
     pub fn forget_account(&self, account: &str) -> Result<()> {

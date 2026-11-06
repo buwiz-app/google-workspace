@@ -62,6 +62,8 @@ pub struct Core {
     pub tickets: Mutex<mail::Tickets>,
     /// The Bot has told this process who is signed in.
     pub pushed: std::sync::atomic::AtomicBool,
+    /// Whether it has finished telling.
+    pub settle: mail::Settle,
     /// What a person's actions changed, for Undo.
     pub undos: Mutex<mail::Undos>,
     /// The same for Drive.
@@ -116,6 +118,7 @@ impl Core {
             hashes: files::Hashes::default(),
             clock: files::Clock::default(),
             pushed: std::sync::atomic::AtomicBool::new(false),
+            settle: mail::Settle::default(),
         }
     }
 
@@ -143,7 +146,11 @@ impl Core {
 
     /// Runs one of the plugin's tools. `args` were checked as an object.
     pub fn run(&self, tool: &str, args: &Value) -> Value {
-        mail::run(self, tool, args)
+        if let Some(refused) = accounts::stale(self, args) {
+            return refused;
+        }
+        accounts::run(self, tool, args)
+            .or_else(|| mail::run(self, tool, args))
             .or_else(|| calendar::run(self, tool, args))
             .or_else(|| drive::run(self, tool, args))
             .or_else(|| drive::write::run(self, tool, args))
@@ -159,10 +166,20 @@ impl Core {
         self.run(tool, args)
     }
 
-    /// `buwiz.account.set` or `.clear`. After either, the store keeps only
-    /// the accounts still signed in: subjects and bodies have no business
-    /// outliving the sign-in, and each is fetched again after the next one.
+    /// `buwiz.account.set` or `.clear`. Subjects and bodies have no business
+    /// outliving the sign-in, and each is fetched again after the next one. So
+    /// the account a push ends goes at once: the one a clear names, or the one
+    /// a new sign-in on its label replaced. Once the pushes have stopped,
+    /// [`mail::finish_wipes`] takes any other nobody pushed. Before that an
+    /// account nobody pushed stays: the Bot sends them one at a time, and it
+    /// may be next.
     pub fn account(&self, method: &str, args: &Value) -> Value {
+        // read first, as a push files its list. After a restart only the active
+        // account has been pushed, and the others are known from their filing
+        let was = self
+            .accounts
+            .subject_of(args)
+            .or_else(|| mail::filed_subject(self, args));
         let mut result = if method == "buwiz.account.set" {
             self.accounts.set(args)
         } else {
@@ -172,8 +189,13 @@ impl Core {
         if result["isError"] != Value::Bool(true) {
             self.pushed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            if !mail::reconcile(self) {
-                // the caller hears, and the next sync tries again
+            self.sync
+                .wake_after(self.settle.pushed(self.clock.now_ms()));
+            // an unfiled sign-in is only found again on the next push: the store
+            // may not be open yet, and nothing below needs this to have worked
+            let _ = mail::with_store(self, |store| mail::file_sign_ins(self, store));
+            if was.is_some_and(|who| !mail::forget(self, &who)) {
+                // the caller hears, and a later sync tries again
                 result["structuredContent"]["mail_kept"] = Value::Bool(true);
             }
         }

@@ -3,8 +3,8 @@
 //! shows as old mail, not as a blank window. Google is asked only by the sync,
 //! by a search, and for a thread not yet opened.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -349,10 +349,11 @@ fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
     Ok(ok(json!({"rows": rows, "more": more, "saved": saved})))
 }
 
-/// Wakes the sync, and remembers when a screen last asked for something.
+/// Wakes the sync, remembers when a screen last asked for something, and when
+/// it next has to look whatever else happens.
 #[derive(Default)]
 pub struct Waker {
-    state: Mutex<(bool, Option<Instant>)>,
+    state: Mutex<(bool, Option<Instant>, Option<Instant>)>,
     bell: Condvar,
     stop: AtomicBool,
 }
@@ -377,6 +378,12 @@ impl Waker {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).1 = Some(Instant::now());
     }
 
+    /// Wakes the sync `after` this long, in place of any such time set before.
+    pub(crate) fn wake_after(&self, after: Duration) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).2 = Some(Instant::now() + after);
+        self.bell.notify_all();
+    }
+
     fn wait(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let every = if state.1.is_some_and(|at| at.elapsed() < LINGER) {
@@ -384,6 +391,9 @@ impl Waker {
         } else {
             IDLE
         };
+        let every = state.2.map_or(every, |at| {
+            every.min(at.saturating_duration_since(Instant::now()))
+        });
         if !state.0 {
             state = self
                 .bell
@@ -392,6 +402,52 @@ impl Waker {
                 .0;
         }
         state.0 = false;
+        if state.2.is_some_and(|at| at <= Instant::now()) {
+            state.2 = None;
+        }
+    }
+}
+
+/// How long the Bot's pushes must have stopped before they count as finished.
+/// It sends them one at a time, and can refresh a token between two.
+pub const SETTLE_MS: i64 = 60_000;
+/// Past [`SETTLE_MS`], so the wake lands after the wait is over and not on it.
+const SETTLE_PAD: Duration = Duration::from_millis(50);
+
+/// Whether the Bot's pushes have finished. Only then does an account nobody
+/// pushed count as signed out: until the last one, it may just be next in line.
+pub struct Settle {
+    wait_ms: AtomicI64,
+    last_ms: AtomicI64,
+    /// A push came, and what nobody holds hasn't been cleared since.
+    owed: AtomicBool,
+}
+
+impl Default for Settle {
+    fn default() -> Self {
+        Self {
+            wait_ms: AtomicI64::new(SETTLE_MS),
+            last_ms: AtomicI64::new(0),
+            owed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Settle {
+    /// A test's shorter wait.
+    pub fn wait_for(&self, ms: i64) {
+        self.wait_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// A push came now. Says how long until they may have finished.
+    pub(crate) fn pushed(&self, now_ms: i64) -> Duration {
+        self.last_ms.store(now_ms, Ordering::Relaxed);
+        self.owed.store(true, Ordering::Relaxed);
+        Duration::from_millis(self.wait_ms.load(Ordering::Relaxed).max(0) as u64) + SETTLE_PAD
+    }
+
+    fn quiet(&self, now_ms: i64) -> bool {
+        now_ms - self.last_ms.load(Ordering::Relaxed) >= self.wait_ms.load(Ordering::Relaxed)
     }
 }
 
@@ -411,13 +467,42 @@ pub fn start(core: Arc<Core>) -> JoinHandle<()> {
     })
 }
 
+/// Writes down whose each label on the Bot's list is, and → those accounts: a
+/// listed account keeps its mail, though after a restart only the active one is
+/// pushed. A label off the list goes from the record too. With no list, as from
+/// an older Bot, nothing is written and nobody is kept by it.
+pub(crate) fn file_sign_ins(core: &Core, store: &Store) -> gws_store::Result<HashSet<String>> {
+    let Some(roster) = core.accounts.roster() else {
+        return Ok(HashSet::new());
+    };
+    let filed: HashMap<String, String> = store.sign_ins()?.into_iter().collect();
+    let rows: Vec<(String, String)> = roster
+        .into_iter()
+        .filter_map(|(listed, who)| {
+            let who = who.or_else(|| filed.get(&listed.label).cloned())?;
+            Some((listed.label, who))
+        })
+        .collect();
+    store.set_sign_ins(&rows)?;
+    Ok(rows.into_iter().map(|(_, who)| who).collect())
+}
+
+/// Whose sign-in `args` name, as last filed.
+pub(crate) fn filed_subject(core: &Core, args: &Value) -> Option<String> {
+    let label = args.get("label").and_then(Value::as_str)?;
+    let filed = with_store(core, |store| store.sign_ins()).ok()?;
+    let row = filed.into_iter().find(|(filed, _)| filed == label)?;
+    Some(row.1)
+}
+
 /// Clears every account in the store that no sign-in holds, whether or not
 /// this process ever saw it signed in. False if it couldn't, and then a marker
 /// on disk has the next sync try again, even after a restart.
 pub fn reconcile(core: &Core) -> bool {
     let cleared = with_store(core, |store| {
+        let listed = file_sign_ins(core, store)?;
         for account in store.accounts()? {
-            if !core.accounts.holds(&account) {
+            if !core.accounts.holds(&account) && !listed.contains(&account) {
                 crate::files::forget_account(core, store, &account)?;
                 store.forget_account(&account)?;
             }
@@ -442,12 +527,38 @@ pub fn reconcile(core: &Core) -> bool {
     cleared
 }
 
-/// Finishes a wipe that failed earlier, in this run or a past one. Not before
-/// the Bot's first push: until then nobody looks signed in, and everyone's mail
-/// would go.
-fn finish_wipes(core: &Core) {
-    let due = core.paths.as_ref().is_ok_and(|p| p.wipe_pending().exists());
-    if due && core.pushed.load(Ordering::Relaxed) {
+/// A sign-in of `account` ended: unless another holds it, its own mail goes now,
+/// and no one else's, as the Bot may have pushes still to come. False if it
+/// couldn't, and then the marker has it cleared with the rest.
+pub(crate) fn forget(core: &Core, account: &str) -> bool {
+    let cleared = with_store(core, |store| {
+        let listed = file_sign_ins(core, store)?;
+        if !core.accounts.holds(account) && !listed.contains(account) {
+            crate::files::forget_account(core, store, account)?;
+            store.forget_account(account)?;
+        }
+        Ok(())
+    })
+    .is_ok();
+    if !cleared
+        && let Ok(paths) = &core.paths
+        && std::fs::write(paths.wipe_pending(), b"").is_err()
+    {
+        eprintln!("buwiz-gws: couldn't keep track of a mail wipe");
+    }
+    cleared
+}
+
+/// Clears what no sign-in holds, once the Bot's pushes have finished, and with
+/// it a wipe that failed earlier, in this run or a past one. Not before the
+/// first push: until then nobody looks signed in, and everyone's mail would go.
+pub fn finish_wipes(core: &Core) {
+    if !core.pushed.load(Ordering::Relaxed) || !core.settle.quiet(core.clock.now_ms()) {
+        return;
+    }
+    let failed = core.paths.as_ref().is_ok_and(|p| p.wipe_pending().exists());
+    // taken first: a push from here on is owed a clear of its own
+    if core.settle.owed.swap(false, Ordering::Relaxed) || failed {
         reconcile(core);
     }
 }
@@ -1076,6 +1187,153 @@ mod tests {
             json!({"account": "google", "label": "default"})
         }
 
+        /// As long after the last push as it takes to count as the last.
+        fn pushes_stop(core: &Core) {
+            core.clock.set(core.clock.now_ms() + SETTLE_MS);
+            finish_wipes(core);
+        }
+
+        const AT: i64 = 1_800_000_000_000;
+
+        fn push(core: &Core, who: &str) {
+            let mut args = sign_in(who);
+            args["label"] = json!(who);
+            let said = core.account("buwiz.account.set", &args);
+            assert_eq!(said["structuredContent"], json!({"ok": true}), "{said}");
+        }
+
+        /// A store that was left holding `who`, each with a mark to look for.
+        fn left_with(paths: &gws_store::Paths, who: &[&str]) {
+            let core = Core::new(&Apis::at("http://127.0.0.1:1"), Ok(paths.clone()));
+            core.unlock("seed");
+            with_store(&core, |s| {
+                who.iter()
+                    .try_for_each(|account| s.set_state(account, "mark", "kept"))
+            })
+            .unwrap();
+        }
+
+        fn marked(core: &Core, who: &str) -> bool {
+            with_store(core, |s| s.state(who, "mark"))
+                .unwrap()
+                .is_some()
+        }
+
+        /// One at a time, with a sync after each as the push wakes one: nothing
+        /// goes while one is still to come, however long a push takes to arrive.
+        fn pushed_one_at_a_time(who: &[&str], tag: &str) {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let paths = dir(tag);
+            left_with(&paths, who);
+            let core = core(&google, &paths);
+            core.clock.set(AT);
+            for (at, account) in who.iter().enumerate() {
+                push(&core, account);
+                let _ = sync(&core);
+                for each in who {
+                    assert!(marked(&core, each), "{each} went at push {at}");
+                }
+                core.clock.set(core.clock.now_ms() + SETTLE_MS - 1);
+                finish_wipes(&core);
+                for each in who {
+                    assert!(marked(&core, each), "{each} went after push {at}");
+                }
+            }
+            pushes_stop(&core);
+            for each in who {
+                assert!(marked(&core, each), "{each} is signed in");
+            }
+        }
+
+        #[test]
+        fn two_accounts_pushed_one_at_a_time_both_stay() {
+            pushed_one_at_a_time(&["a@example.com", "b@example.com"], "two");
+        }
+
+        #[test]
+        fn three_accounts_pushed_one_at_a_time_all_stay() {
+            pushed_one_at_a_time(
+                &["a@example.com", "b@example.com", "c@example.com"],
+                "three",
+            );
+        }
+
+        #[test]
+        fn an_account_nobody_pushed_goes_only_after_the_last_push() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let paths = dir("after-last");
+            let (a, b, gone) = ("a@example.com", "b@example.com", "gone@example.com");
+            left_with(&paths, &[a, b, gone]);
+            let core = core(&google, &paths);
+            core.clock.set(AT);
+            push(&core, a);
+            let _ = sync(&core);
+            assert!(marked(&core, gone) && marked(&core, b));
+            core.clock.set(AT + SETTLE_MS - 1);
+            push(&core, b);
+            core.clock.set(AT + SETTLE_MS);
+            let _ = sync(&core);
+            assert!(marked(&core, gone), "the wait starts over at each push");
+            pushes_stop(&core);
+            assert!(marked(&core, a) && marked(&core, b));
+            assert!(!marked(&core, gone), "nobody pushed it");
+        }
+
+        #[test]
+        fn a_sign_out_takes_its_own_mail_at_once_and_nobody_elses() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let paths = dir("own-only");
+            let (a, b, later) = ("a@example.com", "b@example.com", "later@example.com");
+            left_with(&paths, &[a, b, later]);
+            let core = core(&google, &paths);
+            core.clock.set(AT);
+            push(&core, a);
+            push(&core, b);
+            core.account(
+                "buwiz.account.clear",
+                &json!({"account": "google", "label": a}),
+            );
+            assert!(!marked(&core, a), "it doesn't outlive the sign-in");
+            assert!(marked(&core, b) && marked(&core, later));
+        }
+
+        #[test]
+        fn a_second_sign_in_of_one_account_keeps_it_through_a_sign_out() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let paths = dir("two-labels");
+            left_with(&paths, &[OWNER]);
+            let core = core(&google, &paths);
+            let mut other = sign_in(OWNER);
+            other["label"] = json!("work");
+            core.account("buwiz.account.set", &sign_in(OWNER));
+            core.account("buwiz.account.set", &other);
+            core.account("buwiz.account.clear", &out());
+            assert!(marked(&core, OWNER));
+        }
+
+        /// Nothing else may have to come along for the last clear to happen.
+        #[test]
+        fn the_sync_thread_clears_by_itself_once_the_pushes_stop() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let paths = dir("thread");
+            let (a, gone) = ("a@example.com", "gone@example.com");
+            left_with(&paths, &[a, gone]);
+            let core = Arc::new(core(&google, &paths));
+            core.settle.wait_for(300);
+            let thread = start(core.clone());
+            push(&core, a);
+            assert!(marked(&core, gone), "not yet");
+            let by = Instant::now() + Duration::from_secs(10);
+            while marked(&core, gone) && Instant::now() < by {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let cleared = !marked(&core, gone);
+            core.sync.stop();
+            thread.join().unwrap();
+            assert!(cleared, "nothing woke the clear");
+            assert!(marked(&core, a));
+        }
+
         #[test]
         fn nothing_lands_after_a_sign_out_however_late_it_arrives() {
             let google = FakeGoogle::start(Seed::demo(6));
@@ -1114,7 +1372,10 @@ mod tests {
             let _ = sync(&second);
             assert!(rows(&second) > 0, "the Bot hasn't pushed anything yet");
             second.account("buwiz.account.set", &sign_in("other@example.com"));
-            assert_eq!(rows(&second), 0, "the first push cleared it");
+            let _ = sync(&second);
+            assert!(rows(&second) > 0, "the Bot may have more pushes to come");
+            pushes_stop(&second);
+            assert_eq!(rows(&second), 0, "the last push cleared it");
             assert!(!paths.wipe_pending().exists());
         }
 
@@ -1132,7 +1393,7 @@ mod tests {
             let _ = sync(&second);
             assert!(rows(&second) > 0, "no push yet, so nobody's mail goes");
             second.account("buwiz.account.set", &sign_in(OWNER));
-            let _ = sync(&second);
+            pushes_stop(&second);
             assert!(rows(&second) > 0, "the owner is signed in");
             assert!(!paths.wipe_pending().exists());
         }
@@ -1150,7 +1411,7 @@ mod tests {
             let second = core(&google, &paths);
             let refused = second.account("buwiz.account.set", &json!({"account": "google"}));
             assert_eq!(refused["isError"], true, "{refused}");
-            let _ = sync(&second);
+            pushes_stop(&second);
             assert!(paths.wipe_pending().exists(), "the wipe still waits");
         }
 
@@ -1166,7 +1427,211 @@ mod tests {
             let second = core(&google, &paths);
             assert!(rows(&second) > 0);
             second.account("buwiz.account.clear", &out());
+            pushes_stop(&second);
             assert_eq!(rows(&second), 0);
+        }
+
+        /// A push as the Bot sends one, with its list: `(label, active)`.
+        fn with_list(mut args: Value, list: &[(&str, bool)]) -> Value {
+            let rows: Vec<Value> = list
+                .iter()
+                .map(|(label, active)| json!({"account": "google", "label": label, "active": active}))
+                .collect();
+            args["accounts"] = json!(rows);
+            args
+        }
+
+        fn push_listed(core: &Core, who: &str, list: &[(&str, bool)]) {
+            let mut args = sign_in(who);
+            args["label"] = json!(who);
+            let said = core.account("buwiz.account.set", &with_list(args, list));
+            assert_eq!(said["structuredContent"], json!({"ok": true}), "{said}");
+        }
+
+        fn clear_listed(core: &Core, who: &str, list: &[(&str, bool)]) {
+            let args = json!({"account": "google", "label": who});
+            core.account("buwiz.account.clear", &with_list(args, list));
+        }
+
+        /// The Bot's switch from `from` to `to`: the old one cleared, the new
+        /// one pushed, both with the list as it is by then.
+        fn switch(core: &Core, from: &str, to: &str) {
+            let list = [(from, false), (to, true)];
+            clear_listed(core, from, &list);
+            push_listed(core, to, &list);
+        }
+
+        const A: &str = "a@example.com";
+        const B: &str = "b@example.com";
+
+        /// Both signed in and a on top, on a store holding both.
+        fn two_accounts(google: &FakeGoogle, tag: &str) -> (Core, gws_store::Paths) {
+            let paths = dir(tag);
+            left_with(&paths, &[A, B]);
+            let core = core(google, &paths);
+            core.clock.set(AT);
+            push_listed(&core, B, &[(A, true), (B, false)]);
+            switch(&core, B, A);
+            (core, paths)
+        }
+
+        fn answer(result: &Value) -> &Value {
+            &result["structuredContent"]
+        }
+
+        #[test]
+        fn a_switch_keeps_both_accounts_and_a_sign_out_still_takes_its_own() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (core, _) = two_accounts(&google, "two-switch");
+            switch(&core, A, B);
+            let _ = sync(&core);
+            pushes_stop(&core);
+            assert!(marked(&core, A), "a switch is no sign-out");
+            assert!(marked(&core, B));
+            assert_eq!(core.accounts.session().unwrap().1, B);
+            clear_listed(&core, A, &[(B, true)]);
+            assert!(!marked(&core, A), "off the list, so it's gone at once");
+            assert!(marked(&core, B));
+        }
+
+        #[test]
+        fn an_account_nobody_pushed_since_a_restart_is_still_kept_and_named() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (first, paths) = two_accounts(&google, "two-restart");
+            drop(first);
+            let second = core(&google, &paths);
+            second.clock.set(AT);
+            push_listed(&second, B, &[(A, false), (B, true)]);
+            let _ = sync(&second);
+            pushes_stop(&second);
+            assert!(marked(&second, A), "only the active one is pushed");
+            assert!(marked(&second, B));
+            let rows = second.run(crate::tools::ACCOUNTS, &json!({}));
+            assert_eq!(
+                answer(&rows)["accounts"],
+                json!([
+                    {"label": A, "address": A, "active": false},
+                    {"label": B, "address": B, "active": true},
+                ])
+            );
+        }
+
+        #[test]
+        fn a_label_off_the_list_after_a_restart_goes_with_its_record() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (first, paths) = two_accounts(&google, "two-off-list");
+            drop(first);
+            let second = core(&google, &paths);
+            second.clock.set(AT);
+            push_listed(&second, B, &[(B, true)]);
+            pushes_stop(&second);
+            assert!(!marked(&second, A));
+            assert!(marked(&second, B));
+            let filed = with_store(&second, |s| s.sign_ins()).unwrap();
+            assert_eq!(filed, vec![(B.to_owned(), B.to_owned())]);
+        }
+
+        #[test]
+        fn a_sign_out_of_an_account_nobody_pushed_since_a_restart_goes_at_once() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (first, paths) = two_accounts(&google, "two-out-restart");
+            drop(first);
+            let second = core(&google, &paths);
+            second.clock.set(AT);
+            push_listed(&second, B, &[(A, false), (B, true)]);
+            clear_listed(&second, A, &[(B, true)]);
+            assert!(!marked(&second, A), "not at the next settle: now");
+            assert!(marked(&second, B));
+        }
+
+        /// Not what B7 sends. A Bot that stopped listing can't vouch for a label.
+        #[test]
+        fn a_clear_with_no_list_is_a_sign_out_whatever_the_last_list_said() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (core, _) = two_accounts(&google, "two-no-list");
+            let out = json!({"account": "google", "label": B});
+            core.account("buwiz.account.clear", &out);
+            assert!(!marked(&core, B), "gone at once");
+            assert!(marked(&core, A));
+            let rows = core.run(crate::tools::ACCOUNTS, &json!({}));
+            assert_eq!(
+                answer(&rows)["accounts"],
+                json!([{"label": A, "address": A, "active": true}])
+            );
+        }
+
+        #[test]
+        fn a_clear_whose_list_is_null_has_no_list() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (core, _) = two_accounts(&google, "two-null-list");
+            let out = json!({"account": "google", "label": B, "accounts": null});
+            core.account("buwiz.account.clear", &out);
+            assert!(!marked(&core, B), "gone at once");
+        }
+
+        #[test]
+        fn only_a_listed_other_account_asks_the_bot_to_switch() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (core, _) = two_accounts(&google, "two-use");
+            let ask = |label: &str| core.run(crate::tools::ACCOUNT_USE, &json!({"label": label}));
+            let asked = ask(B);
+            assert_eq!(
+                asked["_meta"],
+                json!({"buwiz/account_use": {"account": "google", "label": B}})
+            );
+            assert_eq!(core.accounts.session().unwrap().1, A, "the Bot switches");
+            let same = ask(A);
+            assert_eq!(same.get("_meta"), None);
+            assert_eq!(answer(&same)["switched"], false);
+            let nobody = ask("nobody");
+            assert_eq!(nobody.get("_meta"), None);
+            assert_eq!(answer(&nobody)["code"], "not_found");
+        }
+
+        #[test]
+        fn a_send_in_its_hold_keeps_the_account_until_it_goes() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (core, _) = two_accounts(&google, "two-hold");
+            let press = core.run(crate::tools::MAIL_SEND_ARM, &json!({}));
+            let ask = || core.run(crate::tools::ACCOUNT_USE, &json!({"label": B}));
+            let held = ask();
+            assert_eq!(held.get("_meta"), None);
+            assert_eq!(answer(&held)["code"], "busy");
+            let armed = answer(&press)["armed"].clone();
+            core.run(crate::tools::MAIL_SEND_DISARM, &json!({"armed": armed}));
+            assert!(ask().get("_meta").is_some(), "Undo frees it");
+        }
+
+        #[test]
+        fn a_write_for_the_account_before_a_switch_is_refused_before_google() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (core, _) = two_accounts(&google, "two-stale");
+            let save = |who: &str| {
+                let args = json!({"as_account": who, "to": "ana@example.com", "subject": "Hi", "body": "x"});
+                core.run(crate::tools::MAIL_DRAFT_SAVE, &args)
+            };
+            assert!(answer(&save(A)).get("draft").is_some(), "its own account");
+            switch(&core, A, B);
+            let refused = save(A);
+            assert_eq!(answer(&refused)["code"], "account_changed");
+            assert!(answer(&save(B)).get("draft").is_some());
+        }
+
+        #[test]
+        fn an_event_draft_stays_on_the_account_it_was_made_on() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (core, _) = two_accounts(&google, "two-event");
+            let args = json!({"title": "Lunch", "start": "2026-11-09T12:00:00+08:00", "end": "2026-11-09T13:00:00+08:00"});
+            let made = core.run(crate::tools::EVENT_DRAFT, &args);
+            let read = |ticket: &Value| {
+                core.run(crate::tools::EVENT_DRAFT_READ, &json!({"ticket": ticket}))
+            };
+            let ticket = answer(&made)["ticket"].clone();
+            assert_eq!(answer(&read(&ticket))["as_account"], A);
+            switch(&core, A, B);
+            assert_eq!(answer(&read(&ticket))["refused"], "not_found");
+            switch(&core, B, A);
+            assert_eq!(answer(&read(&ticket))["title"], "Lunch");
         }
 
         #[test]

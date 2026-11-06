@@ -17,6 +17,10 @@ use nsh_engine::EngineConfig;
 use nsh_testing::Headless;
 use serde_json::{Map, Value, json};
 
+mod bot_filter;
+
+use bot_filter::Filter;
+
 const WAIT: Duration = Duration::from_secs(5);
 /// What the Bot says, word for word, when a press came from the AI.
 const AI_REFUSED: &str = "Only a person can do this in Google Workspace, and this press came from the AI, so nothing was sent. To go ahead, press it yourself.";
@@ -97,6 +101,8 @@ fn when_of(e: &Value) -> Option<When> {
 
 #[derive(Default)]
 struct Fake {
+    /// In place of the three calendars.
+    calendars: Mutex<Option<Value>>,
     props: Mutex<Value>,
     inline: Mutex<bool>,
     status: Mutex<Option<Value>>,
@@ -279,6 +285,10 @@ impl Host for Fake {
                     || json!({"signed_in": true, "features": {"mail": true, "calendar": true, "drive": false}}),
                 ),
             ),
+            "gws_cal_list" if self.calendars.lock().unwrap().is_some() => (
+                String::new(),
+                self.calendars.lock().unwrap().clone().unwrap(),
+            ),
             "gws_cal_list" => {
                 let hidden = self.hidden.lock().unwrap();
                 let list = |id: &str, name: &str, primary, writable| json!({"id": id, "name": name, "primary": primary, "writable": writable, "shown": !hidden.contains(id), "time_zone": "Asia/Manila"});
@@ -440,10 +450,16 @@ fn fill(app: &mut Headless, label: &str, text: &str) {
 /// A new event with this title, in the editor, ready to save.
 fn write_one(app: &mut Headless, title: &str) {
     key(app, "c");
-    app.wait_for_within("label:Title", WAIT)
-        .expect("the editor opens");
-    app.type_text("label:Title", title)
-        .expect("it takes a title");
+    app.wait_for_within(
+        "label:Title, the name guests will see on their calendars",
+        WAIT,
+    )
+    .expect("the editor opens");
+    app.type_text(
+        "label:Title, the name guests will see on their calendars",
+        title,
+    )
+    .expect("it takes a title");
 }
 
 fn add_guest(app: &mut Headless, address: &str) {
@@ -874,7 +890,7 @@ fn detail_shows_the_event_with_replies_and_opens_meet_through_the_link_check() {
         );
     }
     assert!(
-        !app.screen().matches("label:Maybe").unwrap(),
+        !app.screen().matches("label:Answer maybe").unwrap(),
         "not an invite"
     );
 
@@ -903,7 +919,7 @@ fn an_invite_takes_a_reply() {
         !app.screen().matches("label:Edit this event").unwrap(),
         "not this person's to edit"
     );
-    press(&mut app, "label:Maybe");
+    press(&mut app, "label:Answer maybe");
     assert_eq!(
         last(&fake, "gws_event_rsvp"),
         json!({"calendar": "mine", "id": "i1", "response": "tentative"})
@@ -934,7 +950,11 @@ fn save_says_what_it_will_do_and_the_call_carries_those_guests() {
     add_guest(&mut app, "ben@example.com");
     assert!(app.screen().shows("Save and invite 2"));
     assert!(!app.screen().shows("Save"), "the plain word has gone");
-    fill(&mut app, "Place", "The long table");
+    fill(
+        &mut app,
+        "Place, an address or a room that guests will read",
+        "The long table",
+    );
     press(&mut app, "label:Save this event");
 
     let saved = last(&fake, "gws_event_save");
@@ -952,7 +972,9 @@ fn save_says_what_it_will_do_and_the_call_carries_those_guests() {
             .shows("Saved, and the invite went to 2 guests.")
     );
     assert!(
-        !app.screen().matches("label:Title").unwrap(),
+        !app.screen()
+            .matches("label:Title, the name guests will see on their calendars")
+            .unwrap(),
         "the editor closed"
     );
 }
@@ -1012,7 +1034,11 @@ fn a_guest_that_isnt_an_address_stops_the_save_and_says_so() {
     press(&mut app, "label:Save this event");
     assert!(app.screen().shows("Check this guest's address: ana"));
     assert_eq!(fake.writes(), 0);
-    assert!(app.screen().matches("label:Title").unwrap());
+    assert!(
+        app.screen()
+            .matches("label:Title, the name guests will see on their calendars")
+            .unwrap()
+    );
 }
 
 #[test]
@@ -1035,9 +1061,13 @@ fn an_all_day_event_saves_googles_exclusive_end_and_reads_back_the_last_day() {
     let (mut app, fake) = start();
     write_one(&mut app, "Conference");
     press(&mut app, "label:All day");
-    fill(&mut app, "Start date", "2030-05-01");
-    fill(&mut app, "End date", "2030-05-03");
-    assert!(!app.screen().matches("label:Start time").unwrap());
+    fill(&mut app, "Start date, like 2026-11-06", "2030-05-01");
+    fill(&mut app, "End date, like 2026-11-06", "2030-05-03");
+    assert!(
+        !app.screen()
+            .matches("label:Start time, like 09:30 or 14:30 or 18:05")
+            .unwrap()
+    );
     press(&mut app, "label:Save this event");
     let saved = last(&fake, "gws_event_save");
     assert_eq!(
@@ -1049,10 +1079,13 @@ fn an_all_day_event_saves_googles_exclusive_end_and_reads_back_the_last_day() {
     // it moved the view there, so the person sees what they saved
     open(&mut app, "Conference >> nth=0");
     press(&mut app, "label:Edit this event");
-    app.wait_for_within("label:Title", WAIT)
-        .expect("the editor opens");
+    app.wait_for_within(
+        "label:Title, the name guests will see on their calendars",
+        WAIT,
+    )
+    .expect("the editor opens");
     assert_eq!(
-        field(&app, "End date"),
+        field(&app, "End date, like 2026-11-06"),
         "2030-05-03",
         "the last day, not Google's end"
     );
@@ -1062,10 +1095,14 @@ fn an_all_day_event_saves_googles_exclusive_end_and_reads_back_the_last_day() {
 fn an_end_before_the_start_writes_nothing_and_says_so() {
     let (mut app, fake) = start();
     write_one(&mut app, "Backwards");
-    fill(&mut app, "Start date", "2030-05-01");
-    fill(&mut app, "End date", "2030-05-01");
-    fill(&mut app, "Start time", "15:00");
-    fill(&mut app, "End time", "14:00");
+    fill(&mut app, "Start date, like 2026-11-06", "2030-05-01");
+    fill(&mut app, "End date, like 2026-11-06", "2030-05-01");
+    fill(
+        &mut app,
+        "Start time, like 09:30 or 14:30 or 18:05",
+        "15:00",
+    );
+    fill(&mut app, "End time, like 10:30 or 15:30 or 19:05", "14:00");
     press(&mut app, "label:Save this event");
     assert!(app.screen().shows("It ends before it starts."));
     assert_eq!(fake.writes(), 0);
@@ -1076,10 +1113,17 @@ fn an_edit_carries_its_id_and_etag_and_keeps_its_guests() {
     let (mut app, fake) = start();
     open(&mut app, "Team review");
     press(&mut app, "label:Edit this event");
-    app.wait_for_within("label:Title", WAIT)
-        .expect("the editor opens");
+    app.wait_for_within(
+        "label:Title, the name guests will see on their calendars",
+        WAIT,
+    )
+    .expect("the editor opens");
     assert!(app.screen().shows("Save and update 2"));
-    fill(&mut app, "Title", "Team review, moved");
+    fill(
+        &mut app,
+        "Title, the name guests will see on their calendars",
+        "Team review, moved",
+    );
     press(&mut app, "label:Save this event");
     let saved = last(&fake, "gws_event_save");
     assert_eq!((&saved["id"], &saved["etag"]), (&json!("e1"), &json!("e1")));
@@ -1099,8 +1143,11 @@ fn the_persons_own_place_on_the_list_stays_and_isnt_an_invite() {
     let (mut app, fake) = start_with(vec![row]);
     open(&mut app, "Standup");
     press(&mut app, "label:Edit this event");
-    app.wait_for_within("label:Title", WAIT)
-        .expect("the editor opens");
+    app.wait_for_within(
+        "label:Title, the name guests will see on their calendars",
+        WAIT,
+    )
+    .expect("the editor opens");
     assert!(
         app.screen().shows("Save and update 1"),
         "{:?}",
@@ -1118,9 +1165,16 @@ fn a_refused_change_writes_nothing_more_and_shows_the_newer_one() {
     let (mut app, fake) = start();
     open(&mut app, "Team review");
     press(&mut app, "label:Edit this event");
-    app.wait_for_within("label:Title", WAIT)
-        .expect("the editor opens");
-    fill(&mut app, "Title", "My version");
+    app.wait_for_within(
+        "label:Title, the name guests will see on their calendars",
+        WAIT,
+    )
+    .expect("the editor opens");
+    fill(
+        &mut app,
+        "Title, the name guests will see on their calendars",
+        "My version",
+    );
 
     let mut newer = fake.row("e1").unwrap();
     newer["title"] = json!("Their version");
@@ -1135,7 +1189,7 @@ fn a_refused_change_writes_nothing_more_and_shows_the_newer_one() {
     assert!(app.screen().shows("Their version"));
     assert!(app.screen().shows("Room Nine"));
     assert_eq!(
-        field(&app, "Title"),
+        field(&app, "Title, the name guests will see on their calendars"),
         "My version",
         "their words aren't lost"
     );
@@ -1148,7 +1202,10 @@ fn a_refused_change_writes_nothing_more_and_shows_the_newer_one() {
     );
 
     press(&mut app, "label:Keep my changes");
-    assert_eq!(field(&app, "Title"), "My version");
+    assert_eq!(
+        field(&app, "Title, the name guests will see on their calendars"),
+        "My version"
+    );
     press(&mut app, "label:Save this event");
     let saved = fake.called("gws_event_save");
     assert_eq!(saved.len(), 2);
@@ -1160,15 +1217,21 @@ fn use_the_newer_one_fills_the_form_with_it() {
     let (mut app, fake) = start();
     open(&mut app, "Team review");
     press(&mut app, "label:Edit this event");
-    app.wait_for_within("label:Title", WAIT)
-        .expect("the editor opens");
+    app.wait_for_within(
+        "label:Title, the name guests will see on their calendars",
+        WAIT,
+    )
+    .expect("the editor opens");
     let mut newer = fake.row("e1").unwrap();
     newer["title"] = json!("Their version");
     newer["etag"] = json!("e2");
     *fake.changed.lock().unwrap() = Some(newer);
     press(&mut app, "label:Save this event");
     press(&mut app, "label:Use the newer one");
-    assert_eq!(field(&app, "Title"), "Their version");
+    assert_eq!(
+        field(&app, "Title, the name guests will see on their calendars"),
+        "Their version"
+    );
     assert_eq!(fake.called("gws_event_save").len(), 1);
 }
 
@@ -1205,9 +1268,16 @@ fn a_series_asks_before_an_edit_and_the_call_carries_the_scope() {
         let (mut app, fake) = start_with(a_series());
         open(&mut app, "Weekly sync");
         press(&mut app, "label:Edit this event");
-        app.wait_for_within("label:Title", WAIT)
-            .expect("the editor opens");
-        fill(&mut app, "Title", "Weekly sync, new");
+        app.wait_for_within(
+            "label:Title, the name guests will see on their calendars",
+            WAIT,
+        )
+        .expect("the editor opens");
+        fill(
+            &mut app,
+            "Title, the name guests will see on their calendars",
+            "Weekly sync, new",
+        );
         press(&mut app, "label:Save this event");
         assert_eq!(fake.writes(), 0, "not before it's answered");
         assert!(app.screen().shows("Save this change to which events?"));
@@ -1224,13 +1294,20 @@ fn a_series_question_can_be_called_off_and_a_change_drops_it() {
     let (mut app, fake) = start_with(a_series());
     open(&mut app, "Weekly sync");
     press(&mut app, "label:Edit this event");
-    app.wait_for_within("label:Title", WAIT)
-        .expect("the editor opens");
+    app.wait_for_within(
+        "label:Title, the name guests will see on their calendars",
+        WAIT,
+    )
+    .expect("the editor opens");
     press(&mut app, "label:Save this event");
     press(&mut app, "label:Cancel this");
     assert_eq!(fake.writes(), 0);
     press(&mut app, "label:Save this event");
-    fill(&mut app, "Title", "Changed after the question");
+    fill(
+        &mut app,
+        "Title, the name guests will see on their calendars",
+        "Changed after the question",
+    );
     assert!(
         !app.screen().matches("label:All events").unwrap(),
         "asked about something else"
@@ -1242,7 +1319,7 @@ fn a_series_question_can_be_called_off_and_a_change_drops_it() {
 fn a_series_asks_before_a_delete_and_a_reply() {
     let (mut app, fake) = start_with(a_series());
     open(&mut app, "Weekly sync");
-    press(&mut app, "label:Yes");
+    press(&mut app, "label:Answer yes");
     assert_eq!(fake.writes(), 0);
     press(&mut app, "label:All events");
     let reply = last(&fake, "gws_event_rsvp");
@@ -1319,10 +1396,15 @@ fn the_ais_press_on_save_changes_nothing_and_says_so() {
     press(&mut app, "label:Save this event");
     assert!(app.screen().shows(AI_REFUSED), "{:?}", app.screen().texts());
     assert!(
-        app.screen().matches("label:Title").unwrap(),
+        app.screen()
+            .matches("label:Title, the name guests will see on their calendars")
+            .unwrap(),
         "the editor stays"
     );
-    assert_eq!(field(&app, "Title"), "From the AI");
+    assert_eq!(
+        field(&app, "Title, the name guests will see on their calendars"),
+        "From the AI"
+    );
     assert!(app.screen().shows("Save and invite 1"));
     assert_eq!(*fake.events.lock().unwrap(), before);
     assert!(!app.screen().shows("Saved, and the invite went to 1 guest."));
@@ -1352,7 +1434,7 @@ fn the_ais_press_on_a_reply_changes_nothing_and_says_so() {
     ))]);
     open(&mut app, "Launch");
     *fake.ai.lock().unwrap() = true;
-    press(&mut app, "label:Yes");
+    press(&mut app, "label:Answer yes");
     assert!(app.screen().shows(AI_REFUSED));
     assert_eq!(fake.row("i1").unwrap()["response"], "needsAction");
     assert!(!app.screen().shows("Your reply was sent."));
@@ -1416,7 +1498,9 @@ fn keys_do_nothing_while_typing_in_a_field() {
     }
     assert_eq!(fake.called("gws_cal_range").len(), asked, "no view moved");
     assert!(
-        !app.screen().matches("label:Title").unwrap(),
+        !app.screen()
+            .matches("label:Title, the name guests will see on their calendars")
+            .unwrap(),
         "no editor opened"
     );
     assert!(!app.screen().matches("label:Back to the calendar").unwrap());
@@ -1427,24 +1511,31 @@ fn keys_do_nothing_while_typing_in_a_field() {
 fn keys_stay_out_of_the_editor_even_with_no_field_focused() {
     let (mut app, fake) = start();
     key(&mut app, "c");
-    app.wait_for_within("label:Title", WAIT)
-        .expect("the editor opens");
+    app.wait_for_within(
+        "label:Title, the name guests will see on their calendars",
+        WAIT,
+    )
+    .expect("the editor opens");
     let asked = fake.called("gws_cal_range").len();
-    let date = field(&app, "Start date");
+    let date = field(&app, "Start date, like 2026-11-06");
     key(&mut app, "m");
     key(&mut app, "j");
     key(&mut app, "c");
     key(&mut app, "delete");
     assert_eq!(fake.called("gws_cal_range").len(), asked);
-    assert_eq!(field(&app, "Start date"), date);
-    assert_eq!(field(&app, "Title"), "");
+    assert_eq!(field(&app, "Start date, like 2026-11-06"), date);
+    assert_eq!(
+        field(&app, "Title, the name guests will see on their calendars"),
+        ""
+    );
 }
 
 #[test]
 fn cmd_s_saves_while_typing_and_a_second_is_the_same_save() {
     let (mut app, fake) = start();
     write_one(&mut app, "By keyboard");
-    app.press("label:Title").ok();
+    app.press("label:Title, the name guests will see on their calendars")
+        .ok();
     key(&mut app, "mod+s");
     assert_eq!(fake.called("gws_event_save").len(), 1);
     key(&mut app, "mod+s");
@@ -1659,9 +1750,15 @@ fn a_draft_cards_edit_opens_the_screen_on_that_draft_with_its_fields() {
     *fake.props.lock().unwrap() = json!({"draft": "tk1"});
     *fake.draft.lock().unwrap() = a_draft(1);
     let mut app = open_with(fake.clone(), 1000.0, 600.0);
-    app.wait_for_within("label:Title", WAIT)
-        .expect("the editor opens");
-    assert_eq!(field(&app, "Title"), "Quarterly plan");
+    app.wait_for_within(
+        "label:Title, the name guests will see on their calendars",
+        WAIT,
+    )
+    .expect("the editor opens");
+    assert_eq!(
+        field(&app, "Title, the name guests will see on their calendars"),
+        "Quarterly plan"
+    );
     assert!(app.screen().shows("Save and invite 1"));
     assert!(app.screen().shows("guest0@example.com"));
 }
@@ -1770,8 +1867,11 @@ fn a_long_title_and_many_guests_leave_the_editors_presses_on_it() {
     draft["guests"] = json!(guests(12));
     *fake.draft.lock().unwrap() = draft;
     let mut app = open_with(fake.clone(), 300.0, 500.0);
-    app.wait_for_within("label:Title", WAIT)
-        .expect("the editor opens");
+    app.wait_for_within(
+        "label:Title, the name guests will see on their calendars",
+        WAIT,
+    )
+    .expect("the editor opens");
     assert_at_every_width(&mut app, 500.0, &["Cancel", "Save and invite 12"]);
     assert_eq!(fake.writes(), 0);
 }
@@ -1887,8 +1987,11 @@ fn no_screen_puts_a_title_a_guest_or_a_place_in_a_label() {
     assert_no_label_holds(&app, &secrets, "the question");
     press(&mut app, "label:Cancel this");
     press(&mut app, "label:Edit this event");
-    app.wait_for_within("label:Title", WAIT)
-        .expect("the editor opens");
+    app.wait_for_within(
+        "label:Title, the name guests will see on their calendars",
+        WAIT,
+    )
+    .expect("the editor opens");
     assert!(app.screen().shows("ana@example.com"));
     assert_no_label_holds(&app, &secrets, "editor");
 
@@ -1918,6 +2021,337 @@ fn neither_card_puts_a_title_a_guest_or_a_place_in_a_label() {
         &["Quarterly plan", "guest0", "Room Seven", "Bring the plan"],
         "draft card",
     );
+}
+
+// --- Empty states ------------------------------------------------------------
+
+fn audited(fake: &Arc<Fake>, width: f32, height: f32) -> (Headless, Filter) {
+    let def = gws_screens::screens()
+        .iter()
+        .find(|s| s.id == "gws.calendar")
+        .expect("Calendar");
+    let root = (def.build)(Bridge::new(fake.clone()));
+    let mut app = Headless::start(EngineConfig::new(root)).expect("the engine starts");
+    let filter = Filter::watch(&mut app);
+    app.set_viewport(size(px(width), px(height)))
+        .expect("the viewport sets");
+    (app, filter)
+}
+
+fn no_calendars(fake: &Fake) {
+    *fake.calendars.lock().unwrap() = Some(json!({"calendars": []}));
+}
+
+fn all_hidden(fake: &Fake) {
+    let mut hidden = fake.hidden.lock().unwrap();
+    hidden.extend(["mine", "work", "feed"].map(str::to_owned));
+}
+
+const NO_CALENDARS: &str =
+    "No calendars on this account yet. Make one in Google Calendar and it shows here.";
+
+#[test]
+fn every_empty_view_says_so_and_offers_the_next_press() {
+    let (mut app, _) = start_with(Vec::new());
+    assert!(
+        app.screen()
+            .shows("Nothing this week. Press New to add an event."),
+        "{:?}",
+        app.screen().texts()
+    );
+    for (keys, line) in [
+        ("d", "Nothing on this day. Press New to add an event."),
+        ("m", "Nothing this month. Press New to add an event."),
+        ("a", "Nothing in these days. Press New to add an event."),
+    ] {
+        key(&mut app, keys);
+        assert!(app.screen().shows(line), "{:?}", app.screen().texts());
+    }
+    app.type_text("label:Search events", "zzz").unwrap();
+    app.submit("label:Search events").unwrap();
+    settle(&mut app);
+    assert!(app.screen().shows("No events match that. Try other words."));
+}
+
+#[test]
+fn a_view_with_events_says_nothing_of_the_kind() {
+    let (mut app, _) = start();
+    assert!(
+        !app.screen()
+            .shows("Nothing this week. Press New to add an event.")
+    );
+    key(&mut app, "d");
+    assert!(
+        !app.screen()
+            .shows("Nothing on this day. Press New to add an event.")
+    );
+}
+
+#[test]
+fn no_calendars_is_said_on_the_view_the_column_and_the_editor() {
+    let fake = Arc::new(Fake::default());
+    no_calendars(&fake);
+    let mut app = open_with(fake.clone(), 1000.0, 600.0);
+    app.wait_for_within(&format!("text:{NO_CALENDARS}"), WAIT)
+        .expect("it says so");
+    assert!(app.screen().shows("None yet."));
+    key(&mut app, "a");
+    assert!(app.screen().shows(NO_CALENDARS));
+    key(&mut app, "c");
+    assert!(app.screen().shows("You have no calendar to add this to."));
+    press(&mut app, "label:Save this event");
+    assert!(app.screen().shows("Choose a calendar for this event."));
+    assert_eq!(fake.writes(), 0);
+}
+
+#[test]
+fn every_calendar_hidden_is_not_the_same_as_nothing_on() {
+    let fake = Arc::new(Fake::default());
+    all_hidden(&fake);
+    *fake.events.lock().unwrap() = a_day();
+    let mut app = open_with(fake, 1000.0, 600.0);
+    app.wait_for_within(
+        "text:Every calendar is hidden. Turn one on to see its events.",
+        WAIT,
+    )
+    .expect("it says so");
+    assert!(!app.screen().shows("Nothing this week."));
+}
+
+/// The line sits in the flow above the grid, and wraps: nothing it says may run
+/// off the screen, and a screen too narrow for New offers its key.
+#[test]
+fn the_empty_line_stays_whole_at_every_width() {
+    let fake = Arc::new(Fake::default());
+    let (mut app, filter) = audited(&fake, 1000.0, 600.0);
+    app.wait_for_within("label:Today", WAIT).expect("it shows");
+    settle(&mut app);
+    filter.assert_inside("Nothing this week. Press New to add an event.", 1000.0);
+    for width in WIDTHS {
+        app.set_viewport(size(px(width), px(600.0)))
+            .expect("the viewport sets");
+        settle(&mut app);
+        filter.assert_inside("Nothing this week. Press c to add an event.", width);
+    }
+}
+
+// --- What the AI can reach, and what labels hold ------------------------------
+
+/// What the Bot's filter names on any Calendar screen, and why each is safe.
+/// Everything else, and every field of the editor, stays unnamed: a new control
+/// has to be added here, and so has to say why.
+const MAY_REACH: [&str; 12] = [
+    // move the view: no press sends anything by what's shown
+    "Day",
+    "Week",
+    "Month",
+    "List",
+    "Today",
+    // a search with no way to submit it, and a date the same
+    "Search events",
+    "Go to date",
+    // closes the editor, and sends nothing
+    "Cancel",
+    // each calls its write in the press, which the Bot refuses the AI
+    "This event",
+    "All events",
+    "Invite them",
+    // takes back a question
+    "Not yet",
+];
+
+const SECRETS: [&str; 12] = [
+    "Team review",
+    "Dentist",
+    "Offsite",
+    "Room Seven",
+    "Bring the numbers",
+    "ana@example.com",
+    "ben@example.com",
+    "Ana Reyes",
+    "Weekly sync",
+    "Their version",
+    "Quarterly plan",
+    "First up",
+];
+
+/// Every state of every Calendar screen and card, each handed to `look`.
+fn every_state(mut look: impl FnMut(&Headless, &Filter, &str)) {
+    let fake = Arc::new(Fake::default());
+    *fake.events.lock().unwrap() = a_day();
+    let (mut app, filter) = audited(&fake, 1000.0, 600.0);
+    app.wait_for_within("text:Team review", WAIT)
+        .expect("it shows");
+    settle(&mut app);
+    look(&app, &filter, "week");
+    for (keys, name) in [("d", "day"), ("m", "month"), ("a", "list"), ("w", "week")] {
+        key(&mut app, keys);
+        look(&app, &filter, name);
+    }
+    key(&mut app, "g");
+    look(&app, &filter, "go to date");
+    key(&mut app, "escape");
+    app.type_text("label:Search events", "Team").unwrap();
+    app.submit("label:Search events").unwrap();
+    settle(&mut app);
+    look(&app, &filter, "search");
+    app.clear("label:Search events").unwrap();
+    app.submit("label:Search events").unwrap();
+    settle(&mut app);
+
+    open(&mut app, "Team review");
+    assert!(app.screen().shows("ana@example.com"));
+    look(&app, &filter, "an event");
+    press(&mut app, "label:Open the Meet link");
+    assert!(app.screen().matches("label:Open this link").unwrap());
+    look(&app, &filter, "the link's question");
+    press(&mut app, "label:Don't open this link");
+    press(&mut app, "label:Delete this event");
+    look(&app, &filter, "asked to delete");
+    press(&mut app, "label:Cancel this");
+
+    press(&mut app, "label:Edit this event");
+    app.wait_for_within(&format!("label:{TITLE}"), WAIT)
+        .expect("the editor opens");
+    assert!(filter.unnamed_fields() >= 9, "the audit sees the fields");
+    look(&app, &filter, "the editor");
+    app.type_text("label:Guest's address, like name@company.com", "an")
+        .expect("it types");
+    app.wait_for_within("label:Use this address", WAIT)
+        .expect("it suggests");
+    look(&app, &filter, "suggestions");
+    press(&mut app, "label:Use this address");
+    fill(&mut app, TITLE, "My version");
+    let mut newer = fake.row("e1").unwrap();
+    newer["title"] = json!("Their version");
+    newer["etag"] = json!("e2");
+    *fake.changed.lock().unwrap() = Some(newer);
+    press(&mut app, "label:Save this event");
+    assert!(app.screen().shows("Their version"));
+    look(&app, &filter, "someone else's version");
+    press(&mut app, "label:Cancel");
+    settle(&mut app);
+    look(&app, &filter, "told something");
+
+    let (mut app, filter) = {
+        let fake = Arc::new(Fake::default());
+        *fake.events.lock().unwrap() = a_day();
+        audited(&fake, 1000.0, 600.0)
+    };
+    app.wait_for_within("text:Dentist", WAIT).expect("it shows");
+    settle(&mut app);
+    open(&mut app, "Dentist");
+    press(&mut app, "label:Delete this event");
+    press(&mut app, "label:Delete it");
+    assert!(app.screen().matches("label:Undo that").unwrap());
+    look(&app, &filter, "undo");
+
+    let fake = Arc::new(Fake::default());
+    *fake.events.lock().unwrap() = a_series().into_iter().map(invite).collect();
+    let (mut app, filter) = audited(&fake, 1000.0, 600.0);
+    app.wait_for_within("text:Weekly sync", WAIT)
+        .expect("it shows");
+    settle(&mut app);
+    open(&mut app, "Weekly sync");
+    assert!(app.screen().matches("label:Answer yes").unwrap());
+    look(&app, &filter, "an invite in a series");
+    press(&mut app, "label:Answer no");
+    assert!(app.screen().shows("Reply to which events?"));
+    look(&app, &filter, "a series' question");
+
+    let fake = Arc::new(Fake::default());
+    let (mut app, filter) = audited(&fake, 1000.0, 600.0);
+    app.wait_for_within("label:Today", WAIT).expect("it shows");
+    settle(&mut app);
+    for (keys, name) in [
+        ("w", "an empty week"),
+        ("d", "an empty day"),
+        ("m", "an empty month"),
+        ("a", "an empty list"),
+    ] {
+        key(&mut app, keys);
+        look(&app, &filter, name);
+    }
+    app.set_viewport(size(px(300.0), px(600.0)))
+        .expect("the viewport sets");
+    settle(&mut app);
+    look(&app, &filter, "narrow and empty");
+
+    for (set, name) in [
+        (no_calendars as fn(&Fake), "no calendars"),
+        (all_hidden, "every calendar hidden"),
+    ] {
+        let fake = Arc::new(Fake::default());
+        set(&fake);
+        let (mut app, filter) = audited(&fake, 1000.0, 600.0);
+        app.wait_for_within("label:Today", WAIT).expect("it shows");
+        settle(&mut app);
+        look(&app, &filter, name);
+        key(&mut app, "c");
+        look(&app, &filter, "a new event");
+    }
+
+    let fake = Arc::new(Fake::default());
+    *fake.status.lock().unwrap() = Some(json!({"signed_in": false}));
+    let (mut app, filter) = audited(&fake, 1000.0, 600.0);
+    settle(&mut app);
+    look(&app, &filter, "signed out");
+
+    let fake = Arc::new(Fake::default());
+    *fake.inline.lock().unwrap() = true;
+    *fake.props.lock().unwrap() = json!({"view": "next"});
+    *fake.next.lock().unwrap() = next_answer();
+    let (mut app, filter) = audited(&fake, 420.0, 300.0);
+    app.wait_for_within("text:First up", WAIT)
+        .expect("it shows");
+    look(&app, &filter, "the next card");
+    let fake = Arc::new(Fake::default());
+    *fake.inline.lock().unwrap() = true;
+    *fake.props.lock().unwrap() = json!({"view": "next"});
+    *fake.next.lock().unwrap() = json!({"event": null, "after": []});
+    let (mut app, filter) = audited(&fake, 420.0, 300.0);
+    app.wait_for_within("text:Nothing coming up.", WAIT)
+        .expect("it shows");
+    look(&app, &filter, "an empty next card");
+
+    let fake = Arc::new(Fake::default());
+    *fake.inline.lock().unwrap() = true;
+    *fake.props.lock().unwrap() = json!({"draft": "tk1"});
+    *fake.draft.lock().unwrap() = a_draft(7);
+    let (mut app, filter) = audited(&fake, 420.0, 420.0);
+    app.wait_for_within("label:Keep draft", WAIT)
+        .expect("it shows");
+    look(&app, &filter, "a draft card");
+    press(&mut app, "label:Save this event");
+    assert!(app.screen().matches("label:Invite them").unwrap());
+    look(&app, &filter, "a draft card that asks");
+}
+
+const TITLE: &str = "Title, the name guests will see on their calendars";
+
+#[test]
+fn no_label_in_any_state_holds_a_persons_data() {
+    let mut states = 0;
+    every_state(|_, filter, at| {
+        filter.assert_no_data_in_labels(&SECRETS, at);
+        states += 1;
+    });
+    assert!(states >= 25, "{states}");
+}
+
+/// The AI's only way to an event is `gws_event_draft`, shown on a card for the
+/// person to read. Nothing on a screen may be another way.
+#[test]
+fn nothing_a_press_would_send_can_be_reached() {
+    bot_filter::assert_the_copy_works();
+    let mut reached = BTreeSet::new();
+    every_state(|_, filter, at| {
+        filter.assert_stages_nothing(&MAY_REACH, at);
+        reached.extend(filter.reachable().into_iter().map(|(_, name)| name));
+    });
+    // or the audit is looking at nothing
+    assert!(reached.contains("Week"), "{reached:?}");
+    assert!(reached.contains("Search events"), "{reached:?}");
 }
 
 // --- Date maths --------------------------------------------------------------
@@ -2206,4 +2640,90 @@ fn a_new_event_starts_on_the_next_hour_today_and_at_nine_on_another_day() {
     let (start, end) = time::new_slot(date(2026, 11, 6), late);
     assert_eq!(start, date(2026, 11, 7).and_hms_opt(0, 0, 0).unwrap());
     assert_eq!(end, date(2026, 11, 7).and_hms_opt(1, 0, 0).unwrap());
+}
+
+#[test]
+fn a_new_event_names_its_account() {
+    let (mut app, fake) = start();
+    *fake.status.lock().unwrap() = Some(
+        json!({"signed_in": true, "subject": "one@example.com", "features": {"mail": true, "calendar": true, "drive": false}}),
+    );
+    let asked = fake.called("gws_status").len();
+    let by = std::time::Instant::now() + Duration::from_secs(20);
+    while fake.called("gws_status").len() == asked {
+        assert!(std::time::Instant::now() < by, "the check comes round");
+        settle(&mut app);
+    }
+    settle(&mut app);
+    write_one(&mut app, "Board dinner");
+    press(&mut app, "label:Save this event");
+    assert_eq!(
+        last(&fake, "gws_event_save")["as_account"],
+        "one@example.com"
+    );
+}
+
+/// `fake` says `who` is active, and the screen's next check has read it.
+fn active(app: &mut Headless, fake: &Fake, who: &str) {
+    *fake.status.lock().unwrap() = Some(
+        json!({"signed_in": true, "subject": who, "features": {"mail": true, "calendar": true, "drive": false}}),
+    );
+    let asked = fake.called("gws_status").len();
+    let by = std::time::Instant::now() + Duration::from_secs(20);
+    while fake.called("gws_status").len() == asked {
+        assert!(std::time::Instant::now() < by, "the check comes round");
+        settle(app);
+    }
+    settle(app);
+}
+
+/// Its calendar and its guests are that account's: the plugin refuses it there
+/// only if the save still says whose it is.
+#[test]
+fn an_event_opened_before_a_switch_stays_the_account_it_was_opened_on() {
+    let (mut app, fake) = start();
+    active(&mut app, &fake, "one@example.com");
+    write_one(&mut app, "Board dinner");
+    active(&mut app, &fake, "two@example.com");
+    press(&mut app, "label:Save this event");
+    assert_eq!(
+        last(&fake, "gws_event_save")["as_account"],
+        "one@example.com"
+    );
+}
+
+#[test]
+fn the_newer_version_of_an_event_stays_the_account_it_was_opened_on() {
+    let (mut app, fake) = start();
+    active(&mut app, &fake, "one@example.com");
+    open(&mut app, "Team review");
+    press(&mut app, "label:Edit this event");
+    app.wait_for_within(
+        "label:Title, the name guests will see on their calendars",
+        WAIT,
+    )
+    .expect("the editor opens");
+    let mut newer = fake.row("e1").unwrap();
+    newer["etag"] = json!("e2");
+    *fake.changed.lock().unwrap() = Some(newer);
+    press(&mut app, "label:Save this event");
+    active(&mut app, &fake, "two@example.com");
+    press(&mut app, "label:Use the newer one");
+    press(&mut app, "label:Save this event");
+    assert_eq!(
+        last(&fake, "gws_event_save")["as_account"],
+        "one@example.com"
+    );
+}
+
+#[test]
+fn a_draft_card_saves_to_the_account_it_was_made_on() {
+    let mut draft = a_draft(1);
+    draft["as_account"] = json!("one@example.com");
+    let (mut app, fake) = draft_card(draft, 420.0);
+    press(&mut app, "label:Save this event");
+    assert_eq!(
+        last(&fake, "gws_event_save")["as_account"],
+        "one@example.com"
+    );
 }

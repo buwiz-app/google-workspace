@@ -774,6 +774,12 @@ fn rewrite(shown: &Value) -> Value {
     json!({"draft": shown["draft"], "to": ["eve@example.com"], "body": "Rewritten"})
 }
 
+fn rearmed(core: &Core, shown: &Value) -> (Value, Value) {
+    let args = json!({"draft": shown["draft"], "revision": shown["revision"]});
+    let armed = data(core.run("gws_mail_send_arm", &args))["armed"].clone();
+    (shown.clone(), armed)
+}
+
 fn send_args(shown: &Value, armed: &Value) -> Value {
     json!({"draft": shown["draft"], "revision": shown["revision"], "message_id": shown["message_id"], "armed": armed})
 }
@@ -797,6 +803,53 @@ fn a_press_stops_the_model_rewriting_the_draft_until_undo() {
         "Undo spent the press: {spent}"
     );
     assert_eq!(google.sent(), []);
+}
+
+/// However a send fails, the press is spent: the AI gets the draft back, and
+/// the account can be switched.
+#[test]
+fn a_send_that_never_reached_the_draft_still_spends_its_press() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "spent");
+    let (shown, armed) = armed_card(&core);
+    google.draft_reads_fail(true);
+    let tried = core.run("gws_mail_send", &send_args(&shown, &armed));
+    google.draft_reads_fail(false);
+    assert_eq!(tried["isError"], true, "{tried}");
+    assert_eq!(google.sent(), []);
+    let again = core.run_for_model("gws_mail_draft_save", &rewrite(&shown));
+    assert_ne!(again["isError"], true, "the AI has it back: {again}");
+}
+
+/// The panel's press knows only the draft until its own save comes back.
+#[test]
+fn a_newer_press_stops_the_older_one_before_its_own_save() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "newest");
+    let (shown, older) = armed_card(&core);
+    data(core.run("gws_mail_send_arm", &json!({"draft": shown["draft"]})));
+    let refused = core.run("gws_mail_send", &send_args(&shown, &older));
+    assert_eq!(
+        refused["structuredContent"]["refused"], "not_allowed",
+        "{refused}"
+    );
+    assert_eq!(google.sent(), []);
+}
+
+#[test]
+fn a_newer_press_on_a_draft_replaces_the_one_before() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "newer");
+    let (shown, first) = armed_card(&core);
+    let (_, second) = rearmed(&core, &shown);
+    let refused = core.run("gws_mail_send", &send_args(&shown, &first));
+    assert_eq!(
+        refused["structuredContent"]["refused"], "not_allowed",
+        "{refused}"
+    );
+    assert_eq!(google.sent(), []);
+    data(core.run("gws_mail_send", &send_args(&shown, &second)));
+    assert_eq!(google.sent().len(), 1);
 }
 
 /// The worst case: send has looked at the draft and is on its way to `drafts/send`.

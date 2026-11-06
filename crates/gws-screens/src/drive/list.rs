@@ -26,18 +26,41 @@ pub(super) fn cards_across(width: f32) -> usize {
     ((width / CARD_WIDTH) as usize).max(1)
 }
 
+/// What an empty list says, with the next press when this folder takes files.
+fn empty_line(view: &str, folder: bool, searching: bool, adds: bool) -> String {
+    let line = if searching {
+        return "No files match that. Try other words.".to_owned();
+    } else if folder {
+        "This folder is empty."
+    } else {
+        match view {
+            "shared" => return "Nothing is shared with you yet.".to_owned(),
+            "recent" => return "Nothing opened or changed lately.".to_owned(),
+            "starred" => return "Nothing starred yet.".to_owned(),
+            "trash" => return "Trash is empty.".to_owned(),
+            _ => "My Drive is empty.",
+        }
+    };
+    if adds {
+        format!("{line} Press New folder or Upload to add to it.")
+    } else {
+        line.to_owned()
+    }
+}
+
 fn empty(m: Drive) -> impl IntoElement {
     dynamic(move || {
         let line = if m.loading.get() {
-            "Loading your files…"
+            "Loading your files…".to_owned()
         } else if m.problem.with(Option::is_some) {
-            ""
-        } else if m.search.with(Option::is_some) {
-            "No files match that."
-        } else if m.folder.with(Option::is_some) {
-            "This folder is empty."
+            String::new()
         } else {
-            "Nothing here"
+            empty_line(
+                m.view.get(),
+                m.folder.with(Option::is_some),
+                m.search.with(Option::is_some),
+                m.here_adds.get(),
+            )
         };
         view()
             .app_class(Some("p-6 items-center".into()))
@@ -344,4 +367,35 @@ pub(super) fn body(b: Bridge, m: Drive) -> impl IntoElement {
             Layout::Grid => holder.key("grid").child(cards_list(b.clone(), m)),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_list_says_which_list_and_the_press_only_where_it_is_offered() {
+        assert_eq!(
+            empty_line("my", false, false, true),
+            "My Drive is empty. Press New folder or Upload to add to it."
+        );
+        assert_eq!(empty_line("my", false, false, false), "My Drive is empty.");
+        assert_eq!(
+            empty_line("my", true, false, true),
+            "This folder is empty. Press New folder or Upload to add to it."
+        );
+        assert_eq!(
+            empty_line("shared", true, false, false),
+            "This folder is empty."
+        );
+        assert_eq!(empty_line("trash", false, false, false), "Trash is empty.");
+        assert_eq!(
+            empty_line("recent", false, false, true),
+            "Nothing opened or changed lately."
+        );
+        assert_eq!(
+            empty_line("starred", false, true, true),
+            "No files match that. Try other words."
+        );
+    }
 }

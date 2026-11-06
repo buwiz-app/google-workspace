@@ -30,8 +30,8 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::compose::{self, press_send_button, press_text};
 use crate::shell::{
-    Account, BG, INK, Job, LINE, Latest, MUTE, PANEL, POLL, RAIL, account_of, line_of, link_bar,
-    read, sleep,
+    Account, BG, Chooser, INK, Job, LINE, Latest, MUTE, PANEL, POLL, RAIL, account_of, line_of,
+    link_bar, read, sleep,
 };
 use editor::Editor;
 use event::{Calendar, Detail, Event, Key, calendars_in, rows_in};
@@ -58,10 +58,13 @@ enum Ask {
 /// What the screen is showing right now.
 #[derive(Clone, Copy)]
 struct Cal {
+    chooser: Chooser,
     span: Signal<Span>,
     anchor: Signal<NaiveDate>,
     events: Signal<Vec<Event>>,
     calendars: Signal<Vec<Calendar>>,
+    /// The list has come, so an empty one means none.
+    calendars_read: Signal<bool>,
     range_turn: Latest,
     open_turn: Latest,
     loading: Signal<bool>,
@@ -219,7 +222,10 @@ async fn search(b: Bridge, m: Cal, query: String) {
 
 async fn load_calendars(b: Bridge, m: Cal) {
     match read(&b, "gws_cal_list", json!({})).await {
-        Ok(v) => m.calendars.set(calendars_in(&v)),
+        Ok(v) => {
+            m.calendars.set(calendars_in(&v));
+            m.calendars_read.set(true);
+        }
         Err(e) => {
             if let Some(line) = failed(m, e) {
                 m.problem.set(Some(line));
@@ -236,8 +242,23 @@ async fn refresh(b: Bridge, m: Cal) {
     }
 }
 
+/// The account changed under this screen: what's on it is the old one's. An
+/// editor stays, with its words, and its save is refused.
+fn switched(b: &Bridge, m: Cal) {
+    close_detail(m);
+    m.undo.set(None);
+    m.events.set(Vec::new());
+    m.seq.set(-1);
+    fetch(m, load(b.clone(), m));
+    fetch(m, load_calendars(b.clone(), m));
+}
+
 async fn watch(b: Bridge, m: Cal) {
     loop {
+        if m.chooser.check(&b).await {
+            switched(&b, m);
+        }
+        m.editor.adopt(&m.chooser.who.get_untracked());
         if let Ok(v) = read(&b, "gws_cal_changes", json!({})).await {
             let seq = v.get("seq").and_then(Value::as_i64).unwrap_or(0);
             let last = m.seq.get_untracked();
@@ -667,6 +688,14 @@ fn main_area(b: Bridge, m: Cal) -> impl IntoElement {
         .child(header(b, m))
         .child(notice(m))
         .child(dynamic(move || {
+            // the list says so itself, and an open event isn't an empty view
+            if matches!(pane.get(), Pane::Days | Pane::Month) {
+                view().child(grid::nothing(m))
+            } else {
+                view()
+            }
+        }))
+        .child(dynamic(move || {
             let b = pick.clone();
             let body = view().app_class(Some("flex-1".into()));
             match pane.get() {
@@ -848,6 +877,7 @@ pub fn build(bridge: Bridge) -> Root {
         let (jobs, waiting) = unbounded_channel::<Job>();
         let (reads, mut asked) = unbounded_channel::<Job>();
         let m = Cal {
+            chooser: Chooser::new(),
             span: signal(
                 prop("view")
                     .as_deref()
@@ -857,6 +887,7 @@ pub fn build(bridge: Bridge) -> Root {
             anchor: signal(today()),
             events: signal(Vec::new()),
             calendars: signal(Vec::new()),
+            calendars_read: signal(false),
             range_turn: Latest::new(),
             open_turn: Latest::new(),
             loading: signal(true),

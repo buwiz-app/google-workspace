@@ -19,7 +19,8 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use crate::compose::{self, Compose};
 use crate::reader;
 use crate::shell::{
-    BG, CHOSEN, DIM, INK, Job, LINE, Latest, MUTE, PANEL, POLL, RAIL, link_bar, once, read, sleep,
+    BG, CHOSEN, Chooser, DIM, INK, Job, LINE, Latest, MUTE, PANEL, POLL, RAIL, link_bar, once,
+    read, sleep,
 };
 
 const ROW_HEIGHT: f32 = 52.0;
@@ -170,6 +171,29 @@ pub fn notice(status: &str, saved: bool) -> Option<&'static str> {
     }
 }
 
+/// What an empty list says, and the next press where there is one. Until the
+/// first sync is in, empty says nothing about the mailbox; when the last one
+/// failed, the list is only what's saved.
+fn empty_line(label: &str, searching: bool, status: &str, saved: bool) -> &'static str {
+    if searching {
+        return "No mail matches that. Try other words.";
+    }
+    match status {
+        "" | "syncing" => return "Your mail is on its way from Google…",
+        "ok" if !saved => {}
+        _ => return "No mail saved here yet.",
+    }
+    match label {
+        "INBOX" => "Your inbox is empty. Press Write to start a message.",
+        "STARRED" => "Nothing starred yet. Star a conversation and it shows here.",
+        "IMPORTANT" => "Nothing marked important.",
+        "SENT" => "Nothing sent yet. Press Write to start a message.",
+        "DRAFT" => "No drafts. Press Write to start one.",
+        "TRASH" => "Trash is empty.",
+        _ => "No conversations have this label.",
+    }
+}
+
 /// A page's rows the list doesn't hold yet: mail moving between pages can
 /// bring one back, and each row's id must stay unique.
 fn new_rows(have: &[Row], page: Vec<Row>) -> Vec<Row> {
@@ -182,6 +206,7 @@ fn new_rows(have: &[Row], page: Vec<Row>) -> Vec<Row> {
 /// What the screen is showing right now.
 #[derive(Clone, Copy)]
 struct Mail {
+    chooser: Chooser,
     list_turn: Latest,
     open_turn: Latest,
     labels: Signal<Vec<LabelRow>>,
@@ -618,8 +643,37 @@ async fn show(b: Bridge, m: Mail, thread: String) {
     }
 }
 
+/// The account changed under this screen: what's on it is the old one's. A
+/// letter being written stays, on the account it was started on.
+fn switched(b: &Bridge, m: Mail) {
+    m.label.set("INBOX".to_owned());
+    m.query.set(String::new());
+    m.search.set(None);
+    m.chosen.set(None);
+    m.picked.set(Vec::new());
+    m.undo.set(None);
+    m.open_turn.ask();
+    m.page.set(None);
+    m.seq.set(-1);
+    b.spawn(load_list(b.clone(), m, 0));
+    b.spawn(load_labels(b.clone(), m));
+}
+
+/// [`Chooser::check`], and the account a new letter starts on.
+async fn check_account(b: &Bridge, m: Mail) {
+    let changed = m.chooser.check(b).await;
+    // one opened before the first answer is on the account that answer names
+    if !m.compose.open.get_untracked() || m.compose.who.with_untracked(String::is_empty) {
+        m.compose.who.set(m.chooser.who.get_untracked());
+    }
+    if changed {
+        switched(b, m);
+    }
+}
+
 async fn watch(b: Bridge, m: Mail) {
     loop {
+        check_account(&b, m).await;
         if let Ok(v) = read(
             &b,
             "gws_mail_changes",
@@ -654,6 +708,7 @@ fn press_class(on: bool) -> String {
 
 fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
     let writes = b.clone();
+    let chooses = b.clone();
     // the highlight is a binding on each row, not read here: a rebuild on the
     // chosen label would drop the pressed row, and the load it started with it
     let list = dynamic(move || {
@@ -690,10 +745,28 @@ fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
                 )
             })
     });
-    scroll()
-        .app_class(Some(
-            format!("w-[190px] pt-3 border-r {LINE} {RAIL}").into(),
+    let accounts = dynamic(move || {
+        // a letter stays on its account, so a switch waits for it to close. One
+        // left on another account by a switch elsewhere can only be saved from
+        // there, so then it's the way back.
+        if m.compose.open.get() && m.compose.who.get() == m.chooser.who.get() {
+            return view();
+        }
+        let b = chooses.clone();
+        view().child(crate::shell::chooser(
+            b,
+            m.chooser,
+            move |job| m.beside.with_untracked(|beside| drop(beside.send(job))),
+            move |b| {
+                if !m.compose.open.get_untracked() {
+                    m.compose.who.set(m.chooser.who.get_untracked());
+                }
+                switched(b, m);
+            },
         ))
+    });
+    let column = scroll()
+        .app_class(Some("flex-1 pt-3".into()))
         .child(
             view().app_class(Some("px-2 py-2".into())).child(
                 view()
@@ -708,7 +781,11 @@ fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
                     ),
             ),
         )
-        .child(list)
+        .child(list);
+    view()
+        .app_class(Some(format!("w-[190px] border-r {LINE} {RAIL}").into()))
+        .child(column)
+        .child(accounts)
 }
 
 /// One cell of the list. Cells are recycled, so every read goes through
@@ -801,11 +878,13 @@ fn list_pane(b: Bridge, m: Mail) -> impl IntoElement {
     let more = b.clone();
     let row_bridge = b.clone();
     let empty = dynamic(move || {
-        let line = match (m.loading.get(), m.query.with(String::is_empty)) {
-            (true, _) => "Loading your mail…",
-            (false, true) if m.problem.with(Option::is_some) => "",
-            (false, true) => "Nothing here",
-            (false, false) => "No mail matches that.",
+        let searching = !m.query.with(String::is_empty) || m.search.with(Option::is_some);
+        let line = if m.loading.get() {
+            "Loading your mail…"
+        } else if !searching && m.problem.with(Option::is_some) {
+            ""
+        } else {
+            empty_line(&m.label.get(), searching, &m.status.get(), m.saved.get())
         };
         view()
             .app_class(Some("p-6 items-center".into()))
@@ -981,6 +1060,14 @@ fn label_picker(b: Bridge, m: Mail) -> impl IntoElement {
                 .cloned()
                 .collect::<Vec<_>>()
         });
+        if own.is_empty() {
+            return view()
+                .app_class(Some(format!("px-3 py-1 border-b {LINE}").into()))
+                .child(
+                    text("No labels of your own yet. Make one in Gmail and it shows here.")
+                        .app_class(Some(format!("text-[12px] {MUTE}").into())),
+                );
+        }
         own.into_iter().fold(
             view().app_class(Some(format!("px-2 py-1 gap-1 border-b {LINE}").into())),
             |list, l| {
@@ -1170,11 +1257,20 @@ fn reading(b: Bridge, m: Mail) -> impl IntoElement {
             None if m.chosen.get().is_some() => view()
                 .app_class(Some("flex-1 items-center justify-center".into()))
                 .child(text("Opening…").app_class(Some(format!("text-[13px] {MUTE}").into()))),
+            // only this line follows the rows: a page must not rebuild with them
             None => view()
                 .app_class(Some("flex-1 items-center justify-center".into()))
                 .child(
-                    text("Pick a conversation to read it")
-                        .app_class(Some(format!("text-[13px] {MUTE}").into())),
+                    text(move || {
+                        if !m.rows.with(Vec::is_empty) {
+                            "Pick a conversation to read it"
+                        } else if m.loading.get() {
+                            "Loading…"
+                        } else {
+                            "Nothing to read here."
+                        }
+                    })
+                    .app_class(Some(format!("text-[13px] {MUTE}").into())),
                 ),
         }))
 }
@@ -1484,6 +1580,11 @@ fn card(b: Bridge) -> View {
             State::Line(line) => view()
                 .app_class(Some("p-3".into()))
                 .child(text(line).app_class(Some(format!("text-[12px] {MUTE}").into()))),
+            // the card is read live, and what it found can have gone since
+            State::Rows(rows, _) if rows.is_empty() => view().app_class(Some("p-3".into())).child(
+                text("No mail matches this now.")
+                    .app_class(Some(format!("text-[12px] {MUTE}").into())),
+            ),
             State::Rows(rows, saved) => {
                 let now = now_ms();
                 let list = rows
@@ -1573,6 +1674,7 @@ pub fn build(bridge: Bridge) -> Root {
         let (beside, mut alongside) = unbounded_channel::<Job>();
         let (writer, writing) = Compose::new();
         let m = Mail {
+            chooser: Chooser::new(),
             compose: writer,
             problem: signal(None),
             told: signal(None),
@@ -1749,6 +1851,31 @@ mod tests {
         assert_eq!(
             list_args("q", card(), "INBOX".into(), 40),
             json!({"query": "q"})
+        );
+    }
+
+    #[test]
+    fn an_empty_list_says_which_list_and_never_before_the_first_sync() {
+        let line = |label, status| empty_line(label, false, status, false);
+        assert_eq!(
+            line("INBOX", "ok"),
+            "Your inbox is empty. Press Write to start a message."
+        );
+        assert_eq!(line("TRASH", "ok"), "Trash is empty.");
+        assert_eq!(line("Label_7", "ok"), "No conversations have this label.");
+        for early in ["", "syncing"] {
+            assert_eq!(line("INBOX", early), "Your mail is on its way from Google…");
+        }
+        for trouble in ["offline", "failed", "needs_access"] {
+            assert_eq!(line("INBOX", trouble), "No mail saved here yet.");
+        }
+        assert_eq!(
+            empty_line("INBOX", false, "ok", true),
+            "No mail saved here yet."
+        );
+        assert_eq!(
+            empty_line("INBOX", true, "syncing", false),
+            "No mail matches that. Try other words."
         );
     }
 

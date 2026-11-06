@@ -133,10 +133,15 @@ fn a_rename_and_its_undo_reach_google_and_the_list_shows_each() {
     let (mut app, _) = open(&google, "rename");
     pick(&mut app, 1);
     key(&mut app, "f2");
-    app.clear("label:New name").unwrap();
-    app.type_text("label:New name", "Zed's \"notes\".txt")
+    app.clear("label:New name, as it will show in Google Drive to others")
         .unwrap();
-    app.submit("label:New name").unwrap();
+    app.type_text(
+        "label:New name, as it will show in Google Drive to others",
+        "Zed's \"notes\".txt",
+    )
+    .unwrap();
+    app.submit("label:New name, as it will show in Google Drive to others")
+        .unwrap();
     settle(&mut app);
     assert_eq!(
         google.drive_file("drv-a").unwrap().name,
@@ -313,8 +318,13 @@ fn a_new_folder_and_a_picked_file_land_where_the_screen_is() {
     app.press("label:Open this item >> text:Clients").unwrap();
     settle(&mut app);
     press(&mut app, "label:New folder");
-    app.type_text("label:Folder name", "Acme").unwrap();
-    app.submit("label:Folder name").unwrap();
+    app.type_text(
+        "label:Folder name, as it will show in Google Drive to others",
+        "Acme",
+    )
+    .unwrap();
+    app.submit("label:Folder name, as it will show in Google Drive to others")
+        .unwrap();
     settle(&mut app);
     press(&mut app, "label:Upload a file to Google Drive");
     settle(&mut app);
@@ -348,7 +358,11 @@ fn a_file_the_person_cant_edit_offers_nothing_from_what_google_says() {
         );
     }
     key(&mut app, "f2");
-    assert!(!app.screen().matches("label:New name").unwrap());
+    assert!(
+        !app.screen()
+            .matches("label:New name, as it will show in Google Drive to others")
+            .unwrap()
+    );
     assert_eq!(google.writes(), []);
 }
 

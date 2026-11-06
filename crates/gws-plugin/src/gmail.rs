@@ -1,5 +1,4 @@
-//! Gmail's REST API (`gmail/v1/users/me`), read-only, with the token Buwiz
-//! Bot pushed (`crate::accounts`), and what the tools make of its answers:
+//! Gmail's REST API (`gmail/v1/users/me`), with the token Buwiz Bot pushed (`crate::accounts`), and what the tools make of its answers:
 //! headers, a message's plain-text body (text/plain, else text/html with
 //! the tags stripped), one-line snippets, the 64 KiB cap.
 //!
@@ -15,6 +14,11 @@ use serde_json::Value;
 use crate::accounts::Bearer;
 use crate::{clean, js};
 
+/// A thread's messages by id, each with its labels.
+pub type Messages = Vec<(String, Vec<String>)>;
+
+/// The most of one header anything shows or hands on.
+pub const HEADER_MAX: usize = 1024;
 /// The production API base.
 pub const GMAIL_API: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 pub const BODY_MAX: usize = 64 * 1024;
@@ -95,7 +99,26 @@ impl Gmail {
         for (k, v) in &query {
             req = req.query(*k, v);
         }
-        let mut res = req.call().map_err(|e| {
+        Self::answer(req.call(), cap)
+    }
+
+    /// A POST: every write there is, and only a person's press leads here.
+    fn post(&self, auth: &Bearer, path: String, body: &Value) -> Result<Option<Value>, Failure> {
+        let url = format!("{}/{path}", self.base);
+        let req = self
+            .agent
+            .post(&url)
+            .header("authorization", auth.header())
+            .header("accept", "application/json")
+            .header("content-type", "application/json");
+        Self::answer(req.send(body.to_string().as_bytes()), FULL_MAX)
+    }
+
+    fn answer(
+        res: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+        cap: u64,
+    ) -> Result<Option<Value>, Failure> {
+        let mut res = res.map_err(|e| {
             Failure::Offline(format!(
                 "could not reach Gmail: {}",
                 js::slice_utf16(&e.to_string(), 200)
@@ -323,6 +346,63 @@ impl Gmail {
         )
     }
 
+    /// Each message of a thread, with its labels now.
+    pub fn thread_labels(&self, auth: &Bearer, id: &str) -> Result<Option<Messages>, Failure> {
+        let query = vec![("format", "minimal".to_owned())];
+        let Some(v) = self.get(auth, format!("threads/{id}"), query, FULL_MAX)? else {
+            return Ok(None);
+        };
+        let text = |l: &Value| l.as_str().map(str::to_owned);
+        Ok(Some(
+            v.get("messages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|m| {
+                    let labels = m.get("labelIds").and_then(Value::as_array);
+                    Some((
+                        text(m.get("id")?)?,
+                        labels.into_iter().flatten().filter_map(text).collect(),
+                    ))
+                })
+                .collect(),
+        ))
+    }
+
+    pub fn modify_thread(
+        &self,
+        auth: &Bearer,
+        id: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<(), Failure> {
+        let body = serde_json::json!({"addLabelIds": add, "removeLabelIds": remove});
+        self.post(auth, format!("threads/{id}/modify"), &body)
+            .map(drop)
+    }
+
+    pub fn modify_message(
+        &self,
+        auth: &Bearer,
+        id: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<(), Failure> {
+        let body = serde_json::json!({"addLabelIds": add, "removeLabelIds": remove});
+        self.post(auth, format!("messages/{id}/modify"), &body)
+            .map(drop)
+    }
+
+    pub fn trash_thread(&self, auth: &Bearer, id: &str) -> Result<(), Failure> {
+        self.post(auth, format!("threads/{id}/trash"), &Value::Null)
+            .map(drop)
+    }
+
+    pub fn untrash_thread(&self, auth: &Bearer, id: &str) -> Result<(), Failure> {
+        self.post(auth, format!("threads/{id}/untrash"), &Value::Null)
+            .map(drop)
+    }
+
     /// What changed since `start`: the threads touched and the newest history
     /// id. `None`: `start` is too old, so a full sync is needed.
     pub fn history(
@@ -392,6 +472,16 @@ impl Gmail {
 /// A header of a message's `payload` (names are case-insensitive), trimmed;
 /// empty when missing.
 pub fn header(message: &Value, name: &str) -> String {
+    raw_header(message, name).to_owned()
+}
+
+/// A header held to [`HEADER_MAX`], without copying more of it than that: the
+/// sender writes these, and a mail's can run to megabytes.
+pub fn short_header(message: &Value, name: &str) -> String {
+    cap_bytes(raw_header(message, name), HEADER_MAX)
+}
+
+fn raw_header<'a>(message: &'a Value, name: &str) -> &'a str {
     let headers = message
         .pointer("/payload/headers")
         .and_then(Value::as_array);
@@ -406,7 +496,6 @@ pub fn header(message: &Value, name: &str) -> String {
             .and_then(Value::as_str)
             .unwrap_or_default(),
     )
-    .to_owned()
 }
 
 /// Gmail's `snippet` (HTML-escaped) as plain text on one line.

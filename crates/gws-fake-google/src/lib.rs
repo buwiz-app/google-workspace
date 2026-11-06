@@ -382,6 +382,10 @@ fn payload(m: &Mail, full: bool) -> Value {
 #[derive(Default)]
 struct Account {
     mails: Vec<Mail>,
+    /// How many more writes go through; `None` is no limit.
+    writes_left: Option<usize>,
+    wrote: bool,
+    reads_fail_after_write: bool,
     history: i64,
     /// `(history id, change)`, oldest first.
     changes: Vec<(i64, Value)>,
@@ -486,6 +490,12 @@ impl Account {
             .and_then(|t| t.parse().ok())
             .unwrap_or(100)
             .min(500);
+        if self.reads_fail_after_write && self.wrote && r.method == "GET" && format == "metadata" {
+            return Reply::json(
+                500,
+                json!({"error": {"code": 500, "message": "Backend error"}}),
+            );
+        }
         match (r.method.as_str(), segs.as_slice()) {
             ("GET", ["profile"]) => Reply::json(
                 200,
@@ -586,6 +596,70 @@ impl Account {
                     json!({"id": id, "historyId": self.history.to_string(), "messages": messages}),
                 )
             }
+            ("POST", ["threads", id, action]) | ("POST", ["messages", id, action]) => {
+                if self.writes_left == Some(0) {
+                    return Reply::json(
+                        500,
+                        json!({"error": {"code": 500, "message": "Backend error"}}),
+                    );
+                }
+                if let Some(left) = &mut self.writes_left {
+                    *left -= 1;
+                }
+                self.wrote = true;
+                if self
+                    .only_grants
+                    .as_deref()
+                    .is_some_and(|g| !g.contains("gmail.modify"))
+                {
+                    return Reply::json(
+                        403,
+                        json!({"error": {"code": 403, "message": "Request had insufficient authentication scopes."}}),
+                    );
+                }
+                let by_thread = segs[0] == "threads";
+                let body: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+                let list = |k: &str| -> Vec<String> {
+                    body[k]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|l| l.as_str().map(str::to_owned))
+                        .collect()
+                };
+                let (mut add, mut remove) = (list("addLabelIds"), list("removeLabelIds"));
+                match *action {
+                    "modify" => {}
+                    "trash" => {
+                        add.push("TRASH".to_owned());
+                        remove.push("INBOX".to_owned());
+                    }
+                    "untrash" => remove.push("TRASH".to_owned()),
+                    _ => return not_found(),
+                }
+                let mut touched = Vec::new();
+                for m in &mut self.mails {
+                    if (by_thread && m.thread == *id) || (!by_thread && m.id == *id) {
+                        m.labels.retain(|l| !remove.contains(l));
+                        for l in &add {
+                            if !m.labels.contains(l) {
+                                m.labels.push(l.clone());
+                            }
+                        }
+                        touched.push(json!({"message": {"id": m.id, "threadId": m.thread}}));
+                    }
+                }
+                if touched.is_empty() {
+                    return not_found();
+                }
+                self.history += 1;
+                let history = self.history;
+                self.changes.push((
+                    history,
+                    json!({"id": history.to_string(), "labelsAdded": touched}),
+                ));
+                Reply::json(200, json!({"id": id}))
+            }
             ("GET", ["history"]) => {
                 let since: i64 = r
                     .param("startHistoryId")
@@ -655,7 +729,7 @@ impl Account {
 
     fn handle(&mut self, r: Request) -> Reply {
         let path = r.path().to_owned();
-        if path != "/__log" {
+        if path != "/__log" && path != "/__writes" {
             self.log.push(Seen {
                 method: r.method.clone(),
                 target: r.target.clone(),
@@ -670,6 +744,11 @@ impl Account {
                 .map(|s| json!({"method": s.method, "target": s.target, "body": s.body}))
                 .collect();
             return Reply::json(200, json!({"log": log}));
+        }
+        // a live run's way to make writes fail: `?left=<n>`, or no value for none
+        if path == "/__writes" {
+            self.writes_left = r.param("left").and_then(|n| n.parse().ok());
+            return Reply::json(200, json!({"left": self.writes_left}));
         }
         if path == "/o/oauth2/v2/auth" {
             return self.authorize(&r);
@@ -733,6 +812,41 @@ impl FakeGoogle {
             .into_iter()
             .filter(|s| s.method != "GET" && !s.target.starts_with("/token"))
             .collect()
+    }
+
+    /// Each mail's labels, sorted: what a test compares across an undo.
+    pub fn mailbox_labels(&self) -> Value {
+        let a = self.account.lock().unwrap();
+        let mails: Vec<Value> = a
+            .mails
+            .iter()
+            .map(|m| {
+                let mut labels = m.labels.clone();
+                labels.sort();
+                json!({"id": m.id, "labels": labels})
+            })
+            .collect();
+        json!(mails)
+    }
+
+    /// After `n` more writes, every write fails.
+    pub fn writes_fail_after(&self, n: usize) {
+        self.account.lock().unwrap().writes_left = Some(n);
+    }
+
+    /// Writes work again.
+    pub fn writes_work(&self) {
+        self.account.lock().unwrap().writes_left = None;
+    }
+
+    /// Once something is written, reading a thread's metadata fails.
+    pub fn reads_fail_after_a_write(&self) {
+        self.account.lock().unwrap().reads_fail_after_write = true;
+    }
+
+    /// From now on a token covers `scope` alone, and writes need more.
+    pub fn only_grants(&self, scope: &str) {
+        self.account.lock().unwrap().only_grants = Some(scope.to_owned());
     }
 
     /// A new mail arrives, as Gmail's history shows it.

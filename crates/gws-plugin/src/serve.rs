@@ -369,6 +369,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn no_write_is_the_models_or_a_routines() {
+        let writes: Vec<&str> = tools::defs()
+            .iter()
+            .filter(|d| !d.read_only)
+            .map(|d| d.name)
+            .collect();
+        for name in [
+            "gws_mail_mark",
+            "gws_mail_label",
+            "gws_mail_archive",
+            "gws_mail_trash",
+            "gws_mail_undo",
+        ] {
+            assert!(writes.contains(&name), "{name}");
+        }
+        for name in writes {
+            assert!(audience_allows(name, Origin::App), "{name}");
+            assert!(!audience_allows(name, Origin::Agent), "{name}");
+            assert!(!audience_allows(name, Origin::Routine), "{name}");
+            assert!(!audience_allows(name, Origin::Unknown), "{name}");
+        }
+    }
+
+    #[test]
     fn the_model_reaches_only_a_tool_that_names_it() {
         assert!(audience_allows(tools::READ_MAIL, Origin::Agent));
         assert!(audience_allows(tools::READ_MAIL, Origin::Routine));

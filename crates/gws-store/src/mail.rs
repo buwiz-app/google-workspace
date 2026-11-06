@@ -103,6 +103,18 @@ impl Store {
         Ok(())
     }
 
+    /// Every account anything is held for.
+    pub fn accounts(&self) -> Result<Vec<String>> {
+        let mut q = self.conn.prepare(
+            "SELECT account FROM state UNION SELECT account FROM labels \
+             UNION SELECT account FROM threads UNION SELECT account FROM bodies",
+        )?;
+        let accounts = q
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(accounts)
+    }
+
     /// Everything held for `account`: it can all be fetched again after a
     /// sign-in. The `open-<id>` folders are no part of this: they can hold
     /// unsaved work.

@@ -375,14 +375,25 @@ fn no_size(value: &str, at_most: f32) -> bool {
     number.parse::<f32>().is_ok_and(|n| n <= at_most)
 }
 
+type Rgba = [u8; 4];
+
 /// A CSS colour as red, green, blue and alpha, for the forms mail uses.
-fn colour(value: &str) -> Option<[u8; 4]> {
+fn colour(value: &str) -> Option<Rgba> {
     let value = value.trim().to_ascii_lowercase();
     match value.as_str() {
         "transparent" => return Some([0, 0, 0, 0]),
-        "white" => return Some([255, 255, 255, 255]),
         "black" => return Some([0, 0, 0, 255]),
+        "white" | "snow" | "ivory" | "ghostwhite" | "whitesmoke" | "floralwhite" | "mintcream"
+        | "azure" | "aliceblue" | "seashell" | "honeydew" | "lavenderblush" => {
+            return Some([255, 255, 255, 255]);
+        }
         _ => {}
+    }
+    if let Some(inside) = value
+        .strip_prefix("hsla(")
+        .or_else(|| value.strip_prefix("hsl("))
+    {
+        return hsl(inside.strip_suffix(')')?);
     }
     if let Some(hex) = value.strip_prefix('#') {
         let digit = |c: char| c.to_digit(16).map(|d| d as u8);
@@ -412,22 +423,56 @@ fn colour(value: &str) -> Option<[u8; 4]> {
     ])
 }
 
+/// A colour from `hsl()`'s arguments, near enough for [`unreadable`]: mail uses
+/// it for white and black, so only the lightness and alpha are read.
+fn hsl(inside: &str) -> Option<Rgba> {
+    let parts: Vec<&str> = inside
+        .split([',', '/', ' '])
+        .filter(|p| !p.is_empty())
+        .collect();
+    let light: f32 = parts.get(2)?.trim_end_matches('%').parse().ok()?;
+    let alpha = parts
+        .get(3)
+        .and_then(|a| a.parse::<f32>().ok())
+        .unwrap_or(1.0);
+    let level = (light / 100.0 * 255.0) as u8;
+    Some([level, level, level, (alpha * 255.0) as u8])
+}
+
+/// A declaration's words, leaving a function's arguments in one piece.
+fn words(value: &str) -> Vec<&str> {
+    let (mut words, mut depth, mut start) = (Vec::new(), 0, 0);
+    for (at, c) in value.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ' ' if depth == 0 => {
+                words.push(&value[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    words.push(&value[start..]);
+    words
+}
+
 /// Whether text in `ink` can't be told from `paper`.
-fn unreadable(ink: [u8; 4], paper: [u8; 4]) -> bool {
+fn unreadable(ink: Rgba, paper: Rgba) -> bool {
     ink[3] < 13 || (0..3).all(|c| ink[c].abs_diff(paper[c]) <= 16)
 }
 
 /// A `style`, reduced to the declarations a browser would read.
 fn declarations(style: &str) -> Vec<(String, String)> {
-    let style: String = no_comments(style)
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
+    let style = no_comments(style).to_ascii_lowercase();
     style
         .split(';')
         .filter_map(|d| d.split_once(':'))
-        .map(|(name, value)| (name.to_owned(), no_important(value)))
+        .map(|(name, value)| {
+            let value = no_important(value);
+            let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+            (name.trim().to_owned(), value)
+        })
         .collect()
 }
 
@@ -444,7 +489,10 @@ fn hidden(style: &str) -> bool {
             "visibility" => value == "hidden" || value == "collapse",
             "opacity" => no_size(value, 0.05),
             "font-size" => no_size(value, 1.0),
-            "font" => value.starts_with("0/") || value.starts_with("0px"),
+            "font" => words(value).iter().any(|w| {
+                let size = w.split('/').next().unwrap_or_default();
+                size.starts_with(|c: char| c.is_ascii_digit()) && no_size(size, 1.0)
+            }),
             "mso-hide" => value == "all",
             "width" | "height" | "max-width" | "max-height" => no_size(value, 0.0),
             "clip" => value.starts_with("rect(0"),
@@ -465,7 +513,7 @@ fn declared(style: &str, names: &[&str]) -> Option<String> {
 }
 
 /// The reader's light page, which a mail with no background of its own is on.
-const PAGE: [u8; 4] = [255, 255, 255, 255];
+const PAGE: Rgba = [255, 255, 255, 255];
 /// Elements with no closing tag.
 const VOID: &[&str] = &["area", "br", "col", "hr", "img", "wbr"];
 
@@ -489,17 +537,23 @@ fn attribute(tag: &str, name: &str) -> Option<String> {
 }
 
 /// The tag's own background, if it gives one that can be read.
-fn background(tag: &str) -> Option<[u8; 4]> {
+fn background(tag: &str) -> Option<Rgba> {
     let style = attribute(tag, "style").unwrap_or_default();
     let value = declared(&style, &["background-color", "background"])
         .or_else(|| attribute(tag, "bgcolor"))?;
-    colour(&value).filter(|c| c[3] > 0)
+    words(&value)
+        .iter()
+        .find_map(|w| colour(w))
+        .filter(|c| c[3] > 0)
 }
 
 /// The tag's own text colour: its style's, else `<font color>`'s.
-fn ink(tag: &str) -> Option<[u8; 4]> {
+fn ink(tag: &str) -> Option<Rgba> {
     let style = attribute(tag, "style").unwrap_or_default();
-    colour(&declared(&style, &["color"]).or_else(|| attribute(tag, "color"))?)
+    let value = declared(&style, &["-webkit-text-fill-color"])
+        .or_else(|| declared(&style, &["color"]))
+        .or_else(|| attribute(tag, "color"))?;
+    colour(&value)
 }
 
 /// `html` as plain text, read from the markup the reader shows, without what
@@ -512,8 +566,8 @@ pub fn visible_text(html: &str) -> String {
     let mut text = String::new();
     // inside a hidden element: its name, and how many of that name are open
     let mut hiding: Option<(String, usize)> = None;
-    // the backgrounds of the elements open now, innermost last
-    let mut open: Vec<(String, Option<[u8; 4]>)> = Vec::new();
+    // the backgrounds and text colours of the elements open now, innermost last
+    let mut open: Vec<(String, Option<Rgba>, Option<Rgba>)> = Vec::new();
     let mut rest = html.as_str();
     while !rest.is_empty() {
         let lt = rest.find('<').unwrap_or(rest.len());
@@ -544,19 +598,21 @@ pub fn visible_text(html: &str) -> String {
             continue;
         }
         if closing {
-            if let Some(at) = open.iter().rposition(|(n, _)| *n == name) {
+            if let Some(at) = open.iter().rposition(|(n, ..)| *n == name) {
                 open.truncate(at);
             }
         } else if !void {
             let paper = background(tag)
-                .or_else(|| open.iter().rev().find_map(|(_, bg)| *bg))
+                .or_else(|| open.iter().rev().find_map(|(_, bg, _)| *bg))
                 .unwrap_or(PAGE);
-            let unseen = ink(tag).is_some_and(|ink| unreadable(ink, paper));
+            // a colour is inherited, and can meet a background further in
+            let text = ink(tag).or_else(|| open.iter().rev().find_map(|(.., ink)| *ink));
+            let unseen = text.is_some_and(|ink| unreadable(ink, paper));
             if unseen || attribute(tag, "style").is_some_and(|s| hidden(&s)) {
                 hiding = Some((name, 1));
                 continue;
             }
-            open.push((name.clone(), background(tag)));
+            open.push((name.clone(), background(tag), ink(tag)));
         }
         if gmail::BLOCKS.contains(&name.as_str()) {
             text.push('\n');
@@ -611,6 +667,13 @@ mod tests {
             "opacity:/**/0",
             "display:none!IMPORTANT",
             "font:0/0 a",
+            "font:italic 0/0 a",
+            "font:normal 0px arial",
+            "color:hsl(0,0%,100%)",
+            "color:whitesmoke",
+            "-webkit-text-fill-color:transparent",
+            "-webkit-text-fill-color:#fff",
+            "background:#123 no-repeat;color:#123",
             "mso-hide:all",
             "color:#fff",
             "color:#FFFFFF",
@@ -656,6 +719,29 @@ mod tests {
             visible_text(
                 r##"<div style="background:#000"><p style="color:#000">IGNORE</p></div><p>seen</p>"##
             ),
+            "seen"
+        );
+        // a colour carries down onto a background further in
+        assert_eq!(
+            visible_text(
+                r##"<div style="color:#123456"><p style="background:#123456">IGNORE</p></div><p>seen</p>"##
+            ),
+            "seen"
+        );
+        // on a shorthand's background it's readable
+        assert_eq!(
+            visible_text(
+                r##"<div style="background:#000 no-repeat"><p style="color:#fff">seen</p></div>"##
+            ),
+            "seen"
+        );
+        // a size in a real font stays, and so does a colour nobody can read here
+        assert_eq!(
+            visible_text(r##"<p style="font:700 12px arial">seen</p>"##),
+            "seen"
+        );
+        assert_eq!(
+            visible_text(r##"<p style="color:lab(100 0 0)">seen</p>"##),
             "seen"
         );
         // what the reader shows stays

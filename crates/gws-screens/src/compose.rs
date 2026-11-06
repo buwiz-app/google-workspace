@@ -275,6 +275,9 @@ impl Compose {
         self.asking.set(false);
         self.confirming.set(None);
         self.frozen.set(false);
+        // a suggestion belongs to what was being typed
+        self.asked.ask();
+        self.people.set(Vec::new());
     }
 
     fn close(self) {
@@ -595,8 +598,11 @@ async fn upload(b: &Bridge, c: Compose, key: u64, name: &str, mime: &str, bytes:
     true
 }
 
-/// Asks for files and brings them in.
+/// Asks for files and brings them in, unless Send has taken the letter.
 fn attach(b: Bridge, c: Compose) {
+    if c.frozen.get_untracked() {
+        return;
+    }
     let options = PickOptions {
         extensions: Vec::new(),
         multiple: true,
@@ -685,6 +691,10 @@ pub fn send(b: Bridge, c: Compose) {
 }
 
 fn press_send(b: Bridge, c: Compose, confirmed: bool) {
+    // a double click is one press
+    if c.frozen.get_untracked() {
+        return;
+    }
     let why = if c.attaching.get_untracked() {
         Some("A file is still coming in.")
     } else {
@@ -928,6 +938,15 @@ fn suggestions(c: Compose) -> impl IntoElement {
     })
 }
 
+/// The press that sends: the one thing here that should stand out.
+fn press_send_button(label: &'static str, shows: &'static str, press: impl Fn() + 'static) -> View {
+    view()
+        .app_class(Some("px-4 py-1 rounded-md bg-[#2563eb]".into()))
+        .label(label)
+        .on_press(press)
+        .child(text(shows).app_class(Some("text-[12px] font-semibold text-white".into())))
+}
+
 fn press_text(label: &'static str, shows: &'static str, press: impl Fn() + 'static) -> View {
     view()
         .app_class(Some("px-3 py-1".into()))
@@ -1049,7 +1068,7 @@ pub fn panel(b: Bridge, c: Compose) -> impl IntoElement {
                     .child(press_text("Keep writing", "Keep writing", move || {
                         c.confirming.set(None);
                     }))
-                    .child(press_text("Send it", "Send it", move || {
+                    .child(press_send_button("Send it", "Send it", move || {
                         press_send(ask.clone(), c, true);
                     }));
             }
@@ -1075,7 +1094,9 @@ pub fn panel(b: Bridge, c: Compose) -> impl IntoElement {
                 .app_class(Some(
                     format!("flex-row items-center gap-1 px-2 py-1 border-t {LINE} {RAIL}").into(),
                 ))
-                .child(press_text("Send", "Send", move || send(sending.clone(), c)))
+                .child(press_send_button("Send", "Send", move || {
+                    send(sending.clone(), c)
+                }))
                 .child(press_text("Attach a file", "Attach", move || {
                     attach(attaching.clone(), c);
                 }))
@@ -1139,6 +1160,16 @@ fn recipients(l: &Letter) -> usize {
         .flat_map(|f| f.split(','))
         .filter(|a| !a.trim().is_empty())
         .count()
+}
+
+/// What the second press is asked for.
+fn ask_line(letter: &Letter, review: &Review) -> String {
+    let n = recipients(letter);
+    let people = if n == 1 { "person" } else { "people" };
+    match review.new.len() {
+        0 => format!("Send to {n} {people}?"),
+        new => format!("Send to {n} {people}, {new} new to you?"),
+    }
 }
 
 /// Reads the draft again: what's shown is always what Send would send.
@@ -1315,18 +1346,18 @@ pub fn card(b: Bridge, ticket: String) -> View {
                 if c.asking.get() {
                     row = row
                         .child(
-                            text(format!("Send to {}?", recipients(&letter)))
+                            text(ask_line(&letter, &shown))
                                 .app_class(Some(format!("text-[12px] {INK}").into())),
                         )
                         .child(press_text("Not yet", "Not yet", move || {
                             c.asking.set(false)
                         }))
-                        .child(press_text("Send it", "Send it", move || {
+                        .child(press_send_button("Send it", "Send it", move || {
                             c.asking.set(false);
                             send_reviewed(sending.clone(), c, name.clone(), review);
                         }));
                 } else {
-                    row = row.child(press_text("Send", "Send", move || {
+                    row = row.child(press_send_button("Send", "Send", move || {
                         if needs_asking {
                             c.asking.set(true);
                         } else {

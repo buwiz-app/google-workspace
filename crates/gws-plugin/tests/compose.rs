@@ -407,6 +407,62 @@ fn a_job_the_plugin_did_not_start_plants_nothing_and_holds_nobody() {
 }
 
 #[test]
+fn a_running_job_is_never_pushed_out() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "jobs-full");
+    let first = data(core.run("gws_mail_job_start", &json!({})));
+    for _ in 1..16 {
+        data(core.run("gws_mail_job_start", &json!({})));
+    }
+    let refused = core.run("gws_mail_job_start", &json!({}));
+    assert_eq!(refused["isError"], true, "{refused}");
+    let asked = data(core.run("gws_mail_job", &json!({"job": first["job"]})));
+    assert_eq!(asked["gone"], false, "the first is still someone's");
+}
+
+#[test]
+fn failed_saves_leave_nothing_held() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "held");
+    let bytes = file(1024);
+    let mut draft = lunch();
+    draft["attachments"] = json!([attach(&core, "a.pdf", &bytes)]);
+    let saved = data(core.run("gws_mail_draft_save", &draft));
+    let read = data(core.run("gws_mail_draft_read", &json!({"draft": saved["draft"]})));
+    let file0 = &read["attachments"][0];
+    let good = json!({"message": read["revision"], "id": file0["id"], "name": "a.pdf", "mime": "application/pdf"});
+    let before = core.uploads.lock().unwrap().held_bytes();
+    for bad in [
+        json!({"message": "nope!", "id": "x", "name": "b.pdf", "mime": "application/pdf"}),
+        json!({"message": read["revision"], "id": "att-9", "name": "b.pdf", "mime": "application/pdf"}),
+    ] {
+        let mut edit = lunch();
+        edit["draft"] = saved["draft"].clone();
+        edit["keep"] = json!([good, bad]);
+        let refused = core.run("gws_mail_draft_save", &edit);
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert_eq!(
+            core.uploads.lock().unwrap().held_bytes(),
+            before,
+            "nothing left behind"
+        );
+    }
+}
+
+#[test]
+fn a_long_subject_is_read_whole() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "subject");
+    let subject = "Long ".repeat(400).trim_end().to_owned();
+    let saved = data(core.run(
+        "gws_mail_draft_save",
+        &json!({"to": ["ana@example.com"], "subject": subject, "body": "Hi"}),
+    ));
+    let read = data(core.run("gws_mail_draft_read", &json!({"draft": saved["draft"]})));
+    assert_eq!(read["subject"], subject.as_str());
+}
+
+#[test]
 fn a_press_sends_only_the_draft_and_revision_it_was_for_and_a_refusal_spends_it() {
     let google = FakeGoogle::start(Seed::demo(2));
     let core = signed_in(&google, "bound");

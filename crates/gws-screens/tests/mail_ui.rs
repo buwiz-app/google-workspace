@@ -1471,3 +1471,34 @@ fn a_kept_file_is_an_upload_after_the_save_that_moved_it() {
     assert_eq!(last["attachments"], json!(["up7"]));
     assert_eq!(last["keep"], json!([]), "not the old message's id");
 }
+
+#[test]
+fn a_double_click_on_send_is_one_press() {
+    let (mut app, fake) = start();
+    write_one(&mut app);
+    fake.hold("gws_mail_draft_save");
+    app.press("label:Send").expect("Send presses");
+    settle(&mut app);
+    let _ = app.press("label:Send");
+    settle(&mut app);
+    assert_eq!(fake.called("gws_mail_send_arm").len(), 1, "one press");
+    fake.release("gws_mail_draft_save");
+    wait_for_send(&mut app, &fake);
+    assert_eq!(fake.called("gws_mail_send").len(), 1);
+}
+
+#[test]
+fn nothing_can_be_attached_once_send_is_pressed() {
+    let (mut app, fake) = start();
+    write_one(&mut app);
+    fake.hold("gws_mail_draft_save");
+    app.press("label:Send").expect("Send presses");
+    settle(&mut app);
+    let _ = app.press("label:Attach a file");
+    settle(&mut app);
+    assert!(
+        !app.screen().shows("This screen can't reach your files."),
+        "the press does nothing at all"
+    );
+    fake.release("gws_mail_draft_save");
+}

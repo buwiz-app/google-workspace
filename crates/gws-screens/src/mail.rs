@@ -685,13 +685,20 @@ fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
         .app_class(Some(
             format!("w-[190px] pt-3 border-r {LINE} {RAIL}").into(),
         ))
-        .child(view().app_class(Some("px-2 py-2".into())).child(tool(
-            "Write a message",
-            "Write",
-            move || {
-                compose::start(writes.clone(), m.compose);
-            },
-        )))
+        .child(
+            view().app_class(Some("px-2 py-2".into())).child(
+                view()
+                    .app_class(Some(
+                        "items-center px-3 py-1.5 rounded-md bg-[#2563eb]".into(),
+                    ))
+                    .label("Write a message")
+                    .on_press(move || compose::start(writes.clone(), m.compose))
+                    .child(
+                        text("Write")
+                            .app_class(Some("text-[13px] font-semibold text-white".into())),
+                    ),
+            ),
+        )
         .child(list)
 }
 

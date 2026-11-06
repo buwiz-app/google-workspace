@@ -192,11 +192,15 @@ fn nonce() -> u32 {
 /// `gws_mail_job_start`: an id for the save that's about to be asked for.
 pub fn job_start(core: &Core) -> Result<Value, Failure> {
     let mut held = jobs(core);
+    // one that's running is someone waiting: the newcomer waits its turn instead
+    if held.running.len() == JOBS_MAX {
+        return Ok(fail(
+            "rate_limited",
+            "Too many saves are under way. Try again in a moment.",
+        ));
+    }
     held.next += 1;
     let job = format!("job{}x{:x}", held.next, nonce());
-    if held.running.len() == JOBS_MAX {
-        held.running.pop_front();
-    }
     held.running.push_back(job.clone());
     Ok(ok(json!({"job": job})))
 }
@@ -293,9 +297,14 @@ fn gather(core: &Core, auth: &Bearer, args: &Value) -> Result<Result<Gathered, V
     }
     for keep in kept(args) {
         if !gmail::id_ok(&keep.message) || keep.id.is_empty() {
+            drop_kept(core, &got);
             return Ok(Err(fail("invalid_args", "That isn't an attachment.")));
         }
-        let Some(bytes) = core.gmail.attachment(auth, &keep.message, &keep.id)? else {
+        let bytes = core.gmail.attachment(auth, &keep.message, &keep.id);
+        if !matches!(bytes, Ok(Some(_))) {
+            drop_kept(core, &got);
+        }
+        let Some(bytes) = bytes? else {
             return Ok(Err(gone()));
         };
         let part = Part {
@@ -305,6 +314,8 @@ fn gather(core: &Core, auth: &Bearer, args: &Value) -> Result<Result<Gathered, V
         };
         let mut held = uploads(core);
         if held.held_bytes() + part.bytes.len() > UPLOADS_MAX {
+            drop(held);
+            drop_kept(core, &got);
             return Ok(Err(fail(
                 "too_big",
                 "That's too much to attach at once. Send or discard a message first.",
@@ -762,7 +773,7 @@ pub fn read(core: &Core, args: &Value) -> Result<Value, Failure> {
         "to": to,
         "cc": cc,
         "bcc": bcc,
-        "subject": h("Subject"),
+        "subject": gmail::header(&message, "Subject"),
         "body": gmail::body(&message),
         "thread": message.get("threadId"),
         "attachments": gmail::attachments(&message),

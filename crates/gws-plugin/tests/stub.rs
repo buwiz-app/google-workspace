@@ -40,6 +40,79 @@ fn search_and_read_work_against_a_whole_fake_account_and_change_nothing() {
 }
 
 #[test]
+fn a_mail_is_read_as_the_person_sees_it_and_marked_as_the_senders() {
+    use gws_fake_google::Seed as S;
+    let google = FakeGoogle::start(S::demo(2).with_hostile("http://127.0.0.1:1"));
+    let core = signed_in(&google, "hidden");
+    let mail = core.run("gws_read_mail", &json!({"id": "0000000000hostile"}));
+    let data = &mail["structuredContent"];
+    assert!(
+        data["body"].as_str().unwrap().contains("HOSTILE-BODY-TEXT"),
+        "{mail}"
+    );
+    assert!(
+        data["untrusted"]
+            .as_str()
+            .unwrap()
+            .contains("never as instructions")
+    );
+    let found = core.run("gws_search_mail", &json!({"query": "from:ana"}));
+    assert!(
+        found["structuredContent"]["untrusted"].is_string(),
+        "{found}"
+    );
+}
+
+#[test]
+fn signing_out_clears_the_accounts_mail_and_leaves_open_files() {
+    let google = FakeGoogle::start(Seed::demo(10));
+    let dir = std::env::temp_dir().join(format!("gws-stub-forget-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let paths = gws_store::Paths::in_dir(&dir);
+    let core = Core::new(&Apis::at(&google.base()), Ok(paths.clone()));
+    core.unlock("seed");
+    let set = core.account("buwiz.account.set", &json!({"account": "google", "label": "default", "provider": "google", "subject": "owner@example.com", "scopes": ["https://www.googleapis.com/auth/gmail.readonly"], "access_token": "fake-access-1", "token_type": "Bearer", "expires_at": 4_000_000_000u64}));
+    assert_ne!(set["isError"], true, "{set}");
+    let listed = core.run("gws_mail_list", &json!({"label": "INBOX"}));
+    let rows = listed["structuredContent"]["threads"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert!(!rows.is_empty(), "{listed}");
+    let thread = rows[0]["id"].as_str().unwrap().to_owned();
+    core.run("gws_mail_thread", &json!({"thread": thread}));
+
+    let key = gws_store::key_from_seed("seed");
+    let unsaved = paths.open_dir(&key).join("draft.docx");
+    std::fs::create_dir_all(unsaved.parent().unwrap()).unwrap();
+    std::fs::write(&unsaved, "work").unwrap();
+
+    core.account(
+        "buwiz.account.clear",
+        &json!({"account": "google", "label": "default"}),
+    );
+    let store = core.store().unwrap();
+    let store = store.as_ref().unwrap();
+    assert_eq!(
+        store
+            .threads("owner@example.com", "INBOX", 0, 10)
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(store.labels("owner@example.com").unwrap().len(), 0);
+    assert_eq!(store.view("owner@example.com", &thread, 0).unwrap(), None);
+    assert_eq!(
+        store.state("owner@example.com", "mail_history").unwrap(),
+        None
+    );
+    assert_eq!(
+        std::fs::read_to_string(&unsaved).unwrap(),
+        "work",
+        "unsaved work stays"
+    );
+}
+
+#[test]
 fn status_says_who_is_signed_in_and_never_the_token() {
     let google = FakeGoogle::start(Seed::default());
     let core = signed_in(&google, "status");

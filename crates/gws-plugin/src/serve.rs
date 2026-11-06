@@ -328,12 +328,7 @@ fn run(plugin: Gws, manifest: Served) -> std::io::Result<()> {
             Route::Account(name) if core.provisioned() => {
                 let empty = json!({});
                 let args = message.pointer("/params/arguments").unwrap_or(&empty);
-                let result = if name == "buwiz.account.set" {
-                    core.accounts.set(args)
-                } else {
-                    core.accounts.clear(args)
-                };
-                core.sync.wake();
+                let result = core.account(&name, args);
                 write(&out, &json!({"jsonrpc": "2.0", "id": id, "result": result}));
             }
             Route::Provision => {

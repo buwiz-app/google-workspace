@@ -13,7 +13,7 @@ use base64::Engine as _;
 use serde_json::Value;
 
 use crate::accounts::Bearer;
-use crate::js;
+use crate::{clean, js};
 
 /// The production API base.
 pub const GMAIL_API: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
@@ -419,8 +419,9 @@ pub fn snippet(message: &Value) -> String {
     ))
 }
 
-/// The message's body as plain text: its first text/plain part, else its
-/// first text/html part with the tags stripped; attachments are skipped.
+/// The message's body as plain text: what its first text/html part shows,
+/// else its first text/plain part; attachments are skipped. HTML first: that's
+/// what the reader shows, and a plain part nobody sees could say anything.
 pub fn body(message: &Value) -> String {
     let mut leaves = Vec::new();
     if let Some(p) = message.get("payload") {
@@ -432,10 +433,10 @@ pub fn body(message: &Value) -> String {
             .unwrap_or_default()
             .to_ascii_lowercase()
     };
-    let text = if let Some(p) = leaves.iter().find(|p| mime(p) == "text/plain") {
+    let text = if let Some(p) = leaves.iter().find(|p| mime(p) == "text/html") {
+        clean::visible_text(&decode_part(p))
+    } else if let Some(p) = leaves.iter().find(|p| mime(p) == "text/plain") {
         decode_part(p)
-    } else if let Some(p) = leaves.iter().find(|p| mime(p) == "text/html") {
-        strip_html(&decode_part(p))
     } else {
         String::new()
     };
@@ -601,7 +602,7 @@ pub fn decode_entities(s: &str) -> String {
     out
 }
 
-const BLOCKS: [&str; 18] = [
+pub const BLOCKS: [&str; 18] = [
     "br",
     "p",
     "div",
@@ -621,62 +622,14 @@ const BLOCKS: [&str; 18] = [
     "section",
     "article",
 ];
-const SKIPPED: [&str; 4] = ["script", "style", "head", "title"];
 
-/// HTML as plain text: tags gone (a block tag ends its line), script,
-/// style and head dropped, entities decoded, runs of space collapsed, at
-/// most one blank line in a row.
-pub fn strip_html(html: &str) -> String {
-    let lower = html.to_ascii_lowercase();
-    let mut text = String::new();
-    let mut i = 0;
-    while i < html.len() {
-        let Some(lt) = html[i..].find('<').map(|n| i + n) else {
-            text.push_str(&html[i..].replace(['\n', '\r'], " "));
-            break;
-        };
-        // a line break in the source is a space; block tags end lines
-        text.push_str(&html[i..lt].replace(['\n', '\r'], " "));
-        // only a letter, `/`, `!` or `?` opens a tag: `a < b` is text
-        if !html[lt + 1..]
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '/' | '!' | '?'))
-        {
-            text.push('<');
-            i = lt + 1;
-            continue;
-        }
-        if lower[lt..].starts_with("<!--") {
-            i = lower[lt..].find("-->").map_or(html.len(), |n| lt + n + 3);
-            continue;
-        }
-        let gt = html[lt..].find('>').map_or(html.len(), |n| lt + n + 1);
-        let tag = lower[lt + 1..gt].trim_start_matches('/');
-        let name: String = tag
-            .chars()
-            .take_while(char::is_ascii_alphanumeric)
-            .collect();
-        i = gt;
-        if SKIPPED.contains(&name.as_str()) && !lower[lt + 1..].starts_with('/') {
-            let close = format!("</{name}");
-            i = lower[gt..].find(&close).map_or(html.len(), |n| {
-                lower[gt + n..]
-                    .find('>')
-                    .map_or(html.len(), |m| gt + n + m + 1)
-            });
-        } else if BLOCKS.contains(&name.as_str()) {
-            text.push('\n');
-        } else if name == "td" || name == "th" {
-            text.push(' ');
-        }
-    }
+/// Text with its lines tidied: spaces run together, one blank line at most.
+pub fn tidy(text: &str) -> String {
     let mut out = String::new();
     let mut blank = 0;
     for line in text.split('\n') {
-        let decoded = decode_entities(&line.split_whitespace().collect::<Vec<_>>().join(" "));
-        let line = decoded.replace('\u{a0}', " ");
-        let line = line.trim();
+        let line = line.replace('\u{a0}', " ");
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
         if line.is_empty() {
             blank += 1;
             continue;
@@ -685,7 +638,7 @@ pub fn strip_html(html: &str) -> String {
             out.push_str(if blank > 0 { "\n\n" } else { "\n" });
         }
         blank = 0;
-        out.push_str(line);
+        out.push_str(&line);
     }
     out
 }
@@ -751,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn the_body_is_the_text_plain_part_else_the_html_one_stripped() {
+    fn the_body_is_what_the_html_part_shows_else_the_text_plain_part() {
         let plain = json!({"payload": {"mimeType": "multipart/mixed", "parts": [
             {"mimeType": "multipart/alternative", "parts": [
                 {"mimeType": "text/plain", "headers": [{"name": "Content-Type", "value": "text/plain; charset=\"UTF-8\""}], "body": {"data": b64("Your 1701Q was received.\r\n\r\nRef: 2026-ABC\r\n\r\n")}},
@@ -759,7 +712,7 @@ mod tests {
             ]},
             {"mimeType": "text/plain", "filename": "notes.txt", "body": {"attachmentId": "a1"}},
         ]}});
-        assert_eq!(body(&plain), "Your 1701Q was received.\n\nRef: 2026-ABC");
+        assert_eq!(body(&plain), "html", "the part the person sees");
         let html = json!({"payload": {"mimeType": "multipart/alternative", "parts": [
             {"mimeType": "text/html", "body": {"data": b64("<html><head><title>x</title><style>p{}</style></head><body><p>Hello&nbsp;<b>Ann</b>,</p><p>See   you<br>at noon &amp; bring &#8364;5 &#x1F600;</p><script>evil()</script><!-- c --></body></html>")}},
         ]}});
@@ -788,20 +741,20 @@ mod tests {
     #[test]
     fn html_keeps_one_blank_line_and_drops_skipped_blocks() {
         assert_eq!(
-            strip_html("<div>a</div><p></p><p></p><div>b</div>"),
+            clean::visible_text("<div>a</div><p></p><p></p><div>b</div>"),
             "a\n\nb"
         );
         assert_eq!(
-            strip_html("<table><tr><td>x</td><td>y</td></tr></table>"),
+            clean::visible_text("<table><tr><td>x</td><td>y</td></tr></table>"),
             "x y"
         );
-        assert_eq!(strip_html("plain < text"), "plain < text");
+        assert_eq!(clean::visible_text("plain < text"), "plain < text");
         assert_eq!(
-            strip_html("<p>if a < b and c > d</p>"),
+            clean::visible_text("<p>if a < b and c > d</p>"),
             "if a < b and c > d"
         );
-        assert_eq!(strip_html("one\ntwo<br>\nthree"), "one two\nthree");
-        assert_eq!(strip_html("<SCRIPT>a</SCRIPT>ok<style"), "ok");
+        assert_eq!(clean::visible_text("one\ntwo<br>\nthree"), "one two\nthree");
+        assert_eq!(clean::visible_text("<SCRIPT>a</SCRIPT>ok<style"), "ok");
     }
 
     #[test]

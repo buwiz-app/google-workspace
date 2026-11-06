@@ -92,7 +92,7 @@ pub fn unsigned(key_id: &str) -> Value {
         "short": SHORT,
         "version": env!("CARGO_PKG_VERSION"),
         "title": TITLE,
-        "description": "Mail, Calendar and Drive in Buwiz Bot, with the Google account you sign in to.",
+        "description": "Read your Gmail in Buwiz Bot, with the Google account you sign in to.",
         "publisher": { "id": "app.buwiz", "key_id": key_id, "name": "Goldcoders" },
         "commands": [
             { "name": "gws", "description": "Open Mail, Calendar or Drive", "args": "[mail, calendar or drive]", "resolve": tools::RESOLVE },

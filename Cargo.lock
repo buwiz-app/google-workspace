@@ -282,6 +282,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "ureq",
+ "url",
 ]
 
 [[package]]
@@ -1093,6 +1094,7 @@ dependencies = [
  "nsh-testing",
  "serde_json",
  "tokio",
+ "url",
 ]
 
 [[package]]

@@ -24,6 +24,11 @@ use crate::{Core, js};
 pub const PAGE: i64 = 50;
 /// What a thread's view may come to: a result stops at 1 MiB.
 const VIEW_MAX: usize = 900 * 1024;
+/// A generation of [`Tickets`].
+const TICKETS_MAX: usize = 512;
+/// The most of one header a page shows.
+const HEADER_MAX: usize = 2048;
+const TOO_LONG: &str = "<p>This message is too long to show here.</p>";
 /// How often the sync runs with a screen open, and with none.
 const ACTIVE: Duration = Duration::from_secs(30);
 const IDLE: Duration = Duration::from_secs(300);
@@ -66,6 +71,32 @@ pub fn offer_card(core: &Core, tool: &str, args: &Value, result: &mut Value) {
         .unwrap_or_else(|e| e.into_inner())
         .issue(&Subject::Search(query));
     result["_meta"] = json!({"buwiz/open": {"app": "mail", "props": {"search": ticket}, "title": "Mail", "placement": "inline"}});
+}
+
+/// Tickets in two generations, so they can't grow without end: when the newer
+/// fills, the older goes, and a card that old says it's out of date.
+#[derive(Default)]
+pub struct Tickets {
+    newer: buwiz_plugin::Tickets<Subject>,
+    older: buwiz_plugin::Tickets<Subject>,
+    issued: usize,
+}
+
+impl Tickets {
+    pub fn issue(&mut self, subject: &Subject) -> String {
+        if self.issued >= TICKETS_MAX {
+            self.older = std::mem::take(&mut self.newer);
+            self.issued = 0;
+        }
+        self.issued += 1;
+        self.newer.issue(subject)
+    }
+
+    pub fn subject(&self, ticket: &str) -> Option<&Subject> {
+        self.newer
+            .subject(ticket)
+            .or_else(|| self.older.subject(ticket))
+    }
 }
 
 /// A card's rows, each with a ticket to open it by.
@@ -159,6 +190,13 @@ pub fn start(core: Arc<Core>) -> JoinHandle<()> {
             }
         }
     })
+}
+
+/// Clears what's held for `account`, who has signed out.
+pub fn forget(core: &Core, account: &str) {
+    if let Err(Failure::Plain(why)) = with_store(core, |store| store.forget_account(account)) {
+        eprintln!("buwiz-gws: couldn't clear the signed-out account's mail: {why}");
+    }
 }
 
 fn with_store<T>(
@@ -255,6 +293,14 @@ fn fetch_rows(
 ) -> Result<Vec<Thread>, Failure> {
     let found = core.gmail.threads_metadata(auth, ids)?;
     let mut rows = Vec::with_capacity(ids.len());
+    // a sync that outlives its sign-in must not put back what was cleared
+    if core
+        .accounts
+        .signed_in()
+        .is_none_or(|(who, _)| who != account)
+    {
+        return Err(Failure::AccountRequired);
+    }
     with_store(core, |store| {
         for (id, thread) in ids.iter().zip(found) {
             match thread.as_ref().and_then(row_of) {
@@ -493,65 +539,107 @@ pub fn view_of(thread: &Value) -> Value {
         .first()
         .map(|m| gmail::header(m, "Subject"))
         .unwrap_or_default();
-    let mut cleaned: Vec<Option<clean::Cleaned>> = list
+    let meta: Vec<String> = list
         .iter()
-        .map(|m| gmail::html_body(m).map(|h| clean::clean(&h)))
+        .map(|m| {
+            let (name, address) = sender_of(&gmail::header(m, "From"));
+            format!(
+                "<div class=\"gws-meta\"><b>{}</b> &lt;{}&gt; · {}<br>to {}</div>",
+                escape(&gmail::cap_bytes(&name, HEADER_MAX)),
+                escape(&gmail::cap_bytes(&address, HEADER_MAX)),
+                when(millis(m)),
+                escape(&gmail::cap_bytes(&gmail::header(m, "To"), HEADER_MAX))
+            )
+        })
         .collect();
-    let text: Vec<String> = list.iter().map(gmail::body).collect();
-    // plain text is sent escaped, which is what counts against the limit
-    let weight =
-        |c: &Option<clean::Cleaned>, t: &str| c.as_ref().map_or(escape(t).len(), |c| c.html.len());
-    let mut size: usize = cleaned.iter().zip(&text).map(|(c, t)| weight(c, t)).sum();
-    // past what a result can carry, the oldest fall back to plain text
-    for (c, t) in cleaned.iter_mut().zip(&text) {
-        if size <= VIEW_MAX {
-            break;
-        }
-        size -= weight(c, t);
-        *c = None;
-        size += weight(c, t);
-    }
-    let (mut page, mut links, mut images, mut attachments) = (
-        format!(
-            "<h2 style=\"font-size:18px;margin:0 0 12px\">{}</h2>",
-            escape(&subject)
-        ),
-        Vec::new(),
-        0,
-        Vec::new(),
+    let title = format!(
+        "<h2 style=\"font-size:18px;margin:0 0 12px\">{}</h2>",
+        escape(&gmail::cap_bytes(&subject, HEADER_MAX))
     );
-    for ((m, c), t) in list.iter().zip(cleaned).zip(&text) {
-        let (name, address) = sender_of(&gmail::header(m, "From"));
-        page.push_str(&format!(
-            "<div class=\"gws-meta\"><b>{}</b> &lt;{}&gt; · {}<br>to {}</div>",
-            escape(&name),
-            escape(&address),
-            when(millis(m)),
-            escape(&gmail::header(m, "To"))
-        ));
-        match c {
-            Some(mut c) => {
-                for n in (0..c.links.len()).rev() {
-                    c.html = c.html.replace(
-                        &format!("\"gws-link:{n}\""),
-                        &format!("\"gws-link:{}\"", n + links.len()),
-                    );
-                }
-                images += c.images.len();
-                links.append(&mut c.links);
-                page.push_str(&c.html);
+    let attachments: Vec<Value> = list.iter().flat_map(gmail::attachments).collect();
+    let mut parts: Vec<Part> = list
+        .iter()
+        .map(|m| match gmail::html_body(m) {
+            Some(h) => Part::Html(clean::clean(&h), gmail::body(m)),
+            None => Part::Text(gmail::body(m)),
+        })
+        .collect();
+    // what's counted is what's sent: the markup, as JSON
+    let mut size = sent(&title)
+        + meta.iter().map(|m| sent(m)).sum::<usize>()
+        + json!(attachments).to_string().len()
+        + parts.iter().map(Part::size).sum::<usize>();
+    // past what a result can carry, the oldest give way first: HTML to plain
+    // text, then plain text to a line saying so
+    for pass in 0..2 {
+        for part in &mut parts {
+            if size <= VIEW_MAX {
+                break;
             }
-            None if size > VIEW_MAX && t.len() > VIEW_MAX / 2 => {
-                page.push_str("<p>This message is too long to show here.</p>")
+            if pass == 1 || matches!(part, Part::Html(..)) {
+                size -= part.size();
+                part.shrink();
+                size += part.size();
             }
-            None => page.push_str(&format!(
-                "<pre style=\"white-space:pre-wrap;font:inherit;margin:0\">{}</pre>",
-                escape(t)
-            )),
         }
-        attachments.extend(gmail::attachments(m));
+    }
+    let (mut page, mut links, mut images) = (title, Vec::new(), 0);
+    for (meta, part) in meta.iter().zip(parts) {
+        page.push_str(meta);
+        match part {
+            Part::Html(c, _) => {
+                let (base, count) = (links.len(), c.links.len());
+                page.push_str(&clean::rewrite(&c.html, "gws-link:", |n, out| {
+                    let known = n < count;
+                    if known {
+                        out.push_str(&format!("\"gws-link:{}\"", n + base));
+                    }
+                    known
+                }));
+                images += c.images.len();
+                links.extend(c.links);
+            }
+            Part::Text(t) => page.push_str(&pre(&t)),
+            Part::TooLong => page.push_str(TOO_LONG),
+        }
     }
     json!({"id": thread.get("id"), "page": page, "links": links, "images": images, "attachments": attachments})
+}
+
+/// One message of a thread, as much of it as fits.
+enum Part {
+    Html(clean::Cleaned, String),
+    Text(String),
+    TooLong,
+}
+
+impl Part {
+    fn size(&self) -> usize {
+        match self {
+            Part::Html(c, _) => sent(&c.html) + json!(c.links).to_string().len(),
+            Part::Text(t) => sent(&pre(t)),
+            Part::TooLong => TOO_LONG.len(),
+        }
+    }
+
+    fn shrink(&mut self) {
+        *self = match std::mem::replace(self, Part::TooLong) {
+            Part::Html(_, text) => Part::Text(text),
+            _ => Part::TooLong,
+        };
+    }
+}
+
+/// `text`'s size in a JSON result.
+fn sent(text: &str) -> usize {
+    Value::from(text).to_string().len()
+}
+
+fn pre(text: &str) -> String {
+    format!(
+        "<pre style=\"white-space:pre-wrap;font:inherit;margin:0\">{}</pre>",
+        escape(text)
+    )
 }
 
 fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
@@ -648,19 +736,61 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_thread_gives_up_html_oldest_first() {
+    fn an_oversized_thread_gives_up_the_oldest_first() {
         let big = format!("<p>{}</p>", "x".repeat(500 * 1024));
         let view =
             view_of(&json!({"id": "t", "messages": [message("old", &big), message("new", &big)]}));
         let page = view["page"].as_str().unwrap();
+        let cut = page.find("too long").expect("the oldest gives way");
+        assert!(page[cut..].contains("xxxx"), "the newest stays");
+        assert!(view.to_string().len() < 1024 * 1024, "fits a result");
+    }
+
+    #[test]
+    fn what_is_sent_stays_under_a_result_however_it_escapes() {
+        use base64::Engine as _;
+        // a newline costs two bytes as JSON, a control character six
+        let text = "\n\u{1}".repeat(300 * 1024);
+        let data = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&text);
+        let plain = json!({"id": "p", "internalDate": "1793955600000", "payload": {"mimeType": "text/plain", "headers": [], "body": {"data": data}}});
+        let view = view_of(&json!({"id": "t", "messages": [plain]}));
         assert!(
-            page.contains("plain old") && !page.contains("plain new"),
-            "the oldest gives way"
+            view.to_string().len() < 1024 * 1024,
+            "{}",
+            view.to_string().len()
         );
-        assert!(
-            page.len() < 900 * 1024 + 4096 && view.to_string().len() < 1024 * 1024,
-            "fits a result"
+    }
+
+    #[test]
+    fn links_number_on_through_a_thread() {
+        let view = view_of(&json!({"id": "t", "messages": [
+            message("a", r#"<a href="https://one.example/">1</a><a href="https://two.example/">2</a>"#),
+            message("b", r#"<a href="https://three.example/">3</a>"#),
+        ]}));
+        let page = view["page"].as_str().unwrap();
+        assert_eq!(
+            view["links"],
+            json!([
+                "https://one.example/",
+                "https://two.example/",
+                "https://three.example/"
+            ])
         );
+        for n in 0..3 {
+            assert!(page.contains(&format!("\"gws-link:{n}\"")), "{page}");
+        }
+    }
+
+    #[test]
+    fn tickets_stay_bounded_and_the_recent_ones_work() {
+        let mut tickets = Tickets::default();
+        let first = tickets.issue(&Subject::Search("first".to_owned()));
+        let mut last = String::new();
+        for n in 0..TICKETS_MAX * 3 {
+            last = tickets.issue(&Subject::Search(n.to_string()));
+        }
+        assert_eq!(tickets.subject(&first), None, "the oldest went");
+        assert!(tickets.subject(&last).is_some());
     }
 
     #[test]

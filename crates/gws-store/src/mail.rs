@@ -103,6 +103,18 @@ impl Store {
         Ok(())
     }
 
+    /// Everything held for `account`: it can all be fetched again after a
+    /// sign-in. The `open-<id>` folders are no part of this: they can hold
+    /// unsaved work.
+    pub fn forget_account(&self, account: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for table in ["bodies", "thread_labels", "threads", "labels", "state"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE account = ?"), [account])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn remove_thread(&self, account: &str, id: &str) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for table in [

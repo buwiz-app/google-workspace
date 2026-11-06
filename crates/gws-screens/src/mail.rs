@@ -1,9 +1,10 @@
 //! Mail: labels, the list and the reader, on one screen of its own.
 //!
-//! The label rule holds here by construction. A row and a label carry a fixed
-//! `label`, and sender, subject and label names sit in `accessibility_value`,
-//! which `ui_look` never sends. What a mail says lives in the web view, which
-//! no tree shows.
+//! The label rule: a row and a label carry a fixed `label`, with sender and
+//! subject in `accessibility_value` and in the row's `text`s. Those are in the
+//! accessibility tree, as a screen reader needs them, and `ui_look` leaves
+//! them out: it drops values, and a row with several texts goes out unnamed.
+//! The Bot's `agent_hub::filter` tests hold that on the bytes it sends.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -13,6 +14,7 @@ use nsh_core::AccessibilityValue;
 use nsh_core::element::{Root, dark, input};
 use nsh_core::prelude::*;
 use serde_json::{Value, json};
+use url::Url;
 
 use crate::reader;
 use crate::shell::{BG, MUTE, RETRIES, backoff, sleep};
@@ -598,7 +600,19 @@ fn reader_pane(m: Mail) -> impl IntoElement {
         }))
 }
 
-/// The confirm a link needs: the address in full, before anything opens.
+/// Where a link really goes, always shown whole, however long the rest is.
+fn goes_to(link: &str) -> String {
+    let Ok(url) = Url::parse(link) else {
+        return link.to_owned();
+    };
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_owned(),
+        (None, _) => url.path().to_owned(),
+    }
+}
+
+/// The confirm a link needs: where it goes, and the address, before it opens.
 fn link_bar(m: Mail) -> impl IntoElement {
     dynamic(move || match m.link.get() {
         None => view(),
@@ -609,9 +623,17 @@ fn link_bar(m: Mail) -> impl IntoElement {
                     format!("flex-row items-center gap-3 px-3 py-2 border-t {LINE} {RAIL}").into(),
                 ))
                 .child(
-                    text(format!("Open {url}?"))
-                        .number_of_lines(2)
-                        .app_class(Some(format!("flex-1 text-[12px] {INK}").into())),
+                    view()
+                        .app_class(Some("flex-1 gap-[2px]".into()))
+                        .child(
+                            text(format!("Open {}?", goes_to(&url)))
+                                .app_class(Some(format!("text-[12px] {INK}").into())),
+                        )
+                        .child(
+                            text(url.clone())
+                                .number_of_lines(2)
+                                .app_class(Some(format!("text-[11px] {MUTE}").into())),
+                        ),
                 )
                 .child(
                     view()
@@ -943,6 +965,15 @@ pub fn build(bridge: Bridge) -> Root {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_names_its_real_host_however_long_the_rest() {
+        let long = format!("https://real.example/{}", "a/".repeat(500));
+        assert_eq!(goes_to(&long), "real.example");
+        assert_eq!(goes_to("http://127.0.0.1:8822/x?y=1"), "127.0.0.1:8822");
+        assert_eq!(goes_to("https://xn--80ak6aa92e.com/"), "xn--80ak6aa92e.com");
+        assert_eq!(goes_to("mailto:ana@example.com"), "ana@example.com");
+    }
 
     #[test]
     fn the_column_is_the_system_boxes_then_the_persons_labels() {

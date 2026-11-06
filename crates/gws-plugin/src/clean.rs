@@ -11,6 +11,9 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use ammonia::{Builder, UrlRelative};
+use url::Url;
+
+use crate::gmail;
 
 /// What [`clean`] makes of a body.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -106,9 +109,44 @@ const INLINE_IMAGES: &[&str] = &[
     "data:image/webp;",
 ];
 
-fn link_ok(url: &str) -> bool {
-    let lower = url.trim().to_ascii_lowercase();
-    lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:")
+/// Characters that make an address read differently from where it goes.
+fn deceptive(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{ad}'
+                | '\u{61c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{feff}'
+        )
+}
+
+/// A link's address in the one form the person confirms and the browser
+/// opens: a real host, in ASCII, and no `name@` in front of it to pass for one.
+fn link_of(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.chars().any(deceptive) {
+        return None;
+    }
+    let url = Url::parse(raw).ok()?;
+    let plain = url.username().is_empty() && url.password().is_none();
+    match url.scheme() {
+        "https" | "http" if url.host_str().is_some() && plain => Some(url.into()),
+        "mailto" => Some(url.into()),
+        _ => None,
+    }
+}
+
+/// Whether `value` starts with `prefix`, whatever its case. Bytes, not a
+/// slice of the text: a mail's value can have a character across the cut.
+fn starts_with_any_case(value: &str, prefix: &str) -> bool {
+    value
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
 /// A `style` value without any declaration that could load something. A
@@ -124,7 +162,9 @@ fn safe_style(style: &str) -> String {
             "\\",
             "url(",
             "://",
+            "image(",
             "image-set(",
+            "cross-fade(",
             "expression(",
             "@import",
             "behavior:",
@@ -151,12 +191,13 @@ fn inline_ok(data: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"+/=;:,-".contains(&b))
 }
 
-pub fn clean_with(html: &str, inline: &dyn Fn(&str) -> Option<String>) -> Cleaned {
-    // ammonia's filter is Send + Sync + 'static, so it reports through shared
-    // cells, and the lookups in `inline` happen after it
-    let links = Arc::new(Mutex::new(Vec::<String>::new()));
-    let images = Arc::new(Mutex::new(Vec::<String>::new()));
-    let (l, i) = (links.clone(), images.clone());
+/// What the cleaner found: ammonia's filter is Send + Sync + 'static, so it
+/// reports through shared cells.
+type Found = Arc<Mutex<Vec<String>>>;
+
+/// The one set of rules, for what the reader shows and what the model reads.
+fn builder(links: Found, images: Found) -> Builder<'static> {
+    let (l, i) = (links, images);
     let mut builder = Builder::empty();
     builder.tags(TAGS.iter().copied().collect::<HashSet<_>>());
     builder.generic_attributes(ATTRIBUTES.iter().copied().collect::<HashSet<_>>());
@@ -199,16 +240,15 @@ pub fn clean_with(html: &str, inline: &dyn Fn(&str) -> Option<String>) -> Cleane
     );
     builder.attribute_filter(
         move |element, attribute, value| match (element, attribute) {
-            ("a", "href") if link_ok(value) => {
+            ("a", "href") => link_of(value).map(|url| {
                 let mut links = l.lock().unwrap_or_else(|e| e.into_inner());
-                links.push(value.trim().to_owned());
-                Some(format!("gws-link:{}", links.len() - 1).into())
-            }
-            ("a", "href") => None,
+                links.push(url);
+                format!("gws-link:{}", links.len() - 1).into()
+            }),
             ("img", "src")
                 if INLINE_IMAGES
                     .iter()
-                    .any(|p| value.len() > p.len() && value[..p.len()].eq_ignore_ascii_case(p)) =>
+                    .any(|p| value.len() > p.len() && starts_with_any_case(value, p)) =>
             {
                 Some(value.into())
             }
@@ -221,29 +261,182 @@ pub fn clean_with(html: &str, inline: &dyn Fn(&str) -> Option<String>) -> Cleane
             _ => Some(value.into()),
         },
     );
-    let mut html = builder.clean(html).to_string();
-    let take = |cell: &Arc<Mutex<Vec<String>>>| {
-        std::mem::take(&mut *cell.lock().unwrap_or_else(|e| e.into_inner()))
-    };
-    let (links, images) = (take(&links), take(&images));
-    let mut left_out = Vec::new();
-    // highest first, so one number is never found inside another
-    for (n, url) in images.iter().enumerate().rev() {
-        let marker = format!("\"gws-image:{n}\"");
-        match inline(url).filter(|data| inline_ok(data)) {
-            Some(data) => html = html.replace(&marker, &format!("\"{data}\"")),
-            None => {
-                html = html.replace(&format!(" src={marker}"), "");
-                left_out.push(url.clone());
+    builder
+}
+
+/// Walks `html` once, for each `"<prefix><n>"` in it asking `swap` what goes
+/// there. `swap` writes it and says true, or says false to leave it as it was.
+pub fn rewrite(
+    html: &str,
+    prefix: &str,
+    mut swap: impl FnMut(usize, &mut String) -> bool,
+) -> String {
+    let marker = format!("\"{prefix}");
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(at) = rest.find(&marker) {
+        let (before, found) = rest.split_at(at);
+        out.push_str(before);
+        let digits = &found[marker.len()..];
+        let end = digits.find(|c: char| !c.is_ascii_digit());
+        let number = end
+            .filter(|&e| e > 0 && digits[e..].starts_with('"'))
+            .and_then(|e| Some((digits[..e].parse().ok()?, marker.len() + e + 1)));
+        match number {
+            Some((n, len)) if swap(n, &mut out) => rest = &found[len..],
+            _ => {
+                out.push_str(&marker);
+                rest = &found[marker.len()..];
             }
         }
     }
-    left_out.reverse();
+    out.push_str(rest);
+    out
+}
+
+pub fn clean_with(html: &str, inline: &dyn Fn(&str) -> Option<String>) -> Cleaned {
+    let (links, images): (Found, Found) = Default::default();
+    let html = builder(links.clone(), images.clone())
+        .clean(html)
+        .to_string();
+    let take = |cell: &Found| std::mem::take(&mut *cell.lock().unwrap_or_else(|e| e.into_inner()));
+    let (links, images) = (take(&links), take(&images));
+    // the lookups in `inline` wait until here, out of the filter
+    let found: Vec<Option<String>> = images
+        .iter()
+        .map(|url| inline(url).filter(|data| inline_ok(data)))
+        .collect();
+    let html = rewrite(&html, "gws-image:", |n, out| match found.get(n) {
+        Some(Some(data)) => {
+            out.push('"');
+            out.push_str(data);
+            out.push('"');
+            true
+        }
+        Some(None) => {
+            if out.ends_with(" src=") {
+                out.truncate(out.len() - " src=".len());
+            }
+            true
+        }
+        None => false,
+    });
+    let left_out = images
+        .into_iter()
+        .zip(&found)
+        .filter(|(_, data)| data.is_none())
+        .map(|(url, _)| url)
+        .collect();
     Cleaned {
         html,
         links,
         images: left_out,
     }
+}
+
+/// A length a style says is nothing, or next to it.
+fn no_size(value: &str, at_most: f32) -> bool {
+    let number = value.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == '%');
+    number.parse::<f32>().is_ok_and(|n| n <= at_most)
+}
+
+/// Whether a `style` hides what's in it from a person looking at the page.
+fn hidden(style: &str) -> bool {
+    let style: String = style
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase()
+        .replace("!important", "");
+    let far_off = |v: &str| {
+        v.strip_prefix('-')
+            .is_some_and(|v| !no_size(v, 100.0) && v.starts_with(|c: char| c.is_ascii_digit()))
+    };
+    style
+        .split(';')
+        .filter_map(|d| d.split_once(':'))
+        .any(|(name, value)| match name {
+            "display" => value == "none",
+            "visibility" => value == "hidden" || value == "collapse",
+            "opacity" => no_size(value, 0.05),
+            "font-size" => no_size(value, 1.0),
+            "width" | "height" | "max-width" | "max-height" => no_size(value, 0.0),
+            "color" => value == "transparent",
+            "clip" => value.starts_with("rect(0"),
+            "clip-path" => value.starts_with("inset(50%") || value.starts_with("inset(100%"),
+            "transform" => value.contains("scale(0"),
+            "text-indent" | "left" | "top" | "margin-left" | "margin-top" => far_off(value),
+            _ => false,
+        })
+}
+
+/// Elements with no closing tag.
+const VOID: &[&str] = &["area", "br", "col", "hr", "img", "wbr"];
+
+/// A tag of cleaned markup, which the serializer has made regular: every
+/// attribute in double quotes with any `"` inside it escaped, `<` escaped in
+/// text, and each element closed. Its end is the first `>` outside quotes.
+fn tag_end(html: &str) -> usize {
+    let mut quoted = false;
+    html.bytes()
+        .position(|b| {
+            quoted ^= b == b'"';
+            b == b'>' && !quoted
+        })
+        .map_or(html.len(), |at| at + 1)
+}
+
+fn style_of(tag: &str) -> Option<String> {
+    let value = tag.split_once(" style=\"")?.1;
+    Some(gmail::decode_entities(value.split('"').next()?))
+}
+
+/// `html` as plain text: what a person sees of it in the reader, read from the
+/// same cleaned markup, so the model is told nothing the person can't see.
+pub fn visible_text(html: &str) -> String {
+    let (links, images): (Found, Found) = Default::default();
+    let html = builder(links, images).clean(html).to_string();
+    let mut text = String::new();
+    // inside a hidden element: its name, and how many of that name are open
+    let mut hiding: Option<(String, usize)> = None;
+    let mut rest = html.as_str();
+    while !rest.is_empty() {
+        let lt = rest.find('<').unwrap_or(rest.len());
+        if hiding.is_none() {
+            text.push_str(&gmail::decode_entities(&rest[..lt]).replace(['\n', '\r'], " "));
+        }
+        rest = &rest[lt..];
+        if rest.is_empty() {
+            break;
+        }
+        let end = tag_end(rest);
+        let (tag, after) = rest.split_at(end);
+        rest = after;
+        let closing = tag.starts_with("</");
+        let name: String = tag
+            .trim_start_matches(['<', '/'])
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect();
+        let void = VOID.contains(&name.as_str());
+        if let Some((hid, open)) = &mut hiding {
+            if *hid == name && !void {
+                *open = if closing { *open - 1 } else { *open + 1 };
+            }
+            if *open == 0 {
+                hiding = None;
+            }
+            continue;
+        }
+        if !closing && !void && style_of(tag).is_some_and(|s| hidden(&s)) {
+            hiding = Some((name, 1));
+        } else if gmail::BLOCKS.contains(&name.as_str()) {
+            text.push('\n');
+        } else if name == "td" || name == "th" {
+            text.push(' ');
+        }
+    }
+    gmail::tidy(&text)
 }
 
 /// `html` cleaned, remote images left out.
@@ -254,6 +447,123 @@ pub fn clean(html: &str) -> Cleaned {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_character_across_a_cut_is_no_panic() {
+        // each puts a multi-byte character where a prefix's end falls
+        for src in [
+            "data:image/pñg;base64,AA",
+            "data:image/jpe€;base64,AA",
+            "data:imag😀/gif;base64,AA",
+            "dataé",
+            "€€€€€€€€€€€€€€€€",
+        ] {
+            let page = format!(r#"<p>before</p><img src="{src}"><a href="{src}">x</a>"#);
+            assert!(clean(&page).html.contains("before"), "{src}");
+            assert!(visible_text(&page).contains("before"), "{src}");
+        }
+        let cut = "<p style=\"opacity:0\">é€😀</p><p>ñ & é</p>";
+        assert_eq!(visible_text(cut), "ñ & é");
+    }
+
+    #[test]
+    fn the_model_reads_only_what_a_person_sees() {
+        for hide in [
+            "display:none",
+            "DISPLAY : NONE",
+            "display:none!important",
+            "visibility:hidden",
+            "opacity:0",
+            "opacity:.01",
+            "font-size:0",
+            "font-size:0px",
+            "font-size:1px",
+            "height:0;overflow:hidden",
+            "max-height:0px",
+            "width:0",
+            "color:transparent",
+            "position:absolute;left:-9999px",
+            "text-indent:-9999px",
+            "clip:rect(0,0,0,0)",
+            "transform:scale(0)",
+        ] {
+            let page = format!(
+                r#"<p>seen</p><div style="{hide}"><p>IGNORE <b>this</b></p><div>too</div></div><p>after</p>"#
+            );
+            assert_eq!(visible_text(&page), "seen\n\nafter", "{hide}");
+        }
+        // a quoted `>` doesn't end the tag early, and no attribute is text
+        let quoted = r#"<div title="a>b" style="display:none">IGNORE</div><span title="x>IGNORE">seen</span>"#;
+        assert_eq!(visible_text(quoted), "seen");
+        // what the reader shows stays
+        assert_eq!(
+            visible_text(r#"<p style="color:#123;font-size:12px;height:20px">seen</p>"#),
+            "seen"
+        );
+    }
+
+    #[test]
+    fn an_address_that_reads_differently_is_no_link() {
+        for bad in [
+            "https://real.example/\u{202e}elpmaxe.live",
+            "https://real.example\u{2066}.evil.example/",
+            "https://real\u{200b}.example/",
+            "https://real.example/\u{7}",
+            "https://real.example/\u{feff}",
+            "https://real.example/\u{ad}x",
+            "https://real.example@evil.example/",
+            "https://user:pw@evil.example/",
+            "javascript:alert(1)",
+            "https://",
+        ] {
+            assert_eq!(link_of(bad), None, "{bad:?}");
+        }
+        assert_eq!(
+            link_of(" https://a.example/x?y=1 ").as_deref(),
+            Some("https://a.example/x?y=1")
+        );
+        assert_eq!(
+            link_of("https://пример.com/").as_deref(),
+            Some("https://xn--e1afmkfd.com/")
+        );
+        assert_eq!(
+            link_of("mailto:ana@example.com").as_deref(),
+            Some("mailto:ana@example.com")
+        );
+    }
+
+    #[test]
+    fn image_functions_are_risky_too() {
+        assert_eq!(safe_style("background:image(a.png);color:red"), "color:red");
+        assert_eq!(safe_style("background:cross-fade(a.png,b.png)"), "");
+    }
+
+    #[test]
+    fn a_page_of_many_links_and_images_cleans_in_one_pass() {
+        let page = "<a href=\"https://a.example/\">x</a><img src=\"https://a.example/i.png\">"
+            .repeat(20_000);
+        let at = std::time::Instant::now();
+        let out = clean(&page);
+        assert_eq!((out.links.len(), out.images.len()), (20_000, 20_000));
+        assert!(!out.html.contains("gws-image"));
+        assert!(at.elapsed().as_secs() < 20, "took {:?}", at.elapsed());
+    }
+
+    #[test]
+    fn a_marker_nothing_issued_stays_as_it_was() {
+        let html = r#"<a href="gws-link:0">a</a> "gws-link:9" "gws-link:x" "gws-link:"#;
+        let out = rewrite(html, "gws-link:", |n, out| {
+            let known = n == 0;
+            if known {
+                out.push_str("\"gws-link:5\"");
+            }
+            known
+        });
+        assert_eq!(
+            out,
+            r#"<a href="gws-link:5">a</a> "gws-link:9" "gws-link:x" "gws-link:"#
+        );
+    }
 
     const EVIL: &str = "evil.example";
 

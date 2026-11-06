@@ -248,6 +248,18 @@ struct Mail {
     help: Signal<bool>,
 }
 
+/// A write through the bridge, tried once: a person's action can't be sent
+/// again on a guess that the first try did nothing.
+async fn once(b: &Bridge, tool: &str, args: Value) -> Result<Value, String> {
+    b.call(tool, args).await.map_err(|e| {
+        if e.message.contains("Sign in to Google") {
+            "sign-in".to_owned()
+        } else {
+            e.message
+        }
+    })
+}
+
 /// A read through the bridge, tried again while the answer is only busy.
 async fn read(b: &Bridge, tool: &str, args: Value) -> Result<Value, String> {
     for attempt in 0.. {
@@ -320,6 +332,22 @@ fn run(m: Mail, job: impl Future<Output = ()> + 'static) {
     m.jobs.with_untracked(|jobs| drop(jobs.send(Box::pin(job))));
 }
 
+/// `args` for an action on what's picked or open right now: read at the
+/// press, because the job runs later and the person may have moved on.
+fn on_targets(m: Mail, mut args: Value) -> Value {
+    args["threads"] = json!(targets(m));
+    args
+}
+
+fn thread_ids(args: &Value) -> Vec<String> {
+    args.get("threads")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.as_str().map(str::to_owned))
+        .collect()
+}
+
 /// What an action takes: the picked conversations, else the open one.
 fn targets(m: Mail) -> Vec<String> {
     let picked = m.picked.get_untracked();
@@ -346,29 +374,41 @@ async fn act(
     b: Bridge,
     m: Mail,
     tool: &str,
-    mut args: Value,
+    args: Value,
     said: &str,
     leaves: bool,
     change: fn(&mut Row),
 ) {
-    let ids = targets(m);
+    let ids = thread_ids(&args);
     if ids.is_empty() {
         return;
     }
-    args["threads"] = json!(ids);
-    match read(&b, tool, args).await {
+    match once(&b, tool, args).await {
         Ok(v) => {
             if let Some(undo) = v.get("undo").and_then(Value::as_str) {
                 m.undo.set(Some((undo.to_owned(), said.to_owned())));
             }
-            m.picked.set(Vec::new());
-            m.problem.set(None);
+            let done = if v.get("threads").is_some() {
+                thread_ids(&v)
+            } else {
+                ids.clone()
+            };
+            let missed: Vec<String> = ids.iter().filter(|i| !done.contains(i)).cloned().collect();
+            m.problem.set((!missed.is_empty()).then(|| {
+                format!(
+                    "{} of {} went through. The rest didn't.",
+                    done.len(),
+                    ids.len()
+                )
+            }));
+            // what failed stays picked, ready to try again
+            m.picked.set(missed);
             if leaves {
-                let next = m.rows.with_untracked(|r| next_after(r, &ids));
+                let next = m.rows.with_untracked(|r| next_after(r, &done));
                 let open_gone = m
                     .chosen
-                    .with_untracked(|c| c.as_ref().is_some_and(|c| ids.contains(c)));
-                m.rows.update(|r| r.retain(|r| !ids.contains(&r.id)));
+                    .with_untracked(|c| c.as_ref().is_some_and(|c| done.contains(c)));
+                m.rows.update(|r| r.retain(|r| !done.contains(&r.id)));
                 if open_gone {
                     m.chosen.set(next.clone());
                     match next {
@@ -379,7 +419,7 @@ async fn act(
             } else {
                 m.rows.update(|r| {
                     r.iter_mut()
-                        .filter(|r| ids.contains(&r.id))
+                        .filter(|r| done.contains(&r.id))
                         .for_each(change)
                 });
             }
@@ -393,9 +433,13 @@ async fn undo_last(b: Bridge, m: Mail) {
     let Some((undo, _)) = m.undo.get_untracked() else {
         return;
     };
-    m.undo.set(None);
-    match read(&b, "gws_mail_undo", json!({"undo": undo})).await {
-        Ok(_) => load_list(b, m, 0).await,
+    match once(&b, "gws_mail_undo", json!({"undo": undo})).await {
+        Ok(_) => {
+            m.undo.set(None);
+            m.problem.set(None);
+            load_list(b, m, 0).await;
+        }
+        // the bar stays, so it can be pressed again
         Err(e) => m.problem.set(Some(e)),
     }
 }
@@ -420,7 +464,7 @@ async fn open(b: Bridge, m: Mail, index: usize) {
     show(b.clone(), m, id.clone()).await;
     // only a person's open reads a mail, so this is here and not in the tool
     if unread
-        && read(&b, "gws_mail_mark", json!({"threads": [id], "read": true}))
+        && once(&b, "gws_mail_mark", json!({"threads": [id], "read": true}))
             .await
             .is_ok()
     {
@@ -533,6 +577,7 @@ fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
                             m.query.set(String::new());
                             m.search.set(None);
                             m.chosen.set(None);
+                            m.picked.set(Vec::new());
                             m.open_turn.ask();
                             m.page.set(None);
                             b.spawn(load_list(b.clone(), m, 0));
@@ -666,6 +711,7 @@ fn list_pane(b: Bridge, m: Mail) -> impl IntoElement {
                         .on_change(move |value: &str| m.query.set(value.to_owned()))
                         .on_submit(move |_: &str| {
                             m.chosen.set(None);
+                            m.picked.set(Vec::new());
                             submit.spawn(load_list(submit.clone(), m, 0));
                         }),
                 ),
@@ -725,7 +771,15 @@ fn toolbar(b: Bridge, m: Mail) -> impl IntoElement {
         move || {
             run(
                 m,
-                act(b.clone(), m, tool, args.clone(), said, leaves, change),
+                act(
+                    b.clone(),
+                    m,
+                    tool,
+                    on_targets(m, args.clone()),
+                    said,
+                    leaves,
+                    change,
+                ),
             );
         }
     };
@@ -807,7 +861,7 @@ fn label_picker(b: Bridge, m: Mail) -> impl IntoElement {
                                         add.clone(),
                                         m,
                                         "gws_mail_label",
-                                        json!({"add": [labelled.clone()]}),
+                                        on_targets(m, json!({"add": [labelled.clone()]})),
                                         "Label added.",
                                         false,
                                         |_| {},
@@ -825,7 +879,10 @@ fn label_picker(b: Bridge, m: Mail) -> impl IntoElement {
                                         moved.clone(),
                                         m,
                                         "gws_mail_label",
-                                        json!({"add": [id.clone()], "remove": ["INBOX"]}),
+                                        on_targets(
+                                            m,
+                                            json!({"add": [id.clone()], "remove": ["INBOX"]}),
+                                        ),
                                         "Moved.",
                                         true,
                                         |_| {},
@@ -1013,7 +1070,7 @@ fn keys(b: Bridge, m: Mail) {
                 archive.clone(),
                 m,
                 "gws_mail_archive",
-                json!({}),
+                on_targets(m, json!({})),
                 "Archived.",
                 true,
                 |_| {},
@@ -1027,7 +1084,7 @@ fn keys(b: Bridge, m: Mail) {
                 trash.clone(),
                 m,
                 "gws_mail_trash",
-                json!({}),
+                on_targets(m, json!({})),
                 "Moved to Trash.",
                 true,
                 |_| {},
@@ -1050,7 +1107,7 @@ fn keys(b: Bridge, m: Mail) {
                 star.clone(),
                 m,
                 "gws_mail_mark",
-                json!({"starred": !on}),
+                on_targets(m, json!({"starred": !on})),
                 if on { "Star removed." } else { "Starred." },
                 false,
                 change,
@@ -1064,7 +1121,7 @@ fn keys(b: Bridge, m: Mail) {
                 read_it.clone(),
                 m,
                 "gws_mail_mark",
-                json!({"read": true}),
+                on_targets(m, json!({"read": true})),
                 "Marked read.",
                 false,
                 |r| r.unread = false,
@@ -1078,7 +1135,7 @@ fn keys(b: Bridge, m: Mail) {
                 unread_it.clone(),
                 m,
                 "gws_mail_mark",
-                json!({"read": false}),
+                on_targets(m, json!({"read": false})),
                 "Marked unread.",
                 false,
                 |r| r.unread = true,

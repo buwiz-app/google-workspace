@@ -46,6 +46,10 @@ fn thread(id: &str) -> Value {
 struct Fake {
     /// Mail that came in, newest first, ahead of the inbox's rows.
     newer: Mutex<Vec<usize>>,
+    /// Archive answers that it's busy, and an undo that it failed.
+    busy: Mutex<bool>,
+    /// Trash goes through for the first conversation alone.
+    partly: Mutex<bool>,
     /// What the next action answers instead of doing it.
     refuse: Mutex<Option<String>>,
     /// The next change check says the list changed.
@@ -137,8 +141,25 @@ impl Host for Fake {
                 let why = self.refuse.lock().unwrap().take().unwrap();
                 return done(Err(BuwizError::new("needs_access", false, why)));
             }
+            "gws_mail_archive" if *self.busy.lock().unwrap() => {
+                return done(Err(BuwizError::new("busy", true, "busy".to_owned())));
+            }
+            "gws_mail_undo" if *self.busy.lock().unwrap() => {
+                return done(Err(BuwizError::new(
+                    "failed",
+                    false,
+                    "Gmail didn't answer.".to_owned(),
+                )));
+            }
+            "gws_mail_trash" if *self.partly.lock().unwrap() => {
+                let first = args["threads"][0].clone();
+                (
+                    tool.to_owned(),
+                    json!({"undo": "u1", "done": 1, "threads": [first], "partial": true}),
+                )
+            }
             "gws_mail_mark" | "gws_mail_archive" | "gws_mail_trash" | "gws_mail_label" => {
-                (String::new(), json!({"undo": "u1", "done": 1}))
+                (tool.to_owned(), json!({"undo": "u1", "done": 1}))
             }
             "gws_mail_undo" => (String::new(), json!({"done": 1})),
             "gws_mail_thread" => {
@@ -495,4 +516,102 @@ fn an_action_the_sign_in_does_not_cover_says_so_and_changes_nothing_here() {
     assert!(app.screen().shows("Sign in again to turn it on."));
     assert!(app.screen().shows("Subject 3"), "it stays in the list");
     assert!(!app.screen().shows("Archived."));
+}
+
+#[test]
+fn queued_actions_keep_the_conversation_they_were_pressed_on() {
+    let (mut app, fake) = start();
+    app.press("text:Subject 3").expect("the row presses");
+    settle(&mut app);
+    fake.hold("gws_mail_mark");
+    app.press_key("s").expect("the key presses");
+    app.press_key("e").expect("the key presses");
+    app.press_key("j").expect("the key presses");
+    settle(&mut app);
+    assert_eq!(opened(&fake), "t4", "j moved on while the star was out");
+    fake.release("gws_mail_mark");
+    settle(&mut app);
+    let archived = fake.called("gws_mail_archive");
+    assert_eq!(
+        archived.last().expect("an archive")["threads"],
+        json!(["t3"])
+    );
+}
+
+#[test]
+fn a_new_list_drops_the_picks_nobody_can_see() {
+    let (mut app, fake) = start();
+    app.press("text:Subject 2").expect("the row presses");
+    settle(&mut app);
+    app.press_key("x").expect("the key presses");
+    pick_label(&mut app, "Starred");
+    app.press_key("e").expect("the key presses");
+    settle(&mut app);
+    assert!(
+        fake.called("gws_mail_archive").is_empty(),
+        "no pick, nothing open"
+    );
+
+    pick_label(&mut app, "Inbox");
+    app.press("text:Subject 2").expect("the row presses");
+    settle(&mut app);
+    app.press_key("x").expect("the key presses");
+    app.submit("text:Search mail").expect("the search goes");
+    settle(&mut app);
+    app.press_key("e").expect("the key presses");
+    settle(&mut app);
+    assert!(
+        fake.called("gws_mail_archive").is_empty(),
+        "a search drops them too"
+    );
+}
+
+#[test]
+fn what_failed_stays_and_the_screen_says_how_many_went() {
+    let (mut app, fake) = start();
+    app.press("text:Subject 2").expect("the row presses");
+    settle(&mut app);
+    app.press_key("x").expect("the key presses");
+    app.press("text:Subject 5").expect("the row presses");
+    settle(&mut app);
+    app.press_key("x").expect("the key presses");
+    *fake.partly.lock().unwrap() = true;
+    app.press_key("shift+3").expect("the key presses");
+    settle(&mut app);
+    assert!(!app.screen().shows("Subject 2"), "that one went");
+    assert!(app.screen().shows("Subject 5"), "that one stayed");
+    assert!(app.screen().shows("1 of 2 went through. The rest didn't."));
+}
+
+#[test]
+fn a_write_is_never_tried_twice_on_its_own() {
+    let (mut app, fake) = start();
+    app.press("text:Subject 3").expect("the row presses");
+    settle(&mut app);
+    *fake.busy.lock().unwrap() = true;
+    app.press_key("e").expect("the key presses");
+    app.wait(Duration::from_secs(2)).expect("time passes");
+    assert_eq!(fake.called("gws_mail_archive").len(), 1);
+    assert!(app.screen().shows("Subject 3"));
+}
+
+#[test]
+fn an_undo_that_failed_can_be_pressed_again() {
+    let (mut app, fake) = start();
+    app.press("text:Subject 3").expect("the row presses");
+    settle(&mut app);
+    app.press_key("e").expect("the key presses");
+    settle(&mut app);
+    *fake.busy.lock().unwrap() = true;
+    app.press("label:Undo that").expect("the bar offers it");
+    settle(&mut app);
+    assert!(app.screen().shows("Gmail didn't answer."));
+    assert!(
+        app.screen().matches("label:Undo that").unwrap(),
+        "the bar stays"
+    );
+    *fake.busy.lock().unwrap() = false;
+    app.press("label:Undo that").expect("the bar offers it");
+    settle(&mut app);
+    assert!(app.screen().shows("Subject 3"));
 }

@@ -156,6 +156,69 @@ fn each_action_changes_only_what_it_says_and_undo_puts_it_all_back() {
     }
 }
 
+fn first_two(core: &Core) -> (Value, Value) {
+    let listed = core.run("gws_mail_list", &json!({"label": "INBOX"}));
+    let rows = &listed["structuredContent"]["threads"];
+    (rows[0]["id"].clone(), rows[1]["id"].clone())
+}
+
+#[test]
+fn a_failed_read_after_the_write_keeps_the_way_back() {
+    let google = FakeGoogle::start(Seed::demo(12));
+    let core = signed_in(&google, "stale-row");
+    core.unlock("a-seed");
+    gws::mail::sync(&core).unwrap();
+    let (one, _) = first_two(&core);
+    let before = labels(&google);
+    google.reads_fail_after_a_write();
+    let done = core.run("gws_mail_archive", &json!({"threads": [one]}));
+    assert_ne!(done["isError"], true, "{done}");
+    let undo = done["structuredContent"]["undo"].clone();
+    assert!(undo.is_string(), "{done}");
+    let back = core.run("gws_mail_undo", &json!({"undo": undo}));
+    assert_ne!(back["isError"], true, "{back}");
+    assert_eq!(labels(&google), before);
+}
+
+#[test]
+fn a_write_that_stops_partway_names_what_went_through_and_can_be_undone() {
+    let google = FakeGoogle::start(Seed::demo(12));
+    let core = signed_in(&google, "partial");
+    core.unlock("a-seed");
+    gws::mail::sync(&core).unwrap();
+    let (one, two) = first_two(&core);
+    let before = labels(&google);
+    google.writes_fail_after(1);
+    let done = core.run("gws_mail_archive", &json!({"threads": [one, two]}));
+    let data = &done["structuredContent"];
+    assert_eq!(data["partial"], true, "{done}");
+    assert_eq!(data["threads"], json!([one]));
+    google.writes_work();
+    let back = core.run("gws_mail_undo", &json!({"undo": data["undo"]}));
+    assert_ne!(back["isError"], true, "{back}");
+    assert_eq!(labels(&google), before);
+}
+
+#[test]
+fn an_undo_that_stops_partway_can_be_tried_again() {
+    let google = FakeGoogle::start(Seed::demo(12));
+    let core = signed_in(&google, "undo-twice");
+    core.unlock("a-seed");
+    gws::mail::sync(&core).unwrap();
+    let (one, two) = first_two(&core);
+    let before = labels(&google);
+    let done = core.run("gws_mail_archive", &json!({"threads": [one, two]}));
+    let undo = done["structuredContent"]["undo"].clone();
+    google.writes_fail_after(1);
+    let failed = core.run("gws_mail_undo", &json!({"undo": undo}));
+    assert_eq!(failed["isError"], true, "{failed}");
+    assert_ne!(labels(&google), before, "only part went back");
+    google.writes_work();
+    let back = core.run("gws_mail_undo", &json!({"undo": undo}));
+    assert_ne!(back["isError"], true, "{back}");
+    assert_eq!(labels(&google), before);
+}
+
 #[test]
 fn an_archived_thread_leaves_the_stored_inbox_at_once() {
     let google = FakeGoogle::start(Seed::demo(12));

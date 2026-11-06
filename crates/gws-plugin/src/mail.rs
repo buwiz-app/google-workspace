@@ -103,6 +103,10 @@ impl Undos {
         id
     }
 
+    fn put_back(&mut self, id: String, undo: Undo) {
+        self.kept.push_back((id, undo));
+    }
+
     fn take(&mut self, id: &str) -> Option<Undo> {
         let at = self.kept.iter().position(|(k, _)| k == id)?;
         self.kept.remove(at).map(|(_, undo)| undo)
@@ -180,27 +184,64 @@ fn act(core: &Core, tool: &str, args: &Value) -> Result<Value, Failure> {
         }
     }
     let changed: Vec<String> = threads.iter().map(|(id, _)| id.clone()).collect();
-    if !changed.is_empty() {
-        fetch_rows(core, &auth, &account, &changed)?;
-    }
+    // the writes have happened, so the way back is kept before anything else
     let undo = (!threads.is_empty()).then(|| {
         core.undos
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .keep(Undo {
-                account,
+                account: account.clone(),
                 threads,
                 trashed,
             })
     });
+    if !changed.is_empty() {
+        // a failed read here is only a stale row: the sync below mends it
+        let _ = fetch_rows(core, &auth, &account, &changed);
+    }
     core.sync.wake();
     match failure {
         Some(e) if undo.is_none() => Err(e),
         Some(_) => Ok(ok(
-            json!({"undo": undo, "done": changed.len(), "partial": true}),
+            json!({"undo": undo, "done": changed.len(), "threads": changed, "partial": true}),
         )),
-        None => Ok(ok(json!({"undo": undo, "done": changed.len()}))),
+        None => Ok(ok(
+            json!({"undo": undo, "done": changed.len(), "threads": changed}),
+        )),
     }
+}
+
+/// Puts back one thread's messages, each to the labels it had.
+fn restore(
+    core: &Core,
+    auth: &Bearer,
+    thread: &str,
+    messages: &gmail::Messages,
+    trashed: bool,
+) -> Result<(), Failure> {
+    if trashed {
+        core.gmail.untrash_thread(auth, thread)?;
+    }
+    let now = core.gmail.thread_labels(auth, thread)?.unwrap_or_default();
+    for (message, before) in messages {
+        let Some((_, labels)) = now.iter().find(|(m, _)| m == message) else {
+            continue;
+        };
+        let add: Vec<String> = before
+            .iter()
+            .filter(|l| !labels.contains(l))
+            .cloned()
+            .collect();
+        let remove: Vec<String> = labels
+            .iter()
+            .filter(|l| !before.contains(l))
+            .cloned()
+            .collect();
+        if !add.is_empty() || !remove.is_empty() {
+            core.gmail.modify_message(auth, message, &add, &remove)?;
+        }
+    }
+    Ok(())
 }
 
 fn undo(core: &Core, args: &Value) -> Result<Value, Failure> {
@@ -211,35 +252,22 @@ fn undo(core: &Core, args: &Value) -> Result<Value, Failure> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take(&id);
-    let Some(undo) = held.filter(|u| u.account == account) else {
+    let Some(mut undo) = held.filter(|u| u.account == account) else {
         return Ok(fail("not_found", "That can't be undone any more."));
     };
     let ids: Vec<String> = undo.threads.iter().map(|(id, _)| id.clone()).collect();
-    for (thread, messages) in &undo.threads {
-        if undo.trashed {
-            core.gmail.untrash_thread(&auth, thread)?;
+    while let Some((thread, messages)) = undo.threads.first() {
+        if let Err(e) = restore(core, &auth, thread, messages, undo.trashed) {
+            // what's left can be tried again, under the same id
+            core.undos
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .put_back(id, undo);
+            return Err(e);
         }
-        let now = core.gmail.thread_labels(&auth, thread)?.unwrap_or_default();
-        for (message, before) in messages {
-            let Some((_, labels)) = now.iter().find(|(m, _)| m == message) else {
-                continue;
-            };
-            let add: Vec<String> = before
-                .iter()
-                .filter(|l| !labels.contains(l))
-                .cloned()
-                .collect();
-            let remove: Vec<String> = labels
-                .iter()
-                .filter(|l| !before.contains(l))
-                .cloned()
-                .collect();
-            if !add.is_empty() || !remove.is_empty() {
-                core.gmail.modify_message(&auth, message, &add, &remove)?;
-            }
-        }
+        undo.threads.remove(0);
     }
-    fetch_rows(core, &auth, &account, &ids)?;
+    let _ = fetch_rows(core, &auth, &account, &ids);
     core.sync.wake();
     Ok(ok(json!({"done": ids.len()})))
 }
@@ -393,10 +421,12 @@ pub fn reconcile(core: &Core) -> bool {
     cleared
 }
 
-/// Finishes a wipe that failed earlier, in this run or a past one.
+/// Finishes a wipe that failed earlier, in this run or a past one. Not before
+/// the Bot's first push: until then nobody looks signed in, and everyone's mail
+/// would go.
 fn finish_wipes(core: &Core) {
     let due = core.paths.as_ref().is_ok_and(|p| p.wipe_pending().exists());
-    if due {
+    if due && core.pushed.load(Ordering::Relaxed) {
         reconcile(core);
     }
 }
@@ -990,7 +1020,28 @@ mod tests {
             let second = core(&google, &paths);
             assert!(rows(&second) > 0, "still there after the restart");
             let _ = sync(&second);
-            assert_eq!(rows(&second), 0, "the next sync cleared it");
+            assert!(rows(&second) > 0, "the Bot hasn't pushed anything yet");
+            second.account("buwiz.account.set", &sign_in("other@example.com"));
+            assert_eq!(rows(&second), 0, "the first push cleared it");
+            assert!(!paths.wipe_pending().exists());
+        }
+
+        #[test]
+        fn a_pending_wipe_waits_for_the_first_push_and_then_keeps_who_is_signed_in() {
+            let google = FakeGoogle::start(Seed::demo(6));
+            let paths = dir("marker");
+            let first = core(&google, &paths);
+            first.account("buwiz.account.set", &sign_in(OWNER));
+            sync(&first).unwrap();
+            drop(first);
+            std::fs::write(paths.wipe_pending(), b"").unwrap();
+
+            let second = core(&google, &paths);
+            let _ = sync(&second);
+            assert!(rows(&second) > 0, "no push yet, so nobody's mail goes");
+            second.account("buwiz.account.set", &sign_in(OWNER));
+            let _ = sync(&second);
+            assert!(rows(&second) > 0, "the owner is signed in");
             assert!(!paths.wipe_pending().exists());
         }
 

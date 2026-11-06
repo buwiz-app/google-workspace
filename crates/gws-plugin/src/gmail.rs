@@ -346,8 +346,6 @@ impl Gmail {
         )
     }
 
-    /// What changed since `start`: the threads touched and the newest history
-    /// id. `None`: `start` is too old, so a full sync is needed.
     /// Each message of a thread, with its labels now.
     pub fn thread_labels(&self, auth: &Bearer, id: &str) -> Result<Option<Messages>, Failure> {
         let query = vec![("format", "minimal".to_owned())];
@@ -405,6 +403,8 @@ impl Gmail {
             .map(drop)
     }
 
+    /// What changed since `start`: the threads touched and the newest history
+    /// id. `None`: `start` is too old, so a full sync is needed.
     pub fn history(
         &self,
         auth: &Bearer,

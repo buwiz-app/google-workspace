@@ -382,6 +382,10 @@ fn payload(m: &Mail, full: bool) -> Value {
 #[derive(Default)]
 struct Account {
     mails: Vec<Mail>,
+    /// How many more writes go through; `None` is no limit.
+    writes_left: Option<usize>,
+    wrote: bool,
+    reads_fail_after_write: bool,
     history: i64,
     /// `(history id, change)`, oldest first.
     changes: Vec<(i64, Value)>,
@@ -486,6 +490,12 @@ impl Account {
             .and_then(|t| t.parse().ok())
             .unwrap_or(100)
             .min(500);
+        if self.reads_fail_after_write && self.wrote && r.method == "GET" && format == "metadata" {
+            return Reply::json(
+                500,
+                json!({"error": {"code": 500, "message": "Backend error"}}),
+            );
+        }
         match (r.method.as_str(), segs.as_slice()) {
             ("GET", ["profile"]) => Reply::json(
                 200,
@@ -587,6 +597,16 @@ impl Account {
                 )
             }
             ("POST", ["threads", id, action]) | ("POST", ["messages", id, action]) => {
+                if self.writes_left == Some(0) {
+                    return Reply::json(
+                        500,
+                        json!({"error": {"code": 500, "message": "Backend error"}}),
+                    );
+                }
+                if let Some(left) = &mut self.writes_left {
+                    *left -= 1;
+                }
+                self.wrote = true;
                 if self
                     .only_grants
                     .as_deref()
@@ -802,6 +822,21 @@ impl FakeGoogle {
             })
             .collect();
         json!(mails)
+    }
+
+    /// After `n` more writes, every write fails.
+    pub fn writes_fail_after(&self, n: usize) {
+        self.account.lock().unwrap().writes_left = Some(n);
+    }
+
+    /// Writes work again.
+    pub fn writes_work(&self) {
+        self.account.lock().unwrap().writes_left = None;
+    }
+
+    /// Once something is written, reading a thread's metadata fails.
+    pub fn reads_fail_after_a_write(&self) {
+        self.account.lock().unwrap().reads_fail_after_write = true;
     }
 
     /// From now on a token covers `scope` alone, and writes need more.

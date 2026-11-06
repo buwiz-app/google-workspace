@@ -45,6 +45,8 @@ pub struct Core {
     pub sync: mail::Waker,
     /// What a card's tickets stand for: a search, or a thread.
     pub tickets: Mutex<mail::Tickets>,
+    /// The Bot has told this process who is signed in.
+    pub pushed: std::sync::atomic::AtomicBool,
     /// What a person's actions changed, for Undo.
     pub undos: Mutex<mail::Undos>,
 }
@@ -60,6 +62,7 @@ impl Core {
             sync: mail::Waker::default(),
             tickets: Mutex::default(),
             undos: Mutex::default(),
+            pushed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -92,6 +95,8 @@ impl Core {
         } else {
             self.accounts.clear(args)
         };
+        self.pushed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if !mail::reconcile(self) {
             // the caller hears, and the next sync tries again
             result["structuredContent"]["mail_kept"] = Value::Bool(true);

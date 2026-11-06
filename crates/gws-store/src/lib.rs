@@ -63,10 +63,12 @@ const MIGRATIONS: &[(i64, &str)] = &[
         "CREATE TABLE opened(id TEXT PRIMARY KEY, account TEXT NOT NULL, name TEXT NOT NULL, mime TEXT NOT NULL, google INTEGER NOT NULL, attachment INTEGER NOT NULL, hash TEXT NOT NULL, version TEXT NOT NULL, md5 TEXT NOT NULL, opened_ms INTEGER NOT NULL);
          DELETE FROM bodies;",
     ),
+    // nor has it the part of each attachment, which is what opens one now
+    (7, "DELETE FROM bodies;"),
     // what the person may do with a file. No list was read asking for that, so
     // each is read again: a row that says nothing offers presses Google refuses
     (
-        7,
+        8,
         "ALTER TABLE drive_files ADD COLUMN can TEXT;
          DELETE FROM drive_listed;
          DELETE FROM drive_views;",
@@ -119,7 +121,17 @@ impl Paths {
     /// `GWS_DATA_DIR`, else `~/Library/Application Support/app.buwiz.google-workspace`.
     /// A folder that isn't absolute is refused: the working folder is nobody's store.
     pub fn from_env() -> Result<Self> {
-        Self::from_vars(std::env::var_os(DATA_DIR_ENV), std::env::var_os("HOME"))
+        let data = std::env::var_os(DATA_DIR_ENV);
+        // cargo leaves this on all a test starts, so a test that names no folder
+        // stops here, not in the person's. A release never has this check.
+        let tested = cfg!(debug_assertions) && std::env::var_os("CARGO_MANIFEST_DIR").is_some();
+        if tested && data.as_ref().is_none_or(|d| d.is_empty()) {
+            return Err(error(
+                "data_dir",
+                "Under cargo, GWS_DATA_DIR must name a folder.",
+            ));
+        }
+        Self::from_vars(data, std::env::var_os("HOME"))
     }
 
     fn from_vars(
@@ -510,6 +522,24 @@ mod tests {
             sides.iter().all(|s| !std::path::Path::new(s).exists()),
             "no stale journal for a later store"
         );
+    }
+
+    /// One kept from before has no part on its attachments, and none would open.
+    #[test]
+    fn a_stored_mail_view_from_before_parts_goes() {
+        let dir = Dir::new("parts");
+        let paths = Paths::in_dir(&dir.0);
+        let store = Store::open(&paths, &key()).unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "INSERT INTO bodies(account, thread, view, size, used) VALUES('a', 't', '{}', 2, 1);
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&paths, &key()).unwrap();
+        assert_eq!(store.view("a", "t", 2).unwrap(), None);
     }
 
     #[test]

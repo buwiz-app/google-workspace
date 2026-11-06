@@ -73,6 +73,7 @@ pub const MAIL_JOB: &str = "gws_mail_job";
 pub const MAIL_JOB_START: &str = "gws_mail_job_start";
 pub const PEOPLE_SUGGEST: &str = "gws_people_suggest";
 pub const MAIL_SEND_ARM: &str = "gws_mail_send_arm";
+pub const MAIL_SEND_DISARM: &str = "gws_mail_send_disarm";
 pub const MAIL_DRAFT_OF: &str = "gws_mail_draft_of";
 pub const UPLOAD_CHUNK: &str = "gws_upload_chunk";
 pub const UPLOAD_DROP: &str = "gws_upload_drop";
@@ -255,6 +256,11 @@ pub fn defs() -> Vec<Def> {
             json!({"type": "object", "properties": {"draft": {"type": "string"}, "revision": {"type": "string"}}}),
         ),
         write(
+            MAIL_SEND_DISARM,
+            "The person took a Send back: its press is spent, and the draft is free again.",
+            json!({"type": "object", "properties": {"armed": {"type": "string"}}, "required": ["armed"]}),
+        ),
+        write(
             MAIL_SEND,
             "Send the draft the person read. A person's alone.",
             json!({"type": "object", "properties": {"draft": {"type": "string"}, "revision": {"type": "string"}, "message_id": {"type": "string"}, "armed": {"type": "string"}}, "required": ["draft", "revision", "armed"]}),
@@ -349,8 +355,8 @@ pub fn defs() -> Vec<Def> {
         },
         Def {
             name: CAL_RANGE,
-            description: "The events between two RFC 3339 times on the calendars shown, from what's stored.",
-            input_schema: json!({"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}}, "required": ["from", "to"]}),
+            description: "The events between two RFC 3339 times on the calendars shown, from what's stored. For whole days, to_date is the first date left out.",
+            input_schema: json!({"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "to_date": {"type": "string"}}, "required": ["from", "to"]}),
             read_only: true,
             audience: APP_ONLY,
             open_world: true,
@@ -529,7 +535,7 @@ pub fn defs() -> Vec<Def> {
         },
         write(
             FILE_UPLOAD,
-            "Send an edited file back to Drive. A person's alone: update is refused if Drive changed, a Google file takes only copy.",
+            "Send an edited file back to Drive. A person's alone: update is refused if Drive changed, a Google file or an attachment takes only copy.",
             json!({"type": "object", "properties": {"id": {"type": "string"}, "mode": {"type": "string", "enum": ["update", "copy", "replace"]}}, "required": ["id", "mode"]}),
         ),
         Def {
@@ -542,8 +548,8 @@ pub fn defs() -> Vec<Def> {
         },
         write(
             MAIL_ATTACHMENT_OPEN,
-            "Download a mail's attachment to this Mac for the Bot's viewer. A person's press alone. Nothing edited goes back.",
-            json!({"type": "object", "properties": {"message": {"type": "string"}, "attachment": {"type": "string"}, "name": {"type": "string"}, "mime": {"type": "string"}}, "required": ["message", "attachment"]}),
+            "Download a mail's attachment to this Mac for the Bot's viewer. A person's press alone. An edit can only be saved to Drive as a new file.",
+            json!({"type": "object", "properties": {"message": {"type": "string"}, "part": {"type": "string"}}, "required": ["message", "part"]}),
         ),
         Def {
             name: RESOLVE,

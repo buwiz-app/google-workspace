@@ -123,6 +123,8 @@ struct Drive {
     seq: Signal<i64>,
     /// What's being renamed, moved, shared or made.
     acting: Signal<Option<write::Acting>>,
+    /// Which opening of that it is. Only `start_acting` and `stop_acting` move it.
+    opening: Latest,
     /// The name being typed for that.
     typed: Signal<String>,
     /// A write is on its way, so nothing presses it twice.
@@ -387,7 +389,7 @@ fn start_over(b: &Bridge, m: Drive) {
     m.list_turn.ask();
     close_details(m);
     // a name being typed for a folder is for the folder that's going
-    m.acting.set(None);
+    write::stop_acting(m);
     m.here_adds.set(false);
     m.here.set(None);
     m.rows.set(Vec::new());
@@ -965,6 +967,7 @@ pub fn build(bridge: Bridge) -> Root {
             said: signal(None),
             discarding: signal(None),
             acting: signal(None),
+            opening: Latest::new(),
             typed: signal(String::new()),
             writing: signal(false),
             undo: signal(None),

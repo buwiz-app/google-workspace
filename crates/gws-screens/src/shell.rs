@@ -49,6 +49,11 @@ impl Latest {
     pub(crate) fn counts(self, turn: u64) -> bool {
         self.0.get_untracked() == turn
     }
+
+    /// The turn it's on, for what starts now and asks nothing new.
+    pub(crate) fn now(self) -> u64 {
+        self.0.get_untracked()
+    }
 }
 
 /// How many times a busy answer is tried again before it's shown.

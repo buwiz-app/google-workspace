@@ -11,7 +11,11 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveTime, SecondsFormat, TimeDelta};
+use chrono::{
+    DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat, TimeDelta,
+    TimeZone,
+};
+use chrono_tz::Tz;
 use gws_store::calendar::{Calendar, Event, Window};
 use serde_json::{Map, Value, json};
 
@@ -381,11 +385,32 @@ fn is_self(attendee: &Value, account: &str) -> bool {
         || text(attendee, "email").eq_ignore_ascii_case(account)
 }
 
-/// Who an event involves besides the person. A room isn't a guest.
+/// A room isn't a guest, and nor is the person.
+fn is_guest(attendee: &Value, account: &str) -> bool {
+    !is_self(attendee, account) && attendee.get("resource") != Some(&Value::Bool(true))
+}
+
+/// Who an event involves besides the person.
 fn guests_of<'a>(event: &'a Value, account: &str) -> Vec<&'a Value> {
     attendees(event)
         .iter()
-        .filter(|a| !is_self(a, account) && a.get("resource") != Some(&Value::Bool(true)))
+        .filter(|a| is_guest(a, account))
+        .collect()
+}
+
+/// Those a form names who could be guests of `event`. A form read from the
+/// event can hold its room, or the person under another address: they're on
+/// the event already as what they are.
+fn named<'a>(others: &[&'a String], event: &Value, account: &str) -> Vec<&'a String> {
+    let on_it_already = |g: &str| {
+        attendees(event)
+            .iter()
+            .any(|a| !is_guest(a, account) && text(a, "email").eq_ignore_ascii_case(g))
+    };
+    others
+        .iter()
+        .filter(|g| !on_it_already(g))
+        .copied()
         .collect()
 }
 
@@ -424,7 +449,7 @@ pub fn event_of(calendar: &str, account: &str, v: &Value) -> Option<Event> {
         .iter()
         .map(|a| {
             let flag = |k: &str| a.get(k) == Some(&Value::Bool(true));
-            json!({"email": text(a, "email"), "name": text(a, "displayName"), "response": text(a, "responseStatus"), "optional": flag("optional"), "organizer": flag("organizer"), "self": is_self(a, account)})
+            json!({"email": text(a, "email"), "name": text(a, "displayName"), "response": text(a, "responseStatus"), "optional": flag("optional"), "organizer": flag("organizer"), "self": is_self(a, account), "resource": flag("resource")})
         })
         .collect();
     let named = Some(text(organizer, "displayName")).filter(|n| !n.is_empty());
@@ -617,12 +642,19 @@ fn time_in(args: &Value, key: &str) -> Result<Option<DateTime<FixedOffset>>, ()>
 /// The window from `from` up to `to`. An all-day event belongs to dates, so
 /// its dates here are the ones those times fall on where they were written:
 /// a day asked for in Manila and in New York holds the same all-day events.
-fn window_of(from: DateTime<FixedOffset>, to: DateTime<FixedOffset>) -> Option<Window> {
+/// `end` is the first date left out, from a caller who asked for whole days.
+/// Only that caller knows: where the clocks skip midnight, a day starts at
+/// 01:00, and from the time alone that's a day partly in the window.
+fn window_of(
+    from: DateTime<FixedOffset>,
+    to: DateTime<FixedOffset>,
+    end: Option<NaiveDate>,
+) -> Option<Window> {
     let last = to.date_naive();
-    let to_date = if to.time() == NaiveTime::MIN {
-        last
-    } else {
-        last.succ_opt()?
+    let to_date = match end {
+        Some(end) => end,
+        None if to.time() == NaiveTime::MIN => last,
+        None => last.succ_opt()?,
     };
     (from < to).then(|| Window {
         from_ms: from.timestamp_millis(),
@@ -668,7 +700,14 @@ fn range(core: &Core, args: &Value) -> Result<Value, Failure> {
             "A range needs a start and an end, with their offsets.",
         ));
     };
-    let Some(window) = window_of(from, to) else {
+    let end = match js::trim(&js::string_or_empty(args.get("to_date"))) {
+        "" => None,
+        day => match date(day) {
+            Some(day) => Some(day),
+            None => return Ok(bad_args("A range's to_date is YYYY-MM-DD.")),
+        },
+    };
+    let Some(window) = window_of(from, to, end) else {
         return Ok(bad_args("A range has to end after it starts."));
     };
     let saved = saved(core, &auth, &account)?;
@@ -755,7 +794,7 @@ fn search(core: &Core, args: &Value) -> Result<Value, Failure> {
         (from, to) => {
             let open = DateTime::<FixedOffset>::from(DateTime::UNIX_EPOCH);
             let far = open + TimeDelta::days(100_000);
-            let Some(window) = window_of(from.unwrap_or(open), to.unwrap_or(far)) else {
+            let Some(window) = window_of(from.unwrap_or(open), to.unwrap_or(far), None) else {
                 return Ok(plain_error("to has to come after from"));
             };
             Some(window)
@@ -996,6 +1035,7 @@ fn meet_request() -> Value {
 /// The attendee list a save leaves, when it's different. Whoever stays keeps
 /// their whole entry, or their answer would be lost.
 fn attendees_after(others: &[&String], event: &Value, account: &str) -> Option<Value> {
+    let others = named(others, event, account);
     let now = guests_of(event, account);
     let held = |g: &str| {
         now.iter()
@@ -1006,7 +1046,7 @@ fn attendees_after(others: &[&String], event: &Value, account: &str) -> Option<V
     }
     let mut kept: Vec<Value> = attendees(event)
         .iter()
-        .filter(|a| is_self(a, account) || a.get("resource") == Some(&Value::Bool(true)))
+        .filter(|a| !is_guest(a, account))
         .cloned()
         .collect();
     kept.extend(
@@ -1042,18 +1082,84 @@ fn field_changes(form: &Form, event: &Value, account: &str) -> Map<String, Value
     body
 }
 
-/// `side` of a series moved by `by` milliseconds.
-fn shifted(side: &Value, by: i64) -> Option<Value> {
-    let mut moved = side.clone();
-    if side.get("date").is_some() {
-        let day = date(&text(side, "date"))? + TimeDelta::milliseconds(by);
-        moved["date"] = json!(day.to_string());
-    } else {
-        let at = DateTime::parse_from_rfc3339(&text(side, "dateTime")).ok()?;
-        let at = at + TimeDelta::milliseconds(by);
-        moved["dateTime"] = json!(at.to_rfc3339_opts(SecondsFormat::Secs, false));
+const SERIES_UNREADABLE: &str = "That series' times can't be read.";
+const SERIES_SKIPPED: &str = "The clocks skip that time on the series' first day. Choose another.";
+
+/// `time` on the clock of `zone`, or as it's written if no zone is named. The
+/// offset in the text won't do when there is one: Google writes a time in the
+/// calendar's zone, which needn't be the event's.
+fn wall(time: &str, zone: &str) -> Option<NaiveDateTime> {
+    let at = DateTime::parse_from_rfc3339(time).ok()?;
+    if zone.is_empty() {
+        return Some(at.naive_local());
     }
-    Some(moved)
+    Some(at.with_timezone(&zone.parse::<Tz>().ok()?).naive_local())
+}
+
+/// `at` on the clock of `zone`, as a time to send: with no zone, on the offset
+/// of `was`. A time the clocks repeat means the first one, as in the editor.
+fn moment_of(at: NaiveDateTime, zone: &str, was: &str) -> Result<String, &'static str> {
+    let format = SecondsFormat::Secs;
+    let moment = if zone.is_empty() {
+        let was = DateTime::parse_from_rfc3339(was).map_err(|_| SERIES_UNREADABLE)?;
+        let on_clock = was.offset().from_local_datetime(&at).earliest();
+        on_clock.map(|t| t.to_rfc3339_opts(format, false))
+    } else {
+        let zone = zone.parse::<Tz>().map_err(|_| SERIES_UNREADABLE)?;
+        let on_clock = zone.from_local_datetime(&at).earliest();
+        on_clock.map(|t| t.to_rfc3339_opts(format, false))
+    };
+    moment.ok_or(SERIES_SKIPPED)
+}
+
+/// The series' `key` side, moved as the person moved it on `instance` to
+/// `typed`. The move is measured on wall clocks, not in hours: across a clock
+/// change the same time of day is an hour more or less away, and a series
+/// keeps its time of day. `home` is the calendar's zone, for a side naming none.
+fn shifted(
+    form: &Form,
+    key: &str,
+    typed: &str,
+    instance: &Value,
+    master: &Value,
+    home: &str,
+) -> Result<Value, &'static str> {
+    let (was, side) = (&instance[key], &master[key]);
+    let mut moved = side.clone();
+    if form.all_day {
+        let by = date(typed)
+            .zip(date(&text(was, "date")))
+            .map(|(to, from)| to - from);
+        let day = date(&text(side, "date")).zip(by).map(|(day, by)| day + by);
+        moved["date"] = json!(day.ok_or(SERIES_UNREADABLE)?.to_string());
+        return Ok(moved);
+    }
+    let or = |zone: String, other: &str| {
+        if zone.is_empty() {
+            other.to_owned()
+        } else {
+            zone
+        }
+    };
+    let series_zone = or(text(side, "timeZone"), home);
+    let was_zone = or(text(was, "timeZone"), &series_zone);
+    // an instance can have a zone of its own, and that's no change to the series
+    let (typed_zone, zone) = if form.time_zone.is_empty() || form.time_zone == was_zone {
+        (&was_zone, &series_zone)
+    } else {
+        (&form.time_zone, &form.time_zone)
+    };
+    let series_at = text(side, "dateTime");
+    let by = wall(typed, typed_zone)
+        .zip(wall(&text(was, "dateTime"), &was_zone))
+        .map(|(to, from)| to - from);
+    let at = wall(&series_at, &series_zone).zip(by);
+    let at = at.map(|(at, by)| at + by).ok_or(SERIES_UNREADABLE)?;
+    moved["dateTime"] = json!(moment_of(at, zone, &series_at)?);
+    if !zone.is_empty() {
+        moved["timeZone"] = json!(zone);
+    }
+    Ok(moved)
 }
 
 /// A save of `all`, from the instance the person edited. The series keeps its
@@ -1064,35 +1170,15 @@ fn series_changes(
     instance: &Value,
     master: &Value,
     account: &str,
+    home: &str,
 ) -> Result<Map<String, Value>, &'static str> {
     let mut body = field_changes(form, instance, account);
     if !form.same_times(instance) {
         if form.all_day != instance["start"].get("date").is_some() {
             return Err("A series can't change between timed and all-day here.");
         }
-        let edge = |form_side: &str, key: &str| -> Option<i64> {
-            let side = &instance[key];
-            Some(if form.all_day {
-                date_ms(date(form_side)?) - date_ms(date(&text(side, "date"))?)
-            } else {
-                millis(form_side)? - millis(&text(side, "dateTime"))?
-            })
-        };
-        let moved = edge(&form.start, "start")
-            .zip(edge(&form.end, "end"))
-            .and_then(|(by_start, by_end)| {
-                Some((
-                    shifted(&master["start"], by_start)?,
-                    shifted(&master["end"], by_end)?,
-                ))
-            });
-        let Some((mut start, mut end)) = moved else {
-            return Err("That series' times can't be read.");
-        };
-        if !form.time_zone.is_empty() && !form.all_day {
-            start["timeZone"] = json!(form.time_zone);
-            end["timeZone"] = json!(form.time_zone);
-        }
+        let start = shifted(form, "start", &form.start, instance, master, home)?;
+        let end = shifted(form, "end", &form.end, instance, master, home)?;
         body.insert("start".to_owned(), patched(&start));
         body.insert("end".to_owned(), patched(&end));
     }
@@ -1206,7 +1292,8 @@ fn save(core: &Core, args: &Value) -> Result<Value, Failure> {
         let Some(master) = core.calendar.event(&auth, &calendar, &write_id)? else {
             return Ok(gone());
         };
-        match series_changes(&form, &live, &master, &account) {
+        let home = calendar_zone(core, &account, &calendar)?;
+        match series_changes(&form, &live, &master, &account, &home) {
             Ok(body) => (body, text(&master, "etag")),
             Err(why) => return Ok(bad_args(why)),
         }
@@ -1231,9 +1318,10 @@ fn save(core: &Core, args: &Value) -> Result<Value, Failure> {
         let event = event_of(&calendar, &account, &live);
         return Ok(ok(json!({"event": event.as_ref().map(row_json)})));
     }
-    let guests = form
-        .others(&account)
-        .map_or_else(|| guests_of(&live, &account).len(), |g| g.len());
+    let guests = form.others(&account).map_or_else(
+        || guests_of(&live, &account).len(),
+        |g| named(&g, &live, &account).len(),
+    );
     let write = Write {
         // a guest just taken off has to hear of it too
         notify: guests > 0 || !guests_of(&live, &account).is_empty(),
@@ -1258,6 +1346,10 @@ fn zone_for(core: &Core, account: &str, calendar: &str, form: &Form) -> Result<S
     if !form.time_zone.is_empty() {
         return Ok(form.time_zone.clone());
     }
+    calendar_zone(core, account, calendar)
+}
+
+fn calendar_zone(core: &Core, account: &str, calendar: &str) -> Result<String, Failure> {
     let calendars = with_store(core, |store| store.calendars(account))?;
     let held = calendars.into_iter().find(|c| c.id == calendar);
     Ok(held.map(|c| c.time_zone).unwrap_or_default())
@@ -1584,6 +1676,7 @@ mod tests {
             let w = window_of(
                 at(&format!("2026-11-10T00:00:00{zone}")),
                 at(&format!("2026-11-11T00:00:00{zone}")),
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -1594,12 +1687,30 @@ mod tests {
         let w = window_of(
             at("2026-11-10T09:00:00+08:00"),
             at("2026-11-10T10:00:00+08:00"),
+            None,
         )
         .unwrap();
         assert_eq!(w.to_date, "2026-11-11", "the day it ends on still counts");
         assert_eq!(
-            window_of(at("2026-11-11T00:00:00Z"), at("2026-11-10T00:00:00Z")),
+            window_of(at("2026-11-11T00:00:00Z"), at("2026-11-10T00:00:00Z"), None),
             None
+        );
+    }
+
+    /// Havana's clocks change at midnight, so March 8 starts at 01:00, and a
+    /// range of March 7 ends there. March 8 isn't in it.
+    #[test]
+    fn a_range_of_whole_days_ends_on_the_date_it_says() {
+        let at = |t: &str| DateTime::parse_from_rfc3339(t).unwrap();
+        let w = window_of(
+            at("2026-03-07T00:00:00-05:00"),
+            at("2026-03-08T01:00:00-04:00"),
+            date("2026-03-08"),
+        )
+        .unwrap();
+        assert_eq!(
+            (w.from_date.as_str(), w.to_date.as_str()),
+            ("2026-03-07", "2026-03-08")
         );
     }
 
@@ -1647,6 +1758,137 @@ mod tests {
         assert_eq!(
             list,
             json!([{"email": ME, "self": true, "responseStatus": "accepted"}, {"email": "ana@example.com", "responseStatus": "declined"}, {"email": "ben@example.com"}])
+        );
+    }
+
+    #[test]
+    fn a_room_stays_a_room_and_is_never_invited() {
+        let room =
+            json!({"email": "room@example.com", "resource": true, "responseStatus": "accepted"});
+        let event =
+            json!({"attendees": [{"email": ME, "self": true}, {"email": "ana@example.com"}, room]});
+        let (ana, ben) = ("ana@example.com".to_owned(), "ben@example.com".to_owned());
+        let named_room = "Room@example.com".to_owned();
+        assert_eq!(
+            attendees_after(&[&ana, &named_room], &event, ME),
+            None,
+            "the same people, with the room as the form read it"
+        );
+        assert_eq!(
+            attendees_after(&[&ana, &named_room, &ben], &event, ME).unwrap(),
+            json!([{"email": ME, "self": true}, room, {"email": "ana@example.com"}, {"email": "ben@example.com"}])
+        );
+    }
+
+    #[test]
+    fn the_person_under_another_address_is_not_invited_to_their_own_event() {
+        let event = json!({"attendees": [{"email": "alias@example.com", "self": true}, {"email": "ana@example.com"}]});
+        let (ana, alias) = ("ana@example.com".to_owned(), "alias@example.com".to_owned());
+        assert_eq!(attendees_after(&[&alias, &ana], &event, ME), None);
+    }
+
+    const NY: &str = "America/New_York";
+
+    fn form(start: &str, end: &str, zone: &str) -> Form {
+        Form::of(&json!({"start": start, "end": end, "time_zone": zone})).unwrap()
+    }
+
+    fn timed(start: &str, end: &str, zone: &str) -> Value {
+        json!({"start": {"dateTime": start, "timeZone": zone}, "end": {"dateTime": end, "timeZone": zone}})
+    }
+
+    /// Google writes times in the calendar's zone: here Manila's, on an event
+    /// that keeps New York's clock. Its 09:00 either side of the change is 21:00
+    /// and 22:00 in Manila, and moved an hour it's still an hour.
+    #[test]
+    fn a_series_is_read_on_its_own_clock_whatever_offset_it_is_written_with() {
+        let master = timed("2026-10-27T21:00:00+08:00", "2026-10-27T22:00:00+08:00", NY);
+        let instance = timed("2026-11-03T22:00:00+08:00", "2026-11-03T23:00:00+08:00", NY);
+        let moved = form("2026-11-03T10:00:00-05:00", "2026-11-03T11:00:00-05:00", NY);
+        let body = series_changes(&moved, &instance, &master, ME, "Asia/Manila").unwrap();
+        assert_eq!(body["start"]["dateTime"], "2026-10-27T10:00:00-04:00");
+        assert_eq!(body["end"]["dateTime"], "2026-10-27T11:00:00-04:00");
+        assert_eq!(body["start"]["timeZone"], NY);
+    }
+
+    #[test]
+    fn a_series_moved_to_another_zone_lands_on_the_clock_typed_there() {
+        let master = timed("2026-10-27T09:00:00-04:00", "2026-10-27T10:00:00-04:00", NY);
+        let instance = timed("2026-11-03T09:00:00-05:00", "2026-11-03T10:00:00-05:00", NY);
+        let moved = form(
+            "2026-11-03T09:00:00+08:00",
+            "2026-11-03T10:00:00+08:00",
+            "Asia/Manila",
+        );
+        let body = series_changes(&moved, &instance, &master, ME, NY).unwrap();
+        assert_eq!(body["start"]["dateTime"], "2026-10-27T09:00:00+08:00");
+        assert_eq!(body["start"]["timeZone"], "Asia/Manila");
+    }
+
+    /// One instance moved to Manila says nothing of the series, which stays
+    /// on New York's clock when that instance moves it.
+    #[test]
+    fn an_instance_with_a_zone_of_its_own_moves_the_series_on_the_series_clock() {
+        let master = timed("2026-10-27T09:00:00-04:00", "2026-10-27T10:00:00-04:00", NY);
+        let zone = "Asia/Manila";
+        let instance = timed(
+            "2026-11-03T09:00:00+08:00",
+            "2026-11-03T10:00:00+08:00",
+            zone,
+        );
+        let moved = form(
+            "2026-11-03T10:00:00+08:00",
+            "2026-11-03T11:00:00+08:00",
+            zone,
+        );
+        let body = series_changes(&moved, &instance, &master, ME, NY).unwrap();
+        assert_eq!(body["start"]["dateTime"], "2026-10-27T10:00:00-04:00");
+        assert_eq!(body["start"]["timeZone"], NY);
+    }
+
+    #[test]
+    fn a_series_with_no_zone_named_keeps_to_its_calendars() {
+        let side = |t: &str| json!({"dateTime": t});
+        let master = json!({"start": side("2026-10-27T21:00:00+08:00"), "end": side("2026-10-27T22:00:00+08:00")});
+        let instance = json!({"start": side("2026-11-03T22:00:00+08:00"), "end": side("2026-11-03T23:00:00+08:00")});
+        let moved = form("2026-11-03T10:00:00-05:00", "2026-11-03T11:00:00-05:00", "");
+        let body = series_changes(&moved, &instance, &master, ME, NY).unwrap();
+        assert_eq!(body["start"]["dateTime"], "2026-10-27T10:00:00-04:00");
+    }
+
+    #[test]
+    fn a_series_moved_onto_a_time_the_clocks_skip_is_refused() {
+        // its first day is the spring change, when 02:30 never happens
+        let master = timed("2026-03-08T01:30:00-05:00", "2026-03-08T03:30:00-04:00", NY);
+        let instance = timed("2026-03-15T01:30:00-04:00", "2026-03-15T02:30:00-04:00", NY);
+        let moved = form("2026-03-15T02:30:00-04:00", "2026-03-15T03:30:00-04:00", NY);
+        assert_eq!(
+            series_changes(&moved, &instance, &master, ME, NY),
+            Err(SERIES_SKIPPED)
+        );
+    }
+
+    #[test]
+    fn a_series_in_a_zone_nobody_can_read_is_refused_not_guessed() {
+        let zone = "Mars/Olympus";
+        let master = timed(
+            "2026-10-27T09:00:00-04:00",
+            "2026-10-27T10:00:00-04:00",
+            zone,
+        );
+        let instance = timed(
+            "2026-11-03T09:00:00-05:00",
+            "2026-11-03T10:00:00-05:00",
+            zone,
+        );
+        let moved = form(
+            "2026-11-03T10:00:00-05:00",
+            "2026-11-03T11:00:00-05:00",
+            zone,
+        );
+        assert_eq!(
+            series_changes(&moved, &instance, &master, ME, NY),
+            Err(SERIES_UNREADABLE)
         );
     }
 

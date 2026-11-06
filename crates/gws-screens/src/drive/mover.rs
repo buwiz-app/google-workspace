@@ -9,7 +9,9 @@ use serde_json::{Value, json};
 
 use super::edits::{press, press_as};
 use super::file::{Crumb, Row, rows_in};
-use super::write::{Acting, answer_write, keep_undo, landed};
+use super::write::{
+    Acting, answer_write, keep_undo, landed, start_acting, stop_acting, stop_opening,
+};
 use super::{Drive, ask, fetch, value};
 use crate::shell::{INK, LINE, Latest, MUTE, PANEL};
 
@@ -102,7 +104,7 @@ pub(super) fn open(b: &Bridge, m: Drive, row: Row) {
     m.mover.here.set(None);
     m.mover.adds.set(false);
     fetch(m, read_folders(b.clone(), m, row.id.clone()));
-    m.acting.set(Some(Acting::Move(row)));
+    start_acting(m, Acting::Move(row));
 }
 
 fn go(b: &Bridge, m: Drive, moving: &str, trail: Vec<Crumb>) {
@@ -120,8 +122,9 @@ fn move_here(b: &Bridge, m: Drive, row: &Row) {
         .trail
         .with_untracked(|t| t.last().map_or_else(|| "root".to_owned(), |c| c.id.clone()));
     let call = b.call("gws_drive_move", json!({"id": row.id, "to": to}));
-    answer_write(b, m, call, |b, m, v| {
-        m.acting.set(None);
+    let opening = m.opening.now();
+    answer_write(b, m, call, move |b, m, v| {
+        stop_opening(m, opening);
         keep_undo(m, v, "Moved.");
         landed(b, m, v);
     });
@@ -241,7 +244,7 @@ fn footer(b: Bridge, m: Drive, row: Row) -> impl IntoElement {
             "Cancel".to_owned(),
             &shut,
             move || {
-                m.acting.set(None);
+                stop_acting(m);
                 m.said.set(None);
             },
         ))

@@ -170,7 +170,11 @@ pub(super) fn press_as(
 fn buttons(b: &Bridge, m: Drive, e: &Edit) -> View {
     let row = view().app_class(Some("flex-row flex-wrap items-center gap-1".into()));
     let (bb, id) = (b.clone(), e.id.clone());
-    let row = if e.google {
+    let row = if e.attachment {
+        row.child(press("Save to Google Drive", &e.name, move || {
+            upload(&bb, m, &id, "copy", "Saved to Google Drive as a new file.");
+        }))
+    } else if e.google {
         row.child(press("Save a copy to Google Drive", &e.name, move || {
             upload(&bb, m, &id, "copy", "Saved a copy to Google Drive.");
         }))
@@ -232,7 +236,13 @@ fn bar(b: &Bridge, m: Drive, e: &Edit, under_way: bool) -> View {
                 .number_of_lines(2)
                 .app_class(Some(format!("text-[13px] {INK}").into())),
         );
-    let top = if e.google {
+    let top = if e.attachment {
+        top.child(line(
+            "This came from a mail. It stays here until you save it as a new file or discard it."
+                .to_owned(),
+            MUTE,
+        ))
+    } else if e.google {
         top.child(line(
             "Google's own file stays as it is. This saves a new one beside it.".to_owned(),
             MUTE,

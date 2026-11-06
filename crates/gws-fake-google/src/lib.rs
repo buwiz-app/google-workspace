@@ -14,6 +14,7 @@ mod drive;
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
@@ -426,7 +427,9 @@ fn snippet(m: &Mail) -> String {
     m.text.replace('\n', " ").chars().take(120).collect()
 }
 
-fn payload(m: &Mail, full: bool) -> Value {
+/// `read` goes into each attachment's id, which Gmail doesn't promise to keep:
+/// a read counts up once [`FakeGoogle::attachment_ids_change`] says so.
+fn payload(m: &Mail, full: bool, read: u64) -> Value {
     if !full {
         return json!({"mimeType": "multipart/alternative", "headers": headers(m)});
     }
@@ -435,15 +438,15 @@ fn payload(m: &Mail, full: bool) -> Value {
     if let Some(html) = &m.html {
         parts.push(json!({"mimeType": "text/html", "headers": [{"name": "Content-Type", "value": "text/html; charset=utf-8"}], "body": {"data": b64(html.as_bytes()), "size": html.len()}}));
     }
-    let body = json!({"mimeType": "multipart/alternative", "parts": parts});
+    let body = json!({"partId": "0", "mimeType": "multipart/alternative", "parts": parts});
     if m.attachments.is_empty() {
         return json!({"mimeType": "multipart/alternative", "headers": headers(m), "parts": body["parts"]});
     }
     let mut mixed = vec![body];
     for (i, (name, mime, bytes)) in m.attachments.iter().enumerate() {
-        mixed.push(json!({"mimeType": mime, "filename": name, "headers": [{"name": "Content-Disposition", "value": format!("attachment; filename=\"{name}\"")}], "body": {"attachmentId": format!("att-{}-{i}", m.id), "size": bytes.len()}}));
+        mixed.push(json!({"partId": (i + 1).to_string(), "mimeType": mime, "filename": name, "headers": [{"name": "Content-Disposition", "value": format!("attachment; filename=\"{name}\"")}], "body": {"attachmentId": format!("att-{}-{read}-{i}", m.id), "size": bytes.len()}}));
     }
-    json!({"mimeType": "multipart/mixed", "headers": headers(m), "parts": mixed})
+    json!({"partId": "", "mimeType": "multipart/mixed", "headers": headers(m), "parts": mixed})
 }
 
 #[derive(Default)]
@@ -453,6 +456,8 @@ struct Account {
     writes_left: Option<usize>,
     wrote: bool,
     reads_fail_after_write: bool,
+    /// Reads so far, once attachment ids change with each.
+    reads: Option<AtomicU64>,
     /// `(draft id, message id, raw message, thread)`.
     drafts: Vec<(String, String, String, Option<String>)>,
     next_draft: u64,
@@ -742,7 +747,7 @@ impl Account {
         match format {
             "minimal" => {}
             "metadata" => {
-                let mut p = payload(m, false);
+                let mut p = payload(m, false, 0);
                 if !wanted.is_empty() {
                     let kept: Vec<Value> = p["headers"]
                         .as_array()
@@ -761,7 +766,11 @@ impl Account {
                 }
                 v["payload"] = p;
             }
-            _ => v["payload"] = payload(m, true),
+            _ => {
+                let read = self.reads.as_ref();
+                let read = read.map_or(0, |n| n.fetch_add(1, Ordering::Relaxed));
+                v["payload"] = payload(m, true, read);
+            }
         }
         v
     }
@@ -1312,10 +1321,41 @@ impl Account {
     }
 }
 
+/// Where a test stops one request before it does anything, so that what must not
+/// happen in a gap can be made to land in it, with no sleeping.
+#[derive(Default)]
+struct Door {
+    state: Mutex<DoorState>,
+    moved: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct DoorState {
+    /// The method, and what ends the path.
+    holding: Option<(String, String)>,
+    arrived: bool,
+}
+
+impl Door {
+    fn pass(&self, r: &Request) {
+        let mut state = self.state.lock().unwrap();
+        let held = |h: &(String, String)| r.method == h.0 && r.path().ends_with(&h.1);
+        if !state.holding.as_ref().is_some_and(held) {
+            return;
+        }
+        state.arrived = true;
+        self.moved.notify_all();
+        while state.holding.is_some() {
+            state = self.moved.wait(state).unwrap();
+        }
+    }
+}
+
 /// A whole fake Google account on a port of its own.
 pub struct FakeGoogle {
     port: u16,
     account: Arc<Mutex<Account>>,
+    door: Arc<Door>,
 }
 
 impl FakeGoogle {
@@ -1333,10 +1373,40 @@ impl FakeGoogle {
             drive: drive::Drive::new(seed.files),
             ..Account::default()
         }));
-        let shared = account.clone();
-        let port = listen(port, move |r| shared.lock().unwrap().handle(r));
+        let (shared, door) = (account.clone(), Arc::new(Door::default()));
+        let waits = door.clone();
+        let port = listen(port, move |r| {
+            waits.pass(&r);
+            shared.lock().unwrap().handle(r)
+        });
         account.lock().unwrap().drive.base = format!("http://127.0.0.1:{port}");
-        Self { port, account }
+        Self {
+            port,
+            account,
+            door,
+        }
+    }
+
+    /// Stops requests of `method` whose path ends in `path`, before they do
+    /// anything, until [`Self::release`].
+    pub fn hold(&self, method: &str, path: &str) {
+        let mut state = self.door.state.lock().unwrap();
+        state.holding = Some((method.to_owned(), path.to_owned()));
+        state.arrived = false;
+    }
+
+    /// Until a held request has come.
+    pub fn wait_for_held(&self) {
+        let mut state = self.door.state.lock().unwrap();
+        while !state.arrived {
+            state = self.door.moved.wait(state).unwrap();
+        }
+    }
+
+    /// Lets what's held go on.
+    pub fn release(&self) {
+        self.door.state.lock().unwrap().holding = None;
+        self.door.moved.notify_all();
     }
 
     /// `http://127.0.0.1:<port>`: what `GWS_STUB_BASE` names.
@@ -1489,6 +1559,24 @@ impl FakeGoogle {
     /// People a page of `permissions.list` holds.
     pub fn drive_people_page(&self, n: usize) {
         self.account.lock().unwrap().drive.people_page = Some(n);
+    }
+
+    /// From here on an attachment has a new id on each read, and every one of
+    /// them still fetches it.
+    pub fn attachment_ids_change(&self) {
+        self.account.lock().unwrap().reads = Some(AtomicU64::new(1));
+    }
+
+    /// The next piece of an upload has only its first `n` bytes kept, and the
+    /// 308 says so. Google says this can happen to any piece.
+    pub fn drive_keeps_short(&self, n: usize) {
+        self.account.lock().unwrap().drive.keep_short = Some(n);
+    }
+
+    /// The answer to the piece that finishes an upload can't be read, and the
+    /// bytes are on Drive all the same.
+    pub fn drive_garbles_the_last_answer(&self) {
+        self.account.lock().unwrap().drive.garble_last = true;
     }
 
     /// `left` more upload sessions start, and then each gets `status`.

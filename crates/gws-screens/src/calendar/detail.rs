@@ -18,14 +18,19 @@ fn line(title: &'static str, body: String) -> View {
         .child(text(body).app_class(Some(format!("flex-1 text-[13px] {INK}").into())))
 }
 
+/// How many guests, the same count as Delete's: not the person, not a room.
+fn guests_line(n: i64) -> String {
+    match n {
+        0 => "No other guests".to_owned(),
+        1 => "1 guest".to_owned(),
+        n => format!("{n} guests"),
+    }
+}
+
 fn guests(d: &Detail) -> View {
     d.attendees.iter().fold(
         view().app_class(Some("px-4 py-1 gap-1".into())).child(
-            text(match d.attendees.len() {
-                1 => "1 guest".to_owned(),
-                n => format!("{n} guests"),
-            })
-            .app_class(Some(format!("text-[12px] {MUTE}").into())),
+            text(guests_line(d.row.guests)).app_class(Some(format!("text-[12px] {MUTE}").into())),
         ),
         |list, g| {
             let who = if g.name.is_empty() {

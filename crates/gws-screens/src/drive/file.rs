@@ -131,6 +131,8 @@ pub(super) struct Edit {
     pub(super) name: String,
     /// A Google Doc, Sheet or Slides, which only ever takes a copy.
     pub(super) google: bool,
+    /// From a mail, so it has no file on Drive and goes up as a new one.
+    pub(super) attachment: bool,
     /// Drive moved too since it was opened.
     pub(super) changed: bool,
     /// An upload is still going, past what its call waited for.
@@ -148,6 +150,7 @@ pub(super) fn edits_in(v: &Value) -> Vec<Edit> {
                 id: e.get("id")?.as_str()?.to_owned(),
                 name: text(e, "name"),
                 google: flag("google"),
+                attachment: flag("attachment"),
                 changed: flag("changed_on_drive"),
                 working: flag("working"),
             })

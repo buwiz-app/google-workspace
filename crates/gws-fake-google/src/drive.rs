@@ -755,6 +755,10 @@ pub(crate) struct Drive {
     pub(crate) writes: Vec<DriveWrite>,
     /// People a page of `permissions.list` holds.
     pub(crate) people_page: Option<usize>,
+    /// The next piece keeps only this much of what it brought.
+    pub(crate) keep_short: Option<usize>,
+    /// The answer to the last piece is no JSON.
+    pub(crate) garble_last: bool,
 }
 
 impl Drive {
@@ -999,22 +1003,30 @@ impl Drive {
         if from != session.got.len() || to + 1 != from + r.body.len() || total != session.total {
             return invalid("Content-Range");
         }
-        session.got.extend_from_slice(&r.body);
+        let keep = self.keep_short.take().unwrap_or(r.body.len());
+        session
+            .got
+            .extend_from_slice(&r.body[..keep.min(r.body.len())]);
         if session.got.len() < session.total {
-            let held = format!("bytes=0-{}", session.got.len() - 1);
-            return Reply(
-                308,
-                "text/plain",
-                Vec::new(),
-                vec![("range".to_owned(), held)],
-            );
+            // with nothing kept there's nothing to say, and a 308 has no Range
+            let held = (!session.got.is_empty()).then(|| {
+                (
+                    "range".to_owned(),
+                    format!("bytes=0-{}", session.got.len() - 1),
+                )
+            });
+            return Reply(308, "text/plain", Vec::new(), held.into_iter().collect());
         }
         let session = id
             .parse()
             .ok()
             .and_then(|id: u64| self.sessions.remove(&id))
             .expect("the session was just read");
-        self.write(session)
+        let reply = self.write(session);
+        if std::mem::take(&mut self.garble_last) {
+            return Reply(200, "application/json", b"<html>".to_vec(), Vec::new());
+        }
+        reply
     }
 
     fn write(&mut self, session: Session) -> Reply {

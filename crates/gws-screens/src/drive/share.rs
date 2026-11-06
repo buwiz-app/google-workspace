@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 
 use super::edits::{failed_line, press, press_as, say};
 use super::file::{Access, Row, access_in, role_line};
-use super::write::{Acting, landed};
+use super::write::{Acting, landed, start_acting, stop_acting};
 use super::{Drive, ask, fetch, refused, value};
 use crate::shell::{BG, CHOSEN, DIM, INK, LINE, Latest, MUTE, PANEL};
 
@@ -66,10 +66,17 @@ impl Sharing {
     }
 }
 
-async fn read_people(b: Bridge, m: Drive, id: String) {
+/// Starts reading who has `id`. The turn is taken now, not when the read's job
+/// runs: an old answer could land between, under the next file's name.
+fn start_read(b: &Bridge, m: Drive, id: &str) {
     let s = m.sharing;
     let turn = s.turn.ask();
     s.read.set(Read::Reading);
+    fetch(m, read_people(b.clone(), m, id.to_owned(), turn));
+}
+
+async fn read_people(b: Bridge, m: Drive, id: String, turn: u64) {
+    let s = m.sharing;
     let answer = ask(&b, "gws_drive_access", json!({"id": id})).await;
     if !s.turn.counts(turn) {
         return;
@@ -109,9 +116,8 @@ pub(super) fn open(b: &Bridge, m: Drive, row: Row) {
     s.typed.set(String::new());
     s.role.set("reader");
     s.problem.set(None);
-    s.read.set(Read::Reading);
-    fetch(m, read_people(b.clone(), m, row.id.clone()));
-    m.acting.set(Some(Acting::Share(row)));
+    start_read(b, m, &row.id);
+    start_acting(m, Acting::Share(row));
 }
 
 /// What the press does, in as few words as say it.
@@ -185,12 +191,15 @@ fn share(b: &Bridge, m: Drive, id: &str) {
     let args = json!({"id": id, "add": add, "remove": remove, "seen": s.seen.get_untracked()});
     let call = b.call("gws_drive_share", args);
     let (b, id) = (b.clone(), id.to_owned());
+    let opening = m.opening.now();
     m.writing.set(true);
     m.said.set(None);
     fetch(m, async move {
         let answer = call.await;
         m.writing.set(false);
         match answer {
+            // what's up now isn't what was pressed, even if it's the same file
+            Ok(v) if !m.opening.counts(opening) => left_behind(&b, m, &v),
             Ok(v) => shared(&b, m, &id, &v),
             Err(e) => say(m, &failed_line(&e)),
         }
@@ -204,7 +213,7 @@ fn shared(b: &Bridge, m: Drive, id: &str, v: &Value) {
     if let Some(why) = refused(v) {
         say(m, &why);
         if v.get("refused").and_then(Value::as_str) == Some("changed") {
-            fetch(m, read_people(b.clone(), m, id.to_owned()));
+            start_read(b, m, id);
         }
         return;
     }
@@ -212,13 +221,29 @@ fn shared(b: &Bridge, m: Drive, id: &str, v: &Value) {
         say(m, "Only part of that went through. This is who has it now.");
         s.adding.set(Vec::new());
         s.leaving.set(HashSet::new());
-        fetch(m, read_people(b.clone(), m, id.to_owned()));
+        start_read(b, m, id);
         landed(b, m, v);
         return;
     }
     let count = |key: &str| v.get(key).and_then(Value::as_u64).unwrap_or(0) as usize;
-    m.acting.set(None);
+    stop_acting(m);
     say(m, &done_words(count("added"), count("removed")));
+    landed(b, m, v);
+}
+
+/// The answer to a press from an opening that's gone. None of it is the panel's.
+/// A refusal changed nothing, as the person who walked away expects. A press that
+/// went through did, so the rows take it and they're told, in words that can't be
+/// read as being about what's on screen now.
+fn left_behind(b: &Bridge, m: Drive, v: &Value) {
+    if refused(v).is_some() {
+        return;
+    }
+    if v.get("partial") == Some(&Value::Bool(true)) {
+        say(m, "Only part of your earlier share went through.");
+    } else {
+        say(m, "Your earlier share went through.");
+    }
     landed(b, m, v);
 }
 
@@ -410,7 +435,7 @@ fn footer(b: Bridge, m: Drive, row: Row) -> View {
                         text(why).app_class(Some(format!("max-w-full text-[11px] {INK}").into())),
                     )
                     .child(press("Read who has this again", "", move || {
-                        fetch(m, read_people(b.clone(), m, id.clone()));
+                        start_read(&b, m, &id);
                     }))
             }
             Read::Ready => {
@@ -436,7 +461,7 @@ fn footer(b: Bridge, m: Drive, row: Row) -> View {
             "Cancel".to_owned(),
             "",
             move || {
-                m.acting.set(None);
+                stop_acting(m);
                 m.said.set(None);
             },
         ))

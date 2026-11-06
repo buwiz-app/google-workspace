@@ -43,6 +43,26 @@ impl Acting {
     }
 }
 
+/// Puts up what's being done. Each opening is its own turn, so an answer can tell
+/// the one it came from from any other, even on the same file.
+pub(super) fn start_acting(m: Drive, acting: Acting) {
+    m.opening.ask();
+    m.acting.set(Some(acting));
+}
+
+pub(super) fn stop_acting(m: Drive) {
+    m.opening.ask();
+    m.acting.set(None);
+}
+
+/// Closes what a press came from, if it's what is up. A press can land after the
+/// person has cancelled it and gone on to something else.
+pub(super) fn stop_opening(m: Drive, opening: u64) {
+    if m.opening.counts(opening) {
+        stop_acting(m);
+    }
+}
+
 /// The presses Google would take on these rows.
 #[derive(Debug, Default, PartialEq)]
 struct Offer {
@@ -145,7 +165,7 @@ pub(super) fn start_rename(m: Drive) {
     let rows = m.picked_now();
     if offer(&rows).rename {
         m.typed.set(rows[0].name.clone());
-        m.acting.set(rows.into_iter().next().map(Acting::Rename));
+        start_acting(m, Acting::Rename(rows[0].clone()));
     }
 }
 
@@ -200,12 +220,13 @@ fn commit(b: &Bridge, m: Drive) {
         say(m, "Type a name first.");
         return;
     }
+    let opening = m.opening.now();
     match m.acting.get_untracked() {
-        Some(Acting::Rename(row)) if row.name == name => m.acting.set(None),
+        Some(Acting::Rename(row)) if row.name == name => stop_acting(m),
         Some(Acting::Rename(row)) => {
             let call = b.call("gws_drive_rename", json!({"id": row.id, "name": name}));
-            answer_write(b, m, call, |b, m, v| {
-                m.acting.set(None);
+            answer_write(b, m, call, move |b, m, v| {
+                stop_opening(m, opening);
                 keep_undo(m, v, "Renamed.");
                 landed(b, m, v);
             });
@@ -213,8 +234,8 @@ fn commit(b: &Bridge, m: Drive) {
         Some(Acting::NewFolder) => {
             let args = json!({"parent": open_parent(m), "name": name});
             let call = b.call("gws_drive_folder", args);
-            answer_write(b, m, call, |b, m, v| {
-                m.acting.set(None);
+            answer_write(b, m, call, move |b, m, v| {
+                stop_opening(m, opening);
                 say(m, "Made a new folder on Google Drive.");
                 landed(b, m, v);
             });
@@ -270,7 +291,7 @@ fn name_bar(b: Bridge, m: Drive, renaming: bool) -> View {
             commit(&pressed, m);
         }))
         .child(press_as("Cancel this", "Cancel".to_owned(), "", move || {
-            m.acting.set(None);
+            stop_acting(m);
             m.said.set(None);
         }))
 }
@@ -602,7 +623,7 @@ fn action_bar(b: Bridge, m: Drive) -> impl IntoElement {
                 .child(press("New folder", "", move || {
                     m.typed.set(String::new());
                     m.said.set(None);
-                    m.acting.set(Some(Acting::NewFolder));
+                    start_acting(m, Acting::NewFolder);
                 }))
                 // fewer words than its label: the AI mustn't open the picker, as
                 // what's chosen there goes up at the person's press

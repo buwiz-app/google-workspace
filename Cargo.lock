@@ -292,6 +292,7 @@ dependencies = [
  "base64 0.22.1",
  "buwiz-plugin",
  "chrono",
+ "chrono-tz",
  "ed25519-dalek 2.2.0",
  "gws-fake-google",
  "gws-store",

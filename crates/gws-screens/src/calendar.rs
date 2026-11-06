@@ -176,7 +176,7 @@ fn refused_read(v: &Value) -> Option<String> {
 fn range_args(span: Span, anchor: NaiveDate) -> Value {
     let (first, end) = time::range(span, anchor);
     match time::range_args(first, end, &Local) {
-        Some((from, to)) => json!({"from": from, "to": to}),
+        Some((from, to)) => json!({"from": from, "to": to, "to_date": end.to_string()}),
         None => json!({}),
     }
 }

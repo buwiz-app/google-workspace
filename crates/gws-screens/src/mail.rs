@@ -234,6 +234,8 @@ struct Mail {
     labeling: Signal<bool>,
     /// What can be undone, and what to say about it.
     undo: Signal<Option<(String, String)>>,
+    /// The undo already pressed, while it waits for its answer.
+    undoing: Signal<Option<String>>,
     page: Signal<Option<String>>,
     links: Signal<Vec<String>>,
     images: Signal<i64>,
@@ -244,7 +246,7 @@ struct Mail {
     loading: Signal<bool>,
     /// What became of an action: it stays until the person dismisses it or
     /// acts again, as a reload can come at any moment.
-    told: Signal<Option<String>>,
+    told: Signal<Option<Told>>,
     /// Why the list didn't load, in words for the person.
     problem: Signal<Option<String>>,
     seq: Signal<i64>,
@@ -285,16 +287,47 @@ fn list_args(query: &str, search: Option<String>, label: String, skip: usize) ->
     }
 }
 
-async fn load_list(b: Bridge, m: Mail, skip: usize) {
-    let turn = m.list_turn.ask();
-    let args = list_args(
+fn list_now(m: Mail, skip: usize) -> Value {
+    list_args(
         &m.query.get_untracked(),
         m.search.get_untracked(),
         m.label.get_untracked(),
         skip,
-    );
+    )
+}
+
+fn rows_in(v: &Value) -> Vec<Row> {
+    v.get("threads")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Row::of)
+        .collect()
+}
+
+fn show_list(m: Mail, rows: Vec<Row>, v: &Value) {
+    // a pick that left the list is one nobody can see
+    m.picked
+        .update(|p| p.retain(|id| rows.iter().any(|r| r.id == *id)));
+    m.rows.set(rows);
+    m.more.set(v.get("more") == Some(&Value::Bool(true)));
+    m.saved.set(v.get("saved") == Some(&Value::Bool(true)));
+    m.signed_out.set(false);
+    m.problem.set(None);
+}
+
+fn list_failed(m: Mail, e: String) {
+    if e == "sign-in" {
+        m.signed_out.set(true);
+    } else {
+        m.problem.set(Some(e));
+    }
+}
+
+async fn load_list(b: Bridge, m: Mail, skip: usize) {
+    let turn = m.list_turn.ask();
     m.loading.set(true);
-    let answer = read(&b, "gws_mail_list", args).await;
+    let answer = read(&b, "gws_mail_list", list_now(m, skip)).await;
     // a later load owns the list and the flag now
     if !m.list_turn.counts(turn) {
         return;
@@ -302,29 +335,76 @@ async fn load_list(b: Bridge, m: Mail, skip: usize) {
     m.loading.set(false);
     match answer {
         Ok(v) => {
-            let mut rows: Vec<Row> = v
-                .get("threads")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Row::of)
-                .collect();
+            let mut rows = rows_in(&v);
             if skip > 0 {
                 let mut all = m.rows.get_untracked();
                 all.append(&mut new_rows(&all, rows));
                 rows = all;
             }
-            // a pick that left the list is one nobody can see
-            m.picked
-                .update(|p| p.retain(|id| rows.iter().any(|r| r.id == *id)));
-            m.rows.set(rows);
-            m.more.set(v.get("more") == Some(&Value::Bool(true)));
-            m.saved.set(v.get("saved") == Some(&Value::Bool(true)));
-            m.signed_out.set(false);
-            m.problem.set(None);
+            show_list(m, rows, &v);
         }
-        Err(e) if e == "sign-in" => m.signed_out.set(true),
-        Err(e) => m.problem.set(Some(e)),
+        Err(e) => list_failed(m, e),
+    }
+}
+
+/// The list read again where it stands: as far down as it had got, and a page
+/// further while a pick isn't found, as new mail pushes rows down. A pick not
+/// found by then has left this list, and the screen says so.
+async fn reload(b: Bridge, m: Mail) {
+    let turn = m.list_turn.ask();
+    let reach = m.rows.with_untracked(Vec::len);
+    m.loading.set(true);
+    let mut rows: Vec<Row> = Vec::new();
+    let last = loop {
+        let answer = read(&b, "gws_mail_list", list_now(m, rows.len())).await;
+        if !m.list_turn.counts(turn) {
+            return;
+        }
+        let v = match answer {
+            Ok(v) => v,
+            Err(e) => {
+                m.loading.set(false);
+                list_failed(m, e);
+                return;
+            }
+        };
+        let fresh = new_rows(&rows, rows_in(&v));
+        let page = fresh.len();
+        rows.extend(fresh);
+        let seeking = m
+            .picked
+            .with_untracked(|p| p.iter().any(|id| !rows.iter().any(|r| r.id == *id)));
+        let enough = reach + if seeking { page } else { 0 };
+        if page == 0 || rows.len() >= enough || v.get("more") != Some(&Value::Bool(true)) {
+            break v;
+        }
+    };
+    m.loading.set(false);
+    let picks = m.picked.with_untracked(Vec::len);
+    show_list(m, rows, &last);
+    match picks - m.picked.with_untracked(Vec::len) {
+        0 => {}
+        1 => tell_too(m, "A picked conversation left this list."),
+        n => tell_too(m, &format!("{n} picked conversations left this list.")),
+    }
+}
+
+/// A line about what became of an action, and the undo of the one it's about.
+#[derive(Clone, PartialEq)]
+struct Told {
+    line: String,
+    undo: Option<String>,
+}
+
+fn tell(m: Mail, line: String, undo: Option<String>) {
+    m.told.set(Some(Told { line, undo }));
+}
+
+/// A line that doesn't replace what's being said already.
+fn tell_too(m: Mail, line: &str) {
+    match m.told.get_untracked() {
+        Some(Told { line: said, undo }) => tell(m, format!("{said} {line}"), undo),
+        None => tell(m, line.to_owned(), None),
     }
 }
 
@@ -391,8 +471,9 @@ async fn act(
     }
     match once(&b, tool, args).await {
         Ok(v) => {
-            if let Some(undo) = v.get("undo").and_then(Value::as_str) {
-                m.undo.set(Some((undo.to_owned(), said.to_owned())));
+            let undo = v.get("undo").and_then(Value::as_str).map(str::to_owned);
+            if let Some(undo) = &undo {
+                m.undo.set(Some((undo.clone(), said.to_owned())));
             }
             let done = if v.get("threads").is_some() {
                 thread_ids(&v)
@@ -400,12 +481,13 @@ async fn act(
                 ids.clone()
             };
             let missed: Vec<String> = ids.iter().filter(|i| !done.contains(i)).cloned().collect();
-            m.told.set((!missed.is_empty()).then(|| {
-                format!(
+            m.told.set((!missed.is_empty()).then(|| Told {
+                line: format!(
                     "{} of {} went through. The rest didn't.",
                     done.len(),
                     ids.len()
-                )
+                ),
+                undo,
             }));
             // what failed stays picked, ready to try again, with anything picked since
             m.picked.update(|p| p.retain(|id| !done.contains(id)));
@@ -431,7 +513,7 @@ async fn act(
             }
         }
         Err(e) if e == "sign-in" => m.signed_out.set(true),
-        Err(e) => m.told.set(Some(e)),
+        Err(e) => tell(m, e, None),
     }
 }
 
@@ -441,24 +523,39 @@ async fn undo_last(b: Bridge, m: Mail, undo: Option<String>) {
     let Some(undo) = undo else {
         return;
     };
-    match once(&b, "gws_mail_undo", json!({"undo": undo})).await {
+    let answer = once(&b, "gws_mail_undo", json!({"undo": undo})).await;
+    if m.undoing.with_untracked(|u| u.as_ref() == Some(&undo)) {
+        m.undoing.set(None);
+    }
+    match answer {
         Ok(_) => {
             if m.undo
                 .with_untracked(|u| u.as_ref().is_some_and(|(id, _)| *id == undo))
             {
                 m.undo.set(None);
             }
-            m.told.set(None);
-            load_list(b, m, 0).await;
+            // what's said about another action still stands
+            if m.told.with_untracked(|t| {
+                t.as_ref().is_some_and(|t| t.undo.as_ref() == Some(&undo))
+            }) {
+                m.told.set(None);
+            }
+            reload(b, m).await;
         }
         // the bar stays, so it can be pressed again
-        Err(e) => m.told.set(Some(e)),
+        Err(e) => tell(m, e, Some(undo)),
     }
 }
 
-/// What Undo would take back right now.
-fn last_action(m: Mail) -> Option<String> {
-    m.undo.get_untracked().map(|(id, _)| id)
+/// What Undo would take back right now, and nothing while that's on its way: a
+/// second press would ask for what the first already took.
+fn claim_undo(m: Mail) -> Option<String> {
+    let (id, _) = m.undo.get_untracked()?;
+    if m.undoing.with_untracked(|u| u.as_ref() == Some(&id)) {
+        return None;
+    }
+    m.undoing.set(Some(id.clone()));
+    Some(id)
 }
 
 async fn load_labels(b: Bridge, m: Mail) {
@@ -552,7 +649,7 @@ async fn watch(b: Bridge, m: Mail) {
             if v.get("changed") == Some(&Value::Bool(true))
                 && m.query.with_untracked(String::is_empty)
             {
-                load_list(b.clone(), m, 0).await;
+                reload(b.clone(), m).await;
                 load_labels(b.clone(), m).await;
             }
         }
@@ -734,7 +831,7 @@ fn list_pane(b: Bridge, m: Mail) -> impl IntoElement {
                 ),
         )
         .child(dynamic(move || match m.told.get() {
-            Some(line) => view()
+            Some(Told { line, .. }) => view()
                 .app_class(Some(
                     format!("flex-row items-center gap-2 px-3 py-1 border-b {LINE}").into(),
                 ))
@@ -994,7 +1091,7 @@ fn undo_bar(b: Bridge, m: Mail) -> impl IntoElement {
                         .app_class(Some("px-3 py-1".into()))
                         .label("Undo that")
                         .on_press(move || {
-                            run(m, undo_last(b.clone(), m, last_action(m)));
+                            run(m, undo_last(b.clone(), m, claim_undo(m)));
                         })
                         .child(text("Undo").app_class(Some(format!("text-[12px] {INK}").into()))),
                 )
@@ -1184,7 +1281,7 @@ fn keys(b: Bridge, m: Mail) {
         }
     });
     on_key("z", move |_| {
-        run(m, undo_last(back.clone(), m, last_action(m)));
+        run(m, undo_last(back.clone(), m, claim_undo(m)));
     });
 }
 
@@ -1409,6 +1506,7 @@ pub fn build(bridge: Bridge) -> Root {
         let m = Mail {
             problem: signal(None),
             told: signal(None),
+            undoing: signal(None),
             list_turn: Latest::new(),
             open_turn: Latest::new(),
             labels: signal(column(&Value::Null)),

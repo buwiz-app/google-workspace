@@ -162,7 +162,7 @@ impl Host for Fake {
                 let first = args["threads"][0].clone();
                 (
                     tool.to_owned(),
-                    json!({"undo": "u1", "done": 1, "threads": [first], "partial": true}),
+                    json!({"undo": "partly", "done": 1, "threads": [first], "partial": true}),
                 )
             }
             "gws_mail_mark" | "gws_mail_archive" | "gws_mail_trash" | "gws_mail_label" => {
@@ -173,7 +173,7 @@ impl Host for Fake {
                     json!({"undo": format!("u{actions}"), "done": 1}),
                 )
             }
-            "gws_mail_undo" => (String::new(), json!({"done": 1})),
+            "gws_mail_undo" => (tool.to_owned(), json!({"done": 1})),
             "gws_mail_thread" => {
                 let id = args["thread"].as_str().unwrap_or_default();
                 (id.to_owned(), thread(id))
@@ -645,6 +645,108 @@ fn a_queued_undo_takes_back_what_it_was_pressed_on() {
     settle(&mut app);
     let undone = fake.called("gws_mail_undo");
     assert_eq!(undone.last().expect("an undo")["undo"], format!("u{first}"));
+}
+
+#[test]
+fn a_second_undo_press_is_the_same_undo() {
+    let (mut app, fake) = start();
+    app.press("text:Subject 3").expect("the row presses");
+    settle(&mut app);
+    app.press_key("e").expect("the key presses");
+    settle(&mut app);
+    fake.hold("gws_mail_undo");
+    app.press("label:Undo that").expect("the bar offers it");
+    settle(&mut app);
+    app.press_key("z").expect("the key presses");
+    settle(&mut app);
+    fake.release("gws_mail_undo");
+    settle(&mut app);
+    assert_eq!(fake.called("gws_mail_undo").len(), 1, "asked for once");
+    assert!(app.screen().shows("Subject 3"));
+    assert!(!app.screen().matches("label:Dismiss this").unwrap(), "no error after it worked");
+}
+
+#[test]
+fn a_good_undo_leaves_what_was_said_about_another_action() {
+    let (mut app, fake) = start();
+    app.press("text:Subject 3").expect("the row presses");
+    settle(&mut app);
+    app.press_key("e").expect("the key presses");
+    settle(&mut app);
+    fake.hold("gws_mail_trash");
+    app.press("text:Subject 2").expect("the row presses");
+    settle(&mut app);
+    app.press_key("x").expect("the key presses");
+    app.press("text:Subject 5").expect("the row presses");
+    settle(&mut app);
+    app.press_key("x").expect("the key presses");
+    *fake.partly.lock().unwrap() = true;
+    app.press_key("shift+3").expect("the key presses");
+    settle(&mut app);
+    // pressed while the bar still offers the archive, so it runs after the trash
+    app.press("label:Undo that").expect("the bar offers it");
+    settle(&mut app);
+    fake.release("gws_mail_trash");
+    settle(&mut app);
+    assert_eq!(fake.called("gws_mail_undo").len(), 1, "the archive came back");
+    assert!(app.screen().shows("1 of 2 went through. The rest didn't."));
+}
+
+/// A row on the second page, picked, and which it was.
+fn pick_far_down(app: &mut Headless) -> usize {
+    app.scroll("text:Subject 0", px(2500.0))
+        .expect("the list scrolls");
+    settle(app);
+    let n = *shown(app).last().expect("rows show");
+    assert!(n >= PAGE, "row {n} is on the first page");
+    app.press(&format!("text:Subject {n}"))
+        .expect("the row presses");
+    settle(app);
+    app.press_key("x").expect("the key presses");
+    n
+}
+
+/// Until the change check has been answered and the list read again.
+fn reloaded(app: &mut Headless, fake: &Fake) {
+    let by = std::time::Instant::now() + Duration::from_secs(20);
+    while *fake.changed.lock().unwrap() {
+        assert!(std::time::Instant::now() < by, "no change check came");
+        settle(app);
+    }
+    settle(app);
+}
+
+#[test]
+fn a_reload_keeps_the_rows_and_picks_further_down() {
+    let (mut app, fake) = start();
+    let n = pick_far_down(&mut app);
+    // the open one is another row, so an action shows if the pick survived
+    let open = *shown(&app).first().expect("rows show");
+    assert_ne!(open, n);
+    app.press(&format!("text:Subject {open}"))
+        .expect("the row presses");
+    settle(&mut app);
+    fake.newer.lock().unwrap().push(900);
+    *fake.changed.lock().unwrap() = true;
+    reloaded(&mut app, &fake);
+    app.press_key("e").expect("the key presses");
+    settle(&mut app);
+    let archived = fake.called("gws_mail_archive");
+    assert_eq!(
+        archived.last().expect("an archive")["threads"],
+        json!([format!("t{n}")])
+    );
+    assert!(!app.screen().shows("left this list"));
+}
+
+#[test]
+fn a_pick_gone_from_further_down_is_said_on_screen() {
+    let (mut app, fake) = start();
+    let n = pick_far_down(&mut app);
+    fake.gone.lock().unwrap().push(n);
+    *fake.changed.lock().unwrap() = true;
+    app.wait_for_within("text:A picked conversation left this list.", Duration::from_secs(20))
+        .expect("the screen says so");
 }
 
 #[test]

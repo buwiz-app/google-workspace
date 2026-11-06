@@ -57,6 +57,23 @@ impl Editor {
         self.fill(Form::default());
         m.ask.set(None);
     }
+
+    /// A form opened before the screen knew who's signed in is `who`'s.
+    pub(super) fn adopt(self, who: &str) {
+        let unowned = self.form.with_untracked(|f| f.as_account.is_empty());
+        if self.open.get_untracked() && unowned && !who.is_empty() {
+            self.form.update(|f| f.as_account = who.to_owned());
+        }
+    }
+}
+
+/// `form` as the account on the screen now has it. Taken as it opens: by the
+/// save the screen may be on another account, and this form is still this one's.
+fn opened(m: Cal, mut form: Form) -> Form {
+    if form.as_account.is_empty() {
+        form.as_account = m.chooser.who.get_untracked();
+    }
+    form
 }
 
 fn blank(m: Cal) -> Form {
@@ -67,13 +84,13 @@ fn blank(m: Cal) -> Form {
 
 pub(super) fn new_event(m: Cal) {
     m.ask.set(None);
-    m.editor.fill(blank(m));
+    m.editor.fill(opened(m, blank(m)));
     m.editor.open.set(true);
 }
 
 pub(super) fn edit(m: Cal, d: &Detail) {
     m.ask.set(None);
-    m.editor.fill(Form::of_detail(d, &Local));
+    m.editor.fill(opened(m, Form::of_detail(d, &Local)));
     m.editor.open.set(true);
 }
 
@@ -83,7 +100,8 @@ pub(super) async fn open_draft(b: Bridge, m: Cal, ticket: String) {
         Ok(v) => match refused_read(&v) {
             Some(why) => tell(m, why),
             None => {
-                m.editor.fill(Form::of_draft(&v, blank(m), &Local));
+                m.editor
+                    .fill(opened(m, Form::of_draft(&v, blank(m), &Local)));
                 m.editor.open.set(true);
             }
         },
@@ -136,9 +154,6 @@ pub(super) fn save_now(b: &Bridge, m: Cal, scope: Option<&'static str>) {
     };
     if let Some(scope) = scope {
         args["scope"] = scope.into();
-    }
-    if args.get("as_account").is_none() {
-        args = crate::shell::owned(args, &m.chooser.who.get_untracked());
     }
     e.saving.set(true);
     m.ask.set(None);
@@ -601,7 +616,11 @@ fn presses(b: Bridge, m: Cal) -> impl IntoElement {
                 // fewer words than their labels: which version goes is the person's
                 .child(press_text("Use the newer one", "Use newer", move || {
                     if let Some(d) = e.newer.get_untracked() {
-                        e.fill(Form::of_detail(&d, &Local));
+                        let who = e.form.with_untracked(|f| f.as_account.clone());
+                        e.fill(Form {
+                            as_account: who,
+                            ..Form::of_detail(&d, &Local)
+                        });
                         m.told.set(None);
                     }
                 }))

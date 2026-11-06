@@ -445,6 +445,8 @@ fn pick(b: &Bridge, m: Drive) {
         extensions: Vec::new(),
         multiple: true,
     };
+    // as `parent` is: the picker can stay open through a switch
+    let who = m.chooser.who.get_untracked();
     let Some(pick) = b.pick_file(options) else {
         say(m, "This screen can't reach your files.");
         return;
@@ -465,7 +467,7 @@ fn pick(b: &Bridge, m: Drive) {
                     key,
                     file,
                     parent: parent.clone(),
-                    who: m.chooser.who.get_untracked(),
+                    who: who.clone(),
                     arrived: 0,
                     why: None,
                     again: false,

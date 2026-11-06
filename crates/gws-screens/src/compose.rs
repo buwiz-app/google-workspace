@@ -740,8 +740,32 @@ async fn send_pressed(
 ) -> Result<(), String> {
     let press = press.await.map_err(|e| e.message)?;
     let armed = press.get("armed").cloned().unwrap_or(Value::Null);
-    if !save(b, c, &armed).await? {
-        return Ok(());
+    let ready = ready_to_hold(b, c, &armed, confirmed).await;
+    if !matches!(ready, Ok(true)) {
+        // no send will spend it, and while it stands the AI is off this draft
+        // and no account can be switched to: not even the way back from a
+        // refusal. "Send it" is a press of its own
+        let _ = b
+            .call("gws_mail_send_disarm", json!({"armed": armed}))
+            .await;
+    }
+    if ready? {
+        hold_and_send(b, c, armed).await
+    } else {
+        Ok(())
+    }
+}
+
+/// The letter saved under this press, and nothing left to ask. `false` stops
+/// there: it had gone already, or there's someone new to ask about.
+async fn ready_to_hold(
+    b: &Bridge,
+    c: Compose,
+    armed: &Value,
+    confirmed: bool,
+) -> Result<bool, String> {
+    if !save(b, c, armed).await? {
+        return Ok(false);
     }
     if !confirmed {
         let draft = c.letter.with_untracked(|l| l.draft.clone());
@@ -750,10 +774,10 @@ async fn send_pressed(
         let new = people_new(&read.map_err(|e| e.message)?);
         if !new.is_empty() {
             c.confirming.set(Some(new));
-            return Ok(());
+            return Ok(false);
         }
     }
-    hold_and_send(b, c, armed).await
+    Ok(true)
 }
 
 fn people_new(review: &Value) -> Vec<String> {

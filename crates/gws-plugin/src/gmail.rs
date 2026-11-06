@@ -23,6 +23,7 @@ pub const HEADER_MAX: usize = 1024;
 pub const GMAIL_API: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 pub const BODY_MAX: usize = 64 * 1024;
 pub const SNIPPET_MAX: usize = 200;
+pub const PEOPLE_API: &str = "https://people.googleapis.com/v1";
 const TIMEOUT: Duration = Duration::from_secs(30);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// A 25 MB attachment as Gmail answers it, in base64 inside JSON.
@@ -50,6 +51,8 @@ pub enum Failure {
 /// The Gmail API at a base URL.
 #[derive(Clone)]
 pub struct Gmail {
+    /// Where address suggestions come from.
+    people: String,
     agent: ureq::Agent,
     /// For what's big: a whole attachment each way.
     slow: ureq::Agent,
@@ -88,10 +91,56 @@ impl Gmail {
             .user_agent("buwiz-gws")
             .build();
         Self {
+            people: PEOPLE_API.to_owned(),
             agent: config.new_agent(),
             slow: slow.new_agent(),
             base: base.trim_end_matches('/').to_owned(),
         }
+    }
+
+    /// The same, with the People API at `base`.
+    pub fn with_people(mut self, base: &str) -> Self {
+        self.people = base.trim_end_matches('/').to_owned();
+        self
+    }
+
+    /// `(name, address)` of the person's contacts, and of the people Google
+    /// keeps from their mail, that match `query`. An empty `query` is the
+    /// warm-up Google asks for before the first search.
+    pub fn contacts(&self, auth: &Bearer, query: &str) -> Result<Vec<(String, String)>, Failure> {
+        let mut found = Vec::new();
+        for (path, mask) in [
+            ("people:searchContacts", "names,emailAddresses"),
+            ("otherContacts:search", "names,emailAddresses"),
+        ] {
+            let req = self
+                .agent
+                .get(format!("{}/{path}", self.people))
+                .header("authorization", auth.header())
+                .header("accept", "application/json")
+                .query("query", query)
+                .query("readMask", mask)
+                .query("pageSize", "10");
+            let Some(v) = Self::answer(req.call(), FULL_MAX)? else {
+                continue;
+            };
+            let people = v.get("results").and_then(Value::as_array);
+            for person in people.into_iter().flatten() {
+                let name = person
+                    .pointer("/person/names/0/displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let addresses = person
+                    .pointer("/person/emailAddresses")
+                    .and_then(Value::as_array);
+                for address in addresses.into_iter().flatten() {
+                    if let Some(address) = address.get("value").and_then(Value::as_str) {
+                        found.push((name.to_owned(), address.to_owned()));
+                    }
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// A GET of `path` under the base: its JSON, or `None` for a 404.

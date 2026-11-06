@@ -56,6 +56,8 @@ pub struct Core {
     pub uploads: Mutex<compose::Uploads>,
     /// Sends a person's press has allowed, each good for one.
     pub armed: Mutex<compose::Armed>,
+    /// Google's asked-for warm-up of its contact search is done.
+    pub warm: std::sync::atomic::AtomicBool,
     /// How saves too slow for their caller came out.
     pub jobs: Mutex<std::collections::VecDeque<(String, Value)>>,
 }
@@ -64,7 +66,7 @@ impl Core {
     pub fn new(apis: &Apis, paths: Result<Paths, gws_store::Error>) -> Self {
         Self {
             accounts: Accounts::default(),
-            gmail: Gmail::new(&apis.gmail),
+            gmail: Gmail::new(&apis.gmail).with_people(&apis.people),
             paths,
             store_key: Mutex::new(None),
             store: Mutex::new(None),
@@ -74,6 +76,7 @@ impl Core {
             model_drafts: Mutex::default(),
             uploads: Mutex::default(),
             armed: Mutex::default(),
+            warm: std::sync::atomic::AtomicBool::new(false),
             jobs: Mutex::default(),
             pushed: std::sync::atomic::AtomicBool::new(false),
         }

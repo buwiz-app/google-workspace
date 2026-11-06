@@ -554,6 +554,23 @@ impl Sent {
 }
 
 impl Account {
+    /// The People API's two searches: contacts, and who the person's mail knows.
+    fn people(&mut self, r: &Request) -> Reply {
+        if self.only_grants.as_deref().is_some_and(|g| !g.contains("contacts")) {
+            return Self::insufficient();
+        }
+        let query = r.param("query").unwrap_or_default().to_lowercase();
+        let found: Vec<Value> = [("Zed Contact", "zed@contacts.example")]
+            .iter()
+            .filter(|(name, address)| {
+                !query.is_empty()
+                    && (name.to_lowercase().contains(&query) || address.contains(&query))
+            })
+            .map(|(name, address)| json!({"person": {"names": [{"displayName": name}], "emailAddresses": [{"value": address}]}}))
+            .collect();
+        Reply::json(200, json!({"results": found}))
+    }
+
     /// Gmail's upload door: a metadata part and the message itself, handed on
     /// as the same draft write its plain door takes.
     fn upload(&mut self, mut r: Request, rest: &str) -> Reply {
@@ -1054,6 +1071,9 @@ impl Account {
         }
         if let Some(rest) = path.strip_prefix(GMAIL) {
             return self.gmail(&r, rest);
+        }
+        if path.starts_with("/people/v1/") {
+            return self.people(&r);
         }
         if let Some(rest) = path.strip_prefix("/upload").and_then(|p| p.strip_prefix(GMAIL)) {
             let rest = rest.to_owned();

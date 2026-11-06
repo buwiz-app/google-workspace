@@ -34,6 +34,8 @@ const AUTOSAVE: Duration = Duration::from_secs(2);
 /// A file's bytes per call: under 256 KiB of arguments once in base64.
 const CHUNK: usize = 180 * 1024;
 const ATTACHMENTS_MAX: u64 = 25 * 1024 * 1024;
+/// How long typing rests before asking who it could be.
+const SUGGEST_AFTER: Duration = Duration::from_millis(200);
 
 /// A file in the message: uploaded here, or already in the saved draft.
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -185,6 +187,10 @@ pub struct Compose {
     hold: Latest,
     jobs: Signal<UnboundedSender<Job>>,
     next: Signal<u64>,
+    /// `(name, address)` suggested for what's being typed, and where it goes.
+    people: Signal<Vec<(String, String)>>,
+    naming: Signal<Option<fn(&mut Letter) -> &mut String>>,
+    asked: Latest,
 }
 
 impl Compose {
@@ -205,6 +211,9 @@ impl Compose {
             hold: Latest::new(),
             jobs: signal_with(jobs, SignalEquals::Never),
             next: signal(0),
+            people: signal(Vec::new()),
+            naming: signal(None),
+            asked: Latest::new(),
         };
         (c, waiting)
     }
@@ -632,23 +641,128 @@ fn undo(b: Bridge, c: Compose) {
     c.run(async move { bring_back(&b, c).await });
 }
 
-fn field(
-    c: Compose,
-    name: &'static str,
-    get: fn(&Letter) -> &String,
-    set: fn(&mut Letter, String),
-) -> impl IntoElement {
+/// The address being typed: what's after the last comma.
+fn last_word(list: &str) -> &str {
+    list.rsplit(',').next().unwrap_or_default().trim()
+}
+
+/// `list` with the address being typed replaced by `address`, ready for the next.
+fn completed(list: &str, address: &str) -> String {
+    match list.rsplit_once(',') {
+        Some((before, _)) => format!("{before}, {address}, "),
+        None => format!("{address}, "),
+    }
+}
+
+/// Who the word being typed could be, once typing rests for a moment.
+async fn suggest(b: Bridge, c: Compose, word: String) {
+    let turn = c.asked.ask();
+    sleep(SUGGEST_AFTER).await;
+    if !c.asked.counts(turn) {
+        return;
+    }
+    if word.len() < 2 {
+        c.people.set(Vec::new());
+        return;
+    }
+    let found = b.call("gws_people_suggest", json!({"query": word})).await;
+    if !c.asked.counts(turn) {
+        return;
+    }
+    let text = |p: &Value, k: &str| {
+        p.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let people = found.ok().and_then(|v| v.get("people").cloned());
+    c.people.set(
+        people
+            .as_ref()
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|p| (text(p, "name"), text(p, "address")))
+            .collect(),
+    );
+}
+
+fn line(c: Compose, name: &'static str, at: fn(&mut Letter) -> &mut String) -> Input {
     input()
         .label(name)
-        .value(move || c.letter.with(|l| get(l).clone()))
+        .value(move || {
+            let mut letter = c.letter.get();
+            at(&mut letter).clone()
+        })
         .placeholder(name.to_owned())
         .app_class(Some(format!("{FIELD} {LINE} {INK}").into()))
-        .on_change(move |value: &str| {
-            if c.letter.with_untracked(|l| get(l) != value) {
-                let value = value.to_owned();
-                c.edit(|l| set(l, value));
-            }
-        })
+}
+
+/// Takes in what was typed: `false` when that's what the letter holds already,
+/// as setting a field's value answers with a change of its own.
+fn typed(c: Compose, at: fn(&mut Letter) -> &mut String, value: &str) -> bool {
+    let mut letter = c.letter.get_untracked();
+    if at(&mut letter) == value {
+        return false;
+    }
+    let value = value.to_owned();
+    c.edit(|l| *at(l) = value);
+    true
+}
+
+fn field(c: Compose, name: &'static str, at: fn(&mut Letter) -> &mut String) -> Input {
+    line(c, name, at).on_change(move |value: &str| {
+        typed(c, at, value);
+    })
+}
+
+/// A field that takes people, with suggestions as they're typed.
+fn people_field(
+    b: Bridge,
+    c: Compose,
+    name: &'static str,
+    at: fn(&mut Letter) -> &mut String,
+) -> impl IntoElement {
+    line(c, name, at).on_change(move |value: &str| {
+        if typed(c, at, value) {
+            c.naming.set(Some(at));
+            b.spawn(suggest(b.clone(), c, last_word(value).to_owned()));
+        }
+    })
+}
+
+fn suggestions(c: Compose) -> impl IntoElement {
+    dynamic(move || {
+        c.people
+            .get()
+            .into_iter()
+            .fold(view(), move |column, (name, address)| {
+                let shown = if name.is_empty() || name == address {
+                    address.clone()
+                } else {
+                    format!("{name} <{address}>")
+                };
+                let chosen = address.clone();
+                column.child(
+                    view()
+                        .app_class(Some(format!("px-3 py-1 border-b {LINE} {RAIL}").into()))
+                        .label("Use this address")
+                        .accessibility_value(Some(AccessibilityValue {
+                            text: Some(address.into()),
+                            ..AccessibilityValue::default()
+                        }))
+                        .on_press(move || {
+                            if let Some(at) = c.naming.get_untracked() {
+                                let chosen = chosen.clone();
+                                c.edit(|l| *at(l) = completed(at(l), &chosen));
+                            }
+                            c.asked.ask();
+                            c.people.set(Vec::new());
+                        })
+                        .child(text(shown).app_class(Some(format!("text-[12px] {INK}").into()))),
+                )
+            })
+    })
 }
 
 fn press_text(label: &'static str, shows: &'static str, press: impl Fn() + 'static) -> View {
@@ -696,23 +810,24 @@ fn file_row(b: Bridge, c: Compose, file: File) -> View {
 
 /// The panel, in the reader's place.
 pub fn panel(b: Bridge, c: Compose) -> impl IntoElement {
-    let (sending, attaching, keeping, files, ask) =
-        (b.clone(), b.clone(), b.clone(), b.clone(), b);
+    let (sending, attaching, keeping, files, ask, naming) =
+        (b.clone(), b.clone(), b.clone(), b.clone(), b.clone(), b.clone());
     view()
         .app_class(Some("flex-1".into()))
-        .child(field(c, "To", |l| &l.to, |l, v| l.to = v))
+        .child(people_field(b, c, "To", |l| &mut l.to))
         .child(dynamic(move || {
             if c.extra.get() {
                 view()
-                    .child(field(c, "Cc", |l| &l.cc, |l, v| l.cc = v))
-                    .child(field(c, "Bcc", |l| &l.bcc, |l, v| l.bcc = v))
+                    .child(people_field(naming.clone(), c, "Cc", |l| &mut l.cc))
+                    .child(people_field(naming.clone(), c, "Bcc", |l| &mut l.bcc))
             } else {
                 view()
                     .app_class(Some("flex-row".into()))
                     .child(press_text("Add Cc or Bcc", "Cc, Bcc", move || c.extra.set(true)))
             }
         }))
-        .child(field(c, "Subject", |l| &l.subject, |l, v| l.subject = v))
+        .child(suggestions(c))
+        .child(field(c, "Subject", |l| &mut l.subject))
         .child(
             view().app_class(Some("flex-1".into())).child(
                 input()

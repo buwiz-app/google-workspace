@@ -200,6 +200,10 @@ impl Host for Fake {
                 json!({"to": ["ana@example.com"], "cc": [], "subject": "Re: Lunch", "body": "\n\nOn Monday, Ana wrote:\n> Noon?\n", "thread": args["thread"], "in_reply_to": "<a@x>", "references": "<a@x>"}),
             ),
             "gws_mail_draft_of" => (tool.to_owned(), json!({"draft": "d9"})),
+            "gws_people_suggest" => (
+                tool.to_owned(),
+                json!({"people": [{"name": "Ana Reyes", "address": "ana@example.com"}]}),
+            ),
             "gws_mail_draft_read" => (
                 tool.to_owned(),
                 json!({"draft": args["draft"], "revision": "r9", "message_id": "<m9@x>", "to": "ben@example.com", "cc": "", "bcc": "", "subject": "Saved one", "body": "Half written", "thread": "t1", "attachments": [{"name": "a.pdf", "mime": "application/pdf", "size": 2048, "id": "att-0"}]}),
@@ -1011,4 +1015,22 @@ fn a_row_in_drafts_goes_on_from_the_draft_with_its_files() {
     assert_eq!(last["draft"], "d9");
     assert_eq!(last["keep"][0]["id"], "att-0", "its file goes with it");
     assert_eq!(last["keep"][0]["message"], "r9");
+}
+
+#[test]
+fn a_suggestion_finishes_the_address_being_typed_and_keeps_the_rest() {
+    let (mut app, fake) = start();
+    app.press("label:Write a message").expect("the rail offers it");
+    settle(&mut app);
+    app.type_text("label:To", "ben@example.com, an").expect("To takes text");
+    app.wait_for_within("label:Use this address", WAIT).expect("it suggests");
+    let asked = fake.called("gws_people_suggest");
+    assert_eq!(asked.last().unwrap()["query"], "an", "only the word being typed");
+    app.press("label:Use this address").expect("it presses");
+    settle(&mut app);
+    assert_eq!(
+        app.screen().input_text("label:To").unwrap().unwrap(),
+        "ben@example.com, ana@example.com, "
+    );
+    assert!(!app.screen().matches("label:Use this address").unwrap());
 }

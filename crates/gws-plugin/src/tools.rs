@@ -66,6 +66,7 @@ pub const MAIL_DRAFT_DELETE: &str = "gws_mail_draft_delete";
 pub const MAIL_SEND: &str = "gws_mail_send";
 pub const MAIL_REPLY_START: &str = "gws_mail_reply_start";
 pub const MAIL_JOB: &str = "gws_mail_job";
+pub const PEOPLE_SUGGEST: &str = "gws_people_suggest";
 pub const MAIL_SEND_ARM: &str = "gws_mail_send_arm";
 pub const MAIL_DRAFT_OF: &str = "gws_mail_draft_of";
 pub const UPLOAD_CHUNK: &str = "gws_upload_chunk";
@@ -222,6 +223,14 @@ pub fn defs() -> Vec<Def> {
             name: MAIL_DRAFT_OF,
             description: "The draft in a conversation, if there's one.",
             input_schema: json!({"type": "object", "properties": {"thread": {"type": "string"}}, "required": ["thread"]}),
+            read_only: true,
+            audience: APP_ONLY,
+            open_world: true,
+        },
+        Def {
+            name: PEOPLE_SUGGEST,
+            description: "People to write to whose name or address starts like this.",
+            input_schema: json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}),
             read_only: true,
             audience: APP_ONLY,
             open_world: true,

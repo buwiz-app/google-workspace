@@ -19,6 +19,8 @@ pub struct App {
     pub tools: &'static [&'static str],
     /// Also shows as a card in a chat.
     pub card: bool,
+    /// The person can hand it files.
+    pub files: bool,
     /// Sites it may send the person to, after they agree.
     pub sites: &'static [&'static str],
 }
@@ -49,12 +51,14 @@ pub const APPS: [App; 3] = [
             tools::MAIL_SEND,
             tools::MAIL_REPLY_START,
             tools::MAIL_JOB,
+            tools::PEOPLE_SUGGEST,
             tools::MAIL_SEND_ARM,
             tools::MAIL_DRAFT_OF,
             tools::UPLOAD_CHUNK,
             tools::UPLOAD_DROP,
         ],
         card: true,
+        files: true,
         sites: &["https://console.cloud.google.com"],
     },
     App {
@@ -64,6 +68,7 @@ pub const APPS: [App; 3] = [
         description: "Your Google calendar.",
         tools: &[tools::STATUS],
         card: false,
+        files: false,
         sites: &[],
     },
     App {
@@ -73,6 +78,7 @@ pub const APPS: [App; 3] = [
         description: "Your files in Google Drive.",
         tools: &[tools::STATUS],
         card: false,
+        files: false,
         sites: &[],
     },
 ];
@@ -94,6 +100,10 @@ fn app(a: &App) -> Value {
         entry["placement"] = json!(["full", "inline"]);
         entry["inline"] = json!({ "width": 420, "height": 96, "min_height": 96, "max_height": 320, "resizable": false, "wait_ready": true });
         entry["props"] = json!({ "type": "object", "properties": { "search": { "type": "string", "maxLength": 30 }, "thread": { "type": "string", "maxLength": 30 } } });
+    }
+    if a.files {
+        permissions["pick_file"] =
+            json!({ "max_bytes": crate::compose::ATTACHMENTS_MAX, "multiple": true });
     }
     entry["permissions"] = permissions;
     entry

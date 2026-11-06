@@ -20,7 +20,7 @@ use crate::gmail::{self, Failure};
 use crate::tools::{
     MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_DRAFT_DELETE, MAIL_DRAFT_READ, MAIL_DRAFT_SAVE,
     MAIL_DRAFT_OF, MAIL_JOB, MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK, MAIL_REPLY_START,
-    MAIL_SEND, MAIL_SEND_ARM, UPLOAD_CHUNK, UPLOAD_DROP, MAIL_THREAD,
+    MAIL_SEND, MAIL_SEND_ARM, PEOPLE_SUGGEST, UPLOAD_CHUNK, UPLOAD_DROP, MAIL_THREAD,
     MAIL_TRASH, MAIL_UNDO, SEARCH_MAIL, fail, failed, ok,
 };
 use crate::{Core, compose, js};
@@ -451,7 +451,7 @@ fn with_own_store<T>(
     f(store).map_err(|e| Failure::Plain(e.message))
 }
 
-fn with_store<T>(
+pub(crate) fn with_store<T>(
     core: &Core,
     f: impl FnOnce(&Store) -> gws_store::Result<T>,
 ) -> Result<T, Failure> {
@@ -950,6 +950,7 @@ pub fn run(core: &Core, tool: &str, args: &Value) -> Option<Value> {
         MAIL_REPLY_START => compose::reply_start(core, args),
         MAIL_JOB => compose::job(core, args),
         MAIL_SEND_ARM => compose::arm(core),
+        PEOPLE_SUGGEST => compose::suggest(core, args),
         MAIL_DRAFT_OF => compose::draft_of(core, args),
         UPLOAD_CHUNK => compose::upload_chunk(core, args),
         UPLOAD_DROP => compose::upload_drop(core, args),

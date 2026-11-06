@@ -324,3 +324,38 @@ fn a_save_too_slow_for_its_caller_can_be_asked_after() {
     assert_eq!(job["answer"]["structuredContent"]["draft"], saved["draft"]);
     assert_eq!(data(core.run("gws_mail_job", &json!({"job": "j1"})))["done"], false, "told once");
 }
+
+fn suggested(core: &Core, query: &str) -> Vec<String> {
+    let found = data(core.run("gws_people_suggest", &json!({"query": query})));
+    found["people"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["address"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn suggestions_come_from_mail_and_contacts_and_leave_out_the_person() {
+    let google = FakeGoogle::start(Seed::demo(12));
+    let core = signed_in(&google, "people");
+    core.unlock("a-seed");
+    gws::mail::sync(&core).unwrap();
+    assert_eq!(suggested(&core, "ana"), ["ana@example.com"], "one person, once");
+    assert_eq!(suggested(&core, "zed"), ["zed@contacts.example"]);
+    assert_eq!(suggested(&core, "owner"), Vec::<String>::new());
+    assert_eq!(suggested(&core, "  "), Vec::<String>::new());
+    assert_eq!(google.writes(), [], "suggesting changes nothing");
+}
+
+#[test]
+fn a_sign_in_without_contacts_still_suggests_who_wrote() {
+    let mut seed = Seed::demo(12);
+    seed.only_grants = Some("gmail.modify".to_owned());
+    let google = FakeGoogle::start(seed);
+    let core = signed_in(&google, "no-contacts");
+    core.unlock("a-seed");
+    gws::mail::sync(&core).unwrap();
+    assert_eq!(suggested(&core, "ana"), ["ana@example.com"]);
+    assert_eq!(suggested(&core, "zed"), Vec::<String>::new());
+}

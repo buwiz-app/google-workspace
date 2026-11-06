@@ -636,7 +636,11 @@ fn an_answer_that_cant_be_read_after_the_last_piece_is_still_uploaded() {
     fs::write(&path, b"PK mine").unwrap();
     google.drive_garbles_the_last_answer();
     let answer = data(home.upload("drv-a", "copy"));
-    assert_eq!(answer["uploaded"], true);
+    assert_eq!(
+        answer,
+        json!({"uploaded": true, "mode": "copy"}),
+        "no id to give"
+    );
     assert_eq!(google.drive_file("drv-copy-1").unwrap().content, b"PK mine");
     assert!(!home.folder("drv-a").exists());
     assert_eq!(home.edits(), Vec::<Value>::new());
@@ -1006,11 +1010,20 @@ fn only_its_own_account_can_discard_a_file() {
         .account("buwiz.account.set", &push("second@example.com"));
     assert_eq!(refusal(&discard()), "not_found", "as an upload says");
     assert_eq!(fs::read(&path).unwrap(), b"PK mine");
-    home.sign_out();
-    assert_eq!(discard()["structuredContent"]["code"], "account_required");
-    assert_eq!(fs::read(&path).unwrap(), b"PK mine");
     home.core.account("buwiz.account.set", &push(FAKE_EMAIL));
     data(discard());
+    assert!(!home.folder("drv-a").exists());
+}
+
+#[test]
+fn an_edit_can_be_discarded_with_nobody_signed_in() {
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(a_docx("drv-a"));
+    let home = Home::new(&google.base(), "discardout");
+    let path = home.open("drv-a");
+    fs::write(&path, b"PK mine").unwrap();
+    home.sign_out();
+    data(home.core.run("gws_file_discard", &json!({"id": "drv-a"})));
     assert!(!home.folder("drv-a").exists());
 }
 

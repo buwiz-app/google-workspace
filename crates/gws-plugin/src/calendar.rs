@@ -1085,30 +1085,21 @@ fn field_changes(form: &Form, event: &Value, account: &str) -> Map<String, Value
 const SERIES_UNREADABLE: &str = "That series' times can't be read.";
 const SERIES_SKIPPED: &str = "The clocks skip that time on the series' first day. Choose another.";
 
-/// `time` on the clock of `zone`, or as it's written if no zone is named. The
-/// offset in the text won't do when there is one: Google writes a time in the
-/// calendar's zone, which needn't be the event's.
+/// `time` on the clock of `zone`. The offset in the text won't do: Google
+/// writes a time in the calendar's zone, which needn't be the event's. With no
+/// zone there's no clock to read it on, and an offset alone can't say where a
+/// clock change falls, so a move would land an hour off across one.
 fn wall(time: &str, zone: &str) -> Option<NaiveDateTime> {
     let at = DateTime::parse_from_rfc3339(time).ok()?;
-    if zone.is_empty() {
-        return Some(at.naive_local());
-    }
     Some(at.with_timezone(&zone.parse::<Tz>().ok()?).naive_local())
 }
 
-/// `at` on the clock of `zone`, as a time to send: with no zone, on the offset
-/// of `was`. A time the clocks repeat means the first one, as in the editor.
-fn moment_of(at: NaiveDateTime, zone: &str, was: &str) -> Result<String, &'static str> {
-    let format = SecondsFormat::Secs;
-    let moment = if zone.is_empty() {
-        let was = DateTime::parse_from_rfc3339(was).map_err(|_| SERIES_UNREADABLE)?;
-        let on_clock = was.offset().from_local_datetime(&at).earliest();
-        on_clock.map(|t| t.to_rfc3339_opts(format, false))
-    } else {
-        let zone = zone.parse::<Tz>().map_err(|_| SERIES_UNREADABLE)?;
-        let on_clock = zone.from_local_datetime(&at).earliest();
-        on_clock.map(|t| t.to_rfc3339_opts(format, false))
-    };
+/// `at` on the clock of `zone`, as a time to send. A time the clocks repeat
+/// means the first one, as in the editor.
+fn moment_of(at: NaiveDateTime, zone: &str) -> Result<String, &'static str> {
+    let zone = zone.parse::<Tz>().map_err(|_| SERIES_UNREADABLE)?;
+    let on_clock = zone.from_local_datetime(&at).earliest();
+    let moment = on_clock.map(|t| t.to_rfc3339_opts(SecondsFormat::Secs, false));
     moment.ok_or(SERIES_SKIPPED)
 }
 
@@ -1149,16 +1140,13 @@ fn shifted(
     } else {
         (&form.time_zone, &form.time_zone)
     };
-    let series_at = text(side, "dateTime");
     let by = wall(typed, typed_zone)
         .zip(wall(&text(was, "dateTime"), &was_zone))
         .map(|(to, from)| to - from);
-    let at = wall(&series_at, &series_zone).zip(by);
+    let at = wall(&text(side, "dateTime"), &series_zone).zip(by);
     let at = at.map(|(at, by)| at + by).ok_or(SERIES_UNREADABLE)?;
-    moved["dateTime"] = json!(moment_of(at, zone, &series_at)?);
-    if !zone.is_empty() {
-        moved["timeZone"] = json!(zone);
-    }
+    moved["dateTime"] = json!(moment_of(at, zone)?);
+    moved["timeZone"] = json!(zone);
     Ok(moved)
 }
 
@@ -1897,6 +1885,25 @@ mod tests {
             series_changes(&moved, &instance, &master, ME, NY),
             Err(SERIES_UNREADABLE)
         );
+    }
+
+    /// Its calendar isn't held and it names no zone. New York's clocks change
+    /// between these two: kept on -04:00 it would land an hour off.
+    #[test]
+    fn a_series_with_no_zone_anywhere_is_refused_not_moved_on_an_old_offset() {
+        let side = |t: &str| json!({"dateTime": t});
+        let master = json!({"start": side("2026-10-27T09:00:00-04:00"), "end": side("2026-10-27T10:00:00-04:00")});
+        let instance = json!({"start": side("2026-11-03T09:00:00-05:00"), "end": side("2026-11-03T10:00:00-05:00")});
+        let moved = form("2026-11-03T10:00:00-05:00", "2026-11-03T11:00:00-05:00", "");
+        assert_eq!(
+            series_changes(&moved, &instance, &master, ME, ""),
+            Err(SERIES_UNREADABLE)
+        );
+        // its times are all it can't do
+        let renamed = Form::of(&json!({"title": "Renamed", "start": "2026-11-03T09:00:00-05:00", "end": "2026-11-03T10:00:00-05:00"})).unwrap();
+        let body = series_changes(&renamed, &instance, &master, ME, "").unwrap();
+        assert_eq!(body["summary"], "Renamed");
+        assert!(body.get("start").is_none());
     }
 
     #[test]

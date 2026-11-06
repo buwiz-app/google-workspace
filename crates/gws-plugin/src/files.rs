@@ -1152,15 +1152,19 @@ fn upload(core: &Core, args: &Value) -> Result<Value, Failure> {
     let _ = remove(core, &id);
     // the new revision or copy shows when the changes sync brings it
     core.sync.wake();
-    Ok(ok(
-        json!({"uploaded": true, "mode": mode, "id": done.get("id")}),
-    ))
+    let mut answer = json!({"uploaded": true, "mode": mode});
+    // Drive has it either way: an answer it gave that can't be read has no id to pass on
+    if let Some(id) = done.get("id").and_then(Value::as_str) {
+        answer["id"] = id.into();
+    }
+    Ok(ok(answer))
 }
 
-/// `gws_file_discard`: this Mac's copy goes, and Drive hears nothing of it. Only
-/// the account it belongs to can take it, as only that one can send it.
+/// `gws_file_discard`: this Mac's copy goes, and Drive hears nothing of it. Another
+/// account can't take it. With nobody signed in there's no other account, and an
+/// edit shouldn't have to wait for a sign-in to be thrown away.
 fn discard(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (_, account) = signed_in(core)?;
+    let account = core.accounts.signed_in().map(|(who, _)| who);
     let id = match drive::id_of(args) {
         Ok(id) => id,
         Err(answer) => return Ok(answer),
@@ -1169,7 +1173,7 @@ fn discard(core: &Core, args: &Value) -> Result<Value, Failure> {
         return Ok(busy());
     };
     let held = with_store(core, |store| store.opened(&id))?;
-    if !held.is_some_and(|row| row.account == account) {
+    if !held.is_some_and(|row| account.as_ref().is_none_or(|who| row.account == *who)) {
         return Ok(not_here());
     }
     remove(core, &id)?;

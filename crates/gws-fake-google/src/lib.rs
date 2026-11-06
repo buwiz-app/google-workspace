@@ -1420,9 +1420,12 @@ impl FakeGoogle {
 
     /// Until a held request has come.
     pub fn wait_for_held(&self) {
+        let by = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut state = self.door.state.lock().unwrap();
         while !state.arrived {
-            state = self.door.moved.wait(state).unwrap();
+            let left = by.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "the held request never came");
+            state = self.door.moved.wait_timeout(state, left).unwrap().0;
         }
     }
 

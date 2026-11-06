@@ -400,6 +400,12 @@ fn upload(core: &Core, args: &Value) -> Result<Value, Failure> {
         Sent::Done(v) => Answer::Done(v),
         Sent::Refused(answer) => answer,
     });
+    // Drive has it, whatever its answer says: calling that a failure would have
+    // the next press make a second file. It shows when the changes sync brings it
+    if matches!(&answer, Ok(Answer::Done(v)) if file_of(v).is_none()) {
+        core.sync.wake();
+        return Ok(ok(json!({"files": []})));
+    }
     finish_make(core, &auth, &account, answer)
 }
 

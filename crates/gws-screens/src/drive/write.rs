@@ -103,25 +103,31 @@ fn open_parent(m: Drive) -> String {
 }
 
 /// The answer to a press that changes Drive. Only a good answer touches the
-/// screen. What's said for a refused press stays, for the person to act on.
+/// screen. What's said for a refused press stays, for the person to act on,
+/// while they're still on what they pressed it from: an answer from an opening
+/// that's gone says nothing, as it could be read as about what's up now.
 pub(super) fn answer_write(
     b: &Bridge,
     m: Drive,
     call: impl Future<Output = Result<Value, BuwizError>> + 'static,
     done: impl FnOnce(&Bridge, Drive, &Value) + 'static,
 ) {
+    let opening = m.opening.now();
     m.writing.set(true);
     m.said.set(None);
     let b = b.clone();
     fetch(m, async move {
         let answer = call.await;
         m.writing.set(false);
+        let here = m.opening.counts(opening);
         match &answer {
             Ok(v) => match refused(v) {
-                Some(why) => say(m, &why),
+                Some(why) if here => say(m, &why),
+                Some(_) => {}
                 None => done(&b, m, v),
             },
-            Err(e) => say(m, &failed_line(e)),
+            Err(e) if here => say(m, &failed_line(e)),
+            Err(_) => {}
         }
     });
 }
@@ -236,8 +242,16 @@ fn commit(b: &Bridge, m: Drive) {
             let args = owned(args, &m.chooser.who.get_untracked());
             let call = b.call("gws_drive_folder", args);
             answer_write(b, m, call, move |b, m, v| {
+                // it was made either way, in words that can't be taken for what's up now
+                say(
+                    m,
+                    if m.opening.counts(opening) {
+                        "Made a new folder on Google Drive."
+                    } else {
+                        "Your earlier new folder was made on Google Drive."
+                    },
+                );
                 stop_opening(m, opening);
-                say(m, "Made a new folder on Google Drive.");
                 landed(b, m, v);
             });
         }

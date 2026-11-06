@@ -201,6 +201,7 @@ fn share(b: &Bridge, m: Drive, id: &str) {
             // what's up now isn't what was pressed, even if it's the same file
             Ok(v) if !m.opening.counts(opening) => left_behind(&b, m, &v),
             Ok(v) => shared(&b, m, &id, &v),
+            Err(_) if !m.opening.counts(opening) => {}
             Err(e) => say(m, &failed_line(&e)),
         }
     });

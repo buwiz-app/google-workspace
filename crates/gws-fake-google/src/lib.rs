@@ -729,7 +729,7 @@ impl Account {
 
     fn handle(&mut self, r: Request) -> Reply {
         let path = r.path().to_owned();
-        if path != "/__log" {
+        if path != "/__log" && path != "/__writes" {
             self.log.push(Seen {
                 method: r.method.clone(),
                 target: r.target.clone(),
@@ -744,6 +744,11 @@ impl Account {
                 .map(|s| json!({"method": s.method, "target": s.target, "body": s.body}))
                 .collect();
             return Reply::json(200, json!({"log": log}));
+        }
+        // a live run's way to make writes fail: `?left=<n>`, or no value for none
+        if path == "/__writes" {
+            self.writes_left = r.param("left").and_then(|n| n.parse().ok());
+            return Reply::json(200, json!({"left": self.writes_left}));
         }
         if path == "/o/oauth2/v2/auth" {
             return self.authorize(&r);

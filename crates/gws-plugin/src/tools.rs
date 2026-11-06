@@ -537,10 +537,21 @@ fn resolve_calendar(value: &str, listing: bool) -> Value {
             .collect();
         return ok(json!({"result": "choices", "choices": choices}));
     }
-    let (title, _, view, placement) = CALENDAR_VIEWS
-        .iter()
-        .find(matching)
-        .unwrap_or(&CALENDAR_VIEWS[0]);
+    // said bare, it's the week; once open the view can change, so a full
+    // screen's title is the app's and not the view it started on
+    let (title, _, view, placement) = if value.is_empty() {
+        &CALENDAR_VIEWS[1]
+    } else {
+        CALENDAR_VIEWS
+            .iter()
+            .find(matching)
+            .unwrap_or(&CALENDAR_VIEWS[0])
+    };
+    let title = if *placement == "full" {
+        "Calendar"
+    } else {
+        title
+    };
     ok(
         json!({"result": "open", "app": "calendar", "title": title, "placement": placement, "props": {"view": view}}),
     )
@@ -673,7 +684,9 @@ mod view_tests {
     fn a_calendar_view_said_opens_it_and_reaches_no_model() {
         let open =
             |value: &str| resolved(json!({"kind": "command", "name": "calendar", "value": value}));
-        assert_eq!(open("")["props"]["view"], "day");
+        assert_eq!(open("")["props"]["view"], "week");
+        assert_eq!(open("today")["title"], "Calendar");
+        assert_eq!(open("next")["title"], "Next event");
         assert_eq!(open("today")["props"]["view"], "day");
         assert_eq!(open("week")["props"]["view"], "week");
         assert_eq!(open("new")["props"]["view"], "new");

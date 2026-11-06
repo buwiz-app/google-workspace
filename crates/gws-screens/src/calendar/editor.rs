@@ -15,7 +15,7 @@ use super::{
 use crate::compose::{SUGGEST_AFTER, press_text};
 use crate::shell::{CHOSEN, INK, LINE, Latest, MUTE, PANEL, RAIL, read, sleep};
 
-const FIELD: &str = "flex-1 min-w-[80px] rounded-md border px-2 py-1 text-[13px]";
+const FIELD: &str = "flex-1 min-w-[108px] rounded-md border px-2 py-1 text-[13px]";
 
 /// A field of the form.
 type Place = fn(&mut Form) -> &mut String;

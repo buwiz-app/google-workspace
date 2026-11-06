@@ -294,13 +294,28 @@ fn set_when<Z: TimeZone>(form: &mut Form, when: &When, zone: &Z) {
     }
 }
 
+/// `at` on the clock of `from`, as the clock of `to` reads it.
+fn same_moment<Z: TimeZone>(at: NaiveDateTime, from: &Z, to: Option<Tz>) -> NaiveDateTime {
+    let moment = from.from_local_datetime(&at).earliest();
+    match (moment, to) {
+        (Some(moment), Some(to)) => moment.with_timezone(&to).naive_local(),
+        _ => at,
+    }
+}
+
 fn clock(at: NaiveTime) -> String {
     at.format("%H:%M").to_string()
 }
 
 impl Form {
-    /// A new event in the slot `start` to `end`.
+    /// A new event in the slot `start` to `end`, the person's own clock. The
+    /// fields are read in the calendar's zone, so they show that same moment.
     pub fn new(calendar: Option<&Calendar>, start: NaiveDateTime, end: NaiveDateTime) -> Form {
+        let zone = calendar.and_then(|c| c.time_zone.parse::<Tz>().ok());
+        let (start, end) = (
+            same_moment(start, &Local, zone),
+            same_moment(end, &Local, zone),
+        );
         Form {
             start_date: start.date().to_string(),
             end_date: end.date().to_string(),
@@ -530,6 +545,14 @@ mod tests {
         assert_eq!(manila["start"], "2026-11-06T09:00:00+08:00");
         let new_york = typed_for("America/New_York").save_args().unwrap();
         assert_eq!(new_york["start"], "2026-11-06T09:00:00-05:00");
+    }
+
+    #[test]
+    fn a_slot_keeps_its_moment_on_another_zones_clock() {
+        let at = "2026-11-06T09:00:00".parse().unwrap();
+        let there = same_moment(at, &New_York, Some(Manila));
+        assert_eq!(there.to_string(), "2026-11-06 22:00:00");
+        assert_eq!(same_moment(at, &New_York, None), at, "no zone, no change");
     }
 
     #[test]

@@ -101,7 +101,7 @@ fn column(b: &Bridge, m: Cal, day: NaiveDate, rows: &[Event], calendars: &[Calen
     let lanes = time::lanes(&spans);
     let height = HOUR * 24.0;
     let mut col = view().app_class(Some(
-        format!("relative flex-1 h-[{height}px] border-l overflow-hidden {LINE}").into(),
+        format!("relative flex-1 h-[{height}px] border-l {LINE}").into(),
     ));
     for hour in 1..24 {
         let top = hour as f32 * HOUR;

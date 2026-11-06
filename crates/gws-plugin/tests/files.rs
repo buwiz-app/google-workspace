@@ -636,7 +636,11 @@ fn an_answer_that_cant_be_read_after_the_last_piece_is_still_uploaded() {
     fs::write(&path, b"PK mine").unwrap();
     google.drive_garbles_the_last_answer();
     let answer = data(home.upload("drv-a", "copy"));
-    assert_eq!(answer, json!({"uploaded": true, "mode": "copy"}), "no id to give");
+    assert_eq!(
+        answer,
+        json!({"uploaded": true, "mode": "copy"}),
+        "no id to give"
+    );
     assert_eq!(google.drive_file("drv-copy-1").unwrap().content, b"PK mine");
     assert!(!home.folder("drv-a").exists());
     assert_eq!(home.edits(), Vec::<Value>::new());

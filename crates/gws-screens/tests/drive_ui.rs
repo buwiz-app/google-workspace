@@ -3569,7 +3569,11 @@ fn assert_budget_press_is_its_own(app: &mut Headless, fake: &Fake) {
 #[test]
 fn a_late_failure_for_another_file_says_nothing_on_this_files_panel() {
     let (mut app, fake) = start();
-    press_notes_then_stage_budget(&mut app, &fake, json!({"added": 1, "removed": 0, "files": []}));
+    press_notes_then_stage_budget(
+        &mut app,
+        &fake,
+        json!({"added": 1, "removed": 0, "files": []}),
+    );
     fake.release_failed("write:gws_drive_share", "Notes couldn't be shared.");
     settle(&mut app);
     assert_budget_untouched(&app, &fake);

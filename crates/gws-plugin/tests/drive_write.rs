@@ -665,7 +665,11 @@ fn an_upload_whose_last_answer_cant_be_read_is_no_failure() {
         "gws_drive_upload",
         &json!({"upload": upload, "parent": "drv-clients"}),
     ));
-    assert_eq!(done, json!({"files": []}), "a failure would invite a second one");
+    assert_eq!(
+        done,
+        json!({"files": []}),
+        "a failure would invite a second one"
+    );
 }
 
 #[test]

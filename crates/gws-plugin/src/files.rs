@@ -1173,8 +1173,7 @@ fn discard(core: &Core, args: &Value) -> Result<Value, Failure> {
         return Ok(busy());
     };
     let held = with_store(core, |store| store.opened(&id))?;
-    let allowed = |row: &gws_store::Opened| account.as_ref().is_none_or(|who| row.account == *who);
-    if !held.is_some_and(|row| allowed(&row)) {
+    if !held.is_some_and(|row| account.as_ref().is_none_or(|who| row.account == *who)) {
         return Ok(not_here());
     }
     remove(core, &id)?;

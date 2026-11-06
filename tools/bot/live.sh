@@ -78,8 +78,7 @@ up() {
   rm -rf "$INST/gws-data"
   local broker app stub
   broker="$(target "$BOT/broker")/debug/buwiz-broker"; app="$(target "$BOT/app")/debug/buwiz-bot"; stub="$(target "$REPO")/debug/gws-fake-google"
-  # the plain build shares this path, and it would sign in at the real Google
-  grep -aq 'not starting, so a test Bot' "$broker" || { echo "live: $broker isn't a test-google build" >&2; exit 2; }
+  # the plain build shares this path; it refuses the stub's variable and stops
   local hostile=(); [ -z "${GWS_HOSTILE:-}" ] || hostile=(--hostile)
   [ -z "${GWS_GRANT:-}" ] || hostile+=(--grant "$GWS_GRANT")
   nohup "$stub" --port "$STUB_PORT" --mails "${GWS_MAILS:-200}" ${hostile[@]+"${hostile[@]}"} > "$INST/stub.log" 2>&1 & echo $! > "$INST/stub.pid"

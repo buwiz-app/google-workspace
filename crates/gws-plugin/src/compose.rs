@@ -955,22 +955,44 @@ pub fn suggest(core: &Core, args: &Value) -> Result<Value, Failure> {
     let take = SUGGESTIONS_MAX as i64;
     let mut found =
         crate::mail::with_store(core, |s| s.senders(&me, query, take)).unwrap_or_default();
-    // no contacts is no reason to lose what's here: a sign-in from before this
-    // asked for them, or being offline, answers with the rest
-    if !core.warm.swap(true, Ordering::Relaxed) {
-        let _ = core.gmail.contacts(&auth, "");
+    found.extend(contacts_of(core, &auth, query));
+    Ok(ok(people_json(found, &me)))
+}
+
+/// `gws_cal_people`: suggest's contacts alone. Calendar's approval grants no
+/// read of Gmail, so the senders of stored mail stay out of it.
+pub fn contacts(core: &Core, args: &Value) -> Result<Value, Failure> {
+    let query = js::string_or_empty(args.get("query"));
+    let query = query.trim();
+    let Some((auth, me)) = core.accounts.session() else {
+        return Err(Failure::AccountRequired);
+    };
+    if query.is_empty() {
+        return Ok(ok(json!({"people": []})));
     }
-    found.extend(core.gmail.contacts(&auth, query).unwrap_or_default());
+    Ok(ok(people_json(contacts_of(core, &auth, query), &me)))
+}
+
+/// No contacts is no reason to lose the rest: a sign-in from before this asked
+/// for them, or being offline, answers with nothing here.
+fn contacts_of(core: &Core, auth: &Bearer, query: &str) -> Vec<(String, String)> {
+    if !core.warm.swap(true, Ordering::Relaxed) {
+        let _ = core.gmail.contacts(auth, "");
+    }
+    core.gmail.contacts(auth, query).unwrap_or_default()
+}
+
+fn people_json(found: Vec<(String, String)>, me: &str) -> Value {
     let mut seen = HashSet::new();
     let people: Vec<Value> = found
         .into_iter()
         .filter(|(_, address)| {
-            !address.eq_ignore_ascii_case(&me) && seen.insert(address.to_lowercase())
+            !address.eq_ignore_ascii_case(me) && seen.insert(address.to_lowercase())
         })
         .take(SUGGESTIONS_MAX)
         .map(|(name, address)| json!({"name": name, "address": address}))
         .collect();
-    Ok(ok(json!({"people": people})))
+    json!({"people": people})
 }
 
 /// `gws_mail_send`: the person's press, on the revision they read. A Send whose

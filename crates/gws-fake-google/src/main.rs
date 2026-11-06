@@ -11,7 +11,10 @@ fn main() {
     };
     let port = value("--port").unwrap_or(0) as u16;
     let mails = value("--mails").unwrap_or(120);
-    let mut seed = gws_fake_google::Seed::demo(mails);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    let mut seed = gws_fake_google::Seed::demo(mails).with_calendar_around(now);
     if args.iter().any(|a| a == "--hostile") {
         seed = seed.with_hostile(&format!("http://127.0.0.1:{port}"));
     }

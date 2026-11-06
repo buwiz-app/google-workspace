@@ -17,6 +17,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension as _, params};
 use sha2::{Digest as _, Sha256};
 
+pub mod calendar;
 pub mod mail;
 
 pub const DATA_DIR_ENV: &str = "GWS_DATA_DIR";
@@ -38,6 +39,13 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         3,
         "ALTER TABLE threads ADD COLUMN recipient TEXT NOT NULL DEFAULT '';",
+    ),
+    (
+        4,
+        "CREATE TABLE calendars(account TEXT NOT NULL, id TEXT NOT NULL, name TEXT NOT NULL, is_primary INTEGER NOT NULL, writable INTEGER NOT NULL, shown INTEGER NOT NULL, time_zone TEXT NOT NULL, sync_token TEXT NOT NULL DEFAULT '', PRIMARY KEY(account, id));
+         CREATE TABLE events(account TEXT NOT NULL, calendar TEXT NOT NULL, id TEXT NOT NULL, series TEXT NOT NULL, title TEXT NOT NULL, place TEXT NOT NULL, notes TEXT NOT NULL, start_text TEXT NOT NULL, end_text TEXT NOT NULL, all_day INTEGER NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL, status TEXT NOT NULL, response TEXT NOT NULL, guests INTEGER NOT NULL, meet INTEGER NOT NULL, etag TEXT NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(account, calendar, id));
+         CREATE INDEX events_by_time ON events(account, start_ms);
+         CREATE INDEX events_of_series ON events(account, calendar, series);",
     ),
 ];
 

@@ -1,5 +1,5 @@
-//! A stub Google on 127.0.0.1, for tests and test Bots: sign-in, and Gmail,
-//! with fake people and fake mail. It keeps a log of every request, so a
+//! A stub Google on 127.0.0.1, for tests and test Bots: sign-in, Gmail and
+//! Calendar, with fake people, fake mail and fake events. It keeps a log of every request, so a
 //! test can prove what reached "Google" and, as importantly, what didn't.
 //! Two ways in:
 //!
@@ -7,6 +7,8 @@
 //! - [`serve`]: one route function, for a single odd answer (a 403, a 500).
 //!
 //! Nothing here is ever part of a release.
+
+mod calendar;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -16,9 +18,12 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use serde_json::{Value, json};
 
+pub use calendar::{CalendarWrite, FakeCalendar};
+
 /// The account every fake sign-in is.
 pub const FAKE_EMAIL: &str = "owner@example.com";
 const GMAIL: &str = "/gmail/v1/users/me";
+const CALENDAR: &str = "/calendar/v3/";
 
 /// A request the stub saw.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +55,8 @@ struct Request {
     authorization: String,
     /// The `Content-Type`.
     kind: String,
+    /// The `If-Match`.
+    if_match: String,
     body: Vec<u8>,
 }
 
@@ -107,7 +114,8 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
     reader.read_line(&mut line).ok()?;
     let mut parts = line.split(' ');
     let (method, target) = (parts.next()?.to_owned(), parts.next()?.to_owned());
-    let (mut authorization, mut kind, mut length) = (String::new(), String::new(), 0usize);
+    let (mut authorization, mut kind, mut if_match, mut length) =
+        (String::new(), String::new(), String::new(), 0usize);
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
@@ -118,6 +126,8 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
                 authorization = v.trim().to_owned();
             } else if k.eq_ignore_ascii_case("content-type") {
                 kind = v.trim().to_owned();
+            } else if k.eq_ignore_ascii_case("if-match") {
+                if_match = v.trim().to_owned();
             } else if k.eq_ignore_ascii_case("content-length") {
                 length = v.trim().parse().unwrap_or(0);
             }
@@ -130,6 +140,7 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         target,
         authorization,
         kind,
+        if_match,
         body,
     })
 }
@@ -226,6 +237,7 @@ pub struct Seed {
     /// The scope a sign-in gets whatever it asks for, as for someone who
     /// signed in before an update asked for more.
     pub only_grants: Option<String>,
+    pub calendars: Vec<FakeCalendar>,
 }
 
 const PEOPLE: [(&str, &str); 8] = [
@@ -283,8 +295,16 @@ impl Seed {
             .collect();
         Self {
             mails,
-            only_grants: None,
+            ..Self::default()
         }
+    }
+
+    /// Two calendars with events around `now` (Unix milliseconds), so a live
+    /// run has a week to show: an all-day event, a weekly series, one with
+    /// guests and a Meet link, and an invite awaiting a reply.
+    pub fn with_calendar_around(mut self, now: i64) -> Self {
+        self.calendars = calendar::around(now);
+        self
     }
 }
 
@@ -413,6 +433,7 @@ struct Account {
     granted: String,
     only_grants: Option<String>,
     log: Vec<Seen>,
+    calendars: calendar::Calendars,
 }
 
 /// A message sent through the stub, as it arrived.
@@ -581,6 +602,28 @@ impl Account {
             .map(|(name, address)| json!({"person": {"names": [{"displayName": name}], "emailAddresses": [{"value": address}]}}))
             .collect();
         Reply::json(200, json!({"results": found}))
+    }
+
+    fn calendar(&mut self, r: &Request, rest: &str) -> Reply {
+        if self
+            .only_grants
+            .as_deref()
+            .is_some_and(|g| !g.contains("calendar"))
+        {
+            return Self::insufficient();
+        }
+        if r.method != "GET" {
+            if self.writes_left == Some(0) {
+                return Reply::json(
+                    500,
+                    json!({"error": {"code": 500, "message": "Backend error"}}),
+                );
+            }
+            if let Some(left) = &mut self.writes_left {
+                *left -= 1;
+            }
+        }
+        self.calendars.handle(r, rest)
     }
 
     /// Gmail's upload door: a metadata part and the message itself, handed on
@@ -1115,7 +1158,7 @@ impl Account {
 
     fn handle(&mut self, r: Request) -> Reply {
         let path = r.path().to_owned();
-        if path != "/__log" && path != "/__writes" {
+        if !["/__log", "/__writes", "/__calendar"].contains(&path.as_str()) {
             self.log.push(Seen {
                 method: r.method.clone(),
                 target: r.target.clone(),
@@ -1136,6 +1179,18 @@ impl Account {
             self.writes_left = r.param("left").and_then(|n| n.parse().ok());
             return Reply::json(200, json!({"left": self.writes_left}));
         }
+        // a live run's way to force Calendar's odd answers: `?expire=<calendar>`
+        // gives its next sync a 410, `?calendar=<id>&touch=<event>` a 412 to
+        // whoever read the event before
+        if path == "/__calendar" {
+            if let Some(calendar) = r.param("expire") {
+                self.calendars.expire(&calendar);
+            }
+            if let (Some(calendar), Some(event)) = (r.param("calendar"), r.param("touch")) {
+                self.calendars.edit(&calendar, &event, &json!({}));
+            }
+            return Reply::json(200, json!({}));
+        }
         if path == "/o/oauth2/v2/auth" {
             return self.authorize(&r);
         }
@@ -1150,6 +1205,9 @@ impl Account {
         }
         if let Some(rest) = path.strip_prefix(GMAIL) {
             return self.gmail(&r, rest);
+        }
+        if let Some(rest) = path.strip_prefix(CALENDAR) {
+            return self.calendar(&r, rest);
         }
         if path.starts_with("/people/v1/") {
             return self.people(&r);
@@ -1216,6 +1274,7 @@ impl FakeGoogle {
             history: 1000,
             oldest_history: 0,
             only_grants: seed.only_grants,
+            calendars: calendar::Calendars::new(seed.calendars),
             ..Account::default()
         }));
         let (shared, door) = (account.clone(), Arc::new(Door::default()));
@@ -1319,6 +1378,52 @@ impl FakeGoogle {
         let history = a.history;
         a.changes.push((history, json!({"id": history.to_string(), "messagesAdded": [{"message": {"id": id, "threadId": thread, "labelIds": labels}}]})));
         a.mails.insert(0, mail);
+    }
+
+    /// Every Calendar write the stub accepted, oldest first.
+    pub fn calendar_writes(&self) -> Vec<CalendarWrite> {
+        self.account.lock().unwrap().calendars.writes.clone()
+    }
+
+    /// Another calendar on the account.
+    pub fn add_calendar(&self, calendar: FakeCalendar) {
+        self.account
+            .lock()
+            .unwrap()
+            .calendars
+            .add_calendar(calendar);
+    }
+
+    /// An event someone else made. It says nothing to `calendar_writes`.
+    pub fn add_event(&self, calendar: &str, event: Value) {
+        let mut a = self.account.lock().unwrap();
+        a.calendars.add_event(calendar, event);
+    }
+
+    /// Someone else changes an event, which gives it a new ETag.
+    pub fn edit_event(&self, calendar: &str, id: &str, change: &Value) {
+        let mut a = self.account.lock().unwrap();
+        assert!(a.calendars.edit(calendar, id, change), "no event {id}");
+    }
+
+    /// An event or instance as Google now holds it.
+    pub fn event(&self, calendar: &str, id: &str) -> Option<Value> {
+        self.account.lock().unwrap().calendars.read(calendar, id)
+    }
+
+    /// Every sync token of `calendar` goes bad: its next sync gets a 410.
+    pub fn expire_sync(&self, calendar: &str) {
+        self.account.lock().unwrap().calendars.expire(calendar);
+    }
+
+    /// Whether a read of a whole calendar fails. One by sync token still works.
+    pub fn whole_reads_fail(&self, fail: bool) {
+        self.account.lock().unwrap().calendars.whole_reads_fail = fail;
+    }
+
+    /// Lists answer `n` to a page, whatever was asked for.
+    pub fn calendar_page(&self, n: usize) {
+        self.account.lock().unwrap().calendars.page = Some(n);
     }
 
     /// Forgets history before now, as Google does after a while.

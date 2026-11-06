@@ -68,10 +68,26 @@ pub const APPS: [App; 3] = [
         title: "Calendar",
         screen: "gws.calendar",
         description: "Your Google calendar.",
-        tools: &[tools::STATUS],
-        card: false,
+        tools: &[
+            tools::STATUS,
+            tools::CAL_LIST,
+            tools::CAL_SHOW,
+            tools::CAL_RANGE,
+            tools::CAL_CHANGES,
+            tools::CAL_NEXT,
+            tools::CAL_PEOPLE,
+            tools::EVENT_READ,
+            tools::SEARCH_EVENTS,
+            tools::EVENT_SAVE,
+            tools::EVENT_DELETE,
+            tools::EVENT_RESTORE,
+            tools::EVENT_RSVP,
+            tools::EVENT_DRAFT,
+            tools::EVENT_DRAFT_READ,
+        ],
+        card: true,
         files: false,
-        sites: &[],
+        sites: &["https://meet.google.com"],
     },
     App {
         id: "drive",
@@ -101,7 +117,7 @@ fn app(a: &App) -> Value {
     if a.card {
         entry["placement"] = json!(["full", "inline"]);
         entry["inline"] = json!({ "width": 420, "height": 96, "min_height": 96, "max_height": 480, "resizable": false, "wait_ready": true });
-        entry["props"] = json!({ "type": "object", "properties": { "search": { "type": "string", "maxLength": 30 }, "thread": { "type": "string", "maxLength": 30 }, "draft": { "type": "string", "maxLength": 30 }, "view": { "type": "string", "maxLength": 30 } } });
+        entry["props"] = json!({ "type": "object", "properties": { "search": { "type": "string", "maxLength": 30 }, "thread": { "type": "string", "maxLength": 30 }, "draft": { "type": "string", "maxLength": 30 }, "view": { "type": "string", "maxLength": 30 }, "event": { "type": "object", "properties": { "calendar": { "type": "string", "maxLength": 512 }, "id": { "type": "string", "maxLength": 512 } } } } });
     }
     if a.files {
         permissions["pick_file"] =
@@ -125,11 +141,13 @@ pub fn unsigned(key_id: &str) -> Value {
             { "name": "gws", "description": "Open Mail, Calendar or Drive", "args": "[mail, calendar or drive]", "resolve": tools::RESOLVE },
             { "name": "mail", "description": "Open Mail", "args": "[inbox, unread, drafts, sent, important or starred]", "resolve": tools::RESOLVE },
             { "name": "gws-draft", "description": "Start an email for the assistant to draft", "resolve": tools::RESOLVE },
-            { "name": "calendar", "description": "Open Calendar", "resolve": tools::RESOLVE },
+            { "name": "calendar", "description": "Open Calendar", "args": "[today, week, next or new]", "resolve": tools::RESOLVE },
+            { "name": "gws-next", "description": "Show your next event", "resolve": tools::RESOLVE },
             { "name": "drive", "description": "Open Drive", "resolve": tools::RESOLVE }
         ],
         "scopes": [
-            { "name": "mail", "description": "Mailbox view", "resolve": tools::RESOLVE }
+            { "name": "mail", "description": "Mailbox view", "resolve": tools::RESOLVE },
+            { "name": "calendar", "description": "Calendar view", "resolve": tools::RESOLVE }
         ],
         "apps": APPS.iter().map(app).collect::<Vec<_>>(),
     })
@@ -156,6 +174,28 @@ mod tests {
     }
 
     #[test]
+    fn calendar_lists_every_tool_its_screen_calls() {
+        let calendar = APPS
+            .iter()
+            .find(|a| a.tools.contains(&tools::CAL_LIST))
+            .unwrap();
+        let screens = [
+            include_str!("../../gws-screens/src/calendar.rs"),
+            include_str!("../../gws-screens/src/calendar/cards.rs"),
+            include_str!("../../gws-screens/src/calendar/detail.rs"),
+            include_str!("../../gws-screens/src/calendar/editor.rs"),
+            include_str!("../../gws-screens/src/calendar/event.rs"),
+            include_str!("../../gws-screens/src/calendar/grid.rs"),
+        ];
+        for def in tools::defs() {
+            let named = format!("\"{}\"", def.name);
+            if screens.iter().any(|s| s.contains(&named)) {
+                assert!(calendar.tools.contains(&def.name), "{}", def.name);
+            }
+        }
+    }
+
+    #[test]
     fn the_manifest_names_only_real_tools_and_every_tool_has_an_audience() {
         let m = unsigned(RELEASE_KEY_ID);
         assert_eq!(
@@ -173,6 +213,17 @@ mod tests {
                 "{}",
                 d.name
             );
+        }
+        // what writes to a calendar is the person's, and says it writes
+        for name in [
+            tools::EVENT_SAVE,
+            tools::EVENT_DELETE,
+            tools::EVENT_RESTORE,
+            tools::EVENT_RSVP,
+        ] {
+            let def = tools::defs().into_iter().find(|d| d.name == name).unwrap();
+            assert_eq!(def.audience, tools::APP_ONLY, "{name}");
+            assert!(!def.read_only, "{name}");
         }
     }
 
@@ -207,8 +258,42 @@ mod tests {
                 .unwrap()
                 .contains(&json!("gws_read_mail"))
         );
-        assert_eq!(tools_of("calendar"), json!(["gws_status"]));
+        let calendar = tools_of("calendar");
+        let calendar = calendar.as_array().unwrap();
+        assert!(calendar.contains(&json!("gws_event_save")));
+        assert!(
+            !calendar
+                .iter()
+                .any(|t| t.as_str().unwrap().contains("mail") || t == "gws_people_suggest"),
+            "approving Calendar grants no read of Gmail: {calendar:?}"
+        );
         assert_eq!(tools_of("drive"), json!(["gws_status"]));
+    }
+
+    #[test]
+    fn calendar_is_a_card_as_well_as_a_screen_and_has_every_calendar_tool() {
+        let m = unsigned(RELEASE_KEY_ID);
+        let app = m["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "calendar")
+            .unwrap();
+        assert_eq!(app["placement"], json!(["full", "inline"]));
+        assert_eq!(app["permissions"]["open"]["apps"], json!(["calendar"]));
+        for d in tools::defs() {
+            if ["gws_cal_", "gws_event_"]
+                .iter()
+                .any(|p| d.name.starts_with(p))
+            {
+                let held = app["permissions"]["tools"].as_array().unwrap();
+                assert!(held.contains(&json!(d.name)), "{}", d.name);
+            }
+        }
+        let scopes = m["scopes"].as_array().unwrap();
+        assert!(scopes.iter().any(|s| s["name"] == "calendar"));
+        let commands = m["commands"].as_array().unwrap();
+        assert!(commands.iter().any(|c| c["name"] == "gws-next"));
     }
 
     #[test]

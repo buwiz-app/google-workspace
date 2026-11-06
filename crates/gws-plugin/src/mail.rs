@@ -45,7 +45,7 @@ const SEQ: &str = "mail_seq";
 const HISTORY: &str = "mail_history";
 const STATUS: &str = "mail_status";
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
@@ -57,6 +57,8 @@ pub enum Subject {
     Search(String),
     Thread(String),
     Draft(String),
+    /// An event draft's fields, as JSON: it's nowhere else until it's saved.
+    EventDraft(String),
 }
 
 /// How many rows a card shows.
@@ -449,7 +451,7 @@ fn finish_wipes(core: &Core) {
 /// [`with_store`] for a write, which only goes in while `account` is signed
 /// in. Checked under the store's lock, which a sign-out's clear takes too, so
 /// a sync still in flight can't put back what was cleared.
-fn with_own_store<T>(
+pub(crate) fn with_own_store<T>(
     core: &Core,
     account: &str,
     f: impl FnOnce(&Store) -> gws_store::Result<T>,
@@ -475,7 +477,7 @@ pub(crate) fn with_store<T>(
     f(store).map_err(|e| Failure::Plain(e.message))
 }
 
-fn signed_in(core: &Core) -> Result<(Bearer, String), Failure> {
+pub(crate) fn signed_in(core: &Core) -> Result<(Bearer, String), Failure> {
     core.accounts.session().ok_or(Failure::AccountRequired)
 }
 
@@ -672,6 +674,8 @@ pub fn sync(core: &Core) -> Result<(), Failure> {
     if matches!(result, Ok(true)) {
         bump(core, &account)?;
     }
+    // the same check covers events; how that goes is Calendar's to report
+    let _ = crate::calendar::sync(core, &auth, &account);
     result.map(drop)
 }
 

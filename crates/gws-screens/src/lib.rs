@@ -2,6 +2,7 @@
 //! and Drive, each a full screen of its own. The manifest names them; the
 //! plugin serves the tools they call.
 
+pub mod calendar;
 mod compose;
 mod mail;
 pub mod reader;
@@ -35,7 +36,7 @@ fn mail(bridge: Bridge) -> Root {
 }
 
 fn calendar(bridge: Bridge) -> Root {
-    shell::build(bridge, "Calendar")
+    calendar::build(bridge)
 }
 
 fn drive(bridge: Bridge) -> Root {

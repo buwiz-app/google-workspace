@@ -489,6 +489,7 @@ mod mail {
             text: "hello".into(),
             html: None,
             attachments: Vec::new(),
+            message_id: String::new(),
         }
     }
 

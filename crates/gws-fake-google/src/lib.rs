@@ -210,6 +210,8 @@ pub struct Mail {
     pub html: Option<String>,
     /// `(file name, mime, bytes)`.
     pub attachments: Vec<(String, String, Vec<u8>)>,
+    /// Its `Message-ID`, for a search by it.
+    pub message_id: String,
 }
 
 /// What a fake account starts with.
@@ -270,6 +272,7 @@ impl Seed {
                     text: format!("Hello,\n\nThis is fake mail number {i} from {name}.\n\nThanks"),
                     html: (i % 2 == 0).then(|| format!("<html><body><p>Hello,</p><p>This is <b>fake</b> mail number {i} from {name}.</p></body></html>")),
                     attachments: Vec::new(),
+                    message_id: String::new(),
                 }
             })
             .collect();
@@ -309,6 +312,7 @@ impl Seed {
                 text: "plain".into(),
                 html: Some(HOSTILE_HTML.replace("{stub}", stub)),
                 attachments: Vec::new(),
+                message_id: String::new(),
             },
         );
         self
@@ -386,6 +390,10 @@ struct Account {
     writes_left: Option<usize>,
     wrote: bool,
     reads_fail_after_write: bool,
+    /// `(draft id, message id, raw message, thread)`.
+    drafts: Vec<(String, String, String, Option<String>)>,
+    next_draft: u64,
+    sent: Vec<Sent>,
     history: i64,
     /// `(history id, change)`, oldest first.
     changes: Vec<(i64, Value)>,
@@ -397,7 +405,82 @@ struct Account {
     log: Vec<Seen>,
 }
 
+/// A message sent through the stub, as it arrived.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Sent {
+    pub to: String,
+    pub cc: String,
+    pub bcc: String,
+    pub subject: String,
+    pub body: String,
+    pub message_id: String,
+    pub in_reply_to: String,
+}
+
+impl Sent {
+    fn of(raw: &str) -> Sent {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(raw)
+            .unwrap_or_default();
+        let message = String::from_utf8_lossy(&bytes).into_owned();
+        let (head, body) = message.split_once("\r\n\r\n").unwrap_or((&message, ""));
+        let field = |name: &str| {
+            head.lines()
+                .find_map(|l| l.strip_prefix(&format!("{name}: ")))
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let plain = |value: String| match value
+            .strip_prefix("=?UTF-8?B?")
+            .and_then(|v| v.strip_suffix("?="))
+        {
+            Some(encoded) => base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or(value),
+            None => value,
+        };
+        let text = base64::engine::general_purpose::STANDARD
+            .decode(body.replace("\r\n", ""))
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default();
+        Sent {
+            to: field("To"),
+            cc: field("Cc"),
+            bcc: field("Bcc"),
+            subject: plain(field("Subject")),
+            body: text,
+            message_id: field("Message-ID"),
+            in_reply_to: field("In-Reply-To"),
+        }
+    }
+
+    fn resource(&self, id: &str, thread: Option<&str>) -> Value {
+        let header = |name: &str, value: &str| json!({"name": name, "value": value});
+        json!({"id": id, "threadId": thread, "payload": {"mimeType": "text/plain", "headers": [
+            header("To", &self.to), header("Cc", &self.cc), header("Bcc", &self.bcc),
+            header("Subject", &self.subject), header("Message-ID", &self.message_id),
+        ], "body": {"data": b64(self.body.as_bytes())}}})
+    }
+}
+
 impl Account {
+    fn lacks_modify(&self) -> bool {
+        self.only_grants
+            .as_deref()
+            .is_some_and(|g| !g.contains("gmail.modify"))
+    }
+
+    fn insufficient() -> Reply {
+        Reply::json(
+            403,
+            json!({"error": {"code": 403, "message": "Request had insufficient authentication scopes."}}),
+        )
+    }
+
     fn resource(&self, m: &Mail, format: &str, wanted: &[String]) -> Value {
         let mut v = json!({"id": m.id, "threadId": m.thread, "labelIds": m.labels, "snippet": snippet(m), "historyId": self.history.to_string(), "internalDate": m.at.to_string(), "sizeEstimate": m.text.len()});
         match format {
@@ -445,6 +528,9 @@ impl Account {
                     "starred" => m.labels.iter().any(|l| l == "STARRED"),
                     _ => true,
                 };
+            }
+            if let Some(id) = term.strip_prefix("rfc822msgid:") {
+                return m.message_id.eq_ignore_ascii_case(id);
             }
             if term.contains(':') {
                 return true;
@@ -595,6 +681,90 @@ impl Account {
                     200,
                     json!({"id": id, "historyId": self.history.to_string(), "messages": messages}),
                 )
+            }
+            ("POST", ["drafts"]) | ("PUT", ["drafts", _]) => {
+                if self.lacks_modify() {
+                    return Self::insufficient();
+                }
+                let body: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+                let raw = body
+                    .pointer("/message/raw")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let thread = body
+                    .pointer("/message/threadId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                self.next_draft += 1;
+                let message = format!("m{}", self.next_draft);
+                let id = match segs.as_slice() {
+                    [_, id] => {
+                        let Some(held) = self.drafts.iter_mut().find(|d| d.0 == *id) else {
+                            return not_found();
+                        };
+                        held.1 = message.clone();
+                        held.2 = raw;
+                        held.3 = thread;
+                        (*id).to_owned()
+                    }
+                    _ => {
+                        let id = format!("d{}", self.next_draft);
+                        self.drafts.push((id.clone(), message.clone(), raw, thread));
+                        id
+                    }
+                };
+                Reply::json(200, json!({"id": id, "message": {"id": message}}))
+            }
+            ("GET", ["drafts", id]) => match self.drafts.iter().find(|d| d.0 == *id) {
+                Some((id, message, raw, thread)) => {
+                    let sent = Sent::of(raw);
+                    Reply::json(
+                        200,
+                        json!({"id": id, "message": sent.resource(message, thread.as_deref())}),
+                    )
+                }
+                None => not_found(),
+            },
+            ("DELETE", ["drafts", id]) => {
+                let before = self.drafts.len();
+                self.drafts.retain(|d| d.0 != *id);
+                if self.drafts.len() == before {
+                    return not_found();
+                }
+                Reply(204, "text/plain", Vec::new(), Vec::new())
+            }
+            ("POST", ["drafts", "send"]) => {
+                if self.lacks_modify() {
+                    return Self::insufficient();
+                }
+                let body: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+                let id = body["id"].as_str().unwrap_or_default();
+                let Some(at) = self.drafts.iter().position(|d| d.0 == id) else {
+                    return not_found();
+                };
+                let (_, message, raw, thread) = self.drafts.remove(at);
+                let sent = Sent::of(&raw);
+                self.history += 1;
+                let thread = thread.unwrap_or_else(|| message.clone());
+                self.mails.insert(
+                    0,
+                    Mail {
+                        id: message.clone(),
+                        thread: thread.clone(),
+                        labels: vec!["SENT".to_owned()],
+                        from: FAKE_EMAIL.to_owned(),
+                        to: sent.to.clone(),
+                        subject: sent.subject.clone(),
+                        at: 1_793_955_600_000,
+                        text: sent.body.clone(),
+                        html: None,
+                        attachments: Vec::new(),
+                        message_id: sent.message_id.clone(),
+                    },
+                );
+                self.sent.push(sent);
+                Reply::json(200, json!({"id": message, "threadId": thread}))
             }
             ("POST", ["threads", id, action]) | ("POST", ["messages", id, action]) => {
                 if self.writes_left == Some(0) {
@@ -812,6 +982,11 @@ impl FakeGoogle {
             .into_iter()
             .filter(|s| s.method != "GET" && !s.target.starts_with("/token"))
             .collect()
+    }
+
+    /// What was sent, oldest first.
+    pub fn sent(&self) -> Vec<Sent> {
+        self.account.lock().unwrap().sent.clone()
     }
 
     /// Each mail's labels, sorted: what a test compares across an undo.

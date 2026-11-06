@@ -137,6 +137,8 @@ impl Gmail {
                 ))
             })?;
         match status {
+            // a delete answers with nothing
+            200 | 204 if body.is_empty() => Ok(Some(Value::Null)),
             200 => serde_json::from_slice(&body)
                 .map(Some)
                 .map_err(|_| Failure::Plain("Gmail's answer is not JSON".to_owned())),
@@ -367,6 +369,58 @@ impl Gmail {
                 })
                 .collect(),
         ))
+    }
+
+    fn draft_body(raw: &str, thread: Option<&str>) -> Value {
+        let mut message = serde_json::json!({"raw": raw});
+        if let Some(thread) = thread {
+            message["threadId"] = thread.into();
+        }
+        serde_json::json!({"message": message})
+    }
+
+    pub fn draft_create(
+        &self,
+        auth: &Bearer,
+        raw: &str,
+        thread: Option<&str>,
+    ) -> Result<Option<Value>, Failure> {
+        self.post(auth, "drafts".to_owned(), &Self::draft_body(raw, thread))
+    }
+
+    pub fn draft_update(
+        &self,
+        auth: &Bearer,
+        id: &str,
+        raw: &str,
+        thread: Option<&str>,
+    ) -> Result<Option<Value>, Failure> {
+        let req = self
+            .agent
+            .put(format!("{}/drafts/{id}", self.base))
+            .header("authorization", auth.header())
+            .header("accept", "application/json")
+            .header("content-type", "application/json");
+        let body = Self::draft_body(raw, thread).to_string();
+        Self::answer(req.send(body.as_bytes()), FULL_MAX)
+    }
+
+    pub fn draft(&self, auth: &Bearer, id: &str) -> Result<Option<Value>, Failure> {
+        let query = vec![("format", "full".to_owned())];
+        self.get(auth, format!("drafts/{id}"), query, FULL_MAX)
+    }
+
+    pub fn draft_delete(&self, auth: &Bearer, id: &str) -> Result<(), Failure> {
+        let req = self
+            .agent
+            .delete(format!("{}/drafts/{id}", self.base))
+            .header("authorization", auth.header());
+        Self::answer(req.call(), FULL_MAX).map(drop)
+    }
+
+    pub fn draft_send(&self, auth: &Bearer, id: &str) -> Result<(), Failure> {
+        let body = serde_json::json!({"id": id});
+        self.post(auth, "drafts/send".to_owned(), &body).map(drop)
     }
 
     pub fn modify_thread(

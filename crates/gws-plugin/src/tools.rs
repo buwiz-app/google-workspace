@@ -60,6 +60,11 @@ pub const MAIL_LABEL: &str = "gws_mail_label";
 pub const MAIL_ARCHIVE: &str = "gws_mail_archive";
 pub const MAIL_TRASH: &str = "gws_mail_trash";
 pub const MAIL_UNDO: &str = "gws_mail_undo";
+pub const MAIL_DRAFT_SAVE: &str = "gws_mail_draft_save";
+pub const MAIL_DRAFT_READ: &str = "gws_mail_draft_read";
+pub const MAIL_DRAFT_DELETE: &str = "gws_mail_draft_delete";
+pub const MAIL_SEND: &str = "gws_mail_send";
+pub const MAIL_REPLY_START: &str = "gws_mail_reply_start";
 
 /// A write: the person's, on a screen, and never the model's.
 fn write(name: &'static str, description: &'static str, input_schema: Value) -> Def {
@@ -168,6 +173,40 @@ pub fn defs() -> Vec<Def> {
             MAIL_UNDO,
             "Put back exactly what one of these actions changed.",
             json!({"type": "object", "properties": {"undo": {"type": "string"}}, "required": ["undo"]}),
+        ),
+        Def {
+            name: MAIL_DRAFT_SAVE,
+            description: "Write a draft, or replace one. It sends nothing: the person reads it and presses Send.",
+            input_schema: json!({"type": "object", "properties": {"draft": {"type": "string"}, "to": {"type": "array", "items": {"type": "string"}}, "cc": {"type": "array", "items": {"type": "string"}}, "bcc": {"type": "array", "items": {"type": "string"}}, "subject": {"type": "string"}, "body": {"type": "string"}, "thread": {"type": "string"}, "in_reply_to": {"type": "string"}, "references": {"type": "string"}, "message_id": {"type": "string"}}}),
+            read_only: false,
+            audience: AGENT_AND_APP,
+            open_world: true,
+        },
+        Def {
+            name: MAIL_DRAFT_READ,
+            description: "A draft as it stands, with the revision Send needs.",
+            input_schema: json!({"type": "object", "properties": {"draft": {"type": "string"}}, "required": ["draft"]}),
+            read_only: true,
+            audience: APP_ONLY,
+            open_world: true,
+        },
+        Def {
+            name: MAIL_REPLY_START,
+            description: "A reply, reply-all or forward, filled in from a conversation.",
+            input_schema: json!({"type": "object", "properties": {"thread": {"type": "string"}, "mode": {"type": "string", "enum": ["reply", "all", "forward"]}}, "required": ["thread"]}),
+            read_only: true,
+            audience: APP_ONLY,
+            open_world: true,
+        },
+        write(
+            MAIL_DRAFT_DELETE,
+            "Delete a draft for good. A person's alone.",
+            json!({"type": "object", "properties": {"draft": {"type": "string"}}, "required": ["draft"]}),
+        ),
+        write(
+            MAIL_SEND,
+            "Send the draft the person read. A person's alone.",
+            json!({"type": "object", "properties": {"draft": {"type": "string"}, "revision": {"type": "string"}, "message_id": {"type": "string"}}, "required": ["draft", "revision"]}),
         ),
         Def {
             name: RESOLVE,

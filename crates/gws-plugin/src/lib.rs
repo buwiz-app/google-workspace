@@ -11,6 +11,7 @@
 pub mod accounts;
 pub mod apis;
 pub mod clean;
+pub mod compose;
 pub mod gmail;
 pub mod js;
 pub mod mail;

@@ -18,10 +18,11 @@ use crate::accounts::Bearer;
 use crate::clean;
 use crate::gmail::{self, Failure};
 use crate::tools::{
-    MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK,
-    MAIL_THREAD, MAIL_TRASH, MAIL_UNDO, SEARCH_MAIL, fail, failed, ok,
+    MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_DRAFT_DELETE, MAIL_DRAFT_READ, MAIL_DRAFT_SAVE,
+    MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK, MAIL_REPLY_START, MAIL_SEND, MAIL_THREAD,
+    MAIL_TRASH, MAIL_UNDO, SEARCH_MAIL, fail, failed, ok,
 };
-use crate::{Core, js};
+use crate::{Core, compose, js};
 
 /// Rows a list page holds.
 pub const PAGE: i64 = 50;
@@ -941,6 +942,11 @@ pub fn run(core: &Core, tool: &str, args: &Value) -> Option<Value> {
         MAIL_CARD => card(core, args),
         MAIL_MARK | MAIL_LABEL | MAIL_ARCHIVE | MAIL_TRASH => act(core, tool, args),
         MAIL_UNDO => undo(core, args),
+        MAIL_DRAFT_SAVE => compose::save(core, args),
+        MAIL_DRAFT_READ => compose::read(core, args),
+        MAIL_DRAFT_DELETE => compose::delete(core, args),
+        MAIL_SEND => compose::send(core, args),
+        MAIL_REPLY_START => compose::reply_start(core, args),
         _ => return None,
     };
     core.sync.seen();

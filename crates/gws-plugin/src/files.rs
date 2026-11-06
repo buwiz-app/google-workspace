@@ -25,7 +25,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::{Read as _, SeekFrom, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};

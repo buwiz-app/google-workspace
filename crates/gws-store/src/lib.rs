@@ -120,6 +120,12 @@ impl Paths {
         self.dir.join(format!("workspace-{}.db", install_id(key)))
     }
 
+    /// There when a signed-out account's mail couldn't be cleared yet. It says
+    /// no more than that, so it can be written when the store can't.
+    pub fn wipe_pending(&self) -> PathBuf {
+        self.dir.join("wipe-pending")
+    }
+
     /// Where this install keeps open Drive files and attachments. Their edits
     /// can't be fetched again, so only an uninstall ever removes them.
     pub fn open_dir(&self, key: &str) -> PathBuf {

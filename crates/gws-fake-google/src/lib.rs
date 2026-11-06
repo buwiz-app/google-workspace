@@ -586,6 +586,60 @@ impl Account {
                     json!({"id": id, "historyId": self.history.to_string(), "messages": messages}),
                 )
             }
+            ("POST", ["threads", id, action]) | ("POST", ["messages", id, action]) => {
+                if self
+                    .only_grants
+                    .as_deref()
+                    .is_some_and(|g| !g.contains("gmail.modify"))
+                {
+                    return Reply::json(
+                        403,
+                        json!({"error": {"code": 403, "message": "Request had insufficient authentication scopes."}}),
+                    );
+                }
+                let by_thread = segs[0] == "threads";
+                let body: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+                let list = |k: &str| -> Vec<String> {
+                    body[k]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|l| l.as_str().map(str::to_owned))
+                        .collect()
+                };
+                let (mut add, mut remove) = (list("addLabelIds"), list("removeLabelIds"));
+                match *action {
+                    "modify" => {}
+                    "trash" => {
+                        add.push("TRASH".to_owned());
+                        remove.push("INBOX".to_owned());
+                    }
+                    "untrash" => remove.push("TRASH".to_owned()),
+                    _ => return not_found(),
+                }
+                let mut touched = Vec::new();
+                for m in &mut self.mails {
+                    if (by_thread && m.thread == *id) || (!by_thread && m.id == *id) {
+                        m.labels.retain(|l| !remove.contains(l));
+                        for l in &add {
+                            if !m.labels.contains(l) {
+                                m.labels.push(l.clone());
+                            }
+                        }
+                        touched.push(json!({"message": {"id": m.id, "threadId": m.thread}}));
+                    }
+                }
+                if touched.is_empty() {
+                    return not_found();
+                }
+                self.history += 1;
+                let history = self.history;
+                self.changes.push((
+                    history,
+                    json!({"id": history.to_string(), "labelsAdded": touched}),
+                ));
+                Reply::json(200, json!({"id": id}))
+            }
             ("GET", ["history"]) => {
                 let since: i64 = r
                     .param("startHistoryId")
@@ -733,6 +787,26 @@ impl FakeGoogle {
             .into_iter()
             .filter(|s| s.method != "GET" && !s.target.starts_with("/token"))
             .collect()
+    }
+
+    /// Each mail's labels, sorted: what a test compares across an undo.
+    pub fn mailbox_labels(&self) -> Value {
+        let a = self.account.lock().unwrap();
+        let mails: Vec<Value> = a
+            .mails
+            .iter()
+            .map(|m| {
+                let mut labels = m.labels.clone();
+                labels.sort();
+                json!({"id": m.id, "labels": labels})
+            })
+            .collect();
+        json!(mails)
+    }
+
+    /// From now on a token covers `scope` alone, and writes need more.
+    pub fn only_grants(&self, scope: &str) {
+        self.account.lock().unwrap().only_grants = Some(scope.to_owned());
     }
 
     /// A new mail arrives, as Gmail's history shows it.

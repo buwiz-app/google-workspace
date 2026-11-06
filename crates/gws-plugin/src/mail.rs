@@ -3,11 +3,13 @@
 //! shows as old mail, not as a blank window. Google is asked only by the sync,
 //! by a search, and for a thread not yet opened.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use chrono::{Local, TimeZone as _, Utc};
 use gws_store::Store;
 use gws_store::mail::{Label, Thread};
 use serde_json::{Value, json};
@@ -16,7 +18,8 @@ use crate::accounts::Bearer;
 use crate::clean;
 use crate::gmail::{self, Failure};
 use crate::tools::{
-    MAIL_CARD, MAIL_CHANGES, MAIL_LABELS, MAIL_LIST, MAIL_THREAD, SEARCH_MAIL, fail, failed, ok,
+    MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK,
+    MAIL_THREAD, MAIL_TRASH, MAIL_UNDO, SEARCH_MAIL, fail, failed, ok,
 };
 use crate::{Core, js};
 
@@ -24,10 +27,12 @@ use crate::{Core, js};
 pub const PAGE: i64 = 50;
 /// What a thread's view may come to: a result stops at 1 MiB.
 const VIEW_MAX: usize = 900 * 1024;
+/// The most conversations one action takes.
+const ACT_MAX: usize = 100;
+/// How many actions can still be undone.
+const UNDOS_MAX: usize = 20;
 /// A generation of [`Tickets`].
 const TICKETS_MAX: usize = 512;
-/// The most of one header a page shows.
-const HEADER_MAX: usize = 2048;
 const TOO_LONG: &str = "<p>This message is too long to show here.</p>";
 /// How often the sync runs with a screen open, and with none.
 const ACTIVE: Duration = Duration::from_secs(30);
@@ -71,6 +76,172 @@ pub fn offer_card(core: &Core, tool: &str, args: &Value, result: &mut Value) {
         .unwrap_or_else(|e| e.into_inner())
         .issue(&Subject::Search(query));
     result["_meta"] = json!({"buwiz/open": {"app": "mail", "props": {"search": ticket}, "title": "Mail", "placement": "inline"}});
+}
+
+/// What one action changed, kept so Undo can put it back exactly: each
+/// message's own labels, since a thread's messages can differ.
+#[derive(Default)]
+pub struct Undos {
+    next: u64,
+    kept: VecDeque<(String, Undo)>,
+}
+
+struct Undo {
+    account: String,
+    threads: Vec<(String, gmail::Messages)>,
+    trashed: bool,
+}
+
+impl Undos {
+    fn keep(&mut self, undo: Undo) -> String {
+        self.next += 1;
+        let id = format!("u{}", self.next);
+        self.kept.push_back((id.clone(), undo));
+        if self.kept.len() > UNDOS_MAX {
+            self.kept.pop_front();
+        }
+        id
+    }
+
+    fn take(&mut self, id: &str) -> Option<Undo> {
+        let at = self.kept.iter().position(|(k, _)| k == id)?;
+        self.kept.remove(at).map(|(_, undo)| undo)
+    }
+}
+
+fn strings(v: Option<&Value>) -> Vec<String> {
+    v.and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// A write's labels: what to add, what to take off.
+fn change(tool: &str, args: &Value) -> (Vec<String>, Vec<String>) {
+    let (mut add, mut remove) = (Vec::new(), Vec::new());
+    let mut flag = |on: Option<bool>, label: &str| match on {
+        Some(true) => add.push(label.to_owned()),
+        Some(false) => remove.push(label.to_owned()),
+        None => {}
+    };
+    match tool {
+        MAIL_MARK => {
+            flag(
+                args.get("read").and_then(Value::as_bool).map(|r| !r),
+                "UNREAD",
+            );
+            flag(args.get("starred").and_then(Value::as_bool), "STARRED");
+        }
+        MAIL_ARCHIVE => flag(Some(false), "INBOX"),
+        MAIL_LABEL => {
+            add = strings(args.get("add"));
+            remove = strings(args.get("remove"));
+        }
+        _ => {}
+    }
+    (add, remove)
+}
+
+/// A person's action on conversations. It stops at the first that fails, and
+/// what went before it can still be undone.
+fn act(core: &Core, tool: &str, args: &Value) -> Result<Value, Failure> {
+    let (auth, account) = signed_in(core)?;
+    let ids = strings(args.get("threads"));
+    let (add, remove) = change(tool, args);
+    let bad = ids.is_empty()
+        || ids.len() > ACT_MAX
+        || !ids
+            .iter()
+            .chain(&add)
+            .chain(&remove)
+            .all(|i| gmail::id_ok(i));
+    if bad {
+        return Ok(fail("invalid_args", "That isn't a set of conversations."));
+    }
+    let trashed = tool == MAIL_TRASH;
+    let mut threads = Vec::new();
+    let mut failure = None;
+    for id in &ids {
+        let done = core.gmail.thread_labels(&auth, id).and_then(|before| {
+            if trashed {
+                core.gmail.trash_thread(&auth, id)?;
+            } else {
+                core.gmail.modify_thread(&auth, id, &add, &remove)?;
+            }
+            Ok(before)
+        });
+        match done {
+            Ok(before) => threads.push((id.clone(), before.unwrap_or_default())),
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+    let changed: Vec<String> = threads.iter().map(|(id, _)| id.clone()).collect();
+    if !changed.is_empty() {
+        fetch_rows(core, &auth, &account, &changed)?;
+    }
+    let undo = (!threads.is_empty()).then(|| {
+        core.undos
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keep(Undo {
+                account,
+                threads,
+                trashed,
+            })
+    });
+    core.sync.wake();
+    match failure {
+        Some(e) if undo.is_none() => Err(e),
+        Some(_) => Ok(ok(
+            json!({"undo": undo, "done": changed.len(), "partial": true}),
+        )),
+        None => Ok(ok(json!({"undo": undo, "done": changed.len()}))),
+    }
+}
+
+fn undo(core: &Core, args: &Value) -> Result<Value, Failure> {
+    let (auth, account) = signed_in(core)?;
+    let id = js::string_or_empty(args.get("undo"));
+    let held = core
+        .undos
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take(&id);
+    let Some(undo) = held.filter(|u| u.account == account) else {
+        return Ok(fail("not_found", "That can't be undone any more."));
+    };
+    let ids: Vec<String> = undo.threads.iter().map(|(id, _)| id.clone()).collect();
+    for (thread, messages) in &undo.threads {
+        if undo.trashed {
+            core.gmail.untrash_thread(&auth, thread)?;
+        }
+        let now = core.gmail.thread_labels(&auth, thread)?.unwrap_or_default();
+        for (message, before) in messages {
+            let Some((_, labels)) = now.iter().find(|(m, _)| m == message) else {
+                continue;
+            };
+            let add: Vec<String> = before
+                .iter()
+                .filter(|l| !labels.contains(l))
+                .cloned()
+                .collect();
+            let remove: Vec<String> = labels
+                .iter()
+                .filter(|l| !before.contains(l))
+                .cloned()
+                .collect();
+            if !add.is_empty() || !remove.is_empty() {
+                core.gmail.modify_message(&auth, message, &add, &remove)?;
+            }
+        }
+    }
+    fetch_rows(core, &auth, &account, &ids)?;
+    core.sync.wake();
+    Ok(ok(json!({"done": ids.len()})))
 }
 
 /// Tickets in two generations, so they can't grow without end: when the newer
@@ -192,38 +363,42 @@ pub fn start(core: Arc<Core>) -> JoinHandle<()> {
     })
 }
 
-/// Clears what's held for `account`, who has signed out. False if it couldn't
-/// yet: [`retry_wipes`] goes on trying.
-pub fn forget(core: &Core, account: &str) -> bool {
-    let wiped = with_store(core, |store| store.forget_account(account)).is_ok();
-    if !wiped {
-        eprintln!("buwiz-gws: couldn't clear a signed-out account's mail yet");
-        core.wipes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(account.to_owned());
-    }
-    wiped
-}
-
-/// Clears what an earlier sign-out couldn't, unless that account came back.
-fn retry_wipes(core: &Core) {
-    let waiting = std::mem::take(&mut *core.wipes.lock().unwrap_or_else(|e| e.into_inner()));
-    for account in waiting {
-        if !core.accounts.holds(&account) {
-            forget(core, &account);
+/// Clears every account in the store that no sign-in holds, whether or not
+/// this process ever saw it signed in. False if it couldn't, and then a marker
+/// on disk has the next sync try again, even after a restart.
+pub fn reconcile(core: &Core) -> bool {
+    let cleared = with_store(core, |store| {
+        for account in store.accounts()? {
+            if !core.accounts.holds(&account) {
+                store.forget_account(&account)?;
+            }
+        }
+        Ok(())
+    })
+    .is_ok();
+    if let Ok(paths) = &core.paths {
+        let marker = paths.wipe_pending();
+        let marked = if cleared {
+            std::fs::remove_file(&marker).or_else(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(e),
+            })
+        } else {
+            std::fs::write(&marker, b"")
+        };
+        if marked.is_err() {
+            eprintln!("buwiz-gws: couldn't keep track of a mail wipe");
         }
     }
+    cleared
 }
 
-/// [`with_own_store`] for a test that plays a sync still in flight.
-#[doc(hidden)]
-pub fn write_as<T>(
-    core: &Core,
-    account: &str,
-    f: impl FnOnce(&Store) -> gws_store::Result<T>,
-) -> Result<T, Failure> {
-    with_own_store(core, account, f)
+/// Finishes a wipe that failed earlier, in this run or a past one.
+fn finish_wipes(core: &Core) {
+    let due = core.paths.as_ref().is_ok_and(|p| p.wipe_pending().exists());
+    if due {
+        reconcile(core);
+    }
 }
 
 /// [`with_store`] for a write, which only goes in while `account` is signed
@@ -417,7 +592,7 @@ fn sync_once(core: &Core, auth: &Bearer, account: &str) -> Result<bool, Failure>
 
 /// One sync, and its outcome kept for the screens. A change bumps the sequence.
 pub fn sync(core: &Core) -> Result<(), Failure> {
-    retry_wipes(core);
+    finish_wipes(core);
     // who this sync is for, from here to its last write
     let (auth, account) = signed_in(core)?;
     let result = sync_once(core, &auth, &account);
@@ -534,9 +709,16 @@ fn escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// `millis` in the form a mail's header shows, UTC: the screen has no clock of
-/// the person's zone until the Bot gives it one.
+/// `millis` as a mail's header shows it, in the person's zone.
 fn when(ms: i64) -> String {
+    let zone = Utc.timestamp_millis_opt(ms).single().map_or(0, |at| {
+        i64::from(at.with_timezone(&Local).offset().local_minus_utc())
+    });
+    when_in(ms, zone)
+}
+
+fn when_in(ms: i64, zone: i64) -> String {
+    let ms = ms + zone * 1000;
     let (days, secs) = (
         ms.div_euclid(86_400_000),
         ms.div_euclid(1000).rem_euclid(86_400),
@@ -551,11 +733,7 @@ fn when(ms: i64) -> String {
         if mp < 10 { mp + 3 } else { mp - 9 },
     );
     let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y}-{m:02}-{d:02} {:02}:{:02} UTC",
-        secs / 3600,
-        secs / 60 % 60
-    )
+    format!("{y}-{m:02}-{d:02} {:02}:{:02}", secs / 3600, secs / 60 % 60)
 }
 
 /// A thread as one page, every word of it inside the web view: names and
@@ -577,16 +755,16 @@ pub fn view_of(thread: &Value) -> Value {
             let (name, address) = sender_of(&gmail::header(m, "From"));
             format!(
                 "<div class=\"gws-meta\"><b>{}</b> &lt;{}&gt; · {}<br>to {}</div>",
-                escape(&gmail::cap_bytes(&name, HEADER_MAX)),
-                escape(&gmail::cap_bytes(&address, HEADER_MAX)),
+                escape(&gmail::cap_bytes(&name, gmail::HEADER_MAX)),
+                escape(&gmail::cap_bytes(&address, gmail::HEADER_MAX)),
                 when(millis(m)),
-                escape(&gmail::cap_bytes(&gmail::header(m, "To"), HEADER_MAX))
+                escape(&gmail::short_header(m, "To"))
             )
         })
         .collect();
     let title = format!(
         "<h2 style=\"font-size:18px;margin:0 0 12px\">{}</h2>",
-        escape(&gmail::cap_bytes(&subject, HEADER_MAX))
+        escape(&gmail::cap_bytes(&subject, gmail::HEADER_MAX))
     );
     let attachments: Vec<Value> = list.iter().flat_map(gmail::attachments).collect();
     let mut parts: Vec<Part> = list
@@ -731,6 +909,8 @@ pub fn run(core: &Core, tool: &str, args: &Value) -> Option<Value> {
         MAIL_THREAD => thread(core, args),
         MAIL_CHANGES => changes(core, args),
         MAIL_CARD => card(core, args),
+        MAIL_MARK | MAIL_LABEL | MAIL_ARCHIVE | MAIL_TRASH => act(core, tool, args),
+        MAIL_UNDO => undo(core, args),
         _ => return None,
     };
     core.sync.seen();
@@ -740,6 +920,108 @@ pub fn run(core: &Core, tool: &str, args: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod signing_out {
+        use super::*;
+        use crate::apis::Apis;
+        use gws_fake_google::{FakeGoogle, Seed};
+
+        const OWNER: &str = "owner@example.com";
+
+        fn sign_in(subject: &str) -> Value {
+            json!({"account": "google", "label": "default", "provider": "google", "subject": subject, "scopes": [], "access_token": "fake-access-1", "token_type": "Bearer", "expires_at": 4_000_000_000u64})
+        }
+
+        fn dir(name: &str) -> gws_store::Paths {
+            let dir = std::env::temp_dir().join(format!("gws-out-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            gws_store::Paths::in_dir(dir)
+        }
+
+        fn core(google: &FakeGoogle, paths: &gws_store::Paths) -> Core {
+            let core = Core::new(&Apis::at(&google.base()), Ok(paths.clone()));
+            core.unlock("seed");
+            core
+        }
+
+        fn rows(core: &Core) -> usize {
+            with_store(core, |s| s.threads(OWNER, "INBOX", 0, 100))
+                .unwrap_or_default()
+                .len()
+        }
+
+        fn out() -> Value {
+            json!({"account": "google", "label": "default"})
+        }
+
+        #[test]
+        fn nothing_lands_after_a_sign_out_however_late_it_arrives() {
+            let google = FakeGoogle::start(Seed::demo(6));
+            let core = core(&google, &dir("late"));
+            core.account("buwiz.account.set", &sign_in(OWNER));
+            sync(&core).unwrap();
+            core.account("buwiz.account.clear", &out());
+            let late = with_own_store(&core, OWNER, |s| s.set_state(OWNER, "late", "1"));
+            assert!(late.is_err(), "the account is gone");
+            let state = |account: &str, key: &str| {
+                with_store(&core, |s| s.state(account, key)).ok().flatten()
+            };
+            assert_eq!(state(OWNER, "late"), None);
+            assert!(sync(&core).is_err(), "no sync starts for nobody");
+            assert_eq!(state("", STATUS), None);
+        }
+
+        #[test]
+        fn a_wipe_that_failed_says_so_and_survives_a_restart() {
+            let google = FakeGoogle::start(Seed::demo(6));
+            let paths = dir("restart");
+            let first = core(&google, &paths);
+            first.account("buwiz.account.set", &sign_in(OWNER));
+            sync(&first).unwrap();
+            assert!(rows(&first) > 0);
+            // the store can't be reached for this one sign-out
+            first.store_key.lock().unwrap().take();
+            first.store.lock().unwrap().take();
+            let said = first.account("buwiz.account.clear", &out());
+            assert_eq!(said["structuredContent"]["mail_kept"], true, "{said}");
+            assert!(paths.wipe_pending().exists());
+            drop(first);
+
+            let second = core(&google, &paths);
+            assert!(rows(&second) > 0, "still there after the restart");
+            let _ = sync(&second);
+            assert_eq!(rows(&second), 0, "the next sync cleared it");
+            assert!(!paths.wipe_pending().exists());
+        }
+
+        #[test]
+        fn a_clear_for_a_sign_in_this_process_never_saw_still_wipes() {
+            let google = FakeGoogle::start(Seed::demo(6));
+            let paths = dir("unseen");
+            let first = core(&google, &paths);
+            first.account("buwiz.account.set", &sign_in(OWNER));
+            sync(&first).unwrap();
+            drop(first);
+
+            let second = core(&google, &paths);
+            assert!(rows(&second) > 0);
+            second.account("buwiz.account.clear", &out());
+            assert_eq!(rows(&second), 0);
+        }
+
+        #[test]
+        fn a_start_with_no_push_yet_keeps_the_mail() {
+            let google = FakeGoogle::start(Seed::demo(6));
+            let paths = dir("start");
+            let first = core(&google, &paths);
+            first.account("buwiz.account.set", &sign_in(OWNER));
+            sync(&first).unwrap();
+            drop(first);
+            let second = core(&google, &paths);
+            let _ = sync(&second);
+            assert!(rows(&second) > 0, "the Bot hasn't pushed its token yet");
+        }
+    }
 
     #[test]
     fn a_sender_splits_into_name_and_address() {
@@ -856,6 +1138,7 @@ mod tests {
 
     #[test]
     fn dates_read_plainly() {
-        assert_eq!(when(1_793_955_600_000), "2026-11-06 09:00 UTC");
+        assert_eq!(when_in(1_793_955_600_000, 0), "2026-11-06 09:00");
+        assert_eq!(when_in(1_793_955_600_000, 8 * 3600), "2026-11-06 17:00");
     }
 }

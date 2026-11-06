@@ -25,7 +25,7 @@ fn numbers(label: &str) -> Vec<usize> {
 }
 
 fn row(n: usize) -> Value {
-    json!({"id": format!("t{n}"), "sender": format!("Sender {n}"), "subject": format!("Subject {n}"), "snippet": "", "at": 0})
+    json!({"id": format!("t{n}"), "sender": format!("Sender {n}"), "subject": format!("Subject {n}"), "snippet": "", "at": 0, "unread": n == 4})
 }
 
 fn list(args: &Value) -> Value {
@@ -44,6 +44,12 @@ fn thread(id: &str) -> Value {
 
 #[derive(Default)]
 struct Fake {
+    /// Mail that came in, newest first, ahead of the inbox's rows.
+    newer: Mutex<Vec<usize>>,
+    /// What the next action answers instead of doing it.
+    refuse: Mutex<Option<String>>,
+    /// The next change check says the list changed.
+    changed: Mutex<bool>,
     calls: Mutex<Vec<(String, Value)>>,
     /// Calls whose answer waits for [`Fake::release`], by what names them.
     hold: Mutex<Vec<String>>,
@@ -102,15 +108,39 @@ impl Host for Fake {
             .unwrap()
             .push((tool.to_owned(), args.clone()));
         let (name, answer) = match tool {
-            "gws_mail_labels" => (String::new(), json!({"labels": []})),
-            "gws_mail_changes" => (
+            "gws_mail_labels" => (
                 String::new(),
-                json!({"status": "", "seq": 0, "changed": false}),
+                json!({"labels": [{"id": "Label_1", "name": "Work", "kind": "user"}]}),
             ),
-            "gws_mail_list" => (
-                args["label"].as_str().unwrap_or_default().to_owned(),
-                list(args),
-            ),
+            "gws_mail_changes" => {
+                let changed = std::mem::take(&mut *self.changed.lock().unwrap());
+                (
+                    String::new(),
+                    json!({"status": "", "seq": 0, "changed": changed}),
+                )
+            }
+            "gws_mail_list" => {
+                let mut answer = list(args);
+                if args["label"] == "INBOX" && args["skip"] == 0 {
+                    let new = self.newer.lock().unwrap();
+                    let rows = answer["threads"].as_array_mut().unwrap();
+                    for n in new.iter().rev() {
+                        rows.insert(0, row(*n));
+                    }
+                }
+                (
+                    args["label"].as_str().unwrap_or_default().to_owned(),
+                    answer,
+                )
+            }
+            "gws_mail_archive" if self.refuse.lock().unwrap().is_some() => {
+                let why = self.refuse.lock().unwrap().take().unwrap();
+                return done(Err(BuwizError::new("needs_access", false, why)));
+            }
+            "gws_mail_mark" | "gws_mail_archive" | "gws_mail_trash" | "gws_mail_label" => {
+                (String::new(), json!({"undo": "u1", "done": 1}))
+            }
+            "gws_mail_undo" => (String::new(), json!({"done": 1})),
             "gws_mail_thread" => {
                 let id = args["thread"].as_str().unwrap_or_default();
                 (id.to_owned(), thread(id))
@@ -266,4 +296,203 @@ fn a_late_thread_answer_does_not_replace_the_open_one() {
         !app.screen().shows("1 image blocked"),
         "t1's answer landed after t2"
     );
+}
+
+fn opened(fake: &Fake) -> Value {
+    fake.called("gws_mail_thread")
+        .last()
+        .expect("a thread opened")["thread"]
+        .clone()
+}
+
+/// Mail arrives above the list, moving every row down.
+fn mail_arrives(app: &mut Headless, fake: &Fake) {
+    fake.newer.lock().unwrap().extend([900, 901]);
+    *fake.changed.lock().unwrap() = true;
+    app.wait_for_within("text:Subject 900", Duration::from_secs(20))
+        .expect("the new mail shows");
+}
+
+#[test]
+fn new_mail_on_top_leaves_an_action_on_the_conversation_chosen() {
+    let (mut app, fake) = start();
+    app.press("text:Subject 3").expect("the row presses");
+    settle(&mut app);
+    mail_arrives(&mut app, &fake);
+    app.press_key("e").expect("the key presses");
+    settle(&mut app);
+    let archived = fake.called("gws_mail_archive");
+    assert_eq!(
+        archived.last().expect("an archive")["threads"],
+        json!(["t3"])
+    );
+}
+
+#[test]
+fn j_after_new_mail_goes_on_from_the_conversation_chosen() {
+    let (mut app, fake) = start();
+    app.press("text:Subject 3").expect("the row presses");
+    settle(&mut app);
+    mail_arrives(&mut app, &fake);
+    app.press_key("j").expect("the key presses");
+    settle(&mut app);
+    assert_eq!(opened(&fake), "t4");
+}
+
+#[test]
+fn archive_moves_on_to_the_next_and_undo_brings_the_list_back() {
+    let (mut app, fake) = start();
+    app.press("text:Subject 3").expect("the row presses");
+    settle(&mut app);
+    app.press_key("e").expect("the key presses");
+    settle(&mut app);
+    assert!(!app.screen().shows("Subject 3"), "it left the list");
+    assert_eq!(opened(&fake), "t4", "the next one opens");
+    assert!(app.screen().shows("Archived."));
+
+    app.press("label:Undo that").expect("the bar offers it");
+    settle(&mut app);
+    assert_eq!(
+        fake.called("gws_mail_undo").last().expect("an undo")["undo"],
+        "u1"
+    );
+    assert!(app.screen().shows("Subject 3"), "the list came back");
+}
+
+#[test]
+fn picked_conversations_go_together() {
+    let (mut app, fake) = start();
+    app.press("text:Subject 2").expect("the row presses");
+    settle(&mut app);
+    app.press_key("x").expect("the key presses");
+    app.press("text:Subject 5").expect("the row presses");
+    settle(&mut app);
+    app.press_key("x").expect("the key presses");
+    app.press_key("shift+3").expect("the key presses");
+    settle(&mut app);
+    let trashed = fake.called("gws_mail_trash");
+    assert_eq!(
+        trashed.last().expect("a trash")["threads"],
+        json!(["t2", "t5"])
+    );
+}
+
+#[test]
+fn with_nothing_open_an_action_does_nothing() {
+    let (mut app, fake) = start();
+    app.press_key("e").expect("the key presses");
+    app.press_key("shift+3").expect("the key presses");
+    settle(&mut app);
+    assert!(fake.called("gws_mail_archive").is_empty());
+    assert!(fake.called("gws_mail_trash").is_empty());
+}
+
+#[test]
+fn typing_in_search_is_no_action() {
+    let (mut app, fake) = start();
+    app.press("text:Subject 3").expect("the row presses");
+    settle(&mut app);
+    app.press_key("/").expect("the key presses");
+    settle(&mut app);
+    app.press_key("e").expect("the key presses");
+    app.press_key("shift+3").expect("the key presses");
+    settle(&mut app);
+    assert!(
+        fake.called("gws_mail_archive").is_empty(),
+        "e went to the field"
+    );
+    assert!(
+        fake.called("gws_mail_trash").is_empty(),
+        "# went to the field"
+    );
+}
+
+#[test]
+fn opening_an_unread_mail_marks_it_read_and_nothing_else_does() {
+    let (mut app, fake) = start();
+    assert!(
+        fake.called("gws_mail_mark").is_empty(),
+        "the list reads nothing"
+    );
+    app.press("text:Subject 3").expect("the row presses");
+    settle(&mut app);
+    assert!(
+        fake.called("gws_mail_mark").is_empty(),
+        "that one was read already"
+    );
+    app.press("text:Subject 4").expect("the row presses");
+    settle(&mut app);
+    let marked = fake.called("gws_mail_mark");
+    assert_eq!(marked, vec![json!({"threads": ["t4"], "read": true})]);
+}
+
+#[test]
+fn the_toolbar_acts_on_the_open_conversation() {
+    let (mut app, fake) = start();
+    assert!(!app.screen().shows("Archive"), "nothing open, no toolbar");
+    app.press("text:Subject 3").expect("the row presses");
+    settle(&mut app);
+    app.press("label:Star this").expect("the toolbar shows");
+    settle(&mut app);
+    let marked = fake.called("gws_mail_mark");
+    assert_eq!(
+        marked.last().expect("a mark"),
+        &json!({"threads": ["t3"], "starred": true})
+    );
+
+    app.press("label:Delete this").expect("the toolbar shows");
+    settle(&mut app);
+    assert_eq!(
+        fake.called("gws_mail_trash").last().expect("a trash")["threads"],
+        json!(["t3"])
+    );
+    assert!(!app.screen().shows("Subject 3"));
+    assert_eq!(
+        opened(&fake),
+        "t4",
+        "the next one opens, though the bar redrew"
+    );
+}
+
+#[test]
+fn a_label_can_be_added_or_moved_to() {
+    let (mut app, fake) = start();
+    app.press("text:Subject 3").expect("the row presses");
+    settle(&mut app);
+    app.press("label:Choose a label")
+        .expect("the toolbar shows");
+    settle(&mut app);
+    app.press("label:Add this label").expect("the picker shows");
+    settle(&mut app);
+    let labelled = fake.called("gws_mail_label");
+    assert_eq!(
+        labelled.last().expect("a label"),
+        &json!({"threads": ["t3"], "add": ["Label_1"]})
+    );
+    assert!(app.screen().shows("Subject 3"), "adding keeps it here");
+
+    app.press("label:Choose a label")
+        .expect("the toolbar shows");
+    settle(&mut app);
+    app.press("label:Move here").expect("the picker shows");
+    settle(&mut app);
+    let moved = fake.called("gws_mail_label");
+    assert_eq!(
+        moved.last().expect("a move"),
+        &json!({"threads": ["t3"], "add": ["Label_1"], "remove": ["INBOX"]})
+    );
+    assert!(!app.screen().shows("Subject 3"), "a move takes it out");
+}
+
+#[test]
+fn an_action_the_sign_in_does_not_cover_says_so_and_changes_nothing_here() {
+    let (mut app, fake) = start();
+    app.press("text:Subject 3").expect("the row presses");
+    settle(&mut app);
+    *fake.refuse.lock().unwrap() = Some("Sign in again to turn it on.".to_owned());
+    app.press_key("e").expect("the key presses");
+    settle(&mut app);
+    assert!(app.screen().shows("Sign in again to turn it on."));
+    assert!(app.screen().shows("Subject 3"), "it stays in the list");
+    assert!(!app.screen().shows("Archived."));
 }

@@ -7,13 +7,17 @@
 //! The Bot's `agent_hub::filter` tests hold that on the bytes it sends.
 
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use buwiz_app::{Bridge, Placement};
+use chrono::{Local, TimeZone as _, Utc};
 use nsh_core::AccessibilityValue;
 use nsh_core::element::{Root, dark, input};
 use nsh_core::prelude::*;
 use serde_json::{Value, json};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use url::Url;
 
 use crate::reader;
@@ -124,9 +128,22 @@ fn column(labels: &Value) -> Vec<LabelRow> {
     out
 }
 
-/// A row's time: today's as the clock, older as a date. UTC until the Bot
-/// gives a screen the person's zone.
+/// Seconds east of UTC at `ms`, on this Mac: a zone's offset moves with the
+/// date, so each moment asks for its own.
+fn zone_at(ms: i64) -> i64 {
+    Utc.timestamp_millis_opt(ms).single().map_or(0, |at| {
+        i64::from(at.with_timezone(&Local).offset().local_minus_utc())
+    })
+}
+
+/// A row's time in the person's zone: today's as the clock, older as a date.
 pub fn short_time(at: i64, now: i64) -> String {
+    time_in(at, now, zone_at)
+}
+
+fn time_in(at: i64, now: i64, zone: impl Fn(i64) -> i64) -> String {
+    let local = |ms: i64| ms + zone(ms) * 1000;
+    let (at, now) = (local(at), local(now));
     let day = |ms: i64| ms.div_euclid(86_400_000);
     if day(at) == day(now) {
         let secs = at.div_euclid(1000).rem_euclid(86_400);
@@ -207,7 +224,16 @@ struct Mail {
     query: Signal<String>,
     /// A card's search, by its ticket, until the person goes elsewhere.
     search: Signal<Option<String>>,
-    chosen: Signal<Option<usize>>,
+    /// The open conversation, by id: rows move as mail arrives and goes, and
+    /// an action must land on the conversation the person chose.
+    chosen: Signal<Option<String>>,
+    /// Conversations picked with `x`, which actions take over the open one.
+    picked: Signal<Vec<String>>,
+    jobs: Signal<UnboundedSender<Job>>,
+    /// The label picker is open.
+    labeling: Signal<bool>,
+    /// What can be undone, and what to say about it.
+    undo: Signal<Option<(String, String)>>,
     page: Signal<Option<String>>,
     links: Signal<Vec<String>>,
     images: Signal<i64>,
@@ -284,6 +310,96 @@ async fn load_list(b: Bridge, m: Mail, skip: usize) {
     }
 }
 
+/// A person's action waiting its turn.
+type Job = Pin<Box<dyn Future<Output = ()>>>;
+
+/// Hands `job` to the screen's own task. A press's task dies with the view it
+/// was pressed on, and an action redraws what it's pressed on: an action
+/// must outlive that, and two must run in the order they were asked.
+fn run(m: Mail, job: impl Future<Output = ()> + 'static) {
+    m.jobs.with_untracked(|jobs| drop(jobs.send(Box::pin(job))));
+}
+
+/// What an action takes: the picked conversations, else the open one.
+fn targets(m: Mail) -> Vec<String> {
+    let picked = m.picked.get_untracked();
+    if !picked.is_empty() {
+        return picked;
+    }
+    m.chosen.get_untracked().into_iter().collect()
+}
+
+/// The row to open once `gone` have left the list.
+fn next_after(rows: &[Row], gone: &[String]) -> Option<String> {
+    let last = rows.iter().rposition(|r| gone.contains(&r.id))?;
+    let keeps = |r: &&Row| !gone.contains(&r.id);
+    rows[last..]
+        .iter()
+        .find(keeps)
+        .or_else(|| rows[..last].iter().rev().find(keeps))
+        .map(|r| r.id.clone())
+}
+
+/// A person's action, answered and shown. `leaves` says the conversations go
+/// from this list, and `change` what shows on those that stay.
+async fn act(
+    b: Bridge,
+    m: Mail,
+    tool: &str,
+    mut args: Value,
+    said: &str,
+    leaves: bool,
+    change: fn(&mut Row),
+) {
+    let ids = targets(m);
+    if ids.is_empty() {
+        return;
+    }
+    args["threads"] = json!(ids);
+    match read(&b, tool, args).await {
+        Ok(v) => {
+            if let Some(undo) = v.get("undo").and_then(Value::as_str) {
+                m.undo.set(Some((undo.to_owned(), said.to_owned())));
+            }
+            m.picked.set(Vec::new());
+            m.problem.set(None);
+            if leaves {
+                let next = m.rows.with_untracked(|r| next_after(r, &ids));
+                let open_gone = m
+                    .chosen
+                    .with_untracked(|c| c.as_ref().is_some_and(|c| ids.contains(c)));
+                m.rows.update(|r| r.retain(|r| !ids.contains(&r.id)));
+                if open_gone {
+                    m.chosen.set(next.clone());
+                    match next {
+                        Some(id) => show(b, m, id).await,
+                        None => m.page.set(None),
+                    }
+                }
+            } else {
+                m.rows.update(|r| {
+                    r.iter_mut()
+                        .filter(|r| ids.contains(&r.id))
+                        .for_each(change)
+                });
+            }
+        }
+        Err(e) if e == "sign-in" => m.signed_out.set(true),
+        Err(e) => m.problem.set(Some(e)),
+    }
+}
+
+async fn undo_last(b: Bridge, m: Mail) {
+    let Some((undo, _)) = m.undo.get_untracked() else {
+        return;
+    };
+    m.undo.set(None);
+    match read(&b, "gws_mail_undo", json!({"undo": undo})).await {
+        Ok(_) => load_list(b, m, 0).await,
+        Err(e) => m.problem.set(Some(e)),
+    }
+}
+
 async fn load_labels(b: Bridge, m: Mail) {
     if let Ok(v) = read(&b, "gws_mail_labels", json!({})).await {
         m.labels.set(column(&v));
@@ -297,8 +413,23 @@ async fn open(b: Bridge, m: Mail, index: usize) {
     else {
         return;
     };
-    m.chosen.set(Some(index));
-    show(b, m, id).await;
+    m.chosen.set(Some(id.clone()));
+    let unread = m
+        .rows
+        .with_untracked(|r| r.get(index).is_some_and(|r| r.unread));
+    show(b.clone(), m, id.clone()).await;
+    // only a person's open reads a mail, so this is here and not in the tool
+    if unread
+        && read(&b, "gws_mail_mark", json!({"threads": [id], "read": true}))
+            .await
+            .is_ok()
+    {
+        m.rows.update(|r| {
+            if let Some(row) = r.iter_mut().find(|r| r.id == id) {
+                row.unread = false;
+            }
+        });
+    }
 }
 
 /// A card's row, opened in the reader.
@@ -427,14 +558,25 @@ fn row_view(b: Bridge, m: Mail, at: Position) -> impl IntoElement {
                 .with(|r| r.get(at.index()).map(f).unwrap_or_default())
         }
     };
-    let chosen = move || m.chosen.get() == Some(at.index());
+    let chosen = move || {
+        m.chosen.with(|c| {
+            m.rows
+                .with(|r| c.is_some() && r.get(at.index()).map(|r| &r.id) == c.as_ref())
+        })
+    };
+    let picked = move || {
+        m.picked.with(|p| {
+            m.rows
+                .with(|r| r.get(at.index()).is_some_and(|r| p.contains(&r.id)))
+        })
+    };
     let weight = move || m.rows.with(|r| r.get(at.index()).is_some_and(|r| r.unread));
     view()
         .app_class(move || {
             Some(
                 format!(
                     "h-[{ROW_HEIGHT}px] px-3 py-1.5 border-b {LINE} {}",
-                    if chosen() { CHOSEN } else { "" }
+                    if chosen() || picked() { CHOSEN } else { "" }
                 )
                 .into(),
             )
@@ -562,9 +704,155 @@ fn list_pane(b: Bridge, m: Mail) -> impl IntoElement {
         )
 }
 
-fn reader_pane(m: Mail) -> impl IntoElement {
+/// A press on the reader's toolbar: a fixed label, and what it does.
+fn tool(label: &'static str, shows: &'static str, press: impl Fn() + 'static) -> View {
+    view()
+        .app_class(Some("px-2 py-1 rounded-md".into()))
+        .label(label)
+        .on_press(press)
+        .child(text(shows).app_class(Some(format!("text-[12px] {INK}").into())))
+}
+
+/// What can be done to the open conversation, or to the picked ones.
+fn toolbar(b: Bridge, m: Mail) -> impl IntoElement {
+    let go = move |tool: &'static str,
+                   args: Value,
+                   said: &'static str,
+                   leaves: bool,
+                   change: fn(&mut Row)| {
+        let b = b.clone();
+        let args = args.clone();
+        move || {
+            run(
+                m,
+                act(b.clone(), m, tool, args.clone(), said, leaves, change),
+            );
+        }
+    };
+    view()
+        .app_class(Some(
+            format!("flex-row gap-1 px-2 py-1 border-b {LINE}").into(),
+        ))
+        .child(tool(
+            "Archive this",
+            "Archive",
+            go("gws_mail_archive", json!({}), "Archived.", true, |_| {}),
+        ))
+        .child(tool(
+            "Delete this",
+            "Delete",
+            go("gws_mail_trash", json!({}), "Moved to Trash.", true, |_| {}),
+        ))
+        .child(tool(
+            "Star this",
+            "Star",
+            go(
+                "gws_mail_mark",
+                json!({"starred": true}),
+                "Starred.",
+                false,
+                |r| r.starred = true,
+            ),
+        ))
+        .child(tool(
+            "Mark this unread",
+            "Mark unread",
+            go(
+                "gws_mail_mark",
+                json!({"read": false}),
+                "Marked unread.",
+                false,
+                |r| r.unread = true,
+            ),
+        ))
+        .child(tool("Choose a label", "Label", move || {
+            m.labeling.set(!m.labeling.get_untracked())
+        }))
+}
+
+/// The person's own labels: add one, or move the conversation there.
+fn label_picker(b: Bridge, m: Mail) -> impl IntoElement {
+    dynamic(move || {
+        if !m.labeling.get() {
+            return view();
+        }
+        let own = m.labels.with(|l| {
+            l.iter()
+                .filter(|l| !SYSTEM.iter().any(|(id, _)| *id == l.id))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        own.into_iter().fold(
+            view().app_class(Some(format!("px-2 py-1 gap-1 border-b {LINE}").into())),
+            |list, l| {
+                let value = || AccessibilityValue {
+                    text: Some(l.name.clone().into()),
+                    ..AccessibilityValue::default()
+                };
+                let (add, moved, id) = (b.clone(), b.clone(), l.id.clone());
+                let labelled = id.clone();
+                list.child(
+                    view()
+                        .app_class(Some("flex-row items-center gap-2".into()))
+                        .child(
+                            text(l.name.clone())
+                                .app_class(Some(format!("flex-1 text-[12px] {INK}").into())),
+                        )
+                        .child(
+                            tool("Add this label", "Add", move || {
+                                m.labeling.set(false);
+                                run(
+                                    m,
+                                    act(
+                                        add.clone(),
+                                        m,
+                                        "gws_mail_label",
+                                        json!({"add": [labelled.clone()]}),
+                                        "Label added.",
+                                        false,
+                                        |_| {},
+                                    ),
+                                );
+                            })
+                            .accessibility_value(Some(value())),
+                        )
+                        .child(
+                            tool("Move here", "Move", move || {
+                                m.labeling.set(false);
+                                run(
+                                    m,
+                                    act(
+                                        moved.clone(),
+                                        m,
+                                        "gws_mail_label",
+                                        json!({"add": [id.clone()], "remove": ["INBOX"]}),
+                                        "Moved.",
+                                        true,
+                                        |_| {},
+                                    ),
+                                );
+                            })
+                            .accessibility_value(Some(value())),
+                        ),
+                )
+            },
+        )
+    })
+}
+
+fn reader_pane(b: Bridge, m: Mail) -> impl IntoElement {
+    let picking = b.clone();
+    let bar = dynamic(move || {
+        if m.chosen.with(Option::is_none) && m.picked.with(Vec::is_empty) {
+            return view();
+        }
+        view()
+            .child(toolbar(b.clone(), m))
+            .child(label_picker(picking.clone(), m))
+    });
     view()
         .app_class(Some(format!("flex-1 {PANEL}").into()))
+        .child(bar)
         .child(dynamic(move || match m.page.get() {
             Some(page) => view()
                 .app_class(Some("flex-1".into()))
@@ -598,6 +886,30 @@ fn reader_pane(m: Mail) -> impl IntoElement {
                         .app_class(Some(format!("text-[13px] {MUTE}").into())),
                 ),
         }))
+}
+
+/// What was just done, with the way back.
+fn undo_bar(b: Bridge, m: Mail) -> impl IntoElement {
+    dynamic(move || match m.undo.get() {
+        None => view(),
+        Some((_, said)) => {
+            let b = b.clone();
+            view()
+                .app_class(Some(
+                    format!("flex-row items-center gap-3 px-3 py-2 border-t {LINE} {RAIL}").into(),
+                ))
+                .child(text(said).app_class(Some(format!("flex-1 text-[12px] {INK}").into())))
+                .child(
+                    view()
+                        .app_class(Some("px-3 py-1".into()))
+                        .label("Undo that")
+                        .on_press(move || {
+                            run(m, undo_last(b.clone(), m));
+                        })
+                        .child(text("Undo").app_class(Some(format!("text-[12px] {INK}").into()))),
+                )
+        }
+    })
 }
 
 /// Where a link really goes, always shown whole, however long the rest is.
@@ -663,11 +975,17 @@ fn link_bar(m: Mail) -> impl IntoElement {
 }
 
 fn keys(b: Bridge, m: Mail) {
+    let here = move || {
+        let chosen = m.chosen.get_untracked()?;
+        m.rows
+            .with_untracked(|r| r.iter().position(|r| r.id == chosen))
+    };
     let step = move |by: isize| {
         let len = m.rows.with_untracked(Vec::len) as isize;
-        let at = m.chosen.get_untracked().map_or(-1, |i| i as isize);
+        let at = here().map_or(-1, |i| i as isize);
         ((at + by).clamp(0, (len - 1).max(0))) as usize
     };
+    let acts = b.clone();
     let (down, up, enter, oh) = (b.clone(), b.clone(), b.clone(), b);
     on_key("j", move |_| {
         down.spawn(open(down.clone(), m, step(1)));
@@ -676,20 +994,108 @@ fn keys(b: Bridge, m: Mail) {
         up.spawn(open(up.clone(), m, step(-1)));
     });
     on_key("enter", move |_| {
-        enter.spawn(open(
-            enter.clone(),
-            m,
-            m.chosen.get_untracked().unwrap_or(0),
-        ));
+        enter.spawn(open(enter.clone(), m, here().unwrap_or(0)));
     });
     on_key("o", move |_| {
-        oh.spawn(open(oh.clone(), m, m.chosen.get_untracked().unwrap_or(0)));
+        oh.spawn(open(oh.clone(), m, here().unwrap_or(0)));
     });
     on_key("u", move |_| {
         m.chosen.set(None);
         m.page.set(None);
     });
     on_key("shift+/", move |_| m.help.set(!m.help.get_untracked()));
+    let (archive, trash, star) = (acts.clone(), acts.clone(), acts.clone());
+    let (read_it, unread_it, back) = (acts.clone(), acts.clone(), acts);
+    on_key("e", move |_| {
+        run(
+            m,
+            act(
+                archive.clone(),
+                m,
+                "gws_mail_archive",
+                json!({}),
+                "Archived.",
+                true,
+                |_| {},
+            ),
+        );
+    });
+    on_key("shift+3", move |_| {
+        run(
+            m,
+            act(
+                trash.clone(),
+                m,
+                "gws_mail_trash",
+                json!({}),
+                "Moved to Trash.",
+                true,
+                |_| {},
+            ),
+        );
+    });
+    on_key("s", move |_| {
+        let on = m.chosen.get_untracked().is_some_and(|c| {
+            m.rows
+                .with_untracked(|r| r.iter().any(|r| r.id == c && r.starred))
+        });
+        let change: fn(&mut Row) = if on {
+            |r| r.starred = false
+        } else {
+            |r| r.starred = true
+        };
+        run(
+            m,
+            act(
+                star.clone(),
+                m,
+                "gws_mail_mark",
+                json!({"starred": !on}),
+                if on { "Star removed." } else { "Starred." },
+                false,
+                change,
+            ),
+        );
+    });
+    on_key("shift+i", move |_| {
+        run(
+            m,
+            act(
+                read_it.clone(),
+                m,
+                "gws_mail_mark",
+                json!({"read": true}),
+                "Marked read.",
+                false,
+                |r| r.unread = false,
+            ),
+        );
+    });
+    on_key("shift+u", move |_| {
+        run(
+            m,
+            act(
+                unread_it.clone(),
+                m,
+                "gws_mail_mark",
+                json!({"read": false}),
+                "Marked unread.",
+                false,
+                |r| r.unread = true,
+            ),
+        );
+    });
+    on_key("x", move |_| {
+        if let Some(id) = m.chosen.get_untracked() {
+            m.picked.update(|p| match p.iter().position(|x| *x == id) {
+                Some(at) => drop(p.remove(at)),
+                None => p.push(id),
+            });
+        }
+    });
+    on_key("z", move |_| {
+        run(m, undo_last(back.clone(), m));
+    });
 }
 
 /// Each person brings their own Google client, so this is the way in: the
@@ -887,6 +1293,12 @@ fn help_view() -> impl IntoElement {
         "k  previous",
         "o or Enter  open",
         "u  close",
+        "e  archive",
+        "#  delete",
+        "s  star",
+        "Shift+I, Shift+U  read, unread",
+        "x  pick",
+        "z  undo",
         "/  search",
         "?  this help",
     ];
@@ -903,6 +1315,7 @@ pub fn build(bridge: Bridge) -> Root {
         }
         let props = b.props();
         let prop = |k: &str| props.get(k).and_then(Value::as_str).map(str::to_owned);
+        let (jobs, mut waiting) = unbounded_channel::<Job>();
         let m = Mail {
             problem: signal(None),
             list_turn: Latest::new(),
@@ -914,6 +1327,10 @@ pub fn build(bridge: Bridge) -> Root {
             query: signal(String::new()),
             search: signal(prop("search")),
             chosen: signal(None),
+            picked: signal(Vec::new()),
+            undo: signal(None),
+            labeling: signal(false),
+            jobs: signal_with(jobs, SignalEquals::Never),
             page: signal(None),
             links: signal(Vec::new()),
             images: signal(0),
@@ -929,10 +1346,16 @@ pub fn build(bridge: Bridge) -> Root {
         b.spawn(load_list(b.clone(), m, 0));
         b.spawn(load_labels(b.clone(), m));
         b.spawn(watch(b.clone(), m));
+        b.spawn(async move {
+            while let Some(job) = waiting.recv().await {
+                job.await;
+            }
+        });
         if let Some(ticket) = prop("thread") {
             b.spawn(open_ticket(b.clone(), m, ticket));
         }
         let (rail, list, guide) = (b.clone(), b.clone(), b.clone());
+        let (undoing, pane) = (b.clone(), b.clone());
         view()
             .app_class(Some(format!("flex-1 {BG}").into()))
             .child(dynamic(move || {
@@ -948,8 +1371,9 @@ pub fn build(bridge: Bridge) -> Root {
                             .app_class(Some("flex-1 flex-row".into()))
                             .child(label_rail(rail.clone(), m))
                             .child(list_pane(list.clone(), m))
-                            .child(reader_pane(m)),
+                            .child(reader_pane(pane.clone(), m)),
                     )
+                    .child(undo_bar(undoing.clone(), m))
                     .child(link_bar(m))
                     .child(dynamic(move || {
                         if m.help.get() {
@@ -1028,8 +1452,13 @@ mod tests {
     #[test]
     fn times_read_like_a_mail_list() {
         let now = 1_793_955_600_000;
-        assert_eq!(short_time(now - 3_600_000, now), "08:00");
-        assert_eq!(short_time(now - 2 * 86_400_000, now), "Nov 4");
+        let utc = |_| 0;
+        assert_eq!(time_in(now - 3_600_000, now, utc), "08:00");
+        assert_eq!(time_in(now - 2 * 86_400_000, now, utc), "Nov 4");
+        // eight hours east: the clock moves, and so can the day
+        let manila = |_| 8 * 3600;
+        assert_eq!(time_in(now - 3_600_000, now, manila), "16:00");
+        assert_eq!(time_in(now + 12 * 3_600_000, now, manila), "Nov 7");
     }
 
     #[test]

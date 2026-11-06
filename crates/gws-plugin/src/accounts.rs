@@ -16,7 +16,8 @@ pub const GOOGLE: &str = "google";
 pub struct Accounts(Mutex<Held>);
 
 /// The SDK's accounts, and who each label's sign-in is, live or expired: an
-/// expired token is still someone's mail on this Mac.
+/// expired token is still someone's mail on this Mac, and the SDK can't list
+/// what it holds.
 #[derive(Default)]
 struct Held {
     tokens: buwiz_plugin::Accounts,
@@ -81,11 +82,6 @@ impl Accounts {
         let mut held = self.held();
         held.tokens.forget();
         held.who.clear();
-    }
-
-    /// Whose sign-in `label` holds, live or expired.
-    pub fn who(&self, label: &str) -> Option<String> {
-        self.held().who.get(label).cloned()
     }
 
     /// Whether any sign-in is `subject`'s, live or expired.

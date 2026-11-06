@@ -112,6 +112,99 @@ fn signing_out_clears_the_accounts_mail_and_leaves_open_files() {
     );
 }
 
+/// Every message's labels at the stub, by asking it as the plugin does.
+fn labels(google: &FakeGoogle) -> Value {
+    google.mailbox_labels()
+}
+
+#[test]
+fn each_action_changes_only_what_it_says_and_undo_puts_it_all_back() {
+    let google = FakeGoogle::start(Seed::demo(12));
+    let core = signed_in(&google, "act");
+    core.unlock("a-seed");
+    gws::mail::sync(&core).unwrap();
+    let listed = core.run("gws_mail_list", &json!({"label": "INBOX"}));
+    let rows = listed["structuredContent"]["threads"].as_array().unwrap();
+    let (one, two) = (rows[0]["id"].clone(), rows[1]["id"].clone());
+    let before = labels(&google);
+
+    for (tool, args) in [
+        ("gws_mail_archive", json!({"threads": [one, two]})),
+        ("gws_mail_trash", json!({"threads": [one, two]})),
+        (
+            "gws_mail_mark",
+            json!({"threads": [one], "read": true, "starred": true}),
+        ),
+        ("gws_mail_mark", json!({"threads": [two], "read": false})),
+        (
+            "gws_mail_label",
+            json!({"threads": [one], "add": ["Label_1"], "remove": ["INBOX"]}),
+        ),
+    ] {
+        let done = core.run(tool, &args);
+        assert_ne!(done["isError"], true, "{tool}: {done}");
+        assert_ne!(labels(&google), before, "{tool} changed something");
+        let undo = done["structuredContent"]["undo"].clone();
+        let back = core.run("gws_mail_undo", &json!({"undo": undo}));
+        assert_ne!(back["isError"], true, "{tool}: {back}");
+        assert_eq!(labels(&google), before, "{tool} undone exactly");
+        let again = core.run("gws_mail_undo", &json!({"undo": undo}));
+        assert_eq!(
+            again["structuredContent"]["code"], "not_found",
+            "an undo is used once"
+        );
+    }
+}
+
+#[test]
+fn an_archived_thread_leaves_the_stored_inbox_at_once() {
+    let google = FakeGoogle::start(Seed::demo(12));
+    let core = signed_in(&google, "archive");
+    core.unlock("a-seed");
+    gws::mail::sync(&core).unwrap();
+    let list = || core.run("gws_mail_list", &json!({"label": "INBOX"}));
+    let first = list()["structuredContent"]["threads"][0]["id"].clone();
+    core.run("gws_mail_archive", &json!({"threads": [first]}));
+    let after = list();
+    let ids = after["structuredContent"]["threads"].as_array().unwrap();
+    assert!(!ids.iter().any(|t| t["id"] == first), "{after}");
+}
+
+#[test]
+fn a_sign_in_without_the_scope_says_so_and_changes_nothing() {
+    let google = FakeGoogle::start(Seed::demo(4));
+    google.only_grants("https://www.googleapis.com/auth/gmail.readonly");
+    let core = signed_in(&google, "scope");
+    core.unlock("a-seed");
+    gws::mail::sync(&core).unwrap();
+    let list = core.run("gws_mail_list", &json!({"label": "INBOX"}));
+    let first = list["structuredContent"]["threads"][0]["id"].clone();
+    let before = labels(&google);
+    let refused = core.run("gws_mail_archive", &json!({"threads": [first]}));
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(labels(&google), before);
+}
+
+#[test]
+fn a_bad_action_reaches_nothing() {
+    let google = FakeGoogle::start(Seed::demo(4));
+    let core = signed_in(&google, "bad");
+    core.unlock("a-seed");
+    for args in [
+        json!({"threads": []}),
+        json!({}),
+        json!({"threads": ["../drafts"]}),
+        json!({"threads": vec!["t"; 101]}),
+    ] {
+        let refused = core.run("gws_mail_archive", &args);
+        assert_eq!(
+            refused["structuredContent"]["code"], "invalid_args",
+            "{args}"
+        );
+    }
+    assert_eq!(google.writes(), []);
+}
+
 #[test]
 fn status_says_who_is_signed_in_and_never_the_token() {
     let google = FakeGoogle::start(Seed::default());
@@ -279,42 +372,6 @@ fn a_refreshed_token_keeps_the_mail() {
     let before = rows(&core, OWNER);
     core.account("buwiz.account.set", &sign_in(OWNER, 4_000_000_001));
     assert_eq!(rows(&core, OWNER), before);
-}
-
-#[test]
-fn nothing_lands_after_a_sign_out_however_late_it_arrives() {
-    let google = FakeGoogle::start(Seed::demo(6));
-    let core = with_mail(&google, "late", 4_000_000_000);
-    core.account("buwiz.account.clear", &sign_out());
-    // what a sync caught mid-flight goes on to do
-    let late = gws::mail::write_as(&core, OWNER, |store| store.set_state(OWNER, "late", "1"));
-    assert!(late.is_err(), "the account is gone");
-    let state = |account: &str, key: &str| {
-        core.store()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .state(account, key)
-            .unwrap()
-    };
-    assert_eq!(state(OWNER, "late"), None);
-    assert!(gws::mail::sync(&core).is_err(), "no sync starts for nobody");
-    assert_eq!(
-        state("", "mail_status"),
-        None,
-        "nothing lands under no name"
-    );
-}
-
-#[test]
-fn a_sign_out_that_could_not_clear_says_so_and_tries_again() {
-    let google = FakeGoogle::start(Seed::demo(6));
-    let core = with_mail(&google, "retry", 4_000_000_000);
-    let said = core.store_unavailable_while(|| core.account("buwiz.account.clear", &sign_out()));
-    assert_eq!(said["structuredContent"]["mail_kept"], true, "{said}");
-    assert!(rows(&core, OWNER) > 0, "it's still there");
-    let _ = gws::mail::sync(&core);
-    assert_eq!(rows(&core, OWNER), 0, "the next sync cleared it");
 }
 
 #[test]

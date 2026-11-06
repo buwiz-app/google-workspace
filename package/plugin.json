@@ -1,7 +1,7 @@
 {
   "name": "google-workspace",
   "version": "1.4.0",
-  "description": "Read your Gmail in Buwiz Bot, with the Google account you sign in to.",
+  "description": "Your Gmail in Buwiz Bot, with the Google account you sign in to.",
   "author": { "name": "Buwiz" },
   "homepage": "https://github.com/buwiz-app/google-workspace",
   "mcpServers": {
@@ -22,7 +22,7 @@
         "id": "google",
         "provider": "google",
         "label": "Google account",
-        "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+        "scopes": ["https://www.googleapis.com/auth/gmail.modify"],
         "required": true
       }
     ],

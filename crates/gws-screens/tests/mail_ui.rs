@@ -2403,3 +2403,23 @@ fn a_switch_made_elsewhere_reaches_an_open_letter_as_nothing_but_its_account() {
         "the plugin refuses this one, so it can't land on the other account"
     );
 }
+
+#[test]
+fn a_letter_left_on_the_other_account_can_switch_back_and_stays_its_own() {
+    let (mut app, fake) = two_accounts();
+    write_one(&mut app);
+    fake.switch_to(TWO);
+    app.wait_for_within("label:Switch account", Duration::from_secs(20))
+        .expect("the way back shows");
+    app.press(&format!("text:{TWO}")).expect("the row opens");
+    app.wait_for_within(&format!("text:{ONE}"), WAIT)
+        .expect("the letter's account shows");
+    app.press(&format!("text:{ONE}")).expect("it presses");
+    app.wait_for_gone("label:Switch account", WAIT)
+        .expect("back on its account, the chooser waits for the letter");
+    assert_eq!(fake.called("gws_account_use"), vec![json!({"label": ONE})]);
+    app.press("label:Keep draft").expect("it keeps");
+    settle(&mut app);
+    let saves = fake.called("gws_mail_draft_save");
+    assert_eq!(saves.last().unwrap()["as_account"], ONE);
+}

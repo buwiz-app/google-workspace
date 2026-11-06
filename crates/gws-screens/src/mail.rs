@@ -746,8 +746,10 @@ fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
             })
     });
     let accounts = dynamic(move || {
-        // a letter stays on its account, so a switch waits for it to close
-        if m.compose.open.get() {
+        // a letter stays on its account, so a switch waits for it to close. One
+        // left on another account by a switch elsewhere can only be saved from
+        // there, so then it's the way back.
+        if m.compose.open.get() && m.compose.who.get() == m.chooser.who.get() {
             return view();
         }
         let b = chooses.clone();
@@ -756,7 +758,9 @@ fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
             m.chooser,
             move |job| m.beside.with_untracked(|beside| drop(beside.send(job))),
             move |b| {
-                m.compose.who.set(m.chooser.who.get_untracked());
+                if !m.compose.open.get_untracked() {
+                    m.compose.who.set(m.chooser.who.get_untracked());
+                }
                 switched(b, m);
             },
         ))

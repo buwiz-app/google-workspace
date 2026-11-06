@@ -79,6 +79,8 @@ up() {
   local broker app stub
   broker="$(target "$BOT/broker")/debug/buwiz-broker"; app="$(target "$BOT/app")/debug/buwiz-bot"; stub="$(target "$REPO")/debug/gws-fake-google"
   # the plain build shares this path; it refuses the stub's variable and stops
+  # BUWIZ_KEYSTORE below is what keeps a plugin install off the owner's Keychain:
+  # older brokers ignore BUWIZ_NO_KEYCHAIN, and an install replaces the owner's seed
   local hostile=(); [ -z "${GWS_HOSTILE:-}" ] || hostile=(--hostile)
   [ -z "${GWS_GRANT:-}" ] || hostile+=(--grant "$GWS_GRANT")
   nohup "$stub" --port "$STUB_PORT" --mails "${GWS_MAILS:-200}" ${hostile[@]+"${hostile[@]}"} > "$INST/stub.log" 2>&1 & echo $! > "$INST/stub.pid"
@@ -95,7 +97,7 @@ up() {
   env -u GPUI_AGENT -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u OPENROUTER_API_KEY -u OPENAI_API_KEY -u XAI_API_KEY \
     "${model[@]}" OPENCODEX_URL=http://127.0.0.1:1 GEN_BASE_URL=http://127.0.0.1:1 \
     BUWIZ_BROKER_HUB=1 BUWIZ_BROKER_V1_HOST=1 BUWIZ_BROKER_MCP_HOST=1 BUWIZ_BROKER_DATA_DIR="$INST/broker" \
-    BUWIZ_TRUST_FILE="$INST/trust.json" BUWIZ_KEYSTORE="file:$INST/keys" BUWIZ_TEST_GOOGLE="http://127.0.0.1:$STUB_PORT" \
+    BUWIZ_TRUST_FILE="$INST/trust.json" BUWIZ_KEYSTORE="file:$INST/keys" BUWIZ_NO_KEYCHAIN=1 BUWIZ_TEST_GOOGLE="http://127.0.0.1:$STUB_PORT" \
     nohup "$broker" --port "$PORT" --data "$INST/broker" --no-node > "$INST/broker.log" 2>&1 & echo $! > "$INST/broker.pid"
   for _ in $(seq 1 100); do [ -s "$INST/broker/host-token" ] && curl -s "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 0.1; done
   install

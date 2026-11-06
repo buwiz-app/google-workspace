@@ -1046,6 +1046,23 @@ mod tests {
         }
 
         #[test]
+        fn a_refused_push_is_no_push() {
+            let google = FakeGoogle::start(Seed::demo(6));
+            let paths = dir("refused");
+            let first = core(&google, &paths);
+            first.account("buwiz.account.set", &sign_in(OWNER));
+            sync(&first).unwrap();
+            drop(first);
+            std::fs::write(paths.wipe_pending(), b"").unwrap();
+
+            let second = core(&google, &paths);
+            let refused = second.account("buwiz.account.set", &json!({"account": "google"}));
+            assert_eq!(refused["isError"], true, "{refused}");
+            let _ = sync(&second);
+            assert!(paths.wipe_pending().exists(), "the wipe still waits");
+        }
+
+        #[test]
         fn a_clear_for_a_sign_in_this_process_never_saw_still_wipes() {
             let google = FakeGoogle::start(Seed::demo(6));
             let paths = dir("unseen");

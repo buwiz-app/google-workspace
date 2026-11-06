@@ -95,11 +95,14 @@ impl Core {
         } else {
             self.accounts.clear(args)
         };
-        self.pushed
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        if !mail::reconcile(self) {
-            // the caller hears, and the next sync tries again
-            result["structuredContent"]["mail_kept"] = Value::Bool(true);
+        // a refused push says nothing about who is signed in
+        if result["isError"] != Value::Bool(true) {
+            self.pushed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if !mail::reconcile(self) {
+                // the caller hears, and the next sync tries again
+                result["structuredContent"]["mail_kept"] = Value::Bool(true);
+            }
         }
         self.sync.wake();
         result

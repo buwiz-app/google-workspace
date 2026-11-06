@@ -242,6 +242,9 @@ struct Mail {
     signed_out: Signal<bool>,
     link: Signal<Option<String>>,
     loading: Signal<bool>,
+    /// What became of an action: it stays until the person dismisses it or
+    /// acts again, as a reload can come at any moment.
+    told: Signal<Option<String>>,
     /// Why the list didn't load, in words for the person.
     problem: Signal<Option<String>>,
     seq: Signal<i64>,
@@ -311,6 +314,9 @@ async fn load_list(b: Bridge, m: Mail, skip: usize) {
                 all.append(&mut new_rows(&all, rows));
                 rows = all;
             }
+            // a pick that left the list is one nobody can see
+            m.picked
+                .update(|p| p.retain(|id| rows.iter().any(|r| r.id == *id)));
             m.rows.set(rows);
             m.more.set(v.get("more") == Some(&Value::Bool(true)));
             m.saved.set(v.get("saved") == Some(&Value::Bool(true)));
@@ -394,15 +400,15 @@ async fn act(
                 ids.clone()
             };
             let missed: Vec<String> = ids.iter().filter(|i| !done.contains(i)).cloned().collect();
-            m.problem.set((!missed.is_empty()).then(|| {
+            m.told.set((!missed.is_empty()).then(|| {
                 format!(
                     "{} of {} went through. The rest didn't.",
                     done.len(),
                     ids.len()
                 )
             }));
-            // what failed stays picked, ready to try again
-            m.picked.set(missed);
+            // what failed stays picked, ready to try again, with anything picked since
+            m.picked.update(|p| p.retain(|id| !done.contains(id)));
             if leaves {
                 let next = m.rows.with_untracked(|r| next_after(r, &done));
                 let open_gone = m
@@ -425,23 +431,34 @@ async fn act(
             }
         }
         Err(e) if e == "sign-in" => m.signed_out.set(true),
-        Err(e) => m.problem.set(Some(e)),
+        Err(e) => m.told.set(Some(e)),
     }
 }
 
-async fn undo_last(b: Bridge, m: Mail) {
-    let Some((undo, _)) = m.undo.get_untracked() else {
+/// Undoes `undo`, named at the press: another action can finish before this
+/// one's turn comes, and it mustn't be that one that goes back.
+async fn undo_last(b: Bridge, m: Mail, undo: Option<String>) {
+    let Some(undo) = undo else {
         return;
     };
     match once(&b, "gws_mail_undo", json!({"undo": undo})).await {
         Ok(_) => {
-            m.undo.set(None);
-            m.problem.set(None);
+            if m.undo
+                .with_untracked(|u| u.as_ref().is_some_and(|(id, _)| *id == undo))
+            {
+                m.undo.set(None);
+            }
+            m.told.set(None);
             load_list(b, m, 0).await;
         }
         // the bar stays, so it can be pressed again
-        Err(e) => m.problem.set(Some(e)),
+        Err(e) => m.told.set(Some(e)),
     }
+}
+
+/// What Undo would take back right now.
+fn last_action(m: Mail) -> Option<String> {
+    m.undo.get_untracked().map(|(id, _)| id)
 }
 
 async fn load_labels(b: Bridge, m: Mail) {
@@ -716,6 +733,22 @@ fn list_pane(b: Bridge, m: Mail) -> impl IntoElement {
                         }),
                 ),
         )
+        .child(dynamic(move || match m.told.get() {
+            Some(line) => view()
+                .app_class(Some(
+                    format!("flex-row items-center gap-2 px-3 py-1 border-b {LINE}").into(),
+                ))
+                .child(text(line).app_class(Some(format!("flex-1 text-[11px] {INK}").into())))
+                .child(
+                    view()
+                        .label("Dismiss this")
+                        .on_press(move || m.told.set(None))
+                        .child(
+                            text("Dismiss").app_class(Some(format!("text-[11px] {MUTE}").into())),
+                        ),
+                ),
+            None => view(),
+        }))
         .child(dynamic(move || {
             let line = m
                 .problem
@@ -961,7 +994,7 @@ fn undo_bar(b: Bridge, m: Mail) -> impl IntoElement {
                         .app_class(Some("px-3 py-1".into()))
                         .label("Undo that")
                         .on_press(move || {
-                            run(m, undo_last(b.clone(), m));
+                            run(m, undo_last(b.clone(), m, last_action(m)));
                         })
                         .child(text("Undo").app_class(Some(format!("text-[12px] {INK}").into()))),
                 )
@@ -1151,7 +1184,7 @@ fn keys(b: Bridge, m: Mail) {
         }
     });
     on_key("z", move |_| {
-        run(m, undo_last(back.clone(), m));
+        run(m, undo_last(back.clone(), m, last_action(m)));
     });
 }
 
@@ -1375,6 +1408,7 @@ pub fn build(bridge: Bridge) -> Root {
         let (jobs, mut waiting) = unbounded_channel::<Job>();
         let m = Mail {
             problem: signal(None),
+            told: signal(None),
             list_turn: Latest::new(),
             open_turn: Latest::new(),
             labels: signal(column(&Value::Null)),

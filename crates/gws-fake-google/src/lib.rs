@@ -536,8 +536,11 @@ impl Sent {
     fn resource(&self, id: &str, thread: Option<&str>) -> Value {
         let header = |name: &str, value: &str| json!({"name": name, "value": value});
         let headers = json!([
-            header("To", &self.to), header("Cc", &self.cc), header("Bcc", &self.bcc),
-            header("Subject", &self.subject), header("Message-ID", &self.message_id),
+            header("To", &self.to),
+            header("Cc", &self.cc),
+            header("Bcc", &self.bcc),
+            header("Subject", &self.subject),
+            header("Message-ID", &self.message_id),
         ]);
         let text = json!({"mimeType": "text/plain", "body": {"data": b64(self.body.as_bytes())}});
         if self.attachments.is_empty() {
@@ -556,7 +559,11 @@ impl Sent {
 impl Account {
     /// The People API's two searches: contacts, and who the person's mail knows.
     fn people(&mut self, r: &Request) -> Reply {
-        if self.only_grants.as_deref().is_some_and(|g| !g.contains("contacts")) {
+        if self
+            .only_grants
+            .as_deref()
+            .is_some_and(|g| !g.contains("contacts"))
+        {
             return Self::insufficient();
         }
         let query = r.param("query").unwrap_or_default().to_lowercase();
@@ -579,7 +586,10 @@ impl Account {
             .map(|b| parts_of(&r.body, &b))
             .unwrap_or_default();
         let [metadata, message] = parts.as_slice() else {
-            return Reply::json(400, json!({"error": {"code": 400, "message": "Bad upload."}}));
+            return Reply::json(
+                400,
+                json!({"error": {"code": 400, "message": "Bad upload."}}),
+            );
         };
         let after_head = |part: &[u8]| {
             let at = part.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(0);
@@ -641,6 +651,12 @@ impl Account {
         }
         q.split_whitespace().all(|term| {
             let term = term.to_lowercase();
+            if term == "in:sent" {
+                return m.labels.iter().any(|l| l == "SENT");
+            }
+            if let Some(to) = term.strip_prefix("to:") {
+                return m.to.to_lowercase().contains(to);
+            }
             if let Some(from) = term.strip_prefix("from:") {
                 return m.from.to_lowercase().contains(from);
             }
@@ -769,7 +785,11 @@ impl Account {
             },
             ("GET", ["messages", id, "attachments", att]) => {
                 let at = att.rsplit('-').next().and_then(|i| i.parse::<usize>().ok());
-                let held = self.drafts.iter().find(|d| d.1 == *id).map(|d| Sent::of(&d.2));
+                let held = self
+                    .drafts
+                    .iter()
+                    .find(|d| d.1 == *id)
+                    .map(|d| Sent::of(&d.2));
                 let found = match &held {
                     Some(draft) => at.and_then(|i| draft.attachments.get(i)),
                     None => self
@@ -1075,7 +1095,10 @@ impl Account {
         if path.starts_with("/people/v1/") {
             return self.people(&r);
         }
-        if let Some(rest) = path.strip_prefix("/upload").and_then(|p| p.strip_prefix(GMAIL)) {
+        if let Some(rest) = path
+            .strip_prefix("/upload")
+            .and_then(|p| p.strip_prefix(GMAIL))
+        {
             let rest = rest.to_owned();
             return self.upload(r, &rest);
         }

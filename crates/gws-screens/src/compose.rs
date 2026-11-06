@@ -158,6 +158,9 @@ impl Letter {
     }
 }
 
+/// A field of the letter.
+type Place = fn(&mut Letter) -> &mut String;
+
 /// Where a Send that left the panel has got to.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Stage {
@@ -189,7 +192,7 @@ pub struct Compose {
     next: Signal<u64>,
     /// `(name, address)` suggested for what's being typed, and where it goes.
     people: Signal<Vec<(String, String)>>,
-    naming: Signal<Option<fn(&mut Letter) -> &mut String>>,
+    naming: Signal<Option<Place>>,
     asked: Latest,
 }
 
@@ -267,7 +270,10 @@ pub async fn autosave(b: Bridge, c: Compose) {
     loop {
         sleep(AUTOSAVE).await;
         let idle = c.open.get_untracked() && c.dirty() && !c.saving.get_untracked();
-        if idle && c.letter.with_untracked(|l| !l.blank() && l.files.is_empty()) {
+        if idle
+            && c.letter
+                .with_untracked(|l| !l.blank() && l.files.is_empty())
+        {
             c.saving.set(true);
             let b = b.clone();
             c.run(async move {
@@ -409,6 +415,20 @@ pub fn resume(b: Bridge, c: Compose, thread: String) {
     });
 }
 
+/// The draft a card named, opened here to go on with.
+pub fn resume_ticket(b: Bridge, c: Compose, ticket: String) {
+    c.run(async move {
+        match b
+            .call("gws_mail_draft_read", json!({"ticket": ticket}))
+            .await
+        {
+            Ok(v) => c.fill(Letter::of(&v)),
+            Err(e) => c.said.set(Some(e.message)),
+        }
+        c.open.set(true);
+    });
+}
+
 /// Leaves the message for later: saved, unless there's nothing to keep.
 pub fn keep(b: Bridge, c: Compose) {
     c.run(async move {
@@ -471,7 +491,9 @@ async fn upload(b: &Bridge, c: Compose, key: u64, name: &str, mime: &str, bytes:
         };
         id = v.get("upload").cloned().unwrap_or(Value::Null);
         at = v.get("size").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let gone = !c.letter.with_untracked(|l| l.files.iter().any(|f| f.key == key));
+        let gone = !c
+            .letter
+            .with_untracked(|l| l.files.iter().any(|f| f.key == key));
         if gone {
             // taken off while it came: nothing should hold on to it
             let _ = b.call("gws_upload_drop", json!({"upload": id})).await;
@@ -508,10 +530,13 @@ fn attach(b: Bridge, c: Compose) {
             }
         };
         for file in files {
-            let held = c.letter.with_untracked(|l| l.files.iter().map(|f| f.size).sum::<u64>());
+            let held = c
+                .letter
+                .with_untracked(|l| l.files.iter().map(|f| f.size).sum::<u64>());
             if held + file.size > ATTACHMENTS_MAX {
-                c.said
-                    .set(Some("That's over Gmail's 25 MB limit for one message.".to_owned()));
+                c.said.set(Some(
+                    "That's over Gmail's 25 MB limit for one message.".to_owned(),
+                ));
                 continue;
             }
             let key = 1_000 + c.fresh();
@@ -585,42 +610,51 @@ pub fn send(b: Bridge, c: Compose) {
             c.said.set(Some(why));
             return;
         }
-        let letter = c.letter.get_untracked();
-        let args = json!({
-            "draft": letter.draft, "revision": letter.revision,
-            "message_id": letter.message_id, "armed": armed,
-        });
-        c.held.set(Some(letter));
-        c.close();
-        c.stage.set(Some(Stage::Waiting));
-        let turn = c.hold.ask();
-        let mut waited = Duration::ZERO;
-        while waited < HOLD {
-            sleep(TICK).await;
-            waited += TICK;
-            if !c.hold.counts(turn) {
-                return;
-            }
-        }
-        c.stage.set(Some(Stage::Sending));
-        let mut answer = b.call("gws_mail_send", args.clone()).await;
-        // an answer lost on the way: asking again finds it in Sent, and it can't
-        // go twice, as the press it needs is spent
-        if matches!(&answer, Err(e) if e.retryable) {
-            answer = b.call("gws_mail_send", args).await;
-        }
-        match answer {
-            Ok(_) => {
-                c.held.set(None);
-                c.stage.set(Some(Stage::Sent));
-            }
-            Err(e) => {
-                c.stage.set(None);
-                bring_back(&b, c).await;
-                c.said.set(Some(e.message));
-            }
+        if let Err(why) = hold_and_send(&b, c, armed).await {
+            c.said.set(Some(why));
         }
     });
+}
+
+/// The five seconds, then the send of the letter as it stands, which must be
+/// the revision the person read. `Err` has brought the letter back.
+async fn hold_and_send(b: &Bridge, c: Compose, armed: Value) -> Result<(), String> {
+    let letter = c.letter.get_untracked();
+    let args = json!({
+        "draft": letter.draft, "revision": letter.revision,
+        "message_id": letter.message_id, "armed": armed,
+    });
+    c.held.set(Some(letter));
+    c.close();
+    c.stage.set(Some(Stage::Waiting));
+    let turn = c.hold.ask();
+    let mut waited = Duration::ZERO;
+    while waited < HOLD {
+        sleep(TICK).await;
+        waited += TICK;
+        if !c.hold.counts(turn) {
+            return Ok(());
+        }
+    }
+    c.stage.set(Some(Stage::Sending));
+    let mut answer = b.call("gws_mail_send", args.clone()).await;
+    // an answer lost on the way: asking again finds it in Sent, and it can't go
+    // twice, as the press it needs is spent
+    if matches!(&answer, Err(e) if e.retryable) {
+        answer = b.call("gws_mail_send", args).await;
+    }
+    match answer {
+        Ok(_) => {
+            c.held.set(None);
+            c.stage.set(Some(Stage::Sent));
+            Ok(())
+        }
+        Err(e) => {
+            c.stage.set(None);
+            bring_back(b, c).await;
+            Err(e.message)
+        }
+    }
 }
 
 /// The held letter, back in the panel. What was written since is kept as a draft.
@@ -687,7 +721,7 @@ async fn suggest(b: Bridge, c: Compose, word: String) {
     );
 }
 
-fn line(c: Compose, name: &'static str, at: fn(&mut Letter) -> &mut String) -> Input {
+fn line(c: Compose, name: &'static str, at: Place) -> Input {
     input()
         .label(name)
         .value(move || {
@@ -700,7 +734,7 @@ fn line(c: Compose, name: &'static str, at: fn(&mut Letter) -> &mut String) -> I
 
 /// Takes in what was typed: `false` when that's what the letter holds already,
 /// as setting a field's value answers with a change of its own.
-fn typed(c: Compose, at: fn(&mut Letter) -> &mut String, value: &str) -> bool {
+fn typed(c: Compose, at: Place, value: &str) -> bool {
     let mut letter = c.letter.get_untracked();
     if at(&mut letter) == value {
         return false;
@@ -710,19 +744,14 @@ fn typed(c: Compose, at: fn(&mut Letter) -> &mut String, value: &str) -> bool {
     true
 }
 
-fn field(c: Compose, name: &'static str, at: fn(&mut Letter) -> &mut String) -> Input {
+fn field(c: Compose, name: &'static str, at: Place) -> Input {
     line(c, name, at).on_change(move |value: &str| {
         typed(c, at, value);
     })
 }
 
 /// A field that takes people, with suggestions as they're typed.
-fn people_field(
-    b: Bridge,
-    c: Compose,
-    name: &'static str,
-    at: fn(&mut Letter) -> &mut String,
-) -> impl IntoElement {
+fn people_field(b: Bridge, c: Compose, name: &'static str, at: Place) -> impl IntoElement {
     line(c, name, at).on_change(move |value: &str| {
         if typed(c, at, value) {
             c.naming.set(Some(at));
@@ -789,7 +818,9 @@ fn file_row(b: Bridge, c: Compose, file: File) -> View {
     };
     let key = file.key;
     view()
-        .app_class(Some(format!("flex-row items-center gap-2 px-3 py-1 border-b {LINE}").into()))
+        .app_class(Some(
+            format!("flex-row items-center gap-2 px-3 py-1 border-b {LINE}").into(),
+        ))
         .child(
             text(file.name.clone())
                 .number_of_lines(1)
@@ -810,8 +841,14 @@ fn file_row(b: Bridge, c: Compose, file: File) -> View {
 
 /// The panel, in the reader's place.
 pub fn panel(b: Bridge, c: Compose) -> impl IntoElement {
-    let (sending, attaching, keeping, files, ask, naming) =
-        (b.clone(), b.clone(), b.clone(), b.clone(), b.clone(), b.clone());
+    let (sending, attaching, keeping, files, ask, naming) = (
+        b.clone(),
+        b.clone(),
+        b.clone(),
+        b.clone(),
+        b.clone(),
+        b.clone(),
+    );
     view()
         .app_class(Some("flex-1".into()))
         .child(people_field(b, c, "To", |l| &mut l.to))
@@ -821,9 +858,11 @@ pub fn panel(b: Bridge, c: Compose) -> impl IntoElement {
                     .child(people_field(naming.clone(), c, "Cc", |l| &mut l.cc))
                     .child(people_field(naming.clone(), c, "Bcc", |l| &mut l.bcc))
             } else {
-                view()
-                    .app_class(Some("flex-row".into()))
-                    .child(press_text("Add Cc or Bcc", "Cc, Bcc", move || c.extra.set(true)))
+                view().app_class(Some("flex-row".into())).child(press_text(
+                    "Add Cc or Bcc",
+                    "Cc, Bcc",
+                    move || c.extra.set(true),
+                ))
             }
         }))
         .child(suggestions(c))
@@ -847,9 +886,8 @@ pub fn panel(b: Bridge, c: Compose) -> impl IntoElement {
         .child(dynamic(move || {
             let rows = c.letter.with(|l| l.files.clone());
             let b = files.clone();
-            rows.into_iter().fold(view(), move |v, file| {
-                v.child(file_row(b.clone(), c, file))
-            })
+            rows.into_iter()
+                .fold(view(), move |v, file| v.child(file_row(b.clone(), c, file)))
         }))
         .child(dynamic(move || match c.said.get() {
             Some(line) => view()
@@ -861,7 +899,9 @@ pub fn panel(b: Bridge, c: Compose) -> impl IntoElement {
             let ask = ask.clone();
             if c.asking.get() {
                 return view()
-                    .app_class(Some(format!("flex-row items-center gap-2 px-2 py-1 border-t {LINE}").into()))
+                    .app_class(Some(
+                        format!("flex-row items-center gap-2 px-2 py-1 border-t {LINE}").into(),
+                    ))
                     .child(
                         text("Delete this draft for good?")
                             .app_class(Some(format!("flex-1 px-1 text-[12px] {INK}").into())),
@@ -876,7 +916,9 @@ pub fn panel(b: Bridge, c: Compose) -> impl IntoElement {
             let (sending, attaching, keeping) =
                 (sending.clone(), attaching.clone(), keeping.clone());
             view()
-                .app_class(Some(format!("flex-row items-center gap-1 px-2 py-1 border-t {LINE} {RAIL}").into()))
+                .app_class(Some(
+                    format!("flex-row items-center gap-1 px-2 py-1 border-t {LINE} {RAIL}").into(),
+                ))
                 .child(press_text("Send", "Send", move || send(sending.clone(), c)))
                 .child(press_text("Attach a file", "Attach", move || {
                     attach(attaching.clone(), c);
@@ -907,7 +949,9 @@ pub fn hold_bar(b: Bridge, c: Compose) -> impl IntoElement {
             Stage::Sent => "Message sent.",
         };
         let bar = view()
-            .app_class(Some(format!("flex-row items-center gap-3 px-3 py-2 border-t {LINE} {RAIL}").into()))
+            .app_class(Some(
+                format!("flex-row items-center gap-3 px-3 py-2 border-t {LINE} {RAIL}").into(),
+            ))
             .child(text(line).app_class(Some(format!("flex-1 text-[12px] {INK}").into())));
         let b = b.clone();
         match stage {
@@ -920,4 +964,217 @@ pub fn hold_bar(b: Bridge, c: Compose) -> impl IntoElement {
             })),
         }
     })
+}
+
+/// How many recipients a card sends to without asking once more.
+const FEW: usize = 5;
+
+/// What the card has to show.
+#[derive(Clone, PartialEq, Default)]
+struct Review {
+    from: String,
+    /// Recipients the person has never written to.
+    new: Vec<String>,
+}
+
+fn recipients(l: &Letter) -> usize {
+    [&l.to, &l.cc, &l.bcc]
+        .iter()
+        .flat_map(|f| f.split(','))
+        .filter(|a| !a.trim().is_empty())
+        .count()
+}
+
+/// Reads the draft again: what's shown is always what Send would send.
+async fn read_card(
+    b: &Bridge,
+    c: Compose,
+    ticket: &str,
+    review: Signal<Option<Review>>,
+) -> Result<(), String> {
+    let v = b
+        .call("gws_mail_draft_read", json!({"ticket": ticket}))
+        .await
+        .map_err(|e| e.message)?;
+    c.fill(Letter::of(&v));
+    let new = v.get("new").and_then(Value::as_array).into_iter().flatten();
+    review.set(Some(Review {
+        from: v
+            .get("from")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        new: new.filter_map(|n| n.as_str().map(str::to_owned)).collect(),
+    }));
+    Ok(())
+}
+
+fn review_line(label: &'static str, value: String) -> View {
+    view()
+        .app_class(Some("flex-row gap-2 px-3 py-[2px]".into()))
+        .child(text(label).app_class(Some(format!("w-[52px] text-[11px] {MUTE}").into())))
+        .child(text(value).app_class(Some(format!("flex-1 text-[12px] {INK}").into())))
+}
+
+/// The Send press on a card: its own call first, as in the panel. A draft that
+/// changed since it showed is refused by revision, and shown again as it is.
+fn send_reviewed(b: Bridge, c: Compose, ticket: String, review: Signal<Option<Review>>) {
+    let press = b.call("gws_mail_send_arm", json!({}));
+    c.run(async move {
+        let armed = match press.await {
+            Ok(v) => v.get("armed").cloned().unwrap_or(Value::Null),
+            Err(e) => {
+                c.said.set(Some(e.message));
+                return;
+            }
+        };
+        match hold_and_send(&b, c, armed).await {
+            Ok(()) if c.stage.get_untracked() == Some(Stage::Sent) => {
+                let _ = b.settle("Message sent.").await;
+            }
+            Ok(()) => {}
+            Err(why) => {
+                let _ = read_card(&b, c, &ticket, review).await;
+                c.said.set(Some(why));
+            }
+        }
+    });
+}
+
+/// The draft card under a chat's answer: everything Send would send, and the
+/// person's press. The model filled it and can press nothing here.
+pub fn card(b: Bridge, ticket: String) -> View {
+    let (c, waiting) = Compose::new();
+    let review = signal(None::<Review>);
+    let kept = signal(false);
+    b.spawn(work(waiting));
+    let (loading, name) = (b.clone(), ticket.clone());
+    c.run(async move {
+        if let Err(why) = read_card(&loading, c, &name, review).await {
+            c.said.set(Some(why));
+        }
+        loading.ready();
+    });
+    let (fit, bar) = (b.clone(), b.clone());
+    view()
+        .app_class(Some("bg-white dark:bg-[#1d1d1d]".into()))
+        .on_layout(
+            move |bounds: &nsh_core::geometry::Bounds<nsh_core::geometry::Points>| {
+                let _ = fit.fit(bounds.size.height.0.ceil());
+            },
+        )
+        .child(hold_bar(bar, c))
+        .child(dynamic(move || {
+            let shown = review.get();
+            if c.stage.get().is_some() {
+                return view();
+            }
+            if kept.get() {
+                return view().app_class(Some("p-3".into())).child(
+                    text("Kept in Drafts.").app_class(Some(format!("text-[12px] {MUTE}").into())),
+                );
+            }
+            let Some(shown) = shown else {
+                let line = c
+                    .said
+                    .get()
+                    .unwrap_or_else(|| "Reading the draft…".to_owned());
+                return view()
+                    .app_class(Some("p-3".into()))
+                    .child(text(line).app_class(Some(format!("text-[12px] {MUTE}").into())));
+            };
+            let letter = c.letter.get();
+            let stranger = letter.thread.is_some() && !shown.new.is_empty();
+            let mut card = view()
+                .app_class(Some("py-2".into()))
+                .label("This draft")
+                .child(review_line("From", shown.from.clone()))
+                .child(review_line("To", letter.to.clone()));
+            if !letter.cc.is_empty() {
+                card = card.child(review_line("Cc", letter.cc.clone()));
+            }
+            if !letter.bcc.is_empty() {
+                card = card.child(review_line("Bcc", letter.bcc.clone()));
+            }
+            if !shown.new.is_empty() {
+                card = card.child(review_line("New", shown.new.join(", ")));
+            }
+            card = card
+                .child(review_line("Subject", letter.subject.clone()))
+                .child(
+                    scroll()
+                        .app_class(Some(
+                            format!("max-h-[220px] mt-1 px-3 py-2 border-t {LINE}").into(),
+                        ))
+                        .child(
+                            text(letter.body.clone())
+                                .app_class(Some(format!("text-[12px] {INK}").into())),
+                        ),
+                );
+            if let Some(line) = c.said.get() {
+                card = card.child(
+                    view()
+                        .app_class(Some(format!("px-3 py-1 border-t {LINE}").into()))
+                        .child(text(line).app_class(Some(format!("text-[12px] {INK}").into()))),
+                );
+            }
+            if stranger {
+                card = card.child(
+                    view()
+                        .app_class(Some(format!("px-3 py-1 border-t {LINE}").into()))
+                        .child(
+                            text("Replies to someone new. Open the full review to send it.")
+                                .app_class(Some(format!("text-[12px] {INK}").into())),
+                        ),
+                );
+            }
+            let (sending, opening, name) = (b.clone(), b.clone(), ticket.clone());
+            let open = press_text(
+                if stranger {
+                    "Open the full review"
+                } else {
+                    "Edit this draft"
+                },
+                if stranger { "Open full review" } else { "Edit" },
+                move || {
+                    let open = opening.open("mail", json!({"draft": name}));
+                    opening.spawn(async move { drop(open.await) });
+                },
+            );
+            let keep = press_text("Keep draft", "Keep draft", move || kept.set(true));
+            let mut row = view()
+                .app_class(Some(
+                    format!("flex-row items-center gap-1 px-2 py-1 border-t {LINE} {RAIL}").into(),
+                ))
+                .child(keep)
+                .child(open)
+                .child(view().app_class(Some("flex-1".into())));
+            if !stranger {
+                let needs_asking = recipients(&letter) > FEW || !letter.bcc.is_empty();
+                let name = ticket.clone();
+                if c.asking.get() {
+                    row = row
+                        .child(
+                            text(format!("Send to {}?", recipients(&letter)))
+                                .app_class(Some(format!("text-[12px] {INK}").into())),
+                        )
+                        .child(press_text("Not yet", "Not yet", move || {
+                            c.asking.set(false)
+                        }))
+                        .child(press_text("Send it", "Send it", move || {
+                            c.asking.set(false);
+                            send_reviewed(sending.clone(), c, name.clone(), review);
+                        }));
+                } else {
+                    row = row.child(press_text("Send", "Send", move || {
+                        if needs_asking {
+                            c.asking.set(true);
+                        } else {
+                            send_reviewed(sending.clone(), c, name.clone(), review);
+                        }
+                    }));
+                }
+            }
+            view().child(card).child(row)
+        }))
 }

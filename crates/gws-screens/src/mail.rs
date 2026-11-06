@@ -511,9 +511,9 @@ async fn undo_last(b: Bridge, m: Mail, undo: Option<String>) {
                 m.undo.set(None);
             }
             // what's said about another action still stands
-            if m.told.with_untracked(|t| {
-                t.as_ref().is_some_and(|t| t.undo.as_ref() == Some(&undo))
-            }) {
+            if m.told
+                .with_untracked(|t| t.as_ref().is_some_and(|t| t.undo.as_ref() == Some(&undo)))
+            {
                 m.told.set(None);
             }
             reload(b, m).await;
@@ -685,13 +685,13 @@ fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
         .app_class(Some(
             format!("w-[190px] pt-3 border-r {LINE} {RAIL}").into(),
         ))
-        .child(
-            view()
-                .app_class(Some("px-2 py-2".into()))
-                .child(tool("Write a message", "Write", move || {
-                    compose::start(writes.clone(), m.compose);
-                })),
-        )
+        .child(view().app_class(Some("px-2 py-2".into())).child(tool(
+            "Write a message",
+            "Write",
+            move || {
+                compose::start(writes.clone(), m.compose);
+            },
+        )))
         .child(list)
 }
 
@@ -1533,11 +1533,14 @@ fn help_view() -> impl IntoElement {
 
 pub fn build(bridge: Bridge) -> Root {
     buwiz_app::root(bridge, move |b| {
-        if b.viewport_now().placement == Placement::Inline {
-            return view().child(card(b));
-        }
         let props = b.props();
         let prop = |k: &str| props.get(k).and_then(Value::as_str).map(str::to_owned);
+        if b.viewport_now().placement == Placement::Inline {
+            return match prop("draft") {
+                Some(ticket) => view().child(compose::card(b, ticket)),
+                None => view().child(card(b)),
+            };
+        }
         let (jobs, mut waiting) = unbounded_channel::<Job>();
         let (writer, writing) = Compose::new();
         let m = Mail {
@@ -1548,7 +1551,7 @@ pub fn build(bridge: Bridge) -> Root {
             list_turn: Latest::new(),
             open_turn: Latest::new(),
             labels: signal(column(&Value::Null)),
-            label: signal("INBOX".to_owned()),
+            label: signal(prop("view").unwrap_or_else(|| "INBOX".to_owned())),
             rows: signal(Vec::new()),
             more: signal(false),
             query: signal(String::new()),
@@ -1582,6 +1585,9 @@ pub fn build(bridge: Bridge) -> Root {
         });
         if let Some(ticket) = prop("thread") {
             b.spawn(open_ticket(b.clone(), m, ticket));
+        }
+        if let Some(ticket) = prop("draft") {
+            compose::resume_ticket(b.clone(), writer, ticket);
         }
         let (rail, list, guide) = (b.clone(), b.clone(), b.clone());
         let (undoing, pane, holding) = (b.clone(), b.clone(), b.clone());

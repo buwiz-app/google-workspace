@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use crate::accounts::Bearer;
 use crate::gmail::{self, Failure};
+use crate::mail::Subject;
 use crate::tools::{MAIL_DRAFT_SAVE, fail, ok};
 use crate::{Core, js};
 
@@ -76,8 +77,7 @@ impl Uploads {
     }
 
     fn free_draft(&mut self, draft: &str) {
-        self.files
-            .retain(|_, u| u.draft.as_deref() != Some(draft));
+        self.files.retain(|_, u| u.draft.as_deref() != Some(draft));
     }
 }
 
@@ -112,8 +112,8 @@ fn mime_type(kind: &str) -> String {
 /// `gws_upload_chunk`: part of a file. `at` says where it goes, and the answer
 /// where to go on from, so a chunk whose answer was lost isn't kept twice.
 pub fn upload_chunk(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let Ok(data) = base64::engine::general_purpose::STANDARD
-        .decode(js::string_or_empty(args.get("data")))
+    let Ok(data) =
+        base64::engine::general_purpose::STANDARD.decode(js::string_or_empty(args.get("data")))
     else {
         return Ok(fail("invalid_args", "That isn't a file's bytes."));
     };
@@ -126,7 +126,10 @@ pub fn upload_chunk(core: &Core, args: &Value) -> Result<Value, Failure> {
         id = held.start(name, mime_type(&js::string_or_empty(args.get("type"))));
     }
     let Some(upload) = held.files.get_mut(&id) else {
-        return Ok(fail("not_found", "That upload is gone. Attach the file again."));
+        return Ok(fail(
+            "not_found",
+            "That upload is gone. Attach the file again.",
+        ));
     };
     let size = upload.part.bytes.len();
     if at == size {
@@ -476,16 +479,21 @@ pub fn save(core: &Core, args: &Value) -> Result<Value, Failure> {
         let message = draft.message(&message_id, &parts);
         core.gmail.draft_upload(&auth, replaces, &message, thread)?
     } else if held.is_empty() {
-        core.gmail.draft_create(&auth, &draft.raw(&message_id), thread)?
+        core.gmail
+            .draft_create(&auth, &draft.raw(&message_id), thread)?
     } else {
-        core.gmail.draft_update(&auth, &held, &draft.raw(&message_id), thread)?
+        core.gmail
+            .draft_update(&auth, &held, &draft.raw(&message_id), thread)?
     };
     let Some(saved) = saved else {
         return Ok(fail("not_found", "That draft is gone."));
     };
     // a person's edit makes it theirs: `save_for_model` claims it back only for itself
     model_drafts(core).remove(&held);
-    let id = saved.pointer("/id").and_then(Value::as_str).unwrap_or_default();
+    let id = saved
+        .pointer("/id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let mut files = uploads(core);
     for upload in upload_ids(args) {
         if let Some(file) = files.files.get_mut(&upload) {
@@ -500,10 +508,45 @@ pub fn save(core: &Core, args: &Value) -> Result<Value, Failure> {
     })))
 }
 
-/// `gws_mail_draft_read`: a draft as it stands, with the revision Send needs.
+/// The most recipients looked up in Sent: past that, all count as new.
+const LOOKED_UP_MAX: usize = 20;
+
+/// Who in `to`, `cc` and `bcc` the person has never written to.
+fn new_to(core: &Core, auth: &Bearer, lists: &[String]) -> Result<Vec<String>, Failure> {
+    let all: Vec<String> = lists
+        .iter()
+        .flat_map(|l| l.split(','))
+        .filter_map(address)
+        .collect();
+    let mut new = Vec::new();
+    for (at, who) in all.iter().enumerate() {
+        let known = at < LOOKED_UP_MAX
+            && !core
+                .gmail
+                .search(auth, &format!("in:sent to:{who}"), 1)?
+                .is_empty();
+        if !known {
+            new.push(who.clone());
+        }
+    }
+    Ok(new)
+}
+
+/// `gws_mail_draft_read`: a draft as it stands, with the revision Send needs. By
+/// a card's ticket it's a review: it also says who it's from and who's new.
 pub fn read(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let auth = session(core)?;
-    let id = js::string_or_empty(args.get("draft"));
+    let (auth, me) = core.accounts.session().ok_or(Failure::AccountRequired)?;
+    let ticket = js::string_or_empty(args.get("ticket"));
+    let review = !ticket.is_empty();
+    let id = if review {
+        let tickets = core.tickets.lock().unwrap_or_else(|e| e.into_inner());
+        match tickets.subject(&ticket) {
+            Some(Subject::Draft(id)) => id.clone(),
+            _ => return Ok(fail("not_found", "This card is out of date.")),
+        }
+    } else {
+        js::string_or_empty(args.get("draft"))
+    };
     if !gmail::id_ok(&id) {
         return Ok(fail("invalid_args", "That isn't a draft."));
     }
@@ -512,8 +555,15 @@ pub fn read(core: &Core, args: &Value) -> Result<Value, Failure> {
     };
     let message = held.get("message").cloned().unwrap_or(Value::Null);
     let h = |name| gmail::short_header(&message, name);
+    let new = if review {
+        new_to(core, &auth, &[h("To"), h("Cc"), h("Bcc")])?
+    } else {
+        Vec::new()
+    };
     Ok(ok(json!({
         "draft": id,
+        "from": me,
+        "new": new,
         "revision": message.get("id"),
         "message_id": h("Message-ID"),
         "to": h("To"),
@@ -604,7 +654,9 @@ pub fn draft_of(core: &Core, args: &Value) -> Result<Value, Failure> {
     if !gmail::id_ok(&thread) {
         return Ok(fail("invalid_args", "That isn't a conversation."));
     }
-    Ok(ok(json!({"draft": core.gmail.draft_in_thread(&auth, &thread)?})))
+    Ok(ok(
+        json!({"draft": core.gmail.draft_in_thread(&auth, &thread)?}),
+    ))
 }
 
 /// How many people a suggestion list shows.
@@ -622,7 +674,8 @@ pub fn suggest(core: &Core, args: &Value) -> Result<Value, Failure> {
         return Ok(ok(json!({"people": []})));
     }
     let take = SUGGESTIONS_MAX as i64;
-    let mut found = crate::mail::with_store(core, |s| s.senders(&me, query, take)).unwrap_or_default();
+    let mut found =
+        crate::mail::with_store(core, |s| s.senders(&me, query, take)).unwrap_or_default();
     // no contacts is no reason to lose what's here: a sign-in from before this
     // asked for them, or being offline, answers with the rest
     if !core.warm.swap(true, Ordering::Relaxed) {

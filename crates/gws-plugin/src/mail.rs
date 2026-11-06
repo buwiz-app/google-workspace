@@ -18,10 +18,10 @@ use crate::accounts::Bearer;
 use crate::clean;
 use crate::gmail::{self, Failure};
 use crate::tools::{
-    MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_DRAFT_DELETE, MAIL_DRAFT_READ, MAIL_DRAFT_SAVE,
-    MAIL_DRAFT_OF, MAIL_JOB, MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK, MAIL_REPLY_START,
-    MAIL_SEND, MAIL_SEND_ARM, PEOPLE_SUGGEST, UPLOAD_CHUNK, UPLOAD_DROP, MAIL_THREAD,
-    MAIL_TRASH, MAIL_UNDO, SEARCH_MAIL, fail, failed, ok,
+    MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_DRAFT_DELETE, MAIL_DRAFT_OF, MAIL_DRAFT_READ,
+    MAIL_DRAFT_SAVE, MAIL_JOB, MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK, MAIL_REPLY_START,
+    MAIL_SEND, MAIL_SEND_ARM, MAIL_THREAD, MAIL_TRASH, MAIL_UNDO, PEOPLE_SUGGEST, SEARCH_MAIL,
+    UPLOAD_CHUNK, UPLOAD_DROP, fail, failed, ok,
 };
 use crate::{Core, compose, js};
 
@@ -56,6 +56,7 @@ fn now_ms() -> i64 {
 pub enum Subject {
     Search(String),
     Thread(String),
+    Draft(String),
 }
 
 /// How many rows a card shows.
@@ -64,6 +65,18 @@ const CARD_ROWS: usize = 5;
 /// Offers a card with a chat's mail search. Nothing about the mail goes in it:
 /// props hold a ticket, and the card reads its rows itself.
 pub fn offer_card(core: &Core, tool: &str, args: &Value, result: &mut Value) {
+    if tool == MAIL_DRAFT_SAVE {
+        let saved = result.pointer("/structuredContent/draft");
+        if let Some(draft) = saved.and_then(Value::as_str) {
+            let ticket = core
+                .tickets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .issue(&Subject::Draft(draft.to_owned()));
+            result["_meta"] = json!({"buwiz/open": {"app": "mail", "props": {"draft": ticket}, "title": "Draft", "placement": "inline"}});
+        }
+        return;
+    }
     let found = result
         .pointer("/structuredContent/items")
         .and_then(Value::as_array)

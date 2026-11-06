@@ -70,7 +70,10 @@ fn a_send_with_no_press_behind_it_goes_nowhere() {
         "gws_mail_send",
         &json!({"draft": second["draft"], "revision": second["revision"], "armed": press["armed"]}),
     );
-    assert_eq!(again["isError"], true, "a press is good for one send: {again}");
+    assert_eq!(
+        again["isError"], true,
+        "a press is good for one send: {again}"
+    );
     assert_eq!(google.sent().len(), 1);
 }
 
@@ -148,15 +151,24 @@ fn a_reply_goes_to_the_sender_and_reply_all_leaves_out_the_person() {
     let core = signed_in(&google, "reply");
     core.unlock("a-seed");
     let id = thread_from(&core);
-    let reply = data(core.run("gws_mail_reply_start", &json!({"thread": id, "mode": "reply"})));
+    let reply = data(core.run(
+        "gws_mail_reply_start",
+        &json!({"thread": id, "mode": "reply"}),
+    ));
     let to = reply["to"].as_array().unwrap();
     assert_eq!(to.len(), 1, "{reply}");
     assert_ne!(to[0], FAKE_EMAIL);
     assert!(reply["subject"].as_str().unwrap().starts_with("Re: "));
     assert_eq!(reply["thread"], id);
-    let all = data(core.run("gws_mail_reply_start", &json!({"thread": id, "mode": "all"})));
+    let all = data(core.run(
+        "gws_mail_reply_start",
+        &json!({"thread": id, "mode": "all"}),
+    ));
     assert!(!all["to"].to_string().contains(FAKE_EMAIL), "{all}");
-    let forward = data(core.run("gws_mail_reply_start", &json!({"thread": id, "mode": "forward"})));
+    let forward = data(core.run(
+        "gws_mail_reply_start",
+        &json!({"thread": id, "mode": "forward"}),
+    ));
     assert_eq!(forward["to"], json!([]));
     assert!(forward["subject"].as_str().unwrap().starts_with("Fwd: "));
     assert_eq!(forward["thread"], Value::Null, "a forward starts its own");
@@ -168,13 +180,19 @@ fn a_reply_to_ones_own_last_mail_goes_on_to_whoever_it_went_to() {
     let core = signed_in(&google, "self");
     core.unlock("a-seed");
     let id = thread_from(&core);
-    let mut start = data(core.run("gws_mail_reply_start", &json!({"thread": id, "mode": "reply"})));
+    let mut start = data(core.run(
+        "gws_mail_reply_start",
+        &json!({"thread": id, "mode": "reply"}),
+    ));
     let them = start["to"][0].clone();
     start["body"] = json!("Bump");
     let saved = data(core.run("gws_mail_draft_save", &start));
     data(send(&core, &saved));
 
-    let again = data(core.run("gws_mail_reply_start", &json!({"thread": id, "mode": "reply"})));
+    let again = data(core.run(
+        "gws_mail_reply_start",
+        &json!({"thread": id, "mode": "reply"}),
+    ));
     assert_eq!(again["to"], json!([them]), "{again}");
 }
 
@@ -227,10 +245,19 @@ fn a_25_mb_attachment_arrives_whole() {
     };
     assert_eq!(name, "report é.pdf");
     assert_eq!(kind, "application/pdf");
-    assert!(got == &bytes, "{} of {} bytes, or changed", got.len(), bytes.len());
+    assert!(
+        got == &bytes,
+        "{} of {} bytes, or changed",
+        got.len(),
+        bytes.len()
+    );
     assert_eq!(sent[0].body, "Noon?\nThe usual place.");
     assert_eq!(sent[0].to, "ana@example.com");
-    assert_eq!(core.uploads.lock().unwrap().held_bytes(), 0, "sent, so freed");
+    assert_eq!(
+        core.uploads.lock().unwrap().held_bytes(),
+        0,
+        "sent, so freed"
+    );
 }
 
 #[test]
@@ -267,11 +294,20 @@ fn a_chunk_sent_twice_is_kept_once() {
     let google = FakeGoogle::start(Seed::demo(2));
     let core = signed_in(&google, "resend");
     let chunk = base64::engine::general_purpose::STANDARD.encode(b"abc");
-    let first = data(core.run("gws_upload_chunk", &json!({"name": "a.txt", "at": 0, "data": chunk})));
+    let first = data(core.run(
+        "gws_upload_chunk",
+        &json!({"name": "a.txt", "at": 0, "data": chunk}),
+    ));
     let upload = first["upload"].clone();
-    let again = data(core.run("gws_upload_chunk", &json!({"upload": upload, "at": 0, "data": chunk})));
+    let again = data(core.run(
+        "gws_upload_chunk",
+        &json!({"upload": upload, "at": 0, "data": chunk}),
+    ));
     assert_eq!(again["size"], 3);
-    let next = data(core.run("gws_upload_chunk", &json!({"upload": upload, "at": 3, "data": chunk})));
+    let next = data(core.run(
+        "gws_upload_chunk",
+        &json!({"upload": upload, "at": 3, "data": chunk}),
+    ));
     assert_eq!(next["size"], 6);
 }
 
@@ -315,14 +351,21 @@ fn the_model_attaches_nothing() {
 fn a_save_too_slow_for_its_caller_can_be_asked_after() {
     let google = FakeGoogle::start(Seed::demo(2));
     let core = signed_in(&google, "job");
-    assert_eq!(data(core.run("gws_mail_job", &json!({"job": "j1"})))["done"], false);
+    assert_eq!(
+        data(core.run("gws_mail_job", &json!({"job": "j1"})))["done"],
+        false
+    );
     let mut draft = lunch();
     draft["job"] = json!("j1");
     let saved = data(core.run("gws_mail_draft_save", &draft));
     let job = data(core.run("gws_mail_job", &json!({"job": "j1"})));
     assert_eq!(job["done"], true);
     assert_eq!(job["answer"]["structuredContent"]["draft"], saved["draft"]);
-    assert_eq!(data(core.run("gws_mail_job", &json!({"job": "j1"})))["done"], false, "told once");
+    assert_eq!(
+        data(core.run("gws_mail_job", &json!({"job": "j1"})))["done"],
+        false,
+        "told once"
+    );
 }
 
 fn suggested(core: &Core, query: &str) -> Vec<String> {
@@ -341,7 +384,11 @@ fn suggestions_come_from_mail_and_contacts_and_leave_out_the_person() {
     let core = signed_in(&google, "people");
     core.unlock("a-seed");
     gws::mail::sync(&core).unwrap();
-    assert_eq!(suggested(&core, "ana"), ["ana@example.com"], "one person, once");
+    assert_eq!(
+        suggested(&core, "ana"),
+        ["ana@example.com"],
+        "one person, once"
+    );
     assert_eq!(suggested(&core, "zed"), ["zed@contacts.example"]);
     assert_eq!(suggested(&core, "owner"), Vec::<String>::new());
     assert_eq!(suggested(&core, "  "), Vec::<String>::new());
@@ -358,4 +405,39 @@ fn a_sign_in_without_contacts_still_suggests_who_wrote() {
     gws::mail::sync(&core).unwrap();
     assert_eq!(suggested(&core, "ana"), ["ana@example.com"]);
     assert_eq!(suggested(&core, "zed"), Vec::<String>::new());
+}
+
+#[test]
+fn a_chats_draft_comes_with_its_card_and_a_review_names_who_is_new() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "card");
+    let first = data(core.run(
+        "gws_mail_draft_save",
+        &json!({"to": ["ana@example.com"], "body": "Hi"}),
+    ));
+    data(send(&core, &first));
+
+    let result = core.run_for_chat(
+        "gws_mail_draft_save",
+        &json!({"to": ["ana@example.com"], "cc": ["new@example.com"], "subject": "Hi", "body": "Noon?"}),
+    );
+    let open = &result["_meta"]["buwiz/open"];
+    assert_eq!(open["app"], "mail");
+    assert_eq!(open["placement"], "inline");
+    let ticket = open["props"]["draft"].clone();
+    assert!(
+        !result["_meta"].to_string().contains("Noon?"),
+        "nothing of the mail in it"
+    );
+
+    let read = data(core.run("gws_mail_draft_read", &json!({"ticket": ticket})));
+    assert_eq!(read["from"], FAKE_EMAIL);
+    assert_eq!(read["body"], "Noon?");
+    assert_eq!(
+        read["new"],
+        json!(["new@example.com"]),
+        "ana's been written to"
+    );
+    let stale = core.run("gws_mail_draft_read", &json!({"ticket": "nonsense"}));
+    assert_eq!(stale["isError"], true, "{stale}");
 }

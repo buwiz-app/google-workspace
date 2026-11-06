@@ -98,8 +98,8 @@ fn app(a: &App) -> Value {
     }
     if a.card {
         entry["placement"] = json!(["full", "inline"]);
-        entry["inline"] = json!({ "width": 420, "height": 96, "min_height": 96, "max_height": 320, "resizable": false, "wait_ready": true });
-        entry["props"] = json!({ "type": "object", "properties": { "search": { "type": "string", "maxLength": 30 }, "thread": { "type": "string", "maxLength": 30 } } });
+        entry["inline"] = json!({ "width": 420, "height": 96, "min_height": 96, "max_height": 480, "resizable": false, "wait_ready": true });
+        entry["props"] = json!({ "type": "object", "properties": { "search": { "type": "string", "maxLength": 30 }, "thread": { "type": "string", "maxLength": 30 }, "draft": { "type": "string", "maxLength": 30 }, "view": { "type": "string", "maxLength": 30 } } });
     }
     if a.files {
         permissions["pick_file"] =
@@ -121,9 +121,13 @@ pub fn unsigned(key_id: &str) -> Value {
         "publisher": { "id": "app.buwiz", "key_id": key_id, "name": "Goldcoders" },
         "commands": [
             { "name": "gws", "description": "Open Mail, Calendar or Drive", "args": "[mail, calendar or drive]", "resolve": tools::RESOLVE },
-            { "name": "mail", "description": "Open Mail", "resolve": tools::RESOLVE },
+            { "name": "mail", "description": "Open Mail", "args": "[inbox, unread, drafts, sent, important or starred]", "resolve": tools::RESOLVE },
+            { "name": "gws-draft", "description": "Start an email for the assistant to draft", "resolve": tools::RESOLVE },
             { "name": "calendar", "description": "Open Calendar", "resolve": tools::RESOLVE },
             { "name": "drive", "description": "Open Drive", "resolve": tools::RESOLVE }
+        ],
+        "scopes": [
+            { "name": "mail", "description": "Mailbox view", "resolve": tools::RESOLVE }
         ],
         "apps": APPS.iter().map(app).collect::<Vec<_>>(),
     })

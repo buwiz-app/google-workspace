@@ -178,9 +178,7 @@ impl Store {
                 .replace('_', "\\_")
         );
         let mut q = self.conn.prepare("SELECT sender, address FROM threads WHERE account = ?1 AND address != '' AND (sender LIKE ?2 ESCAPE '\\' OR address LIKE ?2 ESCAPE '\\') GROUP BY address ORDER BY MAX(at) DESC LIMIT ?3")?;
-        let rows = q.query_map(params![account, like, take], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?;
+        let rows = q.query_map(params![account, like, take], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 

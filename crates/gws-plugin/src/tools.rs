@@ -191,7 +191,7 @@ pub fn defs() -> Vec<Def> {
         Def {
             name: MAIL_DRAFT_READ,
             description: "A draft as it stands, with the revision Send needs.",
-            input_schema: json!({"type": "object", "properties": {"draft": {"type": "string"}}, "required": ["draft"]}),
+            input_schema: json!({"type": "object", "properties": {"draft": {"type": "string"}, "ticket": {"type": "string"}}}),
             read_only: true,
             audience: APP_ONLY,
             open_world: true,
@@ -362,10 +362,46 @@ fn features(scopes: &[String]) -> Value {
     })
 }
 
+/// The mailbox views `/mail` and `@gws:mail:` offer: what's shown, the label.
+const VIEWS: [(&str, &str); 6] = [
+    ("Inbox", "INBOX"),
+    ("Unread", "UNREAD"),
+    ("Drafts", "DRAFT"),
+    ("Sent", "SENT"),
+    ("Important", "IMPORTANT"),
+    ("Starred", "STARRED"),
+];
+
+/// `/mail [view]` and `@gws:mail:`. While it's being typed the views are a list
+/// that the text filters; said, it opens that view and no model hears of it.
+fn resolve_mail(value: &str, listing: bool) -> Value {
+    let matching = |(name, _): &&(&str, &str)| name.to_lowercase().starts_with(value);
+    if listing {
+        let choices: Vec<Value> = VIEWS
+            .iter()
+            .filter(matching)
+            .map(|(name, _)| json!({"label": name, "value": name.to_lowercase()}))
+            .collect();
+        return ok(json!({"result": "choices", "choices": choices}));
+    }
+    let (title, label) = VIEWS.iter().find(matching).unwrap_or(&VIEWS[0]);
+    ok(
+        json!({"result": "open", "app": "mail", "title": title, "placement": "full", "props": {"view": label}}),
+    )
+}
+
 /// `/mail`, `/calendar`, `/drive`, and `/gws <one of them>`: opens that screen.
 fn resolve(args: &Value) -> Value {
     let name = js::string_or_empty(args.get("name"));
     let value = js::trim(&js::string_or_empty(args.get("value"))).to_lowercase();
+    if name == "gws-draft" {
+        return ok(json!({"result": "prompt", "text": "Draft an email to "}));
+    }
+    if name == "mail" {
+        let kind = js::string_or_empty(args.get("kind"));
+        let listing = kind == "scope" && args.get("complete") == Some(&Value::Bool(true));
+        return resolve_mail(&value, listing);
+    }
     let wanted = if name == "gws" {
         value.as_str()
     } else {
@@ -417,6 +453,52 @@ fn read_mail(gmail: &Gmail, accounts: &Accounts, args: &Value) -> Result<Value, 
     Ok(ok(
         json!({"id": id, "from": h("From"), "to": h("To"), "subject": h("Subject"), "date": h("Date"), "body": gmail::cap_bytes(&gmail::body(&m), BODY_MAX), "untrusted": UNTRUSTED}),
     ))
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    fn resolved(args: Value) -> Value {
+        resolve(&args)["structuredContent"].clone()
+    }
+
+    #[test]
+    fn at_mail_lists_the_views_and_filters_them_as_typed() {
+        let all = resolved(json!({"kind": "scope", "name": "mail", "value": "", "complete": true}));
+        let names: Vec<&str> = all["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["Inbox", "Unread", "Drafts", "Sent", "Important", "Starred"]
+        );
+        let some =
+            resolved(json!({"kind": "scope", "name": "mail", "value": "s", "complete": true}));
+        assert_eq!(some["choices"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_view_said_opens_it_and_reaches_no_model() {
+        let open =
+            resolved(json!({"kind": "scope", "name": "mail", "value": "sent", "complete": false}));
+        assert_eq!(open["result"], "open");
+        assert_eq!(open["props"]["view"], "SENT");
+        let command = resolved(json!({"kind": "command", "name": "mail", "value": "starred"}));
+        assert_eq!(command["props"]["view"], "STARRED");
+        let plain = resolved(json!({"kind": "command", "name": "mail", "value": ""}));
+        assert_eq!(plain["props"]["view"], "INBOX");
+    }
+
+    #[test]
+    fn gws_draft_only_fills_the_composer() {
+        let prompt = resolved(json!({"kind": "command", "name": "gws-draft", "value": ""}));
+        assert_eq!(prompt["result"], "prompt");
+        assert_eq!(prompt["text"], "Draft an email to ");
+    }
 }
 
 #[cfg(test)]

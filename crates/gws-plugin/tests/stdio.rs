@@ -901,7 +901,7 @@ fn every_routine_finds_its_items_and_its_turn_can_only_read() {
     let m: Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
     let data = std::env::temp_dir().join(format!("gws-stdio-routines-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+    let mut child = plugin()
         .arg("mcp")
         .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
         .env("GWS_STUB_BASE", google.base())
@@ -1040,7 +1040,7 @@ fn pushes_one_at_a_time_leave_the_accounts_not_pushed_yet() {
         }
         drop(store);
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+        let mut child = plugin()
             .arg("mcp")
             .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
             .env("GWS_DATA_DIR", &data)

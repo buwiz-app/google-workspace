@@ -85,7 +85,7 @@ mod tests {
     use crate::Paths;
 
     #[test]
-    fn a_row_comes_back_whole_and_goes_with_its_account() {
+    fn a_row_comes_back_whole_and_outlasts_its_account() {
         let dir = std::env::temp_dir().join(format!("gws-opened-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::open(&Paths::in_dir(&dir), &crate::key_from_seed("seed")).unwrap();
@@ -106,6 +106,9 @@ mod tests {
         assert_eq!(store.all_opened().unwrap(), [file]);
         assert_eq!(store.accounts().unwrap(), ["owner@example.com"]);
         store.forget_account("owner@example.com").unwrap();
+        // what's edited here can't be fetched again, so the plugin decides
+        assert!(store.opened("a1").unwrap().is_some());
+        store.forget_opened("a1").unwrap();
         assert_eq!(store.opened("a1").unwrap(), None);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);

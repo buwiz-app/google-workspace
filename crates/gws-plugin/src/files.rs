@@ -9,9 +9,10 @@
 //!
 //! The file sits unencrypted while the viewer has it. It goes after upload or
 //! discard, after 24 hours, and at sign-out. A file edited here and not yet
-//! answered outlasts the 24 hours, since the person's work is in it and nowhere
-//! else; sign-out takes even that one. An attachment has nothing to answer, so
-//! its 24 hours are 24 hours.
+//! answered stays through all of those, since the person's work is in it and
+//! nowhere else, and a sign-out can be a failed refresh and not a choice: only
+//! the person's press or an uninstall takes it. It waits for its own account to
+//! sign in again. An attachment has nothing to answer, so its time is its time.
 //!
 //! We never write over a Google Doc, Sheet or Slides: Google says an update
 //! replaces "the full contents of the document", and doesn't say what becomes
@@ -531,10 +532,14 @@ pub fn copy_name(name: &str) -> String {
     }
 }
 
-fn open_root(core: &Core) -> Result<PathBuf, Failure> {
+/// This install's folder of open files.
+pub fn open_root(core: &Core) -> Result<PathBuf, Failure> {
+    let key = core
+        .key()
+        .ok_or_else(|| Failure::Plain("The plugin isn't ready yet.".to_owned()))?;
     core.paths
         .as_ref()
-        .map(gws_store::Paths::open_dir)
+        .map(|paths| paths.open_dir(&key))
         .map_err(|e| Failure::Plain(e.message.clone()))
 }
 
@@ -1069,29 +1074,25 @@ pub fn sweep(core: &Core) {
     }
 }
 
-/// `account` is no longer signed in: its files go with it, edited or not. The
-/// store's rows go with the rest of what it holds for the account.
+/// `account` is no longer signed in: what can be fetched again goes with it. A
+/// file edited here and unanswered stays, with its row, for that account to
+/// come back to.
 pub fn forget_account(core: &Core, store: &Store, account: &str) -> gws_store::Result<()> {
     for row in store
         .all_opened()?
         .iter()
         .filter(|row| row.account == account)
     {
+        let edited = path_of(core, row).is_ok_and(|path| is_edited(&path, row));
+        if edited && !row.attachment {
+            continue;
+        }
         if let Ok(dir) = folder_of(core, &row.id) {
             let _ = fs::remove_dir_all(dir);
         }
+        store.forget_opened(&row.id)?;
     }
     Ok(())
-}
-
-/// Nobody is signed in, so nothing in the folder is anyone's. This needs no
-/// store: one that won't open must not leave files lying about.
-pub fn clear_when_signed_out(core: &Core) {
-    if !core.accounts.any()
-        && let Ok(root) = open_root(core)
-    {
-        let _ = fs::remove_dir_all(root);
-    }
 }
 
 /// Runs a file tool; `None` for any other tool.

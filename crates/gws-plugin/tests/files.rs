@@ -41,7 +41,7 @@ impl Home {
     }
 
     fn open_dir(&self) -> PathBuf {
-        self.dir.join("open")
+        gws::files::open_root(&self.core).unwrap()
     }
 
     fn folder(&self, id: &str) -> PathBuf {
@@ -909,7 +909,7 @@ fn a_row_whose_file_went_and_a_folder_with_no_row_are_swept() {
 }
 
 #[test]
-fn sign_out_takes_every_file_edited_or_not() {
+fn sign_out_keeps_unsaved_work_and_takes_the_rest() {
     let google = FakeGoogle::start(Seed::default());
     google.seed_file(a_docx("drv-a"));
     google.seed_file(FakeFile::new("drv-b", "Other.docx", DOCX).holding(b"PK"));
@@ -918,19 +918,34 @@ fn sign_out_takes_every_file_edited_or_not() {
     let clean = home.open("drv-b");
     fs::write(&edited, b"PK mine").unwrap();
     home.sign_out();
-    assert!(!edited.exists() && !clean.exists());
-    assert!(!home.open_dir().exists());
+    assert_eq!(fs::read(&edited).unwrap(), b"PK mine", "it's nowhere else");
+    assert!(!clean.exists(), "it can be fetched again");
     assert_eq!(
         drive_writes(&google),
         Vec::<String>::new(),
         "and sends nothing"
     );
     home.core.account("buwiz.account.set", &push(FAKE_EMAIL));
-    assert_eq!(home.edits(), Vec::<Value>::new(), "no record left either");
+    let edits = home.edits();
+    assert_eq!(edits.len(), 1, "back for the person to answer");
+    assert_eq!(edits[0]["id"], "drv-a");
 }
 
 #[test]
-fn another_account_taking_over_takes_the_files_of_the_one_it_replaced() {
+fn a_sweep_after_sign_out_leaves_unsaved_work() {
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(a_docx("drv-a"));
+    let home = Home::new(&google.base(), "signoutsweep");
+    let edited = home.open("drv-a");
+    fs::write(&edited, b"PK mine").unwrap();
+    home.sign_out();
+    home.later(LIFE_MS * 3);
+    gws::files::sweep(&home.core);
+    assert_eq!(fs::read(&edited).unwrap(), b"PK mine");
+}
+
+#[test]
+fn another_account_taking_over_never_sees_the_work_it_replaced() {
     let google = FakeGoogle::start(Seed::default());
     google.seed_file(a_docx("drv-a"));
     let home = Home::new(&google.base(), "replaced");
@@ -938,7 +953,14 @@ fn another_account_taking_over_takes_the_files_of_the_one_it_replaced() {
     fs::write(&path, b"PK mine").unwrap();
     home.core
         .account("buwiz.account.set", &push("second@example.com"));
-    assert!(!path.exists());
+    assert!(path.exists(), "it's still the first account's work");
+    assert_eq!(
+        home.edits(),
+        Vec::<Value>::new(),
+        "and none of the second's"
+    );
+    home.core.account("buwiz.account.set", &push(FAKE_EMAIL));
+    assert_eq!(home.edits().len(), 1);
 }
 
 #[test]
@@ -957,10 +979,9 @@ fn a_second_account_signing_out_leaves_the_others_files() {
     assert!(path.exists(), "that one is still signed in");
 }
 
-/// A store that won't open can't say what's whose. Nobody signed in means
-/// nothing in the folder is anyone's, so it goes all the same.
+/// A store that won't open can't say what's edited, so nothing goes.
 #[test]
-fn sign_out_takes_the_files_even_with_no_store_to_ask() {
+fn sign_out_with_no_store_to_ask_takes_nothing() {
     let google = FakeGoogle::start(Seed::default());
     google.seed_file(a_docx("drv-a"));
     let home = Home::new(&google.base(), "nostore");
@@ -975,7 +996,7 @@ fn sign_out_takes_the_files_even_with_no_store_to_ask() {
         "buwiz.account.clear",
         &json!({"account": "google", "label": "default"}),
     );
-    assert!(!path.exists());
+    assert!(path.exists());
 }
 
 #[test]

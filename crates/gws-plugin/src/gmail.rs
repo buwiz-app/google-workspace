@@ -102,7 +102,7 @@ impl Gmail {
         Self::answer(req.call(), cap)
     }
 
-    /// A POST: every write there is, and only a person's press leads here.
+    /// A POST: a person's press, or a draft the model filled, which sends nothing.
     fn post(&self, auth: &Bearer, path: String, body: &Value) -> Result<Option<Value>, Failure> {
         let url = format!("{}/{path}", self.base);
         let req = self

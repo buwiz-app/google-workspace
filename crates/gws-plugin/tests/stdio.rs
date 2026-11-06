@@ -448,6 +448,11 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
             "gws_mail_archive",
             "gws_mail_trash",
             "gws_mail_undo",
+            "gws_mail_draft_save",
+            "gws_mail_draft_read",
+            "gws_mail_reply_start",
+            "gws_mail_draft_delete",
+            "gws_mail_send",
             "gws_resolve"
         ]
     );

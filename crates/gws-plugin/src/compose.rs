@@ -2,12 +2,15 @@
 //! Send sends the very message the person read: a draft that changed since
 //! has a new revision, and refuses until it's read again.
 
+use std::collections::HashSet;
+use std::sync::MutexGuard;
+
 use base64::Engine as _;
 use serde_json::{Value, json};
 
 use crate::accounts::Bearer;
 use crate::gmail::{self, Failure};
-use crate::tools::{fail, ok};
+use crate::tools::{MAIL_DRAFT_SAVE, fail, ok};
 use crate::{Core, js};
 
 /// The most recipients one message takes.
@@ -147,6 +150,30 @@ fn session(core: &Core) -> Result<Bearer, Failure> {
         .ok_or(Failure::AccountRequired)
 }
 
+fn model_drafts(core: &Core) -> MutexGuard<'_, HashSet<String>> {
+    core.model_drafts.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `gws_mail_draft_save` from the model: a new draft, or one it wrote and the
+/// person hasn't touched. Every other draft is the person's work.
+pub fn save_for_model(core: &Core, args: &Value) -> Value {
+    let held = js::string_or_empty(args.get("draft"));
+    if !held.is_empty() && !model_drafts(core).contains(&held) {
+        return fail(
+            "not_allowed",
+            "That draft is the person's. Write a new one instead.",
+        );
+    }
+    let result = core.run(MAIL_DRAFT_SAVE, args);
+    if let Some(id) = result
+        .pointer("/structuredContent/draft")
+        .and_then(Value::as_str)
+    {
+        model_drafts(core).insert(id.to_owned());
+    }
+    result
+}
+
 /// `gws_mail_draft_save`: writes a draft, or replaces one. Sends nothing.
 pub fn save(core: &Core, args: &Value) -> Result<Value, Failure> {
     let auth = session(core)?;
@@ -171,6 +198,8 @@ pub fn save(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some(saved) = saved else {
         return Ok(fail("not_found", "That draft is gone."));
     };
+    // a person's edit makes it theirs: `save_for_model` claims it back only for itself
+    model_drafts(core).remove(&held);
     Ok(ok(json!({
         "draft": saved.pointer("/id"),
         "revision": saved.pointer("/message/id"),
@@ -317,6 +346,10 @@ pub fn reply_start(core: &Core, args: &Value) -> Result<Value, Failure> {
             let from = h("Reply-To");
             let from = if from.is_empty() { h("From") } else { from };
             let mut to = others(&from);
+            // the last word was the person's own: it goes on to whoever that went to
+            if to.is_empty() {
+                to = others(&h("To"));
+            }
             let mut cc = Vec::new();
             if mode == "all" {
                 to.extend(others(&h("To")));

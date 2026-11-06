@@ -14,6 +14,7 @@ mod drive;
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
@@ -424,7 +425,9 @@ fn snippet(m: &Mail) -> String {
     m.text.replace('\n', " ").chars().take(120).collect()
 }
 
-fn payload(m: &Mail, full: bool) -> Value {
+/// `read` goes into each attachment's id, which Gmail doesn't promise to keep:
+/// a read counts up once [`FakeGoogle::attachment_ids_change`] says so.
+fn payload(m: &Mail, full: bool, read: u64) -> Value {
     if !full {
         return json!({"mimeType": "multipart/alternative", "headers": headers(m)});
     }
@@ -433,15 +436,15 @@ fn payload(m: &Mail, full: bool) -> Value {
     if let Some(html) = &m.html {
         parts.push(json!({"mimeType": "text/html", "headers": [{"name": "Content-Type", "value": "text/html; charset=utf-8"}], "body": {"data": b64(html.as_bytes()), "size": html.len()}}));
     }
-    let body = json!({"mimeType": "multipart/alternative", "parts": parts});
+    let body = json!({"partId": "0", "mimeType": "multipart/alternative", "parts": parts});
     if m.attachments.is_empty() {
         return json!({"mimeType": "multipart/alternative", "headers": headers(m), "parts": body["parts"]});
     }
     let mut mixed = vec![body];
     for (i, (name, mime, bytes)) in m.attachments.iter().enumerate() {
-        mixed.push(json!({"mimeType": mime, "filename": name, "headers": [{"name": "Content-Disposition", "value": format!("attachment; filename=\"{name}\"")}], "body": {"attachmentId": format!("att-{}-{i}", m.id), "size": bytes.len()}}));
+        mixed.push(json!({"partId": (i + 1).to_string(), "mimeType": mime, "filename": name, "headers": [{"name": "Content-Disposition", "value": format!("attachment; filename=\"{name}\"")}], "body": {"attachmentId": format!("att-{}-{read}-{i}", m.id), "size": bytes.len()}}));
     }
-    json!({"mimeType": "multipart/mixed", "headers": headers(m), "parts": mixed})
+    json!({"partId": "", "mimeType": "multipart/mixed", "headers": headers(m), "parts": mixed})
 }
 
 #[derive(Default)]
@@ -451,6 +454,8 @@ struct Account {
     writes_left: Option<usize>,
     wrote: bool,
     reads_fail_after_write: bool,
+    /// Reads so far, once attachment ids change with each.
+    reads: Option<AtomicU64>,
     /// `(draft id, message id, raw message, thread)`.
     drafts: Vec<(String, String, String, Option<String>)>,
     next_draft: u64,
@@ -740,7 +745,7 @@ impl Account {
         match format {
             "minimal" => {}
             "metadata" => {
-                let mut p = payload(m, false);
+                let mut p = payload(m, false, 0);
                 if !wanted.is_empty() {
                     let kept: Vec<Value> = p["headers"]
                         .as_array()
@@ -759,7 +764,11 @@ impl Account {
                 }
                 v["payload"] = p;
             }
-            _ => v["payload"] = payload(m, true),
+            _ => {
+                let read = self.reads.as_ref();
+                let read = read.map_or(0, |n| n.fetch_add(1, Ordering::Relaxed));
+                v["payload"] = payload(m, true, read);
+            }
         }
         v
     }
@@ -1468,6 +1477,24 @@ impl FakeGoogle {
     /// `version` and `md5Checksum` move with them.
     pub fn change_on_drive(&self, id: &str, content: &[u8]) {
         self.edit_file(id, |f| f.content = content.to_vec());
+    }
+
+    /// From here on an attachment has a new id on each read, and every one of
+    /// them still fetches it.
+    pub fn attachment_ids_change(&self) {
+        self.account.lock().unwrap().reads = Some(AtomicU64::new(1));
+    }
+
+    /// The next piece of an upload has only its first `n` bytes kept, and the
+    /// 308 says so. Google says this can happen to any piece.
+    pub fn drive_keeps_short(&self, n: usize) {
+        self.account.lock().unwrap().drive.keep_short = Some(n);
+    }
+
+    /// The answer to the piece that finishes an upload can't be read, and the
+    /// bytes are on Drive all the same.
+    pub fn drive_garbles_the_last_answer(&self) {
+        self.account.lock().unwrap().drive.garble_last = true;
     }
 
     /// `left` more upload sessions start, and then each gets `status`.

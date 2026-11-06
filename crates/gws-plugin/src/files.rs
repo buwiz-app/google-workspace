@@ -12,7 +12,8 @@
 //! answered stays through all of those, since the person's work is in it and
 //! nowhere else, and a sign-out can be a failed refresh and not a choice: only
 //! the person's press or an uninstall takes it. It waits for its own account to
-//! sign in again. An attachment has nothing to answer, so its time is its time.
+//! sign in again. An edited attachment is the same: it has no file on Drive to
+//! go back to, so its answers are a new file in My Drive, or discard.
 //!
 //! We never write over a Google Doc, Sheet or Slides: Google says an update
 //! replaces "the full contents of the document", and doesn't say what becomes
@@ -21,13 +22,13 @@
 //! Drive v3 has no atomic check, so check-then-write leaves a small race.
 //! Revision history is the backstop.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use gws_store::Store;
@@ -46,6 +47,10 @@ use crate::{Core, js};
 
 /// How long a file stays once it's been opened.
 pub const LIFE_MS: i64 = 24 * 60 * 60 * 1000;
+/// How old a file's stamps must be before they can vouch for it: a save in the
+/// same tick as a hash leaves the same stamps, and the coarsest disks tick every
+/// two seconds.
+pub const SETTLE_MS: i64 = 2000;
 /// Google's limit on an export.
 const EXPORT_MAX: u64 = 10 * 1024 * 1024;
 /// A real file: far more than a document needs, and well short of filling a
@@ -64,6 +69,8 @@ const PIECE: usize = 8 * 1024 * 1024;
 const NAME_MAX: usize = 200;
 /// The longest part after the last dot that counts as an extension.
 const EXTENSION_MAX: usize = 16;
+/// The longest part id taken: a path of numbers, as deep as the mail's nesting.
+const PART_ID_MAX: usize = 64;
 /// The longest attachment id taken: Gmail's run to hundreds of characters.
 const ATTACHMENT_ID_MAX: usize = 4096;
 /// Starts the folder of an attachment, and never a Drive file's.
@@ -138,6 +145,59 @@ fn turn<'a>(core: &'a Core, id: &str) -> Option<Turn<'a>> {
         core,
         id: id.to_owned(),
     })
+}
+
+/// What the disk says of a file, without reading it. The change time is here
+/// because nothing can set it back: a save that keeps the size and restores the
+/// modified time still moves it, and a save by rename brings a new inode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    size: u64,
+    inode: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl Stamp {
+    fn of(meta: &fs::Metadata) -> Self {
+        Self {
+            size: meta.len(),
+            inode: meta.ino(),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+
+    /// Whether a later save would show. A stamp from the future says nothing.
+    fn settled(&self, now_ms: i64) -> bool {
+        let ms = |(s, ns): (i64, i64)| s * 1000 + ns / 1_000_000;
+        now_ms - ms(self.modified).max(ms(self.changed)) >= SETTLE_MS
+    }
+}
+
+/// The last hash of each open file, by folder, so a poll doesn't read a big file
+/// again to learn nothing. Only a guess for what shows on a screen: what acts on
+/// a file hashes it for real. Gone at a restart, and the first poll reads again.
+#[derive(Default)]
+pub struct Hashes {
+    known: std::sync::Mutex<HashMap<String, (Stamp, String)>>,
+    runs: AtomicUsize,
+}
+
+impl Hashes {
+    fn held(&self) -> std::sync::MutexGuard<'_, HashMap<String, (Stamp, String)>> {
+        self.known.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How many files have been read through, for a test.
+    pub fn runs(&self) -> usize {
+        self.runs.load(Ordering::Relaxed)
+    }
+
+    fn run(&self, path: &Path) -> std::io::Result<String> {
+        self.runs.fetch_add(1, Ordering::Relaxed);
+        hash_of(path)
+    }
 }
 
 /// What a download came to.
@@ -302,6 +362,7 @@ impl Transfers {
         let mut from = 0u64;
         loop {
             let want = (length - from).min(PIECE as u64) as usize;
+            file.seek(SeekFrom::Start(from)).map_err(|_| cant_save())?;
             file.read_exact(&mut buffer[..want])
                 .map_err(|_| cant_save())?;
             let to = from + want as u64;
@@ -314,23 +375,39 @@ impl Transfers {
                 .map_err(|e| could_not_reach(&e))?;
             let status = res.status().as_u16();
             match status {
-                308 if to < length => from = to,
+                // what Drive kept can be short of what went, and it goes on
+                // from there; a piece that moved nothing on would never end
+                308 => {
+                    let kept = kept_of(&res);
+                    if kept <= from || kept > to || kept == length {
+                        return Err(unfinished());
+                    }
+                    from = kept;
+                }
+                // Drive has it all now, so an answer that can't be read is no
+                // failure: another press would make a second file
                 200 | 201 if to == length => {
-                    let body = res
-                        .body_mut()
-                        .with_config()
-                        .limit(1024 * 1024)
-                        .read_to_vec()
-                        .map_err(|_| unfinished())?;
+                    let body = refusal_body(&mut res);
                     return Ok(Sent::Done(
-                        serde_json::from_slice(&body).map_err(|_| unfinished())?,
+                        serde_json::from_slice(&body).unwrap_or(Value::Null),
                     ));
                 }
-                308 | 200 | 201 => return Err(unfinished()),
+                200 | 201 => return Err(unfinished()),
                 _ => return refusal_of(status, &refusal_body(&mut res)).map(Sent::Refused),
             }
         }
     }
+}
+
+/// How many bytes a 308 says Drive has: `Range: bytes=0-<last>`, and none when
+/// it doesn't say.
+fn kept_of(res: &Response) -> u64 {
+    res.headers()
+        .get("range")
+        .and_then(|range| range.to_str().ok())
+        .and_then(|range| range.strip_prefix("bytes=0-"))
+        .and_then(|last| last.parse::<u64>().ok())
+        .map_or(0, |last| last + 1)
 }
 
 fn unfinished() -> Failure {
@@ -589,14 +666,43 @@ fn path_of(core: &Core, row: &Opened) -> Result<PathBuf, Failure> {
 }
 
 /// Whether the file holds what came. Only a hash can say: the viewer's save
-/// can leave the size alone, and a reopened file its time.
-fn is_edited(path: &Path, row: &Opened) -> bool {
-    hash_of(path).is_ok_and(|hash| hash != row.hash)
+/// can leave the size alone, and a reopened file its time. One that's here but
+/// can't be read counts as edited: nothing goes on a guess.
+fn is_edited(core: &Core, path: &Path, row: &Opened) -> bool {
+    file_here(path) && core.hashes.run(path).map_or(true, |hash| hash != row.hash)
 }
 
-/// The whole `open/<id>/`, and the row that goes with it.
+/// [`is_edited`] for a poll: the file is read only if its stamps moved. They're
+/// taken before the read, so a save during it shows next time, and kept only
+/// once settled, so a save in the same tick can't hide behind them.
+fn seems_edited(core: &Core, path: &Path, row: &Opened) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    let stamp = Stamp::of(&meta);
+    if let Some((seen, hash)) = core.hashes.held().get(&row.id)
+        && *seen == stamp
+    {
+        return *hash != row.hash;
+    }
+    let Ok(hash) = core.hashes.run(path) else {
+        return false;
+    };
+    let edited = hash != row.hash;
+    if stamp.settled(core.clock.now_ms()) {
+        core.hashes.held().insert(row.id.clone(), (stamp, hash));
+    }
+    edited
+}
+
+/// The whole `open/<id>/`, and the row that goes with it. The row goes first and
+/// whatever the folder does: a folder with no row is the sweep's to finish, and
+/// a file with its row still looks like work waiting for an answer.
 fn remove(core: &Core, id: &str) -> Result<(), Failure> {
-    match fs::remove_dir_all(folder_of(core, id)?) {
+    let dir = folder_of(core, id)?;
+    let forgotten = with_store(core, |store| store.forget_opened(id));
+    core.hashes.held().remove(id);
+    match fs::remove_dir_all(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => {
@@ -605,7 +711,7 @@ fn remove(core: &Core, id: &str) -> Result<(), Failure> {
             ));
         }
     }
-    with_store(core, |store| store.forget_opened(id))
+    forgotten
 }
 
 /// The downloaded `.part` as `open/<id>/<name>`, and all that was there before
@@ -702,7 +808,7 @@ fn open(core: &Core, args: &Value) -> Result<Value, Failure> {
     // what's edited here stays as it is, whatever Drive holds now: a download
     // would lose the person's work
     if let Some(row) = &here
-        && is_edited(&path_of(core, row)?, row)
+        && is_edited(core, &path_of(core, row)?, row)
     {
         if row.account != account {
             return Ok(refusal(
@@ -808,6 +914,13 @@ fn download(
     keep(core, &dir, &row)
 }
 
+/// A part of a mail, as [`gmail::attachments`] names it: `1`, `0.2`, `root`.
+fn part_ok(part: &str) -> bool {
+    !part.is_empty()
+        && part.len() <= PART_ID_MAX
+        && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
+}
+
 /// An attachment id: Gmail's, which can be longer than any file name.
 fn attachment_ok(id: &str) -> bool {
     !id.is_empty()
@@ -817,51 +930,66 @@ fn attachment_ok(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// An attachment's folder. Its id goes in as a hash: Gmail's are too long to be
-/// a folder's name, and a name past 255 bytes opens nothing.
-fn attachment_folder(message: &str, attachment: &str) -> String {
-    let hash = format!("{:x}", Sha256::digest(attachment.as_bytes()));
+/// An attachment's folder, by its message and part. Gmail's attachment id can't
+/// be it: nothing promises that id stays the same from one read to the next, and
+/// a new one would be a second folder, with the person's edit left in the first.
+/// The part goes in as a hash so that its dots stay out of the name.
+fn attachment_folder(message: &str, part: &str) -> String {
+    let hash = format!("{:x}", Sha256::digest(part.as_bytes()));
     format!("{ATTACHMENT}{message}-{}", &hash[..32])
 }
 
-/// `gws_mail_attachment_open`. The name and type come from the message. Gmail
-/// can hand out a new id for the same attachment on each read, and the old one
-/// still fetches it, so what the screen was shown stands in when a fresh read
-/// doesn't list it. Either way it's a stranger's name.
+/// `gws_mail_attachment_open`. The name, the type and the id to fetch by all
+/// come from a fresh read of the message, so what lands is that part's. The name
+/// is still a stranger's.
 fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (auth, account) = signed_in(core)?;
     let message = js::trim(&js::string_or_empty(args.get("message"))).to_owned();
-    let attachment = js::trim(&js::string_or_empty(args.get("attachment"))).to_owned();
-    if !gmail::id_ok(&message) || !attachment_ok(&attachment) {
+    let part = js::trim(&js::string_or_empty(args.get("part"))).to_owned();
+    if !gmail::id_ok(&message) || !part_ok(&part) {
         return Ok(bad_args("That isn't an attachment."));
     }
-    let id = attachment_folder(&message, &attachment);
+    let id = attachment_folder(&message, &part);
     let Some(_turn) = turn(core, &id) else {
         return Ok(busy());
     };
     let held = with_store(core, |store| store.opened(&id))?;
-    if let Some(row) = held.filter(|row| row.account == account)
-        && file_here(&path_of(core, &row)?)
-    {
-        return reopen(core, &row);
+    let here = match held {
+        Some(row) if file_here(&path_of(core, &row)?) => Some(row),
+        _ => None,
+    };
+    if let Some(row) = &here {
+        if row.account == account {
+            return reopen(core, row);
+        }
+        // a download would land on another account's work
+        if is_edited(core, &path_of(core, row)?, row) {
+            return Ok(refusal(
+                "in_use",
+                "Another of your Google accounts has edits to this attachment here.",
+            ));
+        }
     }
     let gone = || refusal("not_found", "That attachment is gone from the mail.");
     let Some(mail) = core.gmail.full(&auth, &message)? else {
         return Ok(gone());
     };
     let listed = gmail::attachments(&mail);
-    let found = listed
+    let Some(found) = listed
         .iter()
-        .find(|a| a.get("id").and_then(Value::as_str) == Some(&attachment));
-    let given = |key: &str, hint: &str| {
-        let shown = found.and_then(|a| a.get(key)).and_then(Value::as_str);
-        shown.map_or_else(|| js::string_or_empty(args.get(hint)), str::to_owned)
+        .find(|a| a.get("part").and_then(Value::as_str) == Some(&part))
+    else {
+        return Ok(gone());
     };
-    let (title, mime) = (given("name", "name"), given("mime", "mime"));
-    let Some(kind) = openable(&mime, &title) else {
+    let text = |key: &str| found.get(key).and_then(Value::as_str).unwrap_or_default();
+    let (title, mime, attachment) = (text("name"), text("mime"), text("id"));
+    let Some(kind) = openable(mime, title) else {
         return Ok(unsupported());
     };
-    let Some(bytes) = core.gmail.attachment(&auth, &message, &attachment)? else {
+    if !attachment_ok(attachment) {
+        return Ok(gone());
+    }
+    let Some(bytes) = core.gmail.attachment(&auth, &message, attachment)? else {
         return Ok(gone());
     };
     let dir = start_part(core, &id)?;
@@ -877,7 +1005,7 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
     let row = Opened {
         id,
         account,
-        name: file_name(&title, kind),
+        name: file_name(title, kind),
         mime: kind.to_owned(),
         google: false,
         attachment: true,
@@ -892,7 +1020,7 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
 /// `gws_file_edits`: what's here and edited, with whether Drive moved too. Found
 /// by the hash, so it's what the file holds that counts. Google not answering
 /// says nothing either way, so the file shows as it was: the check that matters
-/// comes again at the press.
+/// comes again at the press. An attachment has nothing on Drive to have moved.
 fn edits(core: &Core) -> Result<Value, Failure> {
     sweep(core);
     let Some((auth, account)) = core.accounts.session() else {
@@ -900,28 +1028,28 @@ fn edits(core: &Core) -> Result<Value, Failure> {
     };
     let rows = with_store(core, Store::all_opened)?;
     let mut files = Vec::new();
-    for row in rows
-        .iter()
-        .filter(|row| row.account == account && !row.attachment)
-    {
-        if !is_edited(&path_of(core, row)?, row) {
+    for row in rows.iter().filter(|row| row.account == account) {
+        if !seems_edited(core, &path_of(core, row)?, row) {
             continue;
         }
-        let changed = match core.drive.file(&auth, &row.id, CHECK_FIELDS) {
-            Ok(Answer::Done(live)) => moved(row, &live),
-            Ok(_) => true,
-            Err(_) => false,
-        };
+        let changed = !row.attachment
+            && match core.drive.file(&auth, &row.id, CHECK_FIELDS) {
+                Ok(Answer::Done(live)) => moved(row, &live),
+                Ok(_) => true,
+                Err(_) => false,
+            };
         files.push(json!({
             "id": row.id, "name": row.name, "state": "edited", "google": row.google,
-            "changed_on_drive": changed, "working": core.working.holds(&row.id),
+            "attachment": row.attachment, "changed_on_drive": changed,
+            "working": core.working.holds(&row.id),
         }));
     }
     Ok(ok(json!({"files": files})))
 }
 
 /// `gws_file_upload`. A Google original is refused before anything else
-/// happens, and `update` writes only when Drive still holds what came.
+/// happens, and `update` writes only when Drive still holds what came. An
+/// attachment takes `copy` alone, which makes it a new file in My Drive.
 fn upload(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (auth, account) = signed_in(core)?;
     let id = match drive::id_of(args) {
@@ -940,10 +1068,10 @@ fn upload(core: &Core, args: &Value) -> Result<Value, Failure> {
     else {
         return Ok(not_here());
     };
-    if row.attachment {
+    if row.attachment && mode != "copy" {
         return Ok(refusal(
             "unsupported",
-            "An attachment can't go back to Google Drive.",
+            "An attachment has no file on Google Drive to write over. Save it as a new one instead.",
         ));
     }
     if row.google && mode != "copy" {
@@ -956,7 +1084,7 @@ fn upload(core: &Core, args: &Value) -> Result<Value, Failure> {
     if !file_here(&path) {
         return Ok(not_here());
     }
-    if !is_edited(&path, &row) {
+    if !is_edited(core, &path, &row) {
         return Ok(refusal(
             "not_edited",
             "This file has no changes here, so there's nothing to upload.",
@@ -971,7 +1099,12 @@ fn upload(core: &Core, args: &Value) -> Result<Value, Failure> {
             "This file is empty here, so nothing was uploaded.",
         ));
     }
-    let live = core.drive.file(&auth, &id, CHECK_FIELDS)?;
+    // an attachment's folder is no Drive id, and there's nothing there to ask
+    let live = if row.attachment {
+        Answer::NotFound
+    } else {
+        core.drive.file(&auth, &id, CHECK_FIELDS)?
+    };
     let metadata = match (mode.as_str(), live) {
         ("copy", live) => {
             // beside the original, or in My Drive once it's gone
@@ -1007,7 +1140,9 @@ fn upload(core: &Core, args: &Value) -> Result<Value, Failure> {
         Sent::Refused(answer) => return Ok(write_refused(answer)),
     };
     drop(file);
-    remove(core, &id)?;
+    // Drive has it, and that's the answer. What won't go from here has lost its
+    // row, so it can't be sent twice, and the sweep finishes it
+    let _ = remove(core, &id);
     // the new revision or copy shows when the changes sync brings it
     core.sync.wake();
     Ok(ok(
@@ -1015,8 +1150,10 @@ fn upload(core: &Core, args: &Value) -> Result<Value, Failure> {
     ))
 }
 
-/// `gws_file_discard`: this Mac's copy goes, and Drive hears nothing of it.
+/// `gws_file_discard`: this Mac's copy goes, and Drive hears nothing of it. Only
+/// the account it belongs to can take it, as only that one can send it.
 fn discard(core: &Core, args: &Value) -> Result<Value, Failure> {
+    let (_, account) = signed_in(core)?;
     let id = match drive::id_of(args) {
         Ok(id) => id,
         Err(answer) => return Ok(answer),
@@ -1024,6 +1161,10 @@ fn discard(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some(_turn) = turn(core, &id) else {
         return Ok(busy());
     };
+    let held = with_store(core, |store| store.opened(&id))?;
+    if !held.is_some_and(|row| row.account == account) {
+        return Ok(not_here());
+    }
     remove(core, &id)?;
     Ok(ok(json!({"discarded": true})))
 }
@@ -1045,7 +1186,9 @@ pub fn sweep(core: &Core) {
             continue;
         }
         let over = now - row.opened_ms >= LIFE_MS;
-        let done = !file_here(&path) || (over && (row.attachment || !is_edited(&path, row)));
+        // the stamps can keep a file and never take one: what would go is read
+        let done = !file_here(&path)
+            || (over && !seems_edited(core, &path, row) && !is_edited(core, &path, row));
         if done && let Some(_turn) = turn(core, &row.id) {
             let _ = remove(core, &row.id);
         }
@@ -1083,8 +1226,7 @@ pub fn forget_account(core: &Core, store: &Store, account: &str) -> gws_store::R
         .iter()
         .filter(|row| row.account == account)
     {
-        let edited = path_of(core, row).is_ok_and(|path| is_edited(&path, row));
-        if edited && !row.attachment {
+        if path_of(core, row).is_ok_and(|path| is_edited(core, &path, row)) {
             continue;
         }
         if let Ok(dir) = folder_of(core, &row.id) {
@@ -1199,10 +1341,14 @@ mod tests {
 
     #[test]
     fn an_attachment_folder_is_short_whatever_its_id_and_stays_one_part() {
-        let id = "A".repeat(ATTACHMENT_ID_MAX);
-        let folder = attachment_folder("18f1a", &id);
+        let part = "1.".repeat(PART_ID_MAX / 2);
+        assert!(part_ok(&part) && part_ok("0.2") && part_ok("root"));
+        let folder = attachment_folder(&"m".repeat(64), &part);
         assert!(id_ok(&folder) && folder.len() < 255 && folder.starts_with(ATTACHMENT));
-        assert_ne!(folder, attachment_folder("18f1a", "other"));
+        assert_ne!(folder, attachment_folder(&"m".repeat(64), "1"));
+        for bad in ["", "a/b", "a b", &"x".repeat(PART_ID_MAX + 1)] {
+            assert!(!part_ok(bad), "{bad}");
+        }
         for bad in ["", "a/b", "..", "a b", &"x".repeat(ATTACHMENT_ID_MAX + 1)] {
             assert!(!attachment_ok(bad), "{bad}");
         }
@@ -1245,6 +1391,41 @@ mod tests {
         assert!(turn(&core, "b2").is_some(), "another file goes on");
         drop(first);
         assert!(turn(&core, "a1").is_some());
+    }
+
+    /// Stamps that lie can only keep a file. No save can make them lie from
+    /// outside, so this one is told to, and the sweep has to read for itself.
+    #[test]
+    fn a_stale_hash_can_keep_a_file_but_never_take_one() {
+        let dir = std::env::temp_dir().join(format!("gws-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let core = Core::new(
+            &crate::apis::Apis::at("http://127.0.0.1:9"),
+            Ok(gws_store::Paths::in_dir(&dir)),
+        );
+        core.unlock("seed");
+        let row = Opened {
+            id: "a1".to_owned(),
+            account: "owner@example.com".to_owned(),
+            name: "Plan.docx".to_owned(),
+            hash: "what came".to_owned(),
+            opened_ms: 1,
+            ..Opened::default()
+        };
+        with_store(&core, |store| store.put_opened(&row)).unwrap();
+        let root = open_root(&core).unwrap();
+        make_folder(&root, &root.join("a1")).unwrap();
+        let path = path_of(&core, &row).unwrap();
+        fs::write(&path, b"PK mine").unwrap();
+        let stamp = Stamp::of(&fs::metadata(&path).unwrap());
+        core.hashes
+            .held()
+            .insert("a1".to_owned(), (stamp, row.hash.clone()));
+        core.clock.set(i64::MAX / 2);
+        assert!(!seems_edited(&core, &path, &row), "it was told so");
+        sweep(&core);
+        assert_eq!(fs::read(&path).unwrap(), b"PK mine");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A download stops at its cap whatever was promised: a real file's cap is

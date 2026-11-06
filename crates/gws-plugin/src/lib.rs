@@ -78,6 +78,8 @@ pub struct Core {
     pub transfers: files::Transfers,
     /// Which files are on their way, each way.
     pub working: files::Working,
+    /// The last hash of each open file.
+    pub hashes: files::Hashes,
     /// What an open file's 24 hours are counted by.
     pub clock: files::Clock,
 }
@@ -105,6 +107,7 @@ impl Core {
             jobs: Mutex::default(),
             transfers: files::Transfers::new(&apis.drive),
             working: files::Working::default(),
+            hashes: files::Hashes::default(),
             clock: files::Clock::default(),
             pushed: std::sync::atomic::AtomicBool::new(false),
         }

@@ -19,7 +19,7 @@ pub struct Opened {
     pub mime: String,
     /// A Google Doc, Sheet or Slides: never written over.
     pub google: bool,
-    /// A mail's attachment: nothing to edit back to.
+    /// A mail's attachment: no file on Drive to edit back to.
     pub attachment: bool,
     /// SHA-256 of what came, in hex.
     pub hash: String,

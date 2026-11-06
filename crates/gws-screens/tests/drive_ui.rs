@@ -1665,7 +1665,8 @@ fn start_edited(width: f32, edits: Vec<Value>) -> (Headless, Arc<Fake>, Frames) 
     (app, fake, frames)
 }
 
-const BUTTONS: [&str; 5] = [
+const BUTTONS: [&str; 6] = [
+    "Save to Google Drive",
     "Upload to Google Drive",
     "Save as a copy",
     "Replace the one on Drive",
@@ -1863,6 +1864,29 @@ fn a_google_file_offers_a_copy_and_nothing_that_writes_over_it() {
         let (app, _, _) = start_edited(1000.0, vec![edit("notes", "Notes.docx", true, changed)]);
         assert_buttons(&app, &["Save a copy to Google Drive", "Discard"]);
     }
+}
+
+/// It has no file on Drive, so nothing offers to write one over, and the person
+/// isn't left with Discard as the only way to answer it.
+#[test]
+fn an_edited_attachment_offers_a_new_file_or_discard_and_says_where_it_came_from() {
+    let mut edited = edit("att-m1-ab", "report.docx", false, false);
+    edited["attachment"] = json!(true);
+    let (mut app, fake, _) = start_edited(1000.0, vec![edited]);
+    assert_buttons(&app, &["Save to Google Drive", "Discard"]);
+    assert!(
+        app.screen().shows(
+            "This came from a mail. It stays here until you save it as a new file or discard it."
+        ),
+        "{:?}",
+        app.screen().texts()
+    );
+    app.press("label:Save to Google Drive").expect("it presses");
+    settle(&mut app);
+    assert_eq!(
+        fake.called("gws_file_upload"),
+        [json!({"id": "att-m1-ab", "mode": "copy"})]
+    );
 }
 
 #[test]

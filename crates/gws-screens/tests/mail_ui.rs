@@ -43,7 +43,7 @@ fn list(args: &Value) -> Value {
 fn thread(id: &str) -> Value {
     let attachments = if id == "t2" {
         json!([
-            {"name": "Roof quote.docx", "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "size": 2048, "id": "att-1", "message": "m7"},
+            {"name": "Roof quote.docx", "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "size": 2048, "id": "att-1", "part": "1", "message": "m7"},
             {"name": "Inline logo.png", "mime": "image/png", "size": 80, "id": null, "message": "m7"},
         ])
     } else {
@@ -1566,9 +1566,7 @@ fn an_attachment_row_opens_with_a_press_and_says_what_it_needs_to() {
     settle(&mut app);
     assert_eq!(
         fake.called("gws_mail_attachment_open"),
-        [
-            json!({"message": "m7", "attachment": "att-1", "name": "Roof quote.docx", "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"})
-        ]
+        [json!({"message": "m7", "part": "1"})]
     );
     assert!(!app.screen().shows("Opening…"), "the answer put it away");
 }

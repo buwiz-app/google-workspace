@@ -63,6 +63,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
         "CREATE TABLE opened(id TEXT PRIMARY KEY, account TEXT NOT NULL, name TEXT NOT NULL, mime TEXT NOT NULL, google INTEGER NOT NULL, attachment INTEGER NOT NULL, hash TEXT NOT NULL, version TEXT NOT NULL, md5 TEXT NOT NULL, opened_ms INTEGER NOT NULL);
          DELETE FROM bodies;",
     ),
+    // nor has it the part of each attachment, which is what opens one now
+    (7, "DELETE FROM bodies;"),
 ];
 
 /// Why the store didn't open or answer: a stable `code` and a message for people.
@@ -502,6 +504,24 @@ mod tests {
             sides.iter().all(|s| !std::path::Path::new(s).exists()),
             "no stale journal for a later store"
         );
+    }
+
+    /// One kept from before has no part on its attachments, and none would open.
+    #[test]
+    fn a_stored_mail_view_from_before_parts_goes() {
+        let dir = Dir::new("parts");
+        let paths = Paths::in_dir(&dir.0);
+        let store = Store::open(&paths, &key()).unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "INSERT INTO bodies(account, thread, view, size, used) VALUES('a', 't', '{}', 2, 1);
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&paths, &key()).unwrap();
+        assert_eq!(store.view("a", "t", 2).unwrap(), None);
     }
 
     #[test]

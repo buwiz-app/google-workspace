@@ -932,7 +932,7 @@ fn a_press_gets_its_document_through_the_real_server_and_the_model_gets_nothing(
         ("gws_file_discard", json!({"id": "drv-open"})),
         (
             "gws_mail_attachment_open",
-            json!({"message": "m1", "attachment": "a1"}),
+            json!({"message": "m1", "part": "1"}),
         ),
     ];
     for caller in [

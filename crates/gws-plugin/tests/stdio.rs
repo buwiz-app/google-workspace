@@ -1268,7 +1268,7 @@ fn the_model_and_a_routine_are_refused_every_drive_write_and_a_person_is_not() {
     let manifest = manifest_file("drive-writes");
     let data = std::env::temp_dir().join(format!("gws-stdio-writes-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+    let mut child = plugin()
         .arg("mcp")
         .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
         .env("GWS_STUB_BASE", google.base())
@@ -1426,7 +1426,7 @@ fn a_test_run_shares_with_nobody_but_its_own_address() {
     let manifest = manifest_file("only-to");
     let data = std::env::temp_dir().join(format!("gws-stdio-only-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+    let mut child = plugin()
         .arg("mcp")
         .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
         .env("GWS_STUB_BASE", google.base())

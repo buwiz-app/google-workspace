@@ -3,7 +3,9 @@
 //! shows as old mail, not as a blank window. Google is asked only by the sync,
 //! by a search, and for a thread not yet opened.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gws_store::Store;
@@ -103,9 +105,20 @@ fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
 pub struct Waker {
     state: Mutex<(bool, Option<Instant>)>,
     bell: Condvar,
+    stop: AtomicBool,
 }
 
 impl Waker {
+    /// Asks the sync thread to end after what it's doing.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.wake();
+    }
+
+    fn stopping(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
     pub fn wake(&self) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).0 = true;
         self.bell.notify_all();
@@ -134,15 +147,18 @@ impl Waker {
 }
 
 /// Starts the background sync.
-pub fn start(core: Arc<Core>) {
+pub fn start(core: Arc<Core>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         loop {
             core.sync.wait();
+            if core.sync.stopping() {
+                return;
+            }
             if core.provisioned() {
                 let _ = sync(&core);
             }
         }
-    });
+    })
 }
 
 fn with_store<T>(

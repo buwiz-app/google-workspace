@@ -12,6 +12,7 @@ use std::io::{BufRead as _, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use buwiz_plugin::manifest::{MANIFEST_ENV, Served};
 use buwiz_plugin::{Caller, Origin, Plugin as _, Server};
@@ -157,6 +158,8 @@ fn invalid(line: &Value) -> Option<Value> {
 /// Tools running at once, past which a call is refused: a Bot's screens hold
 /// 8 in flight each, and each call here is a thread.
 const MAX_RUNNING: usize = 32;
+/// How long exit waits for the sync thread.
+const STOP_WAIT: Duration = Duration::from_secs(2);
 
 type Out = Arc<Mutex<std::io::Stdout>>;
 
@@ -201,7 +204,7 @@ pub fn serve(plugin: Gws) -> Result<(), String> {
 
 fn run(plugin: Gws, manifest: Served) -> std::io::Result<()> {
     let core = plugin.core.clone();
-    crate::mail::start(core.clone());
+    let syncing = crate::mail::start(core.clone());
     let mut server = Server::with_manifest(plugin, manifest);
     let out: Out = Arc::new(Mutex::new(std::io::stdout()));
     let mut running: Vec<JoinHandle<()>> = Vec::new();
@@ -355,6 +358,13 @@ fn run(plugin: Gws, manifest: Served) -> std::io::Result<()> {
     }
     for t in running {
         let _ = t.join();
+    }
+    // the process's own teardown frees what the store's crypto uses, so the
+    // sync thread ends first; a call stuck on the network doesn't hold it up
+    core.sync.stop();
+    let deadline = Instant::now() + STOP_WAIT;
+    while !syncing.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
     }
     Ok(())
 }

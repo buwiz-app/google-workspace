@@ -561,7 +561,6 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
     drop(ask);
     drop(stdin);
     let status = child.wait().unwrap();
-    assert!(status.success());
     let mut stderr = String::new();
     child
         .stderr
@@ -569,6 +568,7 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
         .unwrap()
         .read_to_string(&mut stderr)
         .unwrap();
+    assert!(status.success(), "{status}: {stderr}");
     assert!(!transcript.contains(TOKEN), "stdout never shows the token");
     assert!(
         !stderr.contains(TOKEN),

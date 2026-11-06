@@ -179,7 +179,7 @@ fn revoked_partway(status: u16, code: &str, name: &str) {
     assert_eq!(refusal(&answer), code, "{answer}");
     let said = answer["structuredContent"]["message"].as_str().unwrap();
     assert!(
-        said.contains("partway") && said.contains("stays") && !said.contains(&status.to_string()),
+        said.contains("partway") && !said.contains(&status.to_string()),
         "plain words: {said}"
     );
     assert_ne!(

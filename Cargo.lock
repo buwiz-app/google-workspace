@@ -1121,6 +1121,7 @@ dependencies = [
 name = "gws-screens"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "buwiz-app",
  "chrono",
  "nsh-core",

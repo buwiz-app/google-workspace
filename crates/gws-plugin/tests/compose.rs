@@ -23,9 +23,10 @@ fn lunch() -> Value {
 }
 
 fn send(core: &Core, draft: &Value) -> Value {
+    let armed = data(core.run("gws_mail_send_arm", &json!({})));
     core.run(
         "gws_mail_send",
-        &json!({"draft": draft["draft"], "revision": draft["revision"], "message_id": draft["message_id"]}),
+        &json!({"draft": draft["draft"], "revision": draft["revision"], "message_id": draft["message_id"], "armed": armed["armed"]}),
     )
 }
 
@@ -50,6 +51,27 @@ fn what_was_read_is_what_arrives() {
     assert_eq!(sent[0].bcc, "cara@example.com");
     assert_eq!(sent[0].subject, "Lunch ñ");
     assert_eq!(sent[0].body, "Noon?\nThe usual place.");
+}
+
+#[test]
+fn a_send_with_no_press_behind_it_goes_nowhere() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "unarmed");
+    let saved = data(core.run("gws_mail_draft_save", &lunch()));
+    let args = |armed: &Value| json!({"draft": saved["draft"], "revision": saved["revision"], "armed": armed});
+    let refused = core.run("gws_mail_send", &args(&json!("a1-made-up")));
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(google.sent(), []);
+
+    let press = data(core.run("gws_mail_send_arm", &json!({})));
+    data(core.run("gws_mail_send", &args(&press["armed"])));
+    let second = data(core.run("gws_mail_draft_save", &lunch()));
+    let again = core.run(
+        "gws_mail_send",
+        &json!({"draft": second["draft"], "revision": second["revision"], "armed": press["armed"]}),
+    );
+    assert_eq!(again["isError"], true, "a press is good for one send: {again}");
+    assert_eq!(google.sent().len(), 1);
 }
 
 #[test]

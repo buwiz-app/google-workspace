@@ -7,8 +7,6 @@
 //! The Bot's `agent_hub::filter` tests hold that on the bytes it sends.
 
 use std::collections::HashSet;
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use buwiz_app::{Bridge, Placement};
@@ -20,8 +18,9 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use url::Url;
 
+use crate::compose::{self, Compose};
 use crate::reader;
-use crate::shell::{BG, MUTE, RETRIES, backoff, sleep};
+use crate::shell::{BG, Job, Latest, MUTE, RETRIES, backoff, sleep};
 
 const INK: &str = "text-[#1c1c1c] dark:text-[#f0f0f0]";
 const RAIL: &str = "bg-[#efefec] dark:bg-[#0f0f0f]";
@@ -182,27 +181,6 @@ pub fn notice(status: &str, saved: bool) -> Option<&'static str> {
     }
 }
 
-/// Which of several answers out at once still counts: the latest asked for.
-#[derive(Clone, Copy)]
-struct Latest(Signal<u64>);
-
-impl Latest {
-    fn new() -> Self {
-        Self(signal(0))
-    }
-
-    /// A new question: every earlier one stops counting.
-    fn ask(self) -> u64 {
-        let turn = self.0.get_untracked() + 1;
-        self.0.set(turn);
-        turn
-    }
-
-    fn counts(self, turn: u64) -> bool {
-        self.0.get_untracked() == turn
-    }
-}
-
 /// A page's rows the list doesn't hold yet: mail moving between pages can
 /// bring one back, and each row's id must stay unique.
 fn new_rows(have: &[Row], page: Vec<Row>) -> Vec<Row> {
@@ -230,6 +208,7 @@ struct Mail {
     /// Conversations picked with `x`, which actions take over the open one.
     picked: Signal<Vec<String>>,
     jobs: Signal<UnboundedSender<Job>>,
+    compose: Compose,
     /// The label picker is open.
     labeling: Signal<bool>,
     /// What can be undone, and what to say about it.
@@ -408,9 +387,6 @@ fn tell_too(m: Mail, line: &str) {
     }
 }
 
-/// A person's action waiting its turn.
-type Job = Pin<Box<dyn Future<Output = ()>>>;
-
 /// Hands `job` to the screen's own task. A press's task dies with the view it
 /// was pressed on, and an action redraws what it's pressed on: an action
 /// must outlive that, and two must run in the order they were asked.
@@ -572,6 +548,9 @@ async fn open(b: Bridge, m: Mail, index: usize) {
         return;
     };
     m.chosen.set(Some(id.clone()));
+    if m.label.with_untracked(|l| l == "DRAFT") {
+        return compose::resume(b, m.compose, id);
+    }
     let unread = m
         .rows
         .with_untracked(|r| r.get(index).is_some_and(|r| r.unread));
@@ -665,6 +644,7 @@ fn press_class(on: bool) -> String {
 }
 
 fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
+    let writes = b.clone();
     // the highlight is a binding on each row, not read here: a rebuild on the
     // chosen label would drop the pressed row, and the load it started with it
     let list = dynamic(move || {
@@ -705,6 +685,13 @@ fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
         .app_class(Some(
             format!("w-[190px] pt-3 border-r {LINE} {RAIL}").into(),
         ))
+        .child(
+            view()
+                .app_class(Some("px-2 py-2".into()))
+                .child(tool("Write a message", "Write", move || {
+                    compose::start(writes.clone(), m.compose);
+                })),
+        )
         .child(list)
 }
 
@@ -891,6 +878,15 @@ fn tool(label: &'static str, shows: &'static str, press: impl Fn() + 'static) ->
 
 /// What can be done to the open conversation, or to the picked ones.
 fn toolbar(b: Bridge, m: Mail) -> impl IntoElement {
+    let writes = b.clone();
+    let answer = move |mode: &'static str| {
+        let b = writes.clone();
+        move || {
+            if let Some(thread) = m.chosen.get_untracked() {
+                compose::reply(b.clone(), m.compose, thread, mode);
+            }
+        }
+    };
     let go = move |tool: &'static str,
                    args: Value,
                    said: &'static str,
@@ -917,6 +913,9 @@ fn toolbar(b: Bridge, m: Mail) -> impl IntoElement {
         .app_class(Some(
             format!("flex-row gap-1 px-2 py-1 border-b {LINE}").into(),
         ))
+        .child(tool("Reply to this", "Reply", answer("reply")))
+        .child(tool("Reply to everyone", "Reply all", answer("all")))
+        .child(tool("Forward this", "Forward", answer("forward")))
         .child(tool(
             "Archive this",
             "Archive",
@@ -1028,6 +1027,19 @@ fn label_picker(b: Bridge, m: Mail) -> impl IntoElement {
 }
 
 fn reader_pane(b: Bridge, m: Mail) -> impl IntoElement {
+    view()
+        .app_class(Some(format!("flex-1 {PANEL}").into()))
+        .child(dynamic(move || {
+            let pane = view().app_class(Some("flex-1".into()));
+            if m.compose.open.get() {
+                pane.child(compose::panel(b.clone(), m.compose))
+            } else {
+                pane.child(reading(b.clone(), m))
+            }
+        }))
+}
+
+fn reading(b: Bridge, m: Mail) -> impl IntoElement {
     let picking = b.clone();
     let bar = dynamic(move || {
         if m.chosen.with(Option::is_none) && m.picked.with(Vec::is_empty) {
@@ -1038,7 +1050,7 @@ fn reader_pane(b: Bridge, m: Mail) -> impl IntoElement {
             .child(label_picker(picking.clone(), m))
     });
     view()
-        .app_class(Some(format!("flex-1 {PANEL}").into()))
+        .app_class(Some("flex-1".into()))
         .child(bar)
         .child(dynamic(move || match m.page.get() {
             Some(page) => view()
@@ -1192,7 +1204,7 @@ fn keys(b: Bridge, m: Mail) {
     });
     on_key("shift+/", move |_| m.help.set(!m.help.get_untracked()));
     let (archive, trash, star) = (acts.clone(), acts.clone(), acts.clone());
-    let (read_it, unread_it, back) = (acts.clone(), acts.clone(), acts);
+    let (read_it, unread_it, back) = (acts.clone(), acts.clone(), acts.clone());
     on_key("e", move |_| {
         run(
             m,
@@ -1271,6 +1283,27 @@ fn keys(b: Bridge, m: Mail) {
                 |r| r.unread = true,
             ),
         );
+    });
+    let (new, answer) = (acts.clone(), acts.clone());
+    on_key("c", move |_| compose::start(new.clone(), m.compose));
+    for (key, mode) in [("r", "reply"), ("a", "all"), ("f", "forward")] {
+        let b = answer.clone();
+        on_key(key, move |_| {
+            if let Some(thread) = m.chosen.get_untracked() {
+                compose::reply(b.clone(), m.compose, thread, mode);
+            }
+        });
+    }
+    let (sending, keeping) = (acts.clone(), acts);
+    on_key("cmd+enter", move |_| {
+        if m.compose.open.get_untracked() {
+            compose::send(sending.clone(), m.compose);
+        }
+    });
+    on_key("escape", move |_| {
+        if m.compose.open.get_untracked() {
+            compose::keep(keeping.clone(), m.compose);
+        }
     });
     on_key("x", move |_| {
         if let Some(id) = m.chosen.get_untracked() {
@@ -1486,6 +1519,9 @@ fn help_view() -> impl IntoElement {
         "Shift+I, Shift+U  read, unread",
         "x  pick",
         "z  undo",
+        "c  write a message",
+        "r, a, f  reply, reply all, forward",
+        "Cmd+Enter  send",
         "/  search",
         "?  this help",
     ];
@@ -1503,7 +1539,9 @@ pub fn build(bridge: Bridge) -> Root {
         let props = b.props();
         let prop = |k: &str| props.get(k).and_then(Value::as_str).map(str::to_owned);
         let (jobs, mut waiting) = unbounded_channel::<Job>();
+        let (writer, writing) = Compose::new();
         let m = Mail {
+            compose: writer,
             problem: signal(None),
             told: signal(None),
             undoing: signal(None),
@@ -1535,6 +1573,8 @@ pub fn build(bridge: Bridge) -> Root {
         b.spawn(load_list(b.clone(), m, 0));
         b.spawn(load_labels(b.clone(), m));
         b.spawn(watch(b.clone(), m));
+        b.spawn(compose::work(writing));
+        b.spawn(compose::autosave(b.clone(), writer));
         b.spawn(async move {
             while let Some(job) = waiting.recv().await {
                 job.await;
@@ -1544,7 +1584,7 @@ pub fn build(bridge: Bridge) -> Root {
             b.spawn(open_ticket(b.clone(), m, ticket));
         }
         let (rail, list, guide) = (b.clone(), b.clone(), b.clone());
-        let (undoing, pane) = (b.clone(), b.clone());
+        let (undoing, pane, holding) = (b.clone(), b.clone(), b.clone());
         view()
             .app_class(Some(format!("flex-1 {BG}").into()))
             .child(dynamic(move || {
@@ -1562,6 +1602,7 @@ pub fn build(bridge: Bridge) -> Root {
                             .child(list_pane(list.clone(), m))
                             .child(reader_pane(pane.clone(), m)),
                     )
+                    .child(compose::hold_bar(holding.clone(), writer))
                     .child(undo_bar(undoing.clone(), m))
                     .child(link_bar(m))
                     .child(dynamic(move || {

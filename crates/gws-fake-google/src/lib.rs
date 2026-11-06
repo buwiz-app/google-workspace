@@ -828,6 +828,14 @@ impl Account {
                 };
                 Reply::json(200, json!({"id": id, "message": {"id": message}}))
             }
+            ("GET", ["drafts"]) => {
+                let listed: Vec<Value> = self
+                    .drafts
+                    .iter()
+                    .map(|(id, message, _, thread)| json!({"id": id, "message": {"id": message, "threadId": thread}}))
+                    .collect();
+                Reply::json(200, json!({"drafts": listed}))
+            }
             ("GET", ["drafts", id]) => match self.drafts.iter().find(|d| d.0 == *id) {
                 Some((id, message, raw, thread)) => {
                     let sent = Sent::of(raw);

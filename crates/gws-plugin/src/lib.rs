@@ -54,6 +54,8 @@ pub struct Core {
     pub model_drafts: Mutex<std::collections::HashSet<String>>,
     /// Files on their way into a draft: memory only, like a key.
     pub uploads: Mutex<compose::Uploads>,
+    /// Sends a person's press has allowed, each good for one.
+    pub armed: Mutex<compose::Armed>,
     /// How saves too slow for their caller came out.
     pub jobs: Mutex<std::collections::VecDeque<(String, Value)>>,
 }
@@ -71,6 +73,7 @@ impl Core {
             undos: Mutex::default(),
             model_drafts: Mutex::default(),
             uploads: Mutex::default(),
+            armed: Mutex::default(),
             jobs: Mutex::default(),
             pushed: std::sync::atomic::AtomicBool::new(false),
         }

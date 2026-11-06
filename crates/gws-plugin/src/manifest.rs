@@ -49,6 +49,8 @@ pub const APPS: [App; 3] = [
             tools::MAIL_SEND,
             tools::MAIL_REPLY_START,
             tools::MAIL_JOB,
+            tools::MAIL_SEND_ARM,
+            tools::MAIL_DRAFT_OF,
             tools::UPLOAD_CHUNK,
             tools::UPLOAD_DROP,
         ],

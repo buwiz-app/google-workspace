@@ -481,6 +481,21 @@ impl Gmail {
         Ok(Some(bytes))
     }
 
+    /// The id of the draft in conversation `thread`, among the newest there are.
+    pub fn draft_in_thread(&self, auth: &Bearer, thread: &str) -> Result<Option<String>, Failure> {
+        let query = vec![("maxResults", "500".to_owned())];
+        let Some(list) = self.get(auth, "drafts".to_owned(), query, FULL_MAX)? else {
+            return Ok(None);
+        };
+        Ok(list
+            .get("drafts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|d| d.pointer("/message/threadId").and_then(Value::as_str) == Some(thread))
+            .and_then(|d| d.get("id")?.as_str().map(str::to_owned)))
+    }
+
     pub fn draft(&self, auth: &Bearer, id: &str) -> Result<Option<Value>, Failure> {
         let query = vec![("format", "full".to_owned())];
         self.get(auth, format!("drafts/{id}"), query, FULL_MAX)

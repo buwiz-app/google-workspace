@@ -21,9 +21,10 @@ fn data(answer: Value) -> Value {
 }
 
 fn send(core: &Core, draft: &Value) -> Value {
+    let armed = data(core.run("gws_mail_send_arm", &json!({})));
     core.run(
         "gws_mail_send",
-        &json!({"draft": draft["draft"], "revision": draft["revision"]}),
+        &json!({"draft": draft["draft"], "revision": draft["revision"], "armed": armed["armed"]}),
     )
 }
 

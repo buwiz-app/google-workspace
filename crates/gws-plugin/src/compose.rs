@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::sync::MutexGuard;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -551,6 +552,60 @@ fn outside<'a>(allowed: &str, recipients: impl Iterator<Item = &'a str>) -> Opti
     recipients.find(|r| !r.eq_ignore_ascii_case(allowed))
 }
 
+/// How long a press allows its send: long enough to save a big attachment.
+const ARMED_FOR: Duration = Duration::from_secs(900);
+
+/// Presses of Send, by what each was given. The Bot judges a call by the moment
+/// it's made, not by the press behind it: a send held five seconds could go out
+/// as the person's after the AI pressed, if the person pressed anything in the
+/// gap. So the call that decides comes at the press, and the send needs its answer.
+#[derive(Default)]
+pub struct Armed {
+    presses: Vec<(String, Instant)>,
+    next: u64,
+}
+
+impl Armed {
+    fn take(&mut self, token: &str) -> bool {
+        self.presses.retain(|(_, at)| at.elapsed() < ARMED_FOR);
+        match self.presses.iter().position(|(t, _)| t == token) {
+            Some(at) => {
+                self.presses.remove(at);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+fn armed(core: &Core) -> MutexGuard<'_, Armed> {
+    core.armed.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `gws_mail_send_arm`: the person pressed Send. The model's call never gets
+/// here: this tool is the app's alone, and a press of the AI's goes out as the AI.
+pub fn arm(core: &Core) -> Result<Value, Failure> {
+    let mut held = armed(core);
+    held.next += 1;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let token = format!("a{}-{nanos:x}", held.next);
+    held.presses.push((token.clone(), Instant::now()));
+    Ok(ok(json!({"armed": token})))
+}
+
+/// `gws_mail_draft_of`: the draft in a conversation, for the Drafts list, whose
+/// rows are conversations.
+pub fn draft_of(core: &Core, args: &Value) -> Result<Value, Failure> {
+    let auth = session(core)?;
+    let thread = js::string_or_empty(args.get("thread"));
+    if !gmail::id_ok(&thread) {
+        return Ok(fail("invalid_args", "That isn't a conversation."));
+    }
+    Ok(ok(json!({"draft": core.gmail.draft_in_thread(&auth, &thread)?})))
+}
+
 /// `gws_mail_send`: the person's press, on the revision they read. A Send whose
 /// answer was lost is safe to press again: the draft has gone by then, and the
 /// message is found in Sent instead of going out twice.
@@ -590,6 +645,9 @@ pub fn send(core: &Core, args: &Value) -> Result<Value, Failure> {
                 &format!("This test run writes only to {allowed}, not {other}."),
             ));
         }
+    }
+    if !armed(core).take(&js::string_or_empty(args.get("armed"))) {
+        return Ok(fail("not_allowed", "Only a person's press sends mail."));
     }
     core.gmail.draft_send(&auth, &id)?;
     uploads(core).free_draft(&id);

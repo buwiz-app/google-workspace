@@ -1,15 +1,13 @@
 //! What every screen starts from: it says whether this feature works with the
-//! signed-in account, which is more than being signed in. Each screen's own
-//! content comes in its slice.
+//! signed-in account, which is more than being signed in.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 use buwiz_app::Bridge;
-use nsh_core::element::Root;
 use nsh_core::prelude::*;
-use serde_json::{Value, json};
+use serde_json::Value;
 use url::Url;
 
 pub(crate) const BG: &str = "bg-[#f6f6f4] dark:bg-[#151515]";
@@ -17,6 +15,12 @@ pub(crate) const MUTE: &str = "text-[#5c5c5c] dark:text-[#a0a0a0]";
 pub(crate) const INK: &str = "text-[#1c1c1c] dark:text-[#f0f0f0]";
 pub(crate) const RAIL: &str = "bg-[#efefec] dark:bg-[#0f0f0f]";
 pub(crate) const PANEL: &str = "bg-white dark:bg-[#1d1d1d]";
+
+/// What a card sits in. The Bot's frame can be taller than a short card, and
+/// the rest of it has to be the card and not a dark band.
+pub(crate) fn card_frame() -> nsh_core::element::View {
+    view().app_class(Some(format!("flex-1 {PANEL}").into()))
+}
 pub(crate) const LINE: &str = "border-black/10 dark:border-[#2b2b2b]";
 pub(crate) const CHOSEN: &str = "bg-[#e1ebfb] dark:bg-[#15253f]";
 pub(crate) const DIM: &str = "text-[#8a8a8a] dark:text-[#6e6e6e]";
@@ -188,33 +192,10 @@ pub(crate) fn line_of(account: Account, name: &str) -> String {
     }
 }
 
-pub fn build(bridge: Bridge, name: &'static str) -> Root {
-    buwiz_app::root(bridge, move |b| {
-        let account = signal(Account::Loading);
-        let reader = b.clone();
-        b.spawn(async move {
-            for attempt in 0.. {
-                match reader.call("gws_status", json!({})).await {
-                    Ok(v) => return account.set(account_of(&v, name)),
-                    Err(e) if e.retryable && attempt < RETRIES => sleep(backoff(attempt)).await,
-                    Err(e) => return account.set(Account::Failed(e.message)),
-                }
-            }
-        });
-        let body = dynamic(move || {
-            let line = line_of(account.get(), name);
-            view()
-                .app_class(Some("flex-1 items-center justify-center".into()))
-                .child(text(line).app_class(Some(format!("text-[14px] {MUTE}").into())))
-        });
-        view()
-            .app_class(Some(format!("flex-1 {BG}").into()))
-            .child(body)
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]

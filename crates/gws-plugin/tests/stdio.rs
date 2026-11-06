@@ -11,6 +11,8 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 const TOKEN: &str = "ya29.stdio-secret-token";
+#[cfg(feature = "stub")]
+const FAKE_SUBJECT: &str = "owner@example.com";
 
 fn b64(b: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
@@ -566,6 +568,14 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
             "gws_event_delete",
             "gws_event_restore",
             "gws_event_rsvp",
+            "gws_search_drive",
+            "gws_read_doc_text",
+            "gws_drive_list",
+            "gws_drive_about",
+            "gws_drive_changes",
+            "gws_drive_file",
+            "gws_drive_preview",
+            "gws_drive_card",
             "gws_resolve"
         ]
     );
@@ -758,7 +768,9 @@ fn the_model_is_refused_every_calendar_write_and_never_sees_one_on_its_list() {
             "gws_read_mail",
             "gws_mail_draft_save",
             "gws_search_events",
-            "gws_event_draft"
+            "gws_event_draft",
+            "gws_search_drive",
+            "gws_read_doc_text"
         ]
     );
     for n in [100, 200] {
@@ -770,6 +782,93 @@ fn the_model_is_refused_every_calendar_write_and_never_sees_one_on_its_list() {
             );
         }
     }
+}
+
+/// Through the real server, as the Bot drives it, since a card can be lost
+/// between the tool and stdout where no in-process test sees it. A search from
+/// a chat offers the `files` card; from a routine, or a screen, it doesn't.
+#[cfg(feature = "stub")]
+#[test]
+fn a_chats_drive_search_offers_the_files_card_through_the_real_server() {
+    use gws_fake_google::{FakeFile, FakeGoogle, GOOGLE_DOC, Seed};
+
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(
+        FakeFile::new("drv-card", "Fake roof quote secret-name", GOOGLE_DOC).holding(b"Fake words"),
+    );
+    let manifest = manifest_file("drive-card");
+    let data = std::env::temp_dir().join(format!("gws-stdio-drive-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data);
+    let mut child = plugin()
+        .arg("mcp")
+        .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
+        .env("GWS_STUB_BASE", google.base())
+        .env("GWS_DATA_DIR", &data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut id = 1;
+    let mut ask = |name: &str, args: Value, caller: Value| -> Value {
+        id += 1;
+        writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args, "_meta": {"buwiz/caller": caller}}})).unwrap();
+        // the sync thread writes nothing here, so the next line is this reply
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["id"], id, "{line}");
+        v["result"].clone()
+    };
+    let provision = provision();
+    ask(
+        "buwiz.provision",
+        provision["params"]["arguments"].clone(),
+        json!({}),
+    );
+    ask(
+        "buwiz.account.set",
+        json!({"account": "google", "label": "default", "subject": FAKE_SUBJECT, "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}),
+        json!({}),
+    );
+
+    let agent = json!({"origin": "agent"});
+    let found = ask("gws_search_drive", json!({"query": "roof"}), agent.clone());
+    let open = &found["_meta"]["buwiz/open"];
+    assert_eq!(open["app"], "drive", "{found}");
+    assert_eq!(open["title"], "Drive");
+    assert_eq!(open["placement"], "inline");
+    let ticket = open["props"]["search"].as_str().unwrap();
+    assert!(ticket.len() <= 30, "the manifest's props hold it");
+    assert!(
+        !found["_meta"].to_string().contains("secret-name"),
+        "no file name in _meta: {found}"
+    );
+    assert_eq!(found["structuredContent"]["items"][0]["id"], "drv-card");
+    assert!(found["structuredContent"]["untrusted"].is_string());
+
+    // nothing found is no card
+    let none = ask("gws_search_drive", json!({"query": "zzz"}), agent);
+    assert_eq!(none["structuredContent"]["items"], json!([]));
+    assert_eq!(none.get("_meta"), None, "{none}");
+
+    let routine = ask(
+        "gws_search_drive",
+        json!({"query": "roof"}),
+        json!({"origin": "routine", "routine": "r1"}),
+    );
+    assert_eq!(routine["structuredContent"]["items"][0]["id"], "drv-card");
+    assert_eq!(
+        routine.get("_meta"),
+        None,
+        "a routine has no one to show it to"
+    );
+    drop(ask);
+    drop(stdin);
+    child.wait().unwrap();
+    let _ = std::fs::remove_dir_all(&data);
 }
 
 #[test]

@@ -18,6 +18,7 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use sha2::{Digest as _, Sha256};
 
 pub mod calendar;
+pub mod drive;
 pub mod mail;
 
 pub const DATA_DIR_ENV: &str = "GWS_DATA_DIR";
@@ -46,6 +47,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
          CREATE TABLE events(account TEXT NOT NULL, calendar TEXT NOT NULL, id TEXT NOT NULL, series TEXT NOT NULL, title TEXT NOT NULL, place TEXT NOT NULL, notes TEXT NOT NULL, start_text TEXT NOT NULL, end_text TEXT NOT NULL, all_day INTEGER NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL, status TEXT NOT NULL, response TEXT NOT NULL, guests INTEGER NOT NULL, meet INTEGER NOT NULL, etag TEXT NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(account, calendar, id));
          CREATE INDEX events_by_time ON events(account, start_ms);
          CREATE INDEX events_of_series ON events(account, calendar, series);",
+    ),
+    (
+        5,
+        "CREATE TABLE drive_files(account TEXT NOT NULL, id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, mime TEXT NOT NULL, owner TEXT NOT NULL, mine INTEGER NOT NULL, changed TEXT NOT NULL, changed_ms INTEGER NOT NULL, size INTEGER, starred INTEGER NOT NULL, shared INTEGER NOT NULL, with_me INTEGER NOT NULL, trashed INTEGER NOT NULL, parents TEXT NOT NULL, PRIMARY KEY(account, id));
+         CREATE TABLE drive_views(account TEXT NOT NULL, view TEXT NOT NULL, next TEXT NOT NULL, PRIMARY KEY(account, view));
+         CREATE TABLE drive_listed(account TEXT NOT NULL, view TEXT NOT NULL, file TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(account, view, file));
+         CREATE INDEX drive_listed_in_order ON drive_listed(account, view, at);
+         CREATE INDEX drive_listed_by_file ON drive_listed(account, file);",
     ),
 ];
 

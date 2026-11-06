@@ -364,8 +364,9 @@ fn date_ms(day: NaiveDate) -> i64 {
 }
 
 /// An event's description as plain text. A description may be HTML or plain:
-/// plain keeps its lines, which reading it as HTML would run together.
-fn notes_of(event: &Value) -> String {
+/// plain keeps its lines, which reading it as HTML would run together. Drive's
+/// files have one too.
+pub(crate) fn notes_of(event: &Value) -> String {
     let raw = text(event, "description");
     let html = raw.contains('<') && raw.contains('>');
     let notes = if html { clean::visible_text(&raw) } else { raw };

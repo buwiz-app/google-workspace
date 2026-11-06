@@ -94,8 +94,18 @@ pub const APPS: [App; 3] = [
         title: "Drive",
         screen: "gws.drive",
         description: "Your files in Google Drive.",
-        tools: &[tools::STATUS],
-        card: false,
+        tools: &[
+            tools::STATUS,
+            tools::DRIVE_LIST,
+            tools::DRIVE_ABOUT,
+            tools::DRIVE_CHANGES,
+            tools::DRIVE_FILE,
+            tools::DRIVE_PREVIEW,
+            tools::DRIVE_CARD,
+            tools::SEARCH_DRIVE,
+            tools::READ_DOC_TEXT,
+        ],
+        card: true,
         files: false,
         sites: &[],
     },
@@ -117,7 +127,7 @@ fn app(a: &App) -> Value {
     if a.card {
         entry["placement"] = json!(["full", "inline"]);
         entry["inline"] = json!({ "width": 420, "height": 96, "min_height": 96, "max_height": 480, "resizable": false, "wait_ready": true });
-        entry["props"] = json!({ "type": "object", "properties": { "search": { "type": "string", "maxLength": 30 }, "thread": { "type": "string", "maxLength": 30 }, "draft": { "type": "string", "maxLength": 30 }, "view": { "type": "string", "maxLength": 30 }, "event": { "type": "object", "properties": { "calendar": { "type": "string", "maxLength": 512 }, "id": { "type": "string", "maxLength": 512 } } } } });
+        entry["props"] = json!({ "type": "object", "properties": { "search": { "type": "string", "maxLength": 30 }, "thread": { "type": "string", "maxLength": 30 }, "draft": { "type": "string", "maxLength": 30 }, "view": { "type": "string", "maxLength": 30 }, "folder": { "type": "string", "maxLength": 256 }, "event": { "type": "object", "properties": { "calendar": { "type": "string", "maxLength": 512 }, "id": { "type": "string", "maxLength": 512 } } } } });
     }
     if a.files {
         permissions["pick_file"] =
@@ -143,11 +153,13 @@ pub fn unsigned(key_id: &str) -> Value {
             { "name": "gws-draft", "description": "Start an email for the assistant to draft", "resolve": tools::RESOLVE },
             { "name": "calendar", "description": "Open Calendar", "args": "[today, week, next or new]", "resolve": tools::RESOLVE },
             { "name": "gws-next", "description": "Show your next event", "resolve": tools::RESOLVE },
-            { "name": "drive", "description": "Open Drive", "resolve": tools::RESOLVE }
+            { "name": "drive", "description": "Open Drive", "resolve": tools::RESOLVE },
+            { "name": "file", "description": "Find a file in Drive", "args": "[name]", "resolve": tools::RESOLVE }
         ],
         "scopes": [
             { "name": "mail", "description": "Mailbox view", "resolve": tools::RESOLVE },
-            { "name": "calendar", "description": "Calendar view", "resolve": tools::RESOLVE }
+            { "name": "calendar", "description": "Calendar view", "resolve": tools::RESOLVE },
+            { "name": "file", "description": "A file in Drive, by name", "resolve": tools::RESOLVE }
         ],
         "apps": APPS.iter().map(app).collect::<Vec<_>>(),
     })
@@ -191,6 +203,27 @@ mod tests {
             let named = format!("\"{}\"", def.name);
             if screens.iter().any(|s| s.contains(&named)) {
                 assert!(calendar.tools.contains(&def.name), "{}", def.name);
+            }
+        }
+    }
+
+    #[test]
+    fn drive_lists_every_tool_its_screen_calls() {
+        let drive = APPS
+            .iter()
+            .find(|a| a.tools.contains(&tools::DRIVE_LIST))
+            .unwrap();
+        let screens = [
+            include_str!("../../gws-screens/src/drive.rs"),
+            include_str!("../../gws-screens/src/drive/card.rs"),
+            include_str!("../../gws-screens/src/drive/detail.rs"),
+            include_str!("../../gws-screens/src/drive/file.rs"),
+            include_str!("../../gws-screens/src/drive/list.rs"),
+        ];
+        for def in tools::defs() {
+            let named = format!("\"{}\"", def.name);
+            if screens.iter().any(|s| s.contains(&named)) {
+                assert!(drive.tools.contains(&def.name), "{}", def.name);
             }
         }
     }
@@ -267,7 +300,18 @@ mod tests {
                 .any(|t| t.as_str().unwrap().contains("mail") || t == "gws_people_suggest"),
             "approving Calendar grants no read of Gmail: {calendar:?}"
         );
-        assert_eq!(tools_of("drive"), json!(["gws_status"]));
+        let drive = tools_of("drive");
+        let drive = drive.as_array().unwrap();
+        assert!(drive.contains(&json!("gws_drive_list")));
+        assert!(
+            !drive.iter().any(|t| {
+                let t = t.as_str().unwrap();
+                ["mail", "cal_", "event", "people", "upload"]
+                    .iter()
+                    .any(|other| t.contains(other))
+            }),
+            "approving Drive grants no read of Gmail or Calendar: {drive:?}"
+        );
     }
 
     #[test]
@@ -294,6 +338,36 @@ mod tests {
         assert!(scopes.iter().any(|s| s["name"] == "calendar"));
         let commands = m["commands"].as_array().unwrap();
         assert!(commands.iter().any(|c| c["name"] == "gws-next"));
+    }
+
+    #[test]
+    fn drive_is_a_card_as_well_as_a_screen_and_has_every_drive_tool() {
+        let m = unsigned(RELEASE_KEY_ID);
+        let app = m["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "drive")
+            .unwrap();
+        assert_eq!(app["placement"], json!(["full", "inline"]));
+        assert_eq!(app["permissions"]["open"]["apps"], json!(["drive"]));
+        let held = app["permissions"]["tools"].as_array().unwrap();
+        for d in tools::defs() {
+            if d.name.starts_with("gws_drive_")
+                || [tools::SEARCH_DRIVE, tools::READ_DOC_TEXT].contains(&d.name)
+            {
+                assert!(held.contains(&json!(d.name)), "{}", d.name);
+            }
+        }
+        assert!(app["props"]["properties"]["folder"].is_object());
+        let named = |list: &str| {
+            m[list]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["name"] == "file")
+        };
+        assert!(named("commands") && named("scopes"));
     }
 
     #[test]

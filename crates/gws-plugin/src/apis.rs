@@ -8,6 +8,7 @@ pub struct Apis {
     pub gmail: String,
     pub people: String,
     pub calendar: String,
+    pub drive: String,
 }
 
 /// Names the stub Google, in a `stub` build.
@@ -19,6 +20,7 @@ impl Apis {
             gmail: crate::gmail::GMAIL_API.to_owned(),
             people: crate::gmail::PEOPLE_API.to_owned(),
             calendar: crate::calendar::CALENDAR_API.to_owned(),
+            drive: crate::drive::DRIVE_API.to_owned(),
         }
     }
 
@@ -29,6 +31,7 @@ impl Apis {
             gmail: format!("{base}/gmail/v1/users/me"),
             people: format!("{base}/people/v1"),
             calendar: format!("{base}/calendar/v3"),
+            drive: format!("{base}/drive/v3"),
         }
     }
 

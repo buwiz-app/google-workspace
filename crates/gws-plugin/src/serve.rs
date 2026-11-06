@@ -425,7 +425,9 @@ mod tests {
             [
                 "gws_event_draft",
                 "gws_mail_draft_save",
+                "gws_read_doc_text",
                 "gws_read_mail",
+                "gws_search_drive",
                 "gws_search_events",
                 "gws_search_mail"
             ]

@@ -71,6 +71,7 @@ pub const MAIL_JOB: &str = "gws_mail_job";
 pub const MAIL_JOB_START: &str = "gws_mail_job_start";
 pub const PEOPLE_SUGGEST: &str = "gws_people_suggest";
 pub const MAIL_SEND_ARM: &str = "gws_mail_send_arm";
+pub const MAIL_SEND_DISARM: &str = "gws_mail_send_disarm";
 pub const MAIL_DRAFT_OF: &str = "gws_mail_draft_of";
 pub const UPLOAD_CHUNK: &str = "gws_upload_chunk";
 pub const UPLOAD_DROP: &str = "gws_upload_drop";
@@ -230,6 +231,11 @@ pub fn defs() -> Vec<Def> {
             MAIL_SEND_ARM,
             "The person pressed Send: what lets the send that follows go. Called at the press, as who pressed is only known then.",
             json!({"type": "object", "properties": {"draft": {"type": "string"}, "revision": {"type": "string"}}}),
+        ),
+        write(
+            MAIL_SEND_DISARM,
+            "The person took a Send back: its press is spent, and the draft is free again.",
+            json!({"type": "object", "properties": {"armed": {"type": "string"}}, "required": ["armed"]}),
         ),
         write(
             MAIL_SEND,

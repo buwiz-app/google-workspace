@@ -41,6 +41,9 @@ pub struct File {
     pub with_me: bool,
     pub trashed: bool,
     pub parents: Vec<String>,
+    /// What Google says the person may do with it, in the plugin's words, or
+    /// `None` if it didn't say.
+    pub can: Option<Vec<String>>,
 }
 
 impl File {
@@ -51,6 +54,7 @@ impl File {
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<File> {
     let parents: String = r.get("parents")?;
+    let can: Option<String> = r.get("can")?;
     Ok(File {
         id: r.get("id")?,
         name: r.get("name")?,
@@ -66,13 +70,14 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<File> {
         with_me: r.get("with_me")?,
         trashed: r.get("trashed")?,
         parents: parents.split_whitespace().map(str::to_owned).collect(),
+        can: can.map(|c| c.split_whitespace().map(str::to_owned).collect()),
     })
 }
 
 fn put(conn: &Connection, account: &str, f: &File) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO drive_files(account, id, name, kind, mime, owner, mine, changed, changed_ms, size, starred, shared, with_me, trashed, parents) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        params![account, f.id, f.name, f.kind, f.mime, f.owner, f.mine, f.changed, f.changed_ms, f.size, f.starred, f.shared, f.with_me, f.trashed, f.parents.join(" ")],
+        "INSERT OR REPLACE INTO drive_files(account, id, name, kind, mime, owner, mine, changed, changed_ms, size, starred, shared, with_me, trashed, parents, can) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![account, f.id, f.name, f.kind, f.mime, f.owner, f.mine, f.changed, f.changed_ms, f.size, f.starred, f.shared, f.with_me, f.trashed, f.parents.join(" "), f.can.as_ref().map(|c| c.join(" "))],
     )?;
     Ok(())
 }
@@ -139,6 +144,62 @@ fn unlist(conn: &Connection, account: &str, view: &str, file: &str) -> Result<bo
         params![account, view, file],
     )?;
     Ok(n > 0)
+}
+
+/// Changed files and ones that went, as the lists should now hold them. True if
+/// anything here changed.
+fn apply(
+    conn: &Connection,
+    account: &str,
+    root: &str,
+    changed: &[File],
+    gone: &[String],
+) -> Result<bool> {
+    let views: Vec<(String, String)> = {
+        let mut q = conn.prepare("SELECT view, next FROM drive_views WHERE account = ?")?;
+        q.query_map([account], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    let mut moved = false;
+    for f in changed {
+        let known = conn
+            .query_row(
+                "SELECT 1 FROM drive_files WHERE account = ? AND id = ?",
+                params![account, f.id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        // the row goes in first: a list's own rows are read with it
+        put(conn, account, f)?;
+        let mut wanted = false;
+        for (view, next) in &views {
+            let was = unlist(conn, account, view, &f.id)?;
+            let now = belongs(view, f, root) && place(conn, account, view, next, f)?;
+            wanted |= was || now;
+        }
+        if !known && !wanted {
+            conn.execute(
+                "DELETE FROM drive_files WHERE account = ? AND id = ?",
+                params![account, f.id],
+            )?;
+        }
+        moved |= known || wanted;
+    }
+    for id in gone {
+        let n = conn.execute(
+            "DELETE FROM drive_files WHERE account = ? AND id = ?",
+            params![account, id],
+        )?;
+        let listed = conn.execute(
+            "DELETE FROM drive_listed WHERE account = ? AND file = ?",
+            params![account, id],
+        )?;
+        // what a folder that's gone held can't be reached any more
+        drop_view(conn, account, &format!("folder:{id}"))?;
+        moved |= n + listed > 0;
+    }
+    Ok(moved)
 }
 
 fn drop_view(conn: &Connection, account: &str, view: &str) -> Result<()> {
@@ -276,51 +337,18 @@ impl Store {
         token: &str,
     ) -> Result<bool> {
         let tx = self.conn.unchecked_transaction()?;
-        let views: Vec<(String, String)> = {
-            let mut q = tx.prepare("SELECT view, next FROM drive_views WHERE account = ?")?;
-            q.query_map([account], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        let mut moved = false;
-        for f in changed {
-            let known = tx
-                .query_row(
-                    "SELECT 1 FROM drive_files WHERE account = ? AND id = ?",
-                    params![account, f.id],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some();
-            // the row goes in first: a list's own rows are read with it
-            put(&tx, account, f)?;
-            let mut wanted = false;
-            for (view, next) in &views {
-                let was = unlist(&tx, account, view, &f.id)?;
-                let now = belongs(view, f, root) && place(&tx, account, view, next, f)?;
-                wanted |= was || now;
-            }
-            if !known && !wanted {
-                tx.execute(
-                    "DELETE FROM drive_files WHERE account = ? AND id = ?",
-                    params![account, f.id],
-                )?;
-            }
-            moved |= known || wanted;
-        }
-        for id in gone {
-            let n = tx.execute(
-                "DELETE FROM drive_files WHERE account = ? AND id = ?",
-                params![account, id],
-            )?;
-            let listed = tx.execute(
-                "DELETE FROM drive_listed WHERE account = ? AND file = ?",
-                params![account, id],
-            )?;
-            // what a folder that's gone held can't be reached any more
-            drop_view(&tx, account, &format!("folder:{id}"))?;
-            moved |= n + listed > 0;
-        }
+        let moved = apply(&tx, account, root, changed, gone)?;
         tx.execute("INSERT INTO state(account, key, value) VALUES(?, ?, ?) ON CONFLICT(account, key) DO UPDATE SET value = excluded.value", params![account, CHANGES_TOKEN, token])?;
+        tx.commit()?;
+        Ok(moved)
+    }
+
+    /// Files as a write of the person's just left them, in every list they
+    /// belong to, so the list is right before the next sync. The changes token
+    /// stays: the sync will bring these again, which changes nothing.
+    pub fn apply_write(&self, account: &str, root: &str, files: &[File]) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let moved = apply(&tx, account, root, files, &[])?;
         tx.commit()?;
         Ok(moved)
     }
@@ -444,6 +472,80 @@ mod tests {
             .unwrap();
         assert!(ids(&s, "my").is_empty());
         assert_eq!(s.view_total(ME, "my").unwrap(), 0);
+    }
+
+    #[test]
+    fn a_write_moves_rows_between_lists_and_leaves_the_sync_where_it_was() {
+        let s = store("write");
+        s.put_page(ME, "my", &[file("a", "apple")], "").unwrap();
+        s.put_page(ME, "folder:f", &[file("b", "banana")], "")
+            .unwrap();
+        s.put_page(ME, TRASH, &[], "").unwrap();
+        s.set_state(ME, CHANGES_TOKEN, "t1").unwrap();
+
+        let mut moved = file("a", "cherry");
+        moved.parents = vec!["f".to_owned()];
+        assert!(s.apply_write(ME, ROOT, &[moved.clone()]).unwrap());
+        assert!(ids(&s, "my").is_empty());
+        assert_eq!(ids(&s, "folder:f"), ["b", "a"], "in its place by name");
+
+        moved.trashed = true;
+        s.apply_write(ME, ROOT, &[moved]).unwrap();
+        assert_eq!(ids(&s, "folder:f"), ["b"]);
+        assert_eq!(ids(&s, TRASH), ["a"]);
+        assert_eq!(
+            s.state(ME, CHANGES_TOKEN).unwrap().as_deref(),
+            Some("t1"),
+            "a write says nothing about what the sync has seen"
+        );
+    }
+
+    /// A list read before the store knew what a file allows has to go, or its
+    /// rows would offer every press for as long as nothing changes them.
+    #[test]
+    fn a_store_from_before_capabilities_reads_its_lists_again() {
+        let dir = std::env::temp_dir().join(format!("gws-drive-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = Paths::in_dir(dir);
+        let s = Store::open(&paths, &key_from_seed("seed")).unwrap();
+        s.put_page(ME, "my", &[file("a", "apple")], "").unwrap();
+        s.set_state(ME, CHANGES_TOKEN, "t1").unwrap();
+        s.conn()
+            .execute_batch("ALTER TABLE drive_files DROP COLUMN can; PRAGMA user_version = 6;")
+            .unwrap();
+        drop(s);
+        let s = Store::open(&paths, &key_from_seed("seed")).unwrap();
+        assert_eq!(s.view_next(ME, "my").unwrap(), None, "read again");
+        assert_eq!(s.view_total(ME, "my").unwrap(), 0);
+        assert_eq!(
+            s.state(ME, CHANGES_TOKEN).unwrap().as_deref(),
+            Some("t1"),
+            "the sync goes on from where it was"
+        );
+    }
+
+    #[test]
+    fn what_google_lets_the_person_do_stays_with_the_row() {
+        let s = store("can");
+        let can = |id: &str, can: Option<Vec<String>>| File {
+            can,
+            ..file(id, id)
+        };
+        let some = Some(vec!["rename".to_owned(), "trash".to_owned()]);
+        let rows = [
+            can("some", some.clone()),
+            can("none", Some(Vec::new())),
+            can("unsaid", None),
+        ];
+        s.put_page(ME, "my", &rows, "").unwrap();
+        let held = |id: &str| s.drive_file(ME, id).unwrap().unwrap().can;
+        assert_eq!(held("some"), some);
+        assert_eq!(
+            held("none"),
+            Some(Vec::new()),
+            "nothing allowed isn't unknown"
+        );
+        assert_eq!(held("unsaid"), None);
     }
 
     #[test]

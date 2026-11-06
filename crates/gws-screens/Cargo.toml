@@ -22,4 +22,8 @@ tokio = { version = "1", features = ["sync"] }
 # the same nsh as above: the Mail screen driven with no window
 nsh-engine = { git = "https://github.com/hexuria/nsh", rev = "f1461478d3768fb5da872cb697f0b0a48564ee91" }
 nsh-testing = { git = "https://github.com/hexuria/nsh", rev = "f1461478d3768fb5da872cb697f0b0a48564ee91" }
+# the Drive screen on the real plugin and the stub, so the two can't drift
+buwiz-gws = { path = "../gws-plugin" }
+gws-fake-google = { path = "../gws-fake-google" }
+gws-store = { path = "../gws-store" }
 # the Calendar's date maths, run in real zones: never a dependency of the screens

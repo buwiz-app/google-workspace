@@ -1,7 +1,11 @@
 //! Google Drive, faked: `files.list` with `q`, `orderBy`, paging and `fields`,
 //! `files.get`, `alt=media`, `files.export`, `about.get`, the changes feed, and
-//! `files.update` and `files.create` through a resumable upload. Any other write
-//! gets a 405, and an upload it doesn't know a 400.
+//! `files.update` and `files.create` through a resumable upload, `files.create`
+//! with no bytes, `files.update` for a name, parents and `trashed`, and
+//! `permissions.list`, `create` and `delete`. Any other write gets a 405, a
+//! permanent delete above all, and an upload it doesn't know a 400. Who may do
+//! what follows `capabilities`, and a write the file's rights don't allow gets
+//! the 403 Drive gives.
 //!
 //! `q` is really parsed, quotes and backslashes as Google says they work, so a
 //! query that breaks out of its string does here what it would there. `fields`
@@ -27,6 +31,17 @@ const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessing
 const XLSX: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 const PPTX: &str = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 const OWNER_NAME: &str = "Owner Fake";
+/// What Drive calls the "anyone with the link" permission.
+const LINK_PERMISSION: &str = "anyoneWithLink";
+const PERMISSION_FIELDS: [&str; 7] = [
+    "kind",
+    "id",
+    "type",
+    "role",
+    "displayName",
+    "emailAddress",
+    "domain",
+];
 /// Past this an export is refused, as Google's is.
 const EXPORT_MAX: usize = 10 * 1024 * 1024;
 /// A 1 x 1 PNG.
@@ -63,6 +78,13 @@ pub struct FakeFile {
     pub people: Vec<(String, String, String)>,
     /// Moves with every change to the file, its name included, as Drive's does.
     pub version: i64,
+    /// The person may change it. A file they can only read has every
+    /// capability off, and a write to it is refused.
+    pub can_edit: bool,
+    /// The role of "anyone with the link", if that's on.
+    pub link: Option<String>,
+    /// The folder whose trashing took this along: restoring it brings this back.
+    pub trashed_by: Option<String>,
 }
 
 impl FakeFile {
@@ -86,6 +108,9 @@ impl FakeFile {
             can_download: true,
             people: Vec::new(),
             version: 1,
+            can_edit: true,
+            link: None,
+            trashed_by: None,
         }
     }
 
@@ -114,6 +139,12 @@ impl FakeFile {
         self.parents.clear();
         self.shared = true;
         self.shared_with_me = true;
+        self
+    }
+
+    /// The person can read it and do nothing else.
+    pub fn read_only(mut self) -> Self {
+        self.can_edit = false;
         self
     }
 
@@ -198,6 +229,7 @@ pub(crate) fn demo() -> Vec<FakeFile> {
         FakeFile::new("drv-shared-brief", "Shared brief", GOOGLE_DOC)
             .holding(b"Fake brief from Ana.")
             .shared_by("Ana Reyes", "ana@example.com")
+            .read_only()
             .modified(ago(9)),
         starred,
         trashed,
@@ -238,21 +270,42 @@ fn time(ms: i64) -> String {
     )
 }
 
+/// A person's permission id: never a file's, and never their address.
+fn permission_id(address: &str) -> String {
+    format!("prm-{:x}", tag(address))
+}
+
+/// Everyone a file is open to, the owner first.
+fn permissions(f: &FakeFile) -> Vec<Value> {
+    let person = |name: &str, address: &str, role: &str| json!({"kind": "drive#permission", "id": permission_id(address), "type": "user", "role": role, "displayName": name, "emailAddress": address});
+    let mut all = vec![person(&f.owner.0, &f.owner.1, "owner")];
+    all.extend(
+        f.people
+            .iter()
+            .map(|(name, address, role)| person(name, address, role)),
+    );
+    if let Some(role) = &f.link {
+        all.push(json!({"kind": "drive#permission", "id": LINK_PERMISSION, "type": "anyone", "role": role}));
+    }
+    all
+}
+
 fn resource(f: &FakeFile) -> Value {
     let size = f.claimed_size.unwrap_or(f.content.len() as i64);
     let person = |name: &str, address: &str| json!({"displayName": name, "emailAddress": address});
-    let mut permissions = vec![
-        json!({"type": "user", "role": "owner", "displayName": f.owner.0, "emailAddress": f.owner.1}),
-    ];
-    permissions.extend(f.people.iter().map(|(name, address, role)| json!({"type": "user", "role": role, "displayName": name, "emailAddress": address})));
+    let edit = f.can_edit;
     let mut v = json!({
         "kind": "drive#file", "id": f.id, "name": f.name, "mimeType": f.mime,
         "owners": [{"displayName": f.owner.0, "emailAddress": f.owner.1, "me": f.mine()}],
         "ownedByMe": f.mine(), "modifiedTime": time(f.modified_ms), "createdTime": time(f.created_ms),
         "starred": f.starred, "shared": f.shared, "trashed": f.trashed,
         "lastModifyingUser": person(&f.owner.0, &f.owner.1),
-        "permissions": permissions,
-        "capabilities": {"canDownload": f.can_download},
+        "permissions": permissions(f),
+        "capabilities": {
+            "canDownload": f.can_download, "canRename": edit, "canTrash": f.mine(),
+            "canUntrash": f.mine(), "canMoveItemWithinDrive": edit && !f.parents.is_empty(),
+            "canShare": edit, "canAddChildren": edit && f.mime == FOLDER,
+        },
         "version": f.version.to_string(),
     });
     if !f.parents.is_empty() {
@@ -345,6 +398,12 @@ impl Fields {
         self.0
             .iter()
             .all(|(name, _)| name == "*" || FILE_FIELDS.contains(&name.as_str()))
+    }
+
+    fn known_on_permission(&self) -> bool {
+        self.0
+            .iter()
+            .all(|(name, _)| name == "*" || PERMISSION_FIELDS.contains(&name.as_str()))
     }
 
     fn inner(&self, name: &str) -> Option<&Self> {
@@ -650,6 +709,17 @@ enum Write {
     },
 }
 
+/// A metadata write the stub accepted, as it arrived. Bytes are in the file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DriveWrite {
+    pub method: String,
+    /// What follows `/drive/v3/`.
+    pub path: String,
+    /// Its query, without `fields`, decoded.
+    pub query: BTreeMap<String, String>,
+    pub body: Value,
+}
+
 /// A resumable upload under way.
 struct Session {
     write: Write,
@@ -678,7 +748,13 @@ pub(crate) struct Drive {
     sessions: BTreeMap<u64, Session>,
     next_session: u64,
     next_copy: u64,
+    next_made: u64,
     fail_uploads: Option<Failing>,
+    fail_writes: Option<Failing>,
+    /// Every metadata write accepted, oldest first.
+    pub(crate) writes: Vec<DriveWrite>,
+    /// People a page of `permissions.list` holds.
+    pub(crate) people_page: Option<usize>,
 }
 
 impl Drive {
@@ -742,10 +818,16 @@ impl Drive {
         self.fail_uploads = Some(Failing { left, status });
     }
 
+    /// After `left` more metadata writes, each gets `status`.
+    pub(crate) fn fail_writes(&mut self, left: usize, status: u16) {
+        self.fail_writes = Some(Failing { left, status });
+    }
+
     pub(crate) fn works(&mut self) {
         self.fail_list = None;
         self.fail_changes = None;
         self.fail_uploads = None;
+        self.fail_writes = None;
     }
 
     /// `/upload/drive/v3/…`. Opening a session is `POST files` for a new file or
@@ -847,10 +929,8 @@ impl Drive {
             .flatten()
             .filter_map(|p| p.as_str().map(str::to_owned))
             .collect();
-        for parent in &parents {
-            if parent != DRIVE_ROOT && !self.files.contains_key(parent) {
-                return error(404, "notFound", &format!("File not found: {parent}."));
-            }
+        if let Err(reply) = self.check_parents(&parents) {
+            return reply;
         }
         let write = Write::Create {
             name,
@@ -858,6 +938,29 @@ impl Drive {
             parents,
         };
         self.opened_session(r, write, "files")
+    }
+
+    /// Each new parent is a folder that's there and can take a child.
+    fn check_parents(&self, parents: &[String]) -> Result<(), Reply> {
+        for parent in parents {
+            if parent == DRIVE_ROOT {
+                continue;
+            }
+            let Some(folder) = self.files.get(parent) else {
+                return Err(error(
+                    404,
+                    "notFound",
+                    &format!("File not found: {parent}."),
+                ));
+            };
+            if folder.mime != FOLDER {
+                return Err(error(403, "parentNotAFolder", "A parent must be a folder."));
+            }
+            if !folder.can_edit {
+                return Err(forced(403));
+            }
+        }
+        Ok(())
     }
 
     fn metadata(r: &Request) -> Option<Map<String, Value>> {
@@ -956,15 +1059,332 @@ impl Drive {
         }
     }
 
-    pub(crate) fn handle(&mut self, r: &Request, rest: &str) -> Reply {
-        if r.method != "GET" {
+    /// The writes Drive's metadata takes. `DELETE files/<id>` isn't one: nothing
+    /// here may ever delete a file for good, so it stays a 405.
+    fn write_call(&mut self, r: &Request, parts: &[&str]) -> Reply {
+        let known = matches!(
+            (r.method.as_str(), parts),
+            ("POST", ["files"])
+                | ("PATCH", ["files", _])
+                | ("POST", ["files", _, "permissions"])
+                | ("DELETE", ["files", _, "permissions", _])
+        );
+        if !known {
             return error(405, "methodNotAllowed", "The stub has no such write.");
         }
+        if let Some(reply) = Failing::due(&mut self.fail_writes) {
+            return reply;
+        }
+        let reply = match parts {
+            ["files"] => self.make(r),
+            ["files", id] => self.change(r, id),
+            ["files", id, "permissions"] => self.add_person(r, id),
+            ["files", id, "permissions", person] => self.remove_person(id, person),
+            _ => error(405, "methodNotAllowed", "The stub has no such write."),
+        };
+        if reply.0 < 300 {
+            let mut query: BTreeMap<String, String> = r
+                .query()
+                .into_iter()
+                .filter_map(|(k, mut v)| Some((k, v.pop()?)))
+                .collect();
+            query.remove("fields");
+            self.writes.push(DriveWrite {
+                method: r.method.clone(),
+                path: parts.join("/"),
+                query,
+                body: serde_json::from_slice(&r.body).unwrap_or(Value::Null),
+            });
+        }
+        reply
+    }
+
+    fn answer_with(r: &Request, file: &FakeFile) -> Reply {
+        let v = resource(file);
+        match Self::fields_of(r) {
+            Err(reply) => reply,
+            Ok(Some(fields)) if !fields.known_on_file() => invalid("fields"),
+            Ok(Some(fields)) => Reply::json(200, fields.pick(&v)),
+            Ok(None) => {
+                let plain = Fields::parse("kind,id,name,mimeType").expect("a good field list");
+                Reply::json(200, plain.pick(&v))
+            }
+        }
+    }
+
+    /// `files.create` with no bytes: a folder, or an empty file.
+    fn make(&mut self, r: &Request) -> Reply {
+        let Some(metadata) = Self::metadata(r) else {
+            return invalid("metadata");
+        };
+        if metadata
+            .keys()
+            .any(|k| !["name", "mimeType", "parents"].contains(&k.as_str()))
+        {
+            return invalid("metadata");
+        }
+        let text = |key: &str| {
+            metadata
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        };
+        let (name, mime) = (text("name"), text("mimeType"));
+        let google = mime.starts_with("application/vnd.google-apps.") && mime != FOLDER;
+        if name.is_empty() || mime.is_empty() || google {
+            return invalid("metadata");
+        }
+        let parents: Vec<String> = metadata
+            .get("parents")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.as_str().map(str::to_owned))
+            .collect();
+        if let Err(reply) = self.check_parents(&parents) {
+            return reply;
+        }
+        self.next_made += 1;
+        let kind = if mime == FOLDER { "folder" } else { "file" };
+        let id = format!("drv-new-{kind}-{}", self.next_made);
+        let mut file = FakeFile::new(&id, name, mime);
+        if !parents.is_empty() {
+            file.parents = parents;
+        }
+        self.add(file);
+        Self::answer_with(r, &self.files[&id])
+    }
+
+    /// Whether `folder` is `id` or inside it.
+    fn within(&self, folder: &str, id: &str) -> bool {
+        let mut at = folder;
+        for _ in 0..64 {
+            if at == id {
+                return true;
+            }
+            match self.files.get(at).and_then(|f| f.parents.first()) {
+                Some(up) => at = up,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Everything under `id`, however deep.
+    fn inside(&self, id: &str) -> Vec<String> {
+        self.files
+            .values()
+            .filter(|f| f.id != id && f.parents.iter().any(|p| self.within(p, id)))
+            .map(|f| f.id.clone())
+            .collect()
+    }
+
+    /// `files.update` of metadata: a name, `trashed`, and parents by the query.
+    fn change(&mut self, r: &Request, id: &str) -> Reply {
+        let Some(metadata) = Self::metadata(r) else {
+            return invalid("metadata");
+        };
+        if metadata
+            .keys()
+            .any(|k| !["name", "trashed"].contains(&k.as_str()))
+        {
+            return invalid("metadata");
+        }
+        let split = |key: &str| -> Vec<String> {
+            r.param(key)
+                .unwrap_or_default()
+                .split(',')
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        let (add, remove) = (split("addParents"), split("removeParents"));
+        let file = match self.file(id) {
+            Ok(file) => file.clone(),
+            Err(reply) => return reply,
+        };
+        let name = metadata.get("name").map(|n| n.as_str().unwrap_or_default());
+        if name == Some("") {
+            return invalid("name");
+        }
+        let trashed = metadata.get("trashed").and_then(Value::as_bool);
+        if metadata.contains_key("trashed") && trashed.is_none() {
+            return invalid("trashed");
+        }
+        let moving = !add.is_empty() || !remove.is_empty();
+        if (name.is_some() || moving) && !file.can_edit {
+            return forced(403);
+        }
+        // a person who doesn't own a file can't put it in the trash
+        if trashed.is_some() && !file.mine() {
+            return forced(403);
+        }
+        if moving {
+            if let Err(reply) = self.check_parents(&add) {
+                return reply;
+            }
+            if add.iter().any(|to| self.within(to, id)) {
+                return error(403, "invalidParent", "A folder can't go inside itself.");
+            }
+            if remove.iter().any(|p| !file.parents.contains(p)) {
+                return error(404, "notFound", "That parent isn't one of this file's.");
+            }
+        }
+        if trashed.is_some() && trashed != Some(file.trashed) {
+            self.trash_inside(id, trashed == Some(true));
+        }
+        let name = name.map(str::to_owned);
+        self.edit(id, |f| {
+            if let Some(name) = name {
+                f.name = name;
+            }
+            if let Some(trashed) = trashed {
+                f.trashed = trashed;
+                f.trashed_by = None;
+            }
+            f.parents.retain(|p| !remove.contains(p));
+            f.parents.extend(add);
+            f.modified_ms += 1000;
+        });
+        Self::answer_with(r, &self.files[id])
+    }
+
+    /// What a folder holds goes to the trash with it and comes back with it,
+    /// and what was trashed on its own before stays there.
+    fn trash_inside(&mut self, folder: &str, trashed: bool) {
+        for id in self.inside(folder) {
+            let held = &self.files[&id];
+            let ours = held.trashed_by.as_deref() == Some(folder);
+            if (trashed && !held.trashed) || (!trashed && ours) {
+                self.edit(&id, |f| {
+                    f.trashed = trashed;
+                    f.trashed_by = trashed.then(|| folder.to_owned());
+                });
+            }
+        }
+    }
+
+    /// `permissions.list`, a page at a time.
+    fn people(&self, r: &Request, id: &str) -> Reply {
+        let file = match self.file(id) {
+            Ok(file) => file,
+            Err(reply) => return reply,
+        };
+        if !file.can_edit {
+            return forced(403);
+        }
+        let size = match r.param("pageSize").map(|p| p.parse::<usize>()) {
+            None => 100,
+            Some(Ok(n @ 1..=100)) => n,
+            _ => return invalid("pageSize"),
+        };
+        let size = self.people_page.unwrap_or(size);
+        let from = match r.param("pageToken") {
+            None => 0,
+            Some(token) => match token.strip_prefix("ppl-").and_then(|n| n.parse().ok()) {
+                Some(from) => from,
+                None => return invalid("pageToken"),
+            },
+        };
+        let all = permissions(file);
+        let page: Vec<&Value> = all.iter().skip(from).take(size).collect();
+        let mut v = json!({"kind": "drive#permissionList", "permissions": page});
+        if from + size < all.len() {
+            v["nextPageToken"] = json!(format!("ppl-{}", from + size));
+        }
+        match Self::fields_of(r) {
+            Err(reply) => reply,
+            Ok(Some(fields))
+                if fields
+                    .inner("permissions")
+                    .is_some_and(|f| !f.known_on_permission()) =>
+            {
+                invalid("fields")
+            }
+            Ok(Some(fields)) => Reply::json(200, fields.pick(&v)),
+            Ok(None) => Reply::json(200, v),
+        }
+    }
+
+    /// `permissions.create`, for one person. Nothing else here is shared with.
+    fn add_person(&mut self, r: &Request, id: &str) -> Reply {
+        let Some(metadata) = Self::metadata(r) else {
+            return invalid("metadata");
+        };
+        if metadata
+            .keys()
+            .any(|k| !["type", "role", "emailAddress"].contains(&k.as_str()))
+        {
+            return invalid("metadata");
+        }
+        let text = |key: &str| {
+            metadata
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let (role, address) = (text("role"), text("emailAddress"));
+        if text("type") != "user" || !["reader", "commenter", "writer"].contains(&role.as_str()) {
+            return invalid("metadata");
+        }
+        if !address.contains('@') {
+            return invalid("emailAddress");
+        }
+        match self.file(id) {
+            Ok(file) if !file.can_edit => return forced(403),
+            Ok(_) => {}
+            Err(reply) => return reply,
+        }
+        let answer = json!({"kind": "drive#permission", "id": permission_id(&address), "type": "user", "role": role, "emailAddress": address});
+        self.edit(id, |f| {
+            f.people.push((String::new(), address, role));
+            f.shared = true;
+        });
+        Reply::json(200, answer)
+    }
+
+    /// `permissions.delete`.
+    fn remove_person(&mut self, id: &str, person: &str) -> Reply {
+        let file = match self.file(id) {
+            Ok(file) => file.clone(),
+            Err(reply) => return reply,
+        };
+        if !file.can_edit {
+            return forced(403);
+        }
+        if person == permission_id(&file.owner.1) {
+            return forced(403);
+        }
+        let found = file
+            .people
+            .iter()
+            .any(|(_, address, _)| permission_id(address) == person);
+        let link = person == LINK_PERMISSION && file.link.is_some();
+        if !found && !link {
+            return error(404, "notFound", &format!("Permission not found: {person}."));
+        }
+        self.edit(id, |f| {
+            f.people
+                .retain(|(_, address, _)| permission_id(address) != person);
+            if link {
+                f.link = None;
+            }
+            f.shared = !f.people.is_empty() || f.link.is_some();
+        });
+        Reply(204, "application/json", Vec::new(), Vec::new())
+    }
+
+    pub(crate) fn handle(&mut self, r: &Request, rest: &str) -> Reply {
         let parts: Vec<&str> = rest.split('/').collect();
+        if r.method != "GET" {
+            return self.write_call(r, &parts);
+        }
         match parts.as_slice() {
             ["files"] => self.list(r),
             ["files", id] => self.get(r, id),
             ["files", id, "export"] => self.export(r, id),
+            ["files", id, "permissions"] => self.people(r, id),
             ["about"] => self.about(r),
             ["changes", "startPageToken"] => match Failing::due(&mut self.fail_changes) {
                 Some(reply) => reply,
@@ -1378,6 +1798,138 @@ mod tests {
             assert!(drive.upload(&r, "files").0 >= 400, "{body}");
         }
         assert_eq!(drive.all().len(), 1);
+    }
+
+    fn rest(r: &Request) -> &str {
+        r.target
+            .strip_prefix("/drive/v3/")
+            .map(|t| t.split('?').next().unwrap_or(t))
+            .unwrap()
+    }
+
+    fn call(drive: &mut Drive, method: &str, target: &str, body: &str) -> Reply {
+        let r = request(method, target, body.as_bytes(), &[]);
+        let at = rest(&r).to_owned();
+        drive.handle(&r, &at)
+    }
+
+    #[test]
+    fn a_permanent_delete_is_refused_and_the_file_stays() {
+        let mut drive = Drive::new(vec![FakeFile::new("a", "a.txt", "text/plain")]);
+        for (method, target) in [
+            ("DELETE", "/drive/v3/files/a"),
+            ("DELETE", "/drive/v3/files/trash"),
+            ("POST", "/drive/v3/files/a/copy"),
+            ("PUT", "/drive/v3/files/a"),
+        ] {
+            assert_eq!(call(&mut drive, method, target, "").0, 405, "{target}");
+        }
+        assert!(drive.held("a").is_some());
+        assert_eq!(drive.writes, []);
+    }
+
+    #[test]
+    fn a_change_takes_a_name_trashed_and_parents_and_nothing_else() {
+        let mut drive = Drive::new(vec![FakeFile::new("a", "a.txt", "text/plain")]);
+        let at = "/drive/v3/files/a";
+        for bad in [
+            r#"{"description": "x"}"#,
+            r#"{"trashed": "yes"}"#,
+            r#"{"name": ""}"#,
+            r#"[1]"#,
+        ] {
+            assert_eq!(call(&mut drive, "PATCH", at, bad).0, 400, "{bad}");
+        }
+        assert_eq!(call(&mut drive, "PATCH", at, r#"{"name": "b.txt"}"#).0, 200);
+        assert_eq!(drive.held("a").unwrap().name, "b.txt");
+        assert_eq!(drive.writes.len(), 1, "the refused ones aren't writes");
+    }
+
+    #[test]
+    fn a_file_says_what_the_person_may_do_and_the_stub_holds_it_to_that() {
+        let theirs = FakeFile::new("r", "r", GOOGLE_DOC)
+            .shared_by("Ana", "ana@example.com")
+            .read_only();
+        let v = resource(&theirs);
+        for can in [
+            "canRename",
+            "canTrash",
+            "canMoveItemWithinDrive",
+            "canShare",
+        ] {
+            assert_eq!(v["capabilities"][can], false, "{can}");
+        }
+        let mine = resource(&FakeFile::folder("f", "f"));
+        assert_eq!(mine["capabilities"]["canAddChildren"], true);
+        let mut drive = Drive::new(vec![theirs]);
+        for (method, target, body) in [
+            ("PATCH", "/drive/v3/files/r", r#"{"name": "x"}"#),
+            ("PATCH", "/drive/v3/files/r", r#"{"trashed": true}"#),
+            (
+                "POST",
+                "/drive/v3/files/r/permissions",
+                r#"{"type": "user", "role": "reader", "emailAddress": "b@example.com"}"#,
+            ),
+        ] {
+            assert_eq!(call(&mut drive, method, target, body).0, 403, "{body}");
+        }
+        assert_eq!(
+            call(&mut drive, "GET", "/drive/v3/files/r/permissions", "").0,
+            403
+        );
+    }
+
+    #[test]
+    fn trashing_a_folder_takes_what_is_in_it_but_not_what_was_trashed_first() {
+        let mut early = FakeFile::new("early", "e", "text/plain").inside("f");
+        early.trashed = true;
+        let mut drive = Drive::new(vec![
+            FakeFile::folder("f", "f"),
+            FakeFile::folder("g", "g").inside("f"),
+            FakeFile::new("deep", "d", "text/plain").inside("g"),
+            early,
+        ]);
+        let at = "/drive/v3/files/f";
+        call(&mut drive, "PATCH", at, r#"{"trashed": true}"#);
+        assert!(drive.held("deep").unwrap().trashed);
+        call(&mut drive, "PATCH", at, r#"{"trashed": false}"#);
+        assert!(!drive.held("deep").unwrap().trashed);
+        assert!(drive.held("early").unwrap().trashed, "it went on its own");
+    }
+
+    #[test]
+    fn a_folder_cant_go_inside_itself_however_deep() {
+        let mut drive = Drive::new(vec![
+            FakeFile::folder("f", "f"),
+            FakeFile::folder("g", "g").inside("f"),
+        ]);
+        let at = "/drive/v3/files/f?addParents=g";
+        assert_eq!(call(&mut drive, "PATCH", at, "{}").0, 403);
+        assert_eq!(drive.held("f").unwrap().parents, [DRIVE_ROOT]);
+    }
+
+    #[test]
+    fn the_owner_has_no_permission_to_lose_and_permission_ids_are_their_own() {
+        let mut file = FakeFile::new("a", "a", "text/plain");
+        file.people = vec![(
+            "Ana".to_owned(),
+            "ana@example.com".to_owned(),
+            "writer".to_owned(),
+        )];
+        file.link = Some("reader".to_owned());
+        let all = permissions(&file);
+        let ids: std::collections::BTreeSet<&str> =
+            all.iter().map(|p| p["id"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(!ids.contains("a"), "never a file's id");
+        let owner = all[0]["id"].as_str().unwrap().to_owned();
+        let ana = all[1]["id"].as_str().unwrap().to_owned();
+        let mut drive = Drive::new(vec![file]);
+        let at = |person: &str| format!("/drive/v3/files/a/permissions/{person}");
+        assert_eq!(call(&mut drive, "DELETE", &at(&owner), "").0, 403);
+        assert_eq!(call(&mut drive, "DELETE", &at("prm-nobody"), "").0, 404);
+        assert_eq!(call(&mut drive, "DELETE", &at(&ana), "").0, 204);
+        assert!(drive.held("a").unwrap().people.is_empty());
     }
 
     #[test]

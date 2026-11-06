@@ -19,6 +19,12 @@ fn text(v: &Value, key: &str) -> String {
         .to_owned()
 }
 
+fn words(list: &[Value]) -> Vec<String> {
+    list.iter()
+        .filter_map(|w| w.as_str().map(str::to_owned))
+        .collect()
+}
+
 #[derive(Clone, PartialEq, Default, Debug)]
 pub(super) struct Row {
     pub(super) id: String,
@@ -29,6 +35,10 @@ pub(super) struct Row {
     pub(super) changed: String,
     pub(super) size: Option<u64>,
     pub(super) trashed: bool,
+    /// What Google says the person may do with it. `None` is that it didn't
+    /// say, and then a press is offered and Google answers it.
+    pub(super) can: Option<Vec<String>>,
+    pub(super) parents: Vec<String>,
 }
 
 impl Row {
@@ -43,7 +53,19 @@ impl Row {
             changed: text(v, "changed"),
             size: v.get("size").and_then(Value::as_u64),
             trashed: flag("trashed"),
+            can: v.get("can").and_then(Value::as_array).map(|c| words(c)),
+            parents: v
+                .get("parents")
+                .and_then(Value::as_array)
+                .map_or_else(Vec::new, |p| words(p)),
         })
+    }
+
+    /// Whether Google lets the person do `what` to it.
+    pub(super) fn may(&self, what: &str) -> bool {
+        self.can
+            .as_ref()
+            .is_none_or(|can| can.iter().any(|c| c == what))
     }
 
     pub(super) fn is_folder(&self) -> bool {
@@ -160,6 +182,45 @@ pub(super) struct Person {
     pub(super) role: String,
 }
 
+/// Someone with a file, as `gws_drive_access` says: the list a Share shows.
+#[derive(Clone, PartialEq, Debug)]
+pub(super) struct Access {
+    pub(super) id: String,
+    pub(super) who: String,
+    pub(super) email: String,
+    pub(super) role: String,
+    /// This screen may take them off.
+    pub(super) removable: bool,
+}
+
+fn who_of(name: String, email: String) -> String {
+    match (name.is_empty(), email.is_empty()) {
+        (true, _) => email,
+        (false, true) => name,
+        (false, false) => format!("{name} <{email}>"),
+    }
+}
+
+pub(super) fn access_in(v: &Value) -> Vec<Access> {
+    v.get("people")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            let email = text(p, "email");
+            let who = who_of(text(p, "name"), email.clone());
+            let you = p.get("you") == Some(&Value::Bool(true));
+            Some(Access {
+                id: p.get("id")?.as_str()?.to_owned(),
+                who: if you { format!("{who} (you)") } else { who },
+                email,
+                role: role_line(&text(p, "role")),
+                removable: p.get("removable") == Some(&Value::Bool(true)),
+            })
+        })
+        .collect()
+}
+
 /// What `gws_drive_file` adds to a row.
 #[derive(Clone, PartialEq, Default, Debug)]
 pub(super) struct Facts {
@@ -168,7 +229,7 @@ pub(super) struct Facts {
     pub(super) people: Vec<Person>,
 }
 
-fn role_line(role: &str) -> String {
+pub(super) fn role_line(role: &str) -> String {
     match role {
         "owner" | "organizer" => "Owner".to_owned(),
         "fileOrganizer" | "writer" => "Can edit".to_owned(),
@@ -194,16 +255,9 @@ impl Facts {
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .map(|p| {
-                let (name, email) = (text(p, "name"), text(p, "email"));
-                Person {
-                    who: match (name.is_empty(), email.is_empty()) {
-                        (true, _) => email,
-                        (false, true) => name,
-                        (false, false) => format!("{name} <{email}>"),
-                    },
-                    role: role_line(&text(p, "role")),
-                }
+            .map(|p| Person {
+                who: who_of(text(p, "name"), text(p, "email")),
+                role: role_line(&text(p, "role")),
             })
             .collect();
         Facts {
@@ -460,6 +514,36 @@ mod tests {
         assert_eq!(
             Facts::of(&json!({"path": "Clients / Acme"})).path,
             "Clients / Acme"
+        );
+    }
+
+    #[test]
+    fn a_row_offers_what_google_allows_and_silence_is_left_to_google() {
+        let row = |can: Value| Row::of(&json!({"id": "a", "can": can})).unwrap();
+        assert!(row(json!(["rename"])).may("rename"));
+        assert!(!row(json!(["rename"])).may("trash"));
+        assert!(!row(json!([])).may("rename"), "nothing allowed");
+        assert!(row(Value::Null).may("trash"), "nothing said");
+    }
+
+    #[test]
+    fn who_has_a_file_says_which_one_is_the_person() {
+        let v = json!({"people": [
+            {"id": "1", "name": "Owner Fake", "email": "owner@example.com", "role": "owner", "you": true},
+            {"id": "2", "name": "Anyone with the link", "email": "", "role": "reader", "removable": false},
+            {"id": "3", "name": "", "email": "ben@example.com", "role": "writer", "removable": true},
+        ]});
+        let people = access_in(&v);
+        assert_eq!(people[0].who, "Owner Fake <owner@example.com> (you)");
+        assert_eq!(people[0].role, "Owner");
+        assert_eq!(people[1].who, "Anyone with the link");
+        assert_eq!(
+            (
+                people[2].who.as_str(),
+                people[2].role.as_str(),
+                people[2].removable
+            ),
+            ("ben@example.com", "Can edit", true)
         );
     }
 

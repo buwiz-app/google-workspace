@@ -104,13 +104,23 @@ pub const APPS: [App; 3] = [
             tools::DRIVE_CARD,
             tools::SEARCH_DRIVE,
             tools::READ_DOC_TEXT,
+            tools::DRIVE_ACCESS,
+            tools::DRIVE_UPLOAD,
+            tools::DRIVE_FOLDER,
+            tools::DRIVE_RENAME,
+            tools::DRIVE_MOVE,
+            tools::DRIVE_TRASH,
+            tools::DRIVE_SHARE,
+            tools::DRIVE_UNDO,
+            tools::UPLOAD_CHUNK,
+            tools::UPLOAD_DROP,
             tools::FILE_OPEN,
             tools::FILE_EDITS,
             tools::FILE_UPLOAD,
             tools::FILE_DISCARD,
         ],
         card: true,
-        files: false,
+        files: true,
         // where a file too big to open here goes instead
         sites: &["https://docs.google.com", "https://drive.google.com"],
     },
@@ -225,6 +235,9 @@ mod tests {
             include_str!("../../gws-screens/src/drive/edits.rs"),
             include_str!("../../gws-screens/src/drive/file.rs"),
             include_str!("../../gws-screens/src/drive/list.rs"),
+            include_str!("../../gws-screens/src/drive/mover.rs"),
+            include_str!("../../gws-screens/src/drive/share.rs"),
+            include_str!("../../gws-screens/src/drive/write.rs"),
         ];
         for def in tools::defs() {
             let named = format!("\"{}\"", def.name);
@@ -244,6 +257,61 @@ mod tests {
         }
         let mail = include_str!("../../gws-screens/src/mail.rs");
         assert!(mail.contains(&format!("\"{}\"", tools::MAIL_ATTACHMENT_OPEN)));
+        // and these, or no folder, press or file of the writing slice gets through
+        for name in [
+            tools::DRIVE_ACCESS,
+            tools::DRIVE_UPLOAD,
+            tools::DRIVE_FOLDER,
+            tools::DRIVE_RENAME,
+            tools::DRIVE_MOVE,
+            tools::DRIVE_TRASH,
+            tools::DRIVE_SHARE,
+            tools::DRIVE_UNDO,
+        ] {
+            let named = format!("\"{name}\"");
+            assert!(screens.iter().any(|s| s.contains(&named)), "{name}");
+        }
+        // a picked file comes through these two, from compose.rs, which isn't
+        // one of Drive's own files
+        let upload = include_str!("../../gws-screens/src/compose.rs");
+        let held = drive.tools;
+        for name in [tools::UPLOAD_CHUNK, tools::UPLOAD_DROP] {
+            assert!(upload.contains(&format!("\"{name}\"")), "{name}");
+            assert!(held.contains(&name), "{name}");
+        }
+    }
+
+    /// The picker is a grant of its own: without it the press finds no files.
+    #[test]
+    fn drive_may_ask_the_person_for_a_file() {
+        let m = unsigned(RELEASE_KEY_ID);
+        let drive = m["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "drive")
+            .unwrap();
+        assert_eq!(
+            drive["permissions"]["pick_file"]["max_bytes"],
+            json!(crate::compose::ATTACHMENTS_MAX)
+        );
+    }
+
+    #[test]
+    fn every_drive_write_is_a_persons_and_says_it_writes() {
+        for name in [
+            tools::DRIVE_UPLOAD,
+            tools::DRIVE_FOLDER,
+            tools::DRIVE_RENAME,
+            tools::DRIVE_MOVE,
+            tools::DRIVE_TRASH,
+            tools::DRIVE_SHARE,
+            tools::DRIVE_UNDO,
+        ] {
+            let def = tools::defs().into_iter().find(|d| d.name == name).unwrap();
+            assert_eq!(def.audience, tools::APP_ONLY, "{name}");
+            assert!(!def.read_only, "{name}");
+        }
     }
 
     #[test]
@@ -358,7 +426,7 @@ mod tests {
         assert!(
             !drive.iter().any(|t| {
                 let t = t.as_str().unwrap();
-                ["mail", "cal_", "event", "people", "gws_upload"]
+                ["mail", "cal_", "event", "people"]
                     .iter()
                     .any(|other| t.contains(other))
             }),

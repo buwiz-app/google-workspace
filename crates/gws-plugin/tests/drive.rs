@@ -395,7 +395,7 @@ fn each_view_holds_what_it_should_in_its_order() {
     let row = my.iter().find(|r| r["id"] == "drv-text-todo").unwrap();
     assert_eq!(
         row,
-        &json!({"id": "drv-text-todo", "name": "To do.txt", "kind": "file", "mime": "text/plain", "owner": "Owner Fake", "mine": true, "changed": row["changed"], "size": 32, "starred": false, "shared": false, "trashed": false})
+        &json!({"id": "drv-text-todo", "name": "To do.txt", "kind": "file", "mime": "text/plain", "owner": "Owner Fake", "mine": true, "changed": row["changed"], "size": 32, "starred": false, "shared": false, "trashed": false, "can": ["rename", "trash", "move", "share"], "parents": [gws_fake_google::DRIVE_ROOT]})
     );
     let doc = my.iter().find(|r| r["id"] == "drv-doc-notes").unwrap();
     assert_eq!((&doc["kind"], &doc["size"]), (&json!("doc"), &Value::Null));

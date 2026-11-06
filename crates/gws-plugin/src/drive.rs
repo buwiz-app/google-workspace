@@ -1,6 +1,7 @@
 //! Drive: Google's API (`drive/v3`), a changes sync that rides on Mail's, and
 //! the tools. It reads and nothing else: this file makes no call that writes.
-//! What writes is in `files.rs`, and only a person's press gets there.
+//! What writes is in `drive/write.rs` and `files.rs`, and only a person's press
+//! gets there.
 //!
 //! A list comes from the store, and reaches Google for the next page when the
 //! store runs out, so a lost connection shows the files already seen. A page
@@ -27,6 +28,8 @@ use crate::tools::{
     RESOLVE, SEARCH_DRIVE, UNTRUSTED_DRIVE, failed, ok, plain_error,
 };
 use crate::{Core, calendar, js};
+
+pub mod write;
 
 /// The production API base.
 pub const DRIVE_API: &str = "https://www.googleapis.com/drive/v3";
@@ -63,15 +66,23 @@ const SEQ: &str = "drive_seq";
 const STATUS: &str = "drive_status";
 const ROOT: &str = "drive_root";
 const ABOUT: &str = "drive_about";
-const FOLDER: &str = "application/vnd.google-apps.folder";
+pub(crate) const FOLDER: &str = "application/vnd.google-apps.folder";
 pub(crate) const DOC: &str = "application/vnd.google-apps.document";
 pub(crate) const SHEET: &str = "application/vnd.google-apps.spreadsheet";
 pub(crate) const SLIDES: &str = "application/vnd.google-apps.presentation";
 const TEXT: &str = "text/plain";
 const IMAGES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 /// What a row needs. With no `fields`, Google gives four of these and no more.
-const FILE_FIELDS: &str = "id,name,mimeType,owners(displayName),ownedByMe,modifiedTime,size,starred,shared,sharedWithMeTime,trashed,parents";
-const DETAIL_FIELDS: &str = "createdTime,description,lastModifyingUser(displayName),permissions(type,displayName,emailAddress,role,domain),capabilities(canDownload)";
+const FILE_FIELDS: &str = "id,name,mimeType,owners(displayName),ownedByMe,modifiedTime,size,starred,shared,sharedWithMeTime,trashed,parents,capabilities(canDownload,canRename,canTrash,canMoveItemWithinDrive,canShare,canAddChildren)";
+const DETAIL_FIELDS: &str = "createdTime,description,lastModifyingUser(displayName),permissions(type,displayName,emailAddress,role,domain)";
+/// Google's word for each thing a screen may offer, and ours.
+const CAPABILITIES: [(&str, &str); 5] = [
+    ("canRename", "rename"),
+    ("canTrash", "trash"),
+    ("canMoveItemWithinDrive", "move"),
+    ("canShare", "share"),
+    ("canAddChildren", "add"),
+];
 /// Folders first and then by name, in Google's own order across its pages.
 const BY_NAME: &str = "folder,name";
 const NEWEST: &str = "modifiedTime desc";
@@ -412,6 +423,13 @@ pub fn file_of(v: &Value) -> Option<File> {
             .flatten()
             .filter_map(|p| p.as_str().filter(|p| id_ok(p)).map(str::to_owned))
             .collect(),
+        can: v.get("capabilities").map(|c| {
+            CAPABILITIES
+                .iter()
+                .filter(|(google, _)| flag(c, google))
+                .map(|(_, ours)| (*ours).to_owned())
+                .collect()
+        }),
         mime,
     })
 }
@@ -426,7 +444,7 @@ fn files_of(v: &Value) -> Vec<File> {
 }
 
 fn row_json(f: &File) -> Value {
-    json!({"id": f.id, "name": f.name, "kind": f.kind, "mime": f.mime, "owner": f.owner, "mine": f.mine, "changed": f.changed, "size": f.size, "starred": f.starred, "shared": f.shared, "trashed": f.trashed})
+    json!({"id": f.id, "name": f.name, "kind": f.kind, "mime": f.mime, "owner": f.owner, "mine": f.mine, "changed": f.changed, "size": f.size, "starred": f.starred, "shared": f.shared, "trashed": f.trashed, "can": f.can, "parents": f.parents})
 }
 
 fn rows(files: &[File]) -> Vec<Value> {
@@ -672,6 +690,24 @@ fn path_to(core: &Core, auth: &Bearer, account: &str, folder: &str, online: bool
     path
 }
 
+/// Where a list is, as a file's `parents` would say it, and whether a new file
+/// can go there. A view with no one folder has neither; a folder that says
+/// nothing about it is left for Google to answer.
+fn place_of(core: &Core, account: &str, view: &str) -> Result<(Value, bool), Failure> {
+    if view == "my" {
+        let root = with_store(core, |store| store.state(account, ROOT))?;
+        return Ok((json!(root), true));
+    }
+    let Some(folder) = view.strip_prefix("folder:") else {
+        return Ok((Value::Null, false));
+    };
+    let held = with_store(core, |store| store.drive_file(account, folder))?;
+    let adds = held
+        .and_then(|f| f.can)
+        .is_none_or(|can| can.iter().any(|c| c == "add"));
+    Ok((json!(folder), adds))
+}
+
 /// The store's name for what's asked; `Err` says why it can't be.
 fn view_of(args: &Value) -> Result<String, &'static str> {
     let view = js::string_or_empty(args.get("view"));
@@ -772,8 +808,9 @@ fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
         Some(folder) => path_to(core, &auth, &account, folder, !saved),
         None => Vec::new(),
     };
+    let (at, can_add) = place_of(core, &account, &view)?;
     Ok(ok(
-        json!({"files": rows(&files), "more": more, "saved": saved, "path": path}),
+        json!({"files": rows(&files), "more": more, "saved": saved, "path": path, "at": at, "can_add": can_add}),
     ))
 }
 

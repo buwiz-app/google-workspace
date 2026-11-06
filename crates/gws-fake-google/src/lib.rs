@@ -20,7 +20,9 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 pub use calendar::{CalendarWrite, FakeCalendar};
-pub use drive::{DRIVE_ROOT, FOLDER, FakeFile, GOOGLE_DOC, GOOGLE_SHEET, GOOGLE_SLIDES, TINY_PNG};
+pub use drive::{
+    DRIVE_ROOT, DriveWrite, FOLDER, FakeFile, GOOGLE_DOC, GOOGLE_SHEET, GOOGLE_SLIDES, TINY_PNG,
+};
 
 /// The account every fake sign-in is.
 pub const FAKE_EMAIL: &str = "owner@example.com";
@@ -1235,9 +1237,10 @@ impl Account {
             return Reply::json(200, json!({}));
         }
         // a live run's way to force Drive's failures: `?list=<status>&after=<n>`
-        // lets n more pages of a list through and fails the rest, `?changes=`
-        // and `?uploads=` do the same to the changes feed and to writes, and
-        // `?works` ends all three. `?touch=<id>` changes a file behind the
+        // lets n more pages of a list through and fails the rest, `?changes=`,
+        // `?uploads=` and `?writes=` do the same to the changes feed, to uploads
+        // and to every other write, and `?works` ends them all. `?touch=<id>`
+        // changes a file behind the
         // plugin's back, for a conflict
         if path == "/__drive" {
             let after = r.param("after").and_then(|n| n.parse().ok()).unwrap_or(0);
@@ -1249,6 +1252,9 @@ impl Account {
             }
             if let Some(status) = r.param("uploads").and_then(|s| s.parse().ok()) {
                 self.drive.fail_uploads(after, status);
+            }
+            if let Some(status) = r.param("writes").and_then(|s| s.parse().ok()) {
+                self.drive.fail_writes(after, status);
             }
             if r.param("works").is_some() {
                 self.drive.works();
@@ -1468,6 +1474,21 @@ impl FakeGoogle {
     /// `version` and `md5Checksum` move with them.
     pub fn change_on_drive(&self, id: &str, content: &[u8]) {
         self.edit_file(id, |f| f.content = content.to_vec());
+    }
+
+    /// After `left` more metadata writes, each gets `status`.
+    pub fn drive_writes_fail_after(&self, left: usize, status: u16) {
+        self.account.lock().unwrap().drive.fail_writes(left, status);
+    }
+
+    /// Every metadata write Drive accepted, oldest first.
+    pub fn drive_writes(&self) -> Vec<DriveWrite> {
+        self.account.lock().unwrap().drive.writes.clone()
+    }
+
+    /// People a page of `permissions.list` holds.
+    pub fn drive_people_page(&self, n: usize) {
+        self.account.lock().unwrap().drive.people_page = Some(n);
     }
 
     /// `left` more upload sessions start, and then each gets `status`.

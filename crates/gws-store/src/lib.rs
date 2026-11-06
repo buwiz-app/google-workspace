@@ -63,6 +63,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         "CREATE TABLE opened(id TEXT PRIMARY KEY, account TEXT NOT NULL, name TEXT NOT NULL, mime TEXT NOT NULL, google INTEGER NOT NULL, attachment INTEGER NOT NULL, hash TEXT NOT NULL, version TEXT NOT NULL, md5 TEXT NOT NULL, opened_ms INTEGER NOT NULL);
          DELETE FROM bodies;",
     ),
+    // what the person may do with a file. No list was read asking for that, so
+    // each is read again: a row that says nothing offers presses Google refuses
+    (
+        7,
+        "ALTER TABLE drive_files ADD COLUMN can TEXT;
+         DELETE FROM drive_listed;
+         DELETE FROM drive_views;",
+    ),
 ];
 
 /// Why the store didn't open or answer: a stable `code` and a message for people.

@@ -403,6 +403,13 @@ mod tests {
             "gws_file_upload",
             "gws_file_discard",
             "gws_mail_attachment_open",
+            "gws_drive_upload",
+            "gws_drive_folder",
+            "gws_drive_rename",
+            "gws_drive_move",
+            "gws_drive_trash",
+            "gws_drive_share",
+            "gws_drive_undo",
         ] {
             assert!(writes.contains(&name), "{name}");
         }
@@ -441,6 +448,14 @@ mod tests {
             tools::FILE_UPLOAD,
             tools::FILE_DISCARD,
             tools::MAIL_ATTACHMENT_OPEN,
+            tools::DRIVE_ACCESS,
+            tools::DRIVE_UPLOAD,
+            tools::DRIVE_FOLDER,
+            tools::DRIVE_RENAME,
+            tools::DRIVE_MOVE,
+            tools::DRIVE_TRASH,
+            tools::DRIVE_SHARE,
+            tools::DRIVE_UNDO,
         ] {
             assert!(tools::has(name), "{name}");
             assert!(!list.contains(&name), "{name}");

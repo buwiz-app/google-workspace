@@ -1,6 +1,6 @@
 //! Opening a Drive file or a mail's attachment in the Bot's viewer, and editing
-//! back. This is the only file here that writes to Drive, and only a person's
-//! press reaches it: nothing uploads on its own, in the background or on a timer.
+//! back. Only a person's press reaches this: nothing uploads on its own, in the
+//! background or on a timer. `drive/write.rs` has Drive's other writes.
 //!
 //! An open file lands in `open/<id>/<name>`. Both parts come from outside, so
 //! the id is checked and the name made safe before either touches a path, and
@@ -148,7 +148,7 @@ enum Saved {
 }
 
 /// What a session's start or its last piece came to.
-enum Sent {
+pub(crate) enum Sent {
     Done(Value),
     Refused(Answer),
 }
@@ -255,14 +255,16 @@ impl Transfers {
     }
 
     /// Starts a resumable upload: where its pieces go. The one way in for a file
-    /// of any size, and the bytes never need the token.
-    fn session(
+    /// of any size, and the bytes never need the token. `fields` is what the
+    /// last piece's answer holds.
+    pub(crate) fn session(
         &self,
         auth: &Bearer,
         id: Option<&str>,
         metadata: &Value,
         mime: &str,
         length: u64,
+        fields: &str,
     ) -> Result<Result<String, Answer>, Failure> {
         let req = match id {
             Some(id) => self.agent.patch(format!("{}/files/{id}", self.upload)),
@@ -270,7 +272,7 @@ impl Transfers {
         };
         let mut res = req
             .query("uploadType", "resumable")
-            .query("fields", "id")
+            .query("fields", fields)
             .header("authorization", auth.header())
             .header("content-type", "application/json; charset=UTF-8")
             .header("x-upload-content-type", mime)
@@ -296,7 +298,12 @@ impl Transfers {
     }
 
     /// The file's bytes, a piece at a time.
-    fn send(&self, place: &str, file: &mut File, length: u64) -> Result<Sent, Failure> {
+    pub(crate) fn send(
+        &self,
+        place: &str,
+        file: &mut impl std::io::Read,
+        length: u64,
+    ) -> Result<Sent, Failure> {
         let mut buffer = vec![0; PIECE];
         let mut from = 0u64;
         loop {
@@ -992,7 +999,7 @@ fn upload(core: &Core, args: &Value) -> Result<Value, Failure> {
     let target = (mode != "copy").then_some(id.as_str());
     let place = match core
         .transfers
-        .session(&auth, target, &metadata, &row.mime, length)?
+        .session(&auth, target, &metadata, &row.mime, length, "id")?
     {
         Ok(place) => place,
         Err(answer) => return Ok(write_refused(answer)),

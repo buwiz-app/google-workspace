@@ -484,6 +484,14 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
             "gws_drive_file",
             "gws_drive_preview",
             "gws_drive_card",
+            "gws_drive_access",
+            "gws_drive_upload",
+            "gws_drive_folder",
+            "gws_drive_rename",
+            "gws_drive_move",
+            "gws_drive_trash",
+            "gws_drive_share",
+            "gws_drive_undo",
             "gws_file_open",
             "gws_file_edits",
             "gws_file_upload",
@@ -947,6 +955,252 @@ fn a_press_gets_its_document_through_the_real_server_and_the_model_gets_nothing(
         }
     }
     assert_eq!(google.writes().len(), writes);
+    drop(ask);
+    drop(stdin);
+    child.wait().unwrap();
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// Trash and Share are the person's and never the AI's, whatever it's pressing.
+/// Through the real server: the same calls go through for a press of the
+/// person's, so it's who's asking that's refused and nothing else. An AI's press
+/// reaches here as the AI, and a label it can read, "Move to trash" or "Share",
+/// is no way in: nothing here reads one, and the tool is refused all the same.
+#[cfg(feature = "stub")]
+#[test]
+fn the_model_and_a_routine_are_refused_every_drive_write_and_a_person_is_not() {
+    use gws_fake_google::{FakeFile, FakeGoogle, Seed};
+
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(
+        FakeFile::new("drv-a", "Roof quote secret-name.txt", "text/plain").holding(b"x"),
+    );
+    google.seed_file(FakeFile::folder("drv-into", "Clients"));
+    let manifest = manifest_file("drive-writes");
+    let data = std::env::temp_dir().join(format!("gws-stdio-writes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+        .arg("mcp")
+        .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
+        .env("GWS_STUB_BASE", google.base())
+        .env("GWS_DATA_DIR", &data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut id = 1;
+    let mut ask = |name: &str, args: Value, caller: Value| -> Value {
+        id += 1;
+        writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args, "_meta": {"buwiz/caller": caller}}})).unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["id"], id, "{line}");
+        v["result"].clone()
+    };
+    let provision = provision();
+    ask(
+        "buwiz.provision",
+        provision["params"]["arguments"].clone(),
+        json!({}),
+    );
+    ask(
+        "buwiz.account.set",
+        json!({"account": "google", "label": "default", "subject": FAKE_SUBJECT, "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}),
+        json!({}),
+    );
+
+    let writes = [
+        (
+            "gws_drive_trash",
+            json!({"ids": ["drv-a"], "label": "Move to trash"}),
+        ),
+        (
+            "gws_drive_share",
+            json!({"id": "drv-a", "add": [{"email": "ana@example.com", "role": "writer"}], "seen": "x", "label": "Share with these people"}),
+        ),
+        ("gws_drive_rename", json!({"id": "drv-a", "name": "Stolen"})),
+        ("gws_drive_move", json!({"id": "drv-a", "to": "drv-into"})),
+        (
+            "gws_drive_folder",
+            json!({"parent": "root", "name": "Stolen"}),
+        ),
+        (
+            "gws_drive_upload",
+            json!({"upload": "up1", "parent": "root"}),
+        ),
+        ("gws_drive_undo", json!({"undo": "du1"})),
+        ("gws_drive_access", json!({"id": "drv-a"})),
+    ];
+    for caller in [
+        json!({"origin": "agent"}),
+        json!({"origin": "routine", "routine": "r1"}),
+    ] {
+        for (tool, args) in &writes {
+            let answer = ask(tool, args.clone(), caller.clone());
+            assert_eq!(
+                answer["structuredContent"]["code"], "permission_denied",
+                "{tool}: {answer}"
+            );
+            assert_eq!(answer["isError"], true, "{tool}");
+            assert!(!answer.to_string().contains("secret-name"), "{answer}");
+        }
+    }
+    assert_eq!(google.writes(), [], "not one write reached Google");
+    assert_eq!(google.drive_writes(), []);
+    let file = google.drive_file("drv-a").unwrap();
+    assert!(!file.trashed && file.people.is_empty());
+
+    // the same calls, from a screen a person has open
+    let plan = gws::manifest::unsigned(gws::manifest::RELEASE_KEY_ID);
+    let entry = buwiz_plugin::manifest::app(&plan, "drive").unwrap();
+    let not_after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 3_600_000;
+    let open_id = buwiz_plugin::b64::encode(&[7; 16]);
+    let opened = ask(
+        "buwiz.session.open",
+        json!({"app": "drive", "open_id": open_id, "ks_pub": buwiz_plugin::b64::encode(&[2; 32]), "perms_sha256": buwiz_plugin::manifest::permissions_digest(entry).unwrap(), "not_after": not_after}),
+        Value::Null,
+    );
+    assert_ne!(opened["isError"], true, "{opened}");
+    let press = json!({"origin": "app", "plugin": "app.buwiz.google-workspace", "app": "drive", "open_id": open_id, "ts": 1});
+
+    let people = ask("gws_drive_access", json!({"id": "drv-a"}), press.clone());
+    let seen = people["structuredContent"]["seen"].as_str().unwrap();
+    assert_eq!(
+        people["structuredContent"]["people"][0]["role"], "owner",
+        "{people}"
+    );
+    let shared = ask(
+        "gws_drive_share",
+        json!({"id": "drv-a", "add": [{"email": "ana@example.com", "role": "writer"}], "message": "Please look", "seen": seen}),
+        press.clone(),
+    );
+    assert_eq!(shared["structuredContent"]["added"], 1, "{shared}");
+    assert_eq!(shared["structuredContent"]["files"][0]["id"], "drv-a");
+    assert_eq!(shared["structuredContent"]["files"][0]["shared"], true);
+    let invited = google.drive_writes();
+    assert_eq!(
+        invited[0]
+            .query
+            .get("sendNotificationEmail")
+            .map(String::as_str),
+        Some("true")
+    );
+
+    let trashed = ask("gws_drive_trash", json!({"ids": ["drv-a"]}), press.clone());
+    let undo = trashed["structuredContent"]["undo"].as_str().unwrap();
+    assert_eq!(
+        trashed["structuredContent"]["files"][0]["trashed"], true,
+        "{trashed}"
+    );
+    assert!(google.drive_file("drv-a").unwrap().trashed);
+    let back = ask("gws_drive_undo", json!({"undo": undo}), press.clone());
+    assert_eq!(
+        back["structuredContent"]["files"][0]["trashed"], false,
+        "{back}"
+    );
+    assert!(!google.drive_file("drv-a").unwrap().trashed);
+
+    // an Undo the model can't spend, even with the id the screen just had
+    let again = ask("gws_drive_trash", json!({"ids": ["drv-a"]}), press);
+    let undo = again["structuredContent"]["undo"].as_str().unwrap();
+    let refused = ask(
+        "gws_drive_undo",
+        json!({"undo": undo}),
+        json!({"origin": "agent"}),
+    );
+    assert_eq!(refused["structuredContent"]["code"], "permission_denied");
+    assert!(google.drive_file("drv-a").unwrap().trashed);
+
+    drop(ask);
+    drop(stdin);
+    child.wait().unwrap();
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// A live run against a real account writes to one address alone, so Share keeps
+/// to that as Send does, before any request leaves.
+#[cfg(feature = "stub")]
+#[test]
+fn a_test_run_shares_with_nobody_but_its_own_address() {
+    use gws_fake_google::{FakeFile, FakeGoogle, Seed};
+
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(FakeFile::new("drv-a", "A.txt", "text/plain").holding(b"x"));
+    let manifest = manifest_file("only-to");
+    let data = std::env::temp_dir().join(format!("gws-stdio-only-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+        .arg("mcp")
+        .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
+        .env("GWS_STUB_BASE", google.base())
+        .env("GWS_DATA_DIR", &data)
+        .env("GWS_ONLY_TO", "support@example.com")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut id = 1;
+    let mut ask = |name: &str, args: Value, caller: Value| -> Value {
+        id += 1;
+        writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args, "_meta": {"buwiz/caller": caller}}})).unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()["result"].clone()
+    };
+    let provision = provision();
+    ask(
+        "buwiz.provision",
+        provision["params"]["arguments"].clone(),
+        json!({}),
+    );
+    ask(
+        "buwiz.account.set",
+        json!({"account": "google", "label": "default", "subject": FAKE_SUBJECT, "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}),
+        json!({}),
+    );
+    let plan = gws::manifest::unsigned(gws::manifest::RELEASE_KEY_ID);
+    let entry = buwiz_plugin::manifest::app(&plan, "drive").unwrap();
+    let open_id = buwiz_plugin::b64::encode(&[6; 16]);
+    let not_after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 3_600_000;
+    ask(
+        "buwiz.session.open",
+        json!({"app": "drive", "open_id": open_id, "ks_pub": buwiz_plugin::b64::encode(&[2; 32]), "perms_sha256": buwiz_plugin::manifest::permissions_digest(entry).unwrap(), "not_after": not_after}),
+        Value::Null,
+    );
+    let press = json!({"origin": "app", "plugin": "app.buwiz.google-workspace", "app": "drive", "open_id": open_id, "ts": 1});
+    let people = ask("gws_drive_access", json!({"id": "drv-a"}), press.clone());
+    let seen = people["structuredContent"]["seen"].clone();
+    let refused = ask(
+        "gws_drive_share",
+        json!({"id": "drv-a", "add": [{"email": "ana@example.com", "role": "reader"}], "seen": seen}),
+        press.clone(),
+    );
+    assert_eq!(
+        refused["structuredContent"]["refused"], "not_allowed",
+        "{refused}"
+    );
+    assert_eq!(google.drive_writes(), []);
+    let fine = ask(
+        "gws_drive_share",
+        json!({"id": "drv-a", "add": [{"email": "support@example.com", "role": "reader"}], "seen": seen}),
+        press,
+    );
+    assert_eq!(fine["structuredContent"]["added"], 1, "{fine}");
     drop(ask);
     drop(stdin);
     child.wait().unwrap();

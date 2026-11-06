@@ -31,8 +31,8 @@ const JOB_ASKS: u32 = 330;
 /// How long typing rests before a draft saves.
 const AUTOSAVE: Duration = Duration::from_secs(2);
 /// A file's bytes per call: under 256 KiB of arguments once in base64.
-const CHUNK: usize = 180 * 1024;
-const ATTACHMENTS_MAX: u64 = 25 * 1024 * 1024;
+pub(crate) const CHUNK: usize = 180 * 1024;
+pub(crate) const ATTACHMENTS_MAX: u64 = 25 * 1024 * 1024;
 /// How long typing rests before asking who it could be.
 pub(crate) const SUGGEST_AFTER: Duration = Duration::from_millis(200);
 
@@ -544,7 +544,7 @@ fn discard(b: Bridge, c: Compose) {
 
 /// One chunk, tried again while the answer is only busy: `at` keeps a chunk
 /// from being kept twice, so trying again is safe here.
-async fn chunk(b: &Bridge, args: Value) -> Result<Value, BuwizError> {
+pub(crate) async fn chunk(b: &Bridge, args: Value) -> Result<Value, BuwizError> {
     let mut attempt = 0;
     loop {
         match b.call("gws_upload_chunk", args.clone()).await {

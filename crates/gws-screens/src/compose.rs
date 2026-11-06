@@ -861,9 +861,18 @@ async fn suggest(b: Bridge, c: Compose, word: String) {
     );
 }
 
-fn line(c: Compose, name: &'static str, at: Place) -> Input {
+// The Bot's filter leaves a field unnamed, and refuses the AI, when its label
+// holds an @ or runs past 48 characters. The AI writes a mail only as a draft,
+// which the person reads before Send, and never in a panel they're about to send.
+const TO: &str = "To, like name@company.com";
+const CC: &str = "Cc, like name@company.com";
+const BCC: &str = "Bcc, like name@company.com";
+const SUBJECT: &str = "Subject, the line people see first in their inbox";
+const MESSAGE: &str = "Message, the words of this mail as they will be sent";
+
+fn line(c: Compose, label: &'static str, name: &'static str, at: Place) -> Input {
     input()
-        .label(name)
+        .label(label)
         .value(move || {
             let mut letter = c.letter.get();
             at(&mut letter).clone()
@@ -885,15 +894,21 @@ fn typed(c: Compose, at: Place, value: &str) -> bool {
     true
 }
 
-fn field(c: Compose, name: &'static str, at: Place) -> Input {
-    line(c, name, at).on_change(move |value: &str| {
+fn field(c: Compose, label: &'static str, name: &'static str, at: Place) -> Input {
+    line(c, label, name, at).on_change(move |value: &str| {
         typed(c, at, value);
     })
 }
 
 /// A field that takes people, with suggestions as they're typed.
-fn people_field(b: Bridge, c: Compose, name: &'static str, at: Place) -> impl IntoElement {
-    line(c, name, at).on_change(move |value: &str| {
+fn people_field(
+    b: Bridge,
+    c: Compose,
+    label: &'static str,
+    name: &'static str,
+    at: Place,
+) -> impl IntoElement {
+    line(c, label, name, at).on_change(move |value: &str| {
         if typed(c, at, value) {
             c.naming.set(Some(at));
             b.spawn(suggest(b.clone(), c, last_word(value).to_owned()));
@@ -1009,12 +1024,12 @@ pub fn panel(b: Bridge, c: Compose) -> impl IntoElement {
     );
     view()
         .app_class(Some("flex-1".into()))
-        .child(people_field(b, c, "To", |l| &mut l.to))
+        .child(people_field(b, c, TO, "To", |l| &mut l.to))
         .child(dynamic(move || {
             if c.extra.get() {
                 view()
-                    .child(people_field(naming.clone(), c, "Cc", |l| &mut l.cc))
-                    .child(people_field(naming.clone(), c, "Bcc", |l| &mut l.bcc))
+                    .child(people_field(naming.clone(), c, CC, "Cc", |l| &mut l.cc))
+                    .child(people_field(naming.clone(), c, BCC, "Bcc", |l| &mut l.bcc))
             } else {
                 view().app_class(Some("flex-row".into())).child(press_text(
                     "Add Cc or Bcc",
@@ -1024,11 +1039,11 @@ pub fn panel(b: Bridge, c: Compose) -> impl IntoElement {
             }
         }))
         .child(suggestions(c))
-        .child(field(c, "Subject", |l| &mut l.subject))
+        .child(field(c, SUBJECT, "Subject", |l| &mut l.subject))
         .child(
             view().app_class(Some("flex-1".into())).child(
                 input()
-                    .label("Message")
+                    .label(MESSAGE)
                     .multiline(true)
                     .readonly(move || c.frozen.get())
                     .value(move || c.letter.with(|l| l.body.clone()))

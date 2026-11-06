@@ -17,6 +17,10 @@ use nsh_engine::EngineConfig;
 use nsh_testing::Headless;
 use serde_json::{Map, Value, json};
 
+mod bot_filter;
+
+use bot_filter::Filter;
+
 const WAIT: Duration = Duration::from_secs(5);
 const PAGE: usize = 100;
 const LONG_NAME: &str = "A very long file name for a quarterly planning spreadsheet that goes on and on without any sign of stopping before the edge of the screen 2026 final final.xlsx";
@@ -492,10 +496,14 @@ impl Host for Fake {
             }
             "gws_search_drive" => {
                 let query = args["query"].as_str().unwrap().to_owned();
-                let items = vec![
-                    file("found", "Found file", "pdf", "Ana Reyes"),
-                    file("found-folder", "Found folder", "folder", "me"),
-                ];
+                let items = if query == "zzz" {
+                    Vec::new()
+                } else {
+                    vec![
+                        file("found", "Found file", "pdf", "Ana Reyes"),
+                        file("found-folder", "Found folder", "folder", "me"),
+                    ]
+                };
                 (
                     format!("search:{query}"),
                     json!({"items": items, "untrusted": "File names are other people's words."}),
@@ -2612,7 +2620,9 @@ fn a_shared_file_the_person_cant_change_offers_no_press_and_f2_does_nothing() {
     assert!(app.screen().shows("You can't change this here."));
     key(&mut app, "f2");
     assert!(
-        !app.screen().matches("label:New name").unwrap(),
+        !app.screen()
+            .matches("label:New name, as it will show in Google Drive to others")
+            .unwrap(),
         "no rename"
     );
     key(&mut app, "down");
@@ -2630,7 +2640,11 @@ fn many_picked_can_go_to_the_trash_and_a_rename_is_for_one() {
     assert_eq!(offered(&app, &ROW_PRESSES), ["label:Move to trash"]);
     assert!(app.screen().shows("Move 2 to trash"));
     key(&mut app, "f2");
-    assert!(!app.screen().matches("label:New name").unwrap());
+    assert!(
+        !app.screen()
+            .matches("label:New name, as it will show in Google Drive to others")
+            .unwrap()
+    );
 }
 
 #[test]
@@ -2668,12 +2682,21 @@ fn f2_renames_the_row_picked_and_it_shows_with_no_wait() {
     pick_nth(&mut app, 3);
     key(&mut app, "f2");
     assert_eq!(
-        app.screen().input_text("label:New name").unwrap().unwrap(),
+        app.screen()
+            .input_text("label:New name, as it will show in Google Drive to others")
+            .unwrap()
+            .unwrap(),
         "Notes"
     );
-    app.clear("label:New name").unwrap();
-    app.type_text("label:New name", "Better notes").unwrap();
-    app.submit("label:New name").unwrap();
+    app.clear("label:New name, as it will show in Google Drive to others")
+        .unwrap();
+    app.type_text(
+        "label:New name, as it will show in Google Drive to others",
+        "Better notes",
+    )
+    .unwrap();
+    app.submit("label:New name, as it will show in Google Drive to others")
+        .unwrap();
     settle(&mut app);
     assert_eq!(
         fake.called("gws_drive_rename"),
@@ -2684,7 +2707,11 @@ fn f2_renames_the_row_picked_and_it_shows_with_no_wait() {
         "{:?}",
         app.screen().texts()
     );
-    assert!(!app.screen().matches("label:New name").unwrap());
+    assert!(
+        !app.screen()
+            .matches("label:New name, as it will show in Google Drive to others")
+            .unwrap()
+    );
     assert!(app.screen().shows("Renamed."));
 }
 
@@ -2693,17 +2720,30 @@ fn the_rename_press_does_what_f2_does_and_a_name_that_didnt_change_writes_nothin
     let (mut app, fake) = start();
     pick_nth(&mut app, 3);
     press(&mut app, "label:Rename");
-    assert!(app.screen().matches("label:New name").unwrap());
+    assert!(
+        app.screen()
+            .matches("label:New name, as it will show in Google Drive to others")
+            .unwrap()
+    );
     press(&mut app, "label:Save this name");
     assert!(fake.called("gws_drive_rename").is_empty());
-    assert!(!app.screen().matches("label:New name").unwrap());
+    assert!(
+        !app.screen()
+            .matches("label:New name, as it will show in Google Drive to others")
+            .unwrap()
+    );
     press(&mut app, "label:Rename");
-    app.clear("label:New name").unwrap();
+    app.clear("label:New name, as it will show in Google Drive to others")
+        .unwrap();
     press(&mut app, "label:Save this name");
     assert!(app.screen().shows("Type a name first."));
     assert!(fake.called("gws_drive_rename").is_empty());
     press(&mut app, "label:Cancel this");
-    assert!(!app.screen().matches("label:New name").unwrap());
+    assert!(
+        !app.screen()
+            .matches("label:New name, as it will show in Google Drive to others")
+            .unwrap()
+    );
     assert!(app.screen().shows("Notes"));
 }
 
@@ -2712,15 +2752,23 @@ fn f2_and_undo_stay_out_of_a_field() {
     let (mut app, fake) = start();
     pick_nth(&mut app, 3);
     key(&mut app, "f2");
-    app.clear("label:New name").unwrap();
-    app.type_text("label:New name", "Renamed").unwrap();
-    app.submit("label:New name").unwrap();
+    app.clear("label:New name, as it will show in Google Drive to others")
+        .unwrap();
+    app.type_text(
+        "label:New name, as it will show in Google Drive to others",
+        "Renamed",
+    )
+    .unwrap();
+    app.submit("label:New name, as it will show in Google Drive to others")
+        .unwrap();
     settle(&mut app);
     key(&mut app, "/");
     key(&mut app, "f2");
     key(&mut app, "cmd+z");
     assert!(
-        !app.screen().matches("label:New name").unwrap(),
+        !app.screen()
+            .matches("label:New name, as it will show in Google Drive to others")
+            .unwrap(),
         "no rename"
     );
     assert!(fake.called("gws_drive_undo").is_empty(), "no undo");
@@ -2743,14 +2791,20 @@ fn a_rename_google_refuses_changes_nothing_says_why_and_can_be_tried_again() {
     let (mut app, fake) = start();
     pick_nth(&mut app, 3);
     key(&mut app, "f2");
-    app.clear("label:New name").unwrap();
-    app.type_text("label:New name", "Other").unwrap();
+    app.clear("label:New name, as it will show in Google Drive to others")
+        .unwrap();
+    app.type_text(
+        "label:New name, as it will show in Google Drive to others",
+        "Other",
+    )
+    .unwrap();
     fake.write_answers.lock().unwrap().insert(
         "gws_drive_rename".to_owned(),
         json!({"refused": "no_access", "message": "This account can't do that in Google Drive, so nothing changed."}),
     );
     let reads = fake.called("gws_drive_list").len();
-    app.submit("label:New name").unwrap();
+    app.submit("label:New name, as it will show in Google Drive to others")
+        .unwrap();
     settle(&mut app);
     assert!(
         app.screen()
@@ -2762,7 +2816,10 @@ fn a_rename_google_refuses_changes_nothing_says_why_and_can_be_tried_again() {
         "nothing to undo"
     );
     assert_eq!(
-        app.screen().input_text("label:New name").unwrap().unwrap(),
+        app.screen()
+            .input_text("label:New name, as it will show in Google Drive to others")
+            .unwrap()
+            .unwrap(),
         "Other",
         "what was typed stays"
     );
@@ -2772,7 +2829,8 @@ fn a_rename_google_refuses_changes_nothing_says_why_and_can_be_tried_again() {
         "nothing read again"
     );
     fake.write_answers.lock().unwrap().clear();
-    app.submit("label:New name").unwrap();
+    app.submit("label:New name, as it will show in Google Drive to others")
+        .unwrap();
     settle(&mut app);
     assert!(app.screen().shows("Other"));
 }
@@ -2783,13 +2841,17 @@ fn a_new_folder_goes_in_the_folder_that_is_open_and_shows() {
     press(&mut app, "label:New folder");
     assert_eq!(
         app.screen()
-            .input_text("label:Folder name")
+            .input_text("label:Folder name, as it will show in Google Drive to others")
             .unwrap()
             .unwrap(),
         "",
         "a new one starts empty"
     );
-    app.type_text("label:Folder name", "Quotes").unwrap();
+    app.type_text(
+        "label:Folder name, as it will show in Google Drive to others",
+        "Quotes",
+    )
+    .unwrap();
     press(&mut app, "label:Make this folder");
     assert_eq!(
         fake.called("gws_drive_folder"),
@@ -2800,8 +2862,13 @@ fn a_new_folder_goes_in_the_folder_that_is_open_and_shows() {
 
     open(&mut app, "Clients");
     press(&mut app, "label:New folder");
-    app.type_text("label:Folder name", "Inner").unwrap();
-    app.submit("label:Folder name").unwrap();
+    app.type_text(
+        "label:Folder name, as it will show in Google Drive to others",
+        "Inner",
+    )
+    .unwrap();
+    app.submit("label:Folder name, as it will show in Google Drive to others")
+        .unwrap();
     settle(&mut app);
     assert_eq!(
         last_of(&fake, "gws_drive_folder"),
@@ -2813,9 +2880,17 @@ fn a_new_folder_goes_in_the_folder_that_is_open_and_shows() {
 fn a_name_half_typed_goes_with_the_folder_it_was_for() {
     let (mut app, fake) = start();
     press(&mut app, "label:New folder");
-    app.type_text("label:Folder name", "For My Drive").unwrap();
+    app.type_text(
+        "label:Folder name, as it will show in Google Drive to others",
+        "For My Drive",
+    )
+    .unwrap();
     press(&mut app, "label:Starred");
-    assert!(!app.screen().matches("label:Folder name").unwrap());
+    assert!(
+        !app.screen()
+            .matches("label:Folder name, as it will show in Google Drive to others")
+            .unwrap()
+    );
     assert!(fake.called("gws_drive_folder").is_empty());
 }
 
@@ -2824,9 +2899,15 @@ fn a_name_half_typed_goes_with_the_folder_it_was_for() {
 fn rename_notes(app: &mut Headless) {
     pick_nth(app, 3);
     key(app, "f2");
-    app.clear("label:New name").unwrap();
-    app.type_text("label:New name", "Better notes").unwrap();
-    app.submit("label:New name").unwrap();
+    app.clear("label:New name, as it will show in Google Drive to others")
+        .unwrap();
+    app.type_text(
+        "label:New name, as it will show in Google Drive to others",
+        "Better notes",
+    )
+    .unwrap();
+    app.submit("label:New name, as it will show in Google Drive to others")
+        .unwrap();
     settle(app);
 }
 
@@ -2999,8 +3080,13 @@ fn the_ais_press_on_any_write_changes_nothing_and_says_so() {
     assert!(!app.screen().matches("label:Undo that").unwrap());
     assert_eq!(selected(&app), [3]);
     key(&mut app, "f2");
-    app.clear("label:New name").unwrap();
-    app.type_text("label:New name", "From the AI").unwrap();
+    app.clear("label:New name, as it will show in Google Drive to others")
+        .unwrap();
+    app.type_text(
+        "label:New name, as it will show in Google Drive to others",
+        "From the AI",
+    )
+    .unwrap();
     press(&mut app, "label:Save this name");
     assert!(app.screen().shows(AI_REFUSED));
     assert!(app.screen().shows("Notes"));
@@ -3664,13 +3750,21 @@ fn the_undo_bar_and_a_failed_upload_keep_their_presses_whole_at_every_width() {
     *fake.picks.lock().unwrap() = vec![(LONG_NAME.to_owned(), b"x".to_vec())];
     pick_nth(&mut app, 0);
     key(&mut app, "f2");
-    app.submit("label:New name").unwrap();
+    app.submit("label:New name, as it will show in Google Drive to others")
+        .unwrap();
     settle(&mut app);
-    app.clear("label:New name").ok();
+    app.clear("label:New name, as it will show in Google Drive to others")
+        .ok();
     key(&mut app, "f2");
-    app.clear("label:New name").unwrap();
-    app.type_text("label:New name", "Other").unwrap();
-    app.submit("label:New name").unwrap();
+    app.clear("label:New name, as it will show in Google Drive to others")
+        .unwrap();
+    app.type_text(
+        "label:New name, as it will show in Google Drive to others",
+        "Other",
+    )
+    .unwrap();
+    app.submit("label:New name, as it will show in Google Drive to others")
+        .unwrap();
     settle(&mut app);
     *fake.write_fails.lock().unwrap() = Some(LONG_NAME.to_owned());
     press(&mut app, "label:Upload a file to Google Drive");
@@ -3925,4 +4019,295 @@ fn what_a_press_says_afterwards_holds_no_name() {
         .collect::<Vec<_>>();
     assert_eq!(told, ["Moved to Trash."]);
     assert_eq!(fake.called("gws_drive_trash").len(), 1);
+}
+
+// --- Empty states ------------------------------------------------------------
+
+#[test]
+fn every_empty_list_says_which_it_is_and_the_press_where_there_is_one() {
+    let (mut app, fake) = start();
+    *fake.rows.lock().unwrap() = Some(Vec::new());
+    for (view, line) in [
+        ("Shared", "Nothing is shared with you yet."),
+        ("Recent", "Nothing opened or changed lately."),
+        ("Starred", "Nothing starred yet."),
+        ("Trash", "Trash is empty."),
+        (
+            "My Drive",
+            "My Drive is empty. Press New folder or Upload to add to it.",
+        ),
+    ] {
+        press(&mut app, &format!("label:{view}"));
+        assert!(
+            app.screen().shows(line),
+            "{view}: {:?}",
+            app.screen().texts()
+        );
+    }
+    app.type_text("label:Search Google Drive", "zzz").unwrap();
+    app.submit("label:Search Google Drive").unwrap();
+    settle(&mut app);
+    assert!(app.screen().shows("No files match that. Try other words."));
+}
+
+#[test]
+fn an_empty_folder_offers_its_presses_only_if_it_takes_files() {
+    let (mut app, fake) = start();
+    open(&mut app, "Big folder");
+    app.wait_for_within("text:Item 0", WAIT)
+        .expect("the folder");
+    *fake.rows.lock().unwrap() = Some(Vec::new());
+    press(&mut app, "label:Open this folder >> text:Big folder");
+    assert!(
+        app.screen()
+            .shows("This folder is empty. Press New folder or Upload to add to it."),
+        "{:?}",
+        app.screen().texts()
+    );
+    fake.no_add.lock().unwrap().insert("big".to_owned());
+    press(&mut app, "label:Open this folder >> text:Big folder");
+    assert!(app.screen().shows("This folder is empty."));
+}
+
+#[test]
+fn the_empty_lines_stay_whole_at_every_width() {
+    let fake = Arc::new(Fake::default());
+    *fake.rows.lock().unwrap() = Some(Vec::new());
+    let (mut app, frames) = open_app(fake, 1000.0, 700.0);
+    let line = "My Drive is empty. Press New folder or Upload to add to it.";
+    app.wait_for_within(&format!("text:{line}"), WAIT)
+        .expect("it says so");
+    settle(&mut app);
+    sweep(&mut app, &frames, &["label:Upload a file to Google Drive"]);
+    for width in WIDTHS {
+        app.set_viewport(size(px(width), px(700.0)))
+            .expect("the viewport sets");
+        settle(&mut app);
+        for (left, right) in frames.text_edges(line) {
+            assert!(
+                left >= -0.5 && right <= width + 0.5,
+                "at {width} it runs from {left} to {right}"
+            );
+        }
+    }
+}
+
+// --- What the AI can reach, and what labels hold ------------------------------
+
+/// What the Bot's filter names on any Drive screen, and why each is safe.
+/// Everything else, and every field but the search, stays unnamed: a new control
+/// has to be added here, and so has to say why.
+const MAY_REACH: [&str; 26] = [
+    // move the list: a pick that leaves it goes with it
+    "My Drive",
+    "Shared",
+    "Recent",
+    "Starred",
+    "Trash",
+    "List",
+    "Grid",
+    // a search with no way to submit it
+    "Search Google Drive",
+    // read again
+    "Try again",
+    "Read who has this again",
+    // open a bar or a panel whose every field and choice is out of reach
+    "New folder",
+    "Rename",
+    "Move",
+    "Share",
+    // each calls its write in the press, which the Bot refuses the AI
+    "Move to trash",
+    "Move here",
+    "Upload to Google Drive",
+    "Save as a copy",
+    "Replace the one on Drive",
+    "Save a copy to Google Drive",
+    "Discard my edits",
+    // takes back a question
+    "Keep my edits",
+    // takes a line off the screen, and sends nothing
+    "Forget this upload",
+    "Dismiss",
+    // the file's own page on Google, by the Bot's own confirm
+    "Open in the browser",
+    // the card's own search, on the full screen
+    "Open full screen",
+];
+
+fn audited(fake: &Arc<Fake>, width: f32, height: f32) -> (Headless, Filter) {
+    let def = gws_screens::screens()
+        .iter()
+        .find(|s| s.id == "gws.drive")
+        .expect("Drive");
+    let root = (def.build)(Bridge::new(fake.clone()));
+    let mut app = Headless::start(EngineConfig::new(root)).expect("the engine starts");
+    let filter = Filter::watch(&mut app);
+    app.set_viewport(size(px(width), px(height)))
+        .expect("the viewport sets");
+    (app, filter)
+}
+
+fn audited_at_home(fake: &Arc<Fake>) -> (Headless, Filter) {
+    let (mut app, filter) = audited(fake, 1000.0, 700.0);
+    app.wait_for_within("text:Notes", WAIT).expect("My Drive");
+    settle(&mut app);
+    (app, filter)
+}
+
+/// Every state of every Drive screen and card, each handed to `look`.
+fn every_state(mut look: impl FnMut(&Headless, &Filter, &str)) {
+    let fake = Arc::new(Fake::default());
+    let (mut app, filter) = audited_at_home(&fake);
+    look(&app, &filter, "the list");
+    press(&mut app, "label:Grid");
+    look(&app, &filter, "the grid");
+    press(&mut app, "label:List");
+    open(&mut app, "Clients");
+    open(&mut app, "Acme");
+    look(&app, &filter, "a folder, deep down");
+    details(&mut app, "Deep notes");
+    assert!(app.screen().shows("Ana Reyes <ana@example.com>"));
+    look(&app, &filter, "details");
+    press(&mut app, "label:My Drive");
+    details(&mut app, "Photo.png");
+    look(&app, &filter, "an image's details");
+    press(&mut app, "label:Close these details");
+    app.type_text("label:Search Google Drive", "Budget")
+        .unwrap();
+    app.submit("label:Search Google Drive").unwrap();
+    settle(&mut app);
+    look(&app, &filter, "a search");
+    app.clear("label:Search Google Drive").unwrap();
+    app.submit("label:Search Google Drive").unwrap();
+    settle(&mut app);
+
+    pick_nth(&mut app, 3);
+    assert!(app.screen().matches("label:Rename").unwrap());
+    look(&app, &filter, "a picked file");
+    press(&mut app, "label:Rename");
+    assert!(filter.unnamed_fields() >= 1, "the audit sees the field");
+    look(&app, &filter, "a new name");
+    press(&mut app, "label:Cancel this");
+    press(&mut app, "label:New folder");
+    look(&app, &filter, "a new folder");
+    press(&mut app, "label:Cancel this");
+
+    press(&mut app, "label:Move");
+    app.wait_for_within("label:Go into this folder", WAIT)
+        .expect("the folders");
+    settle(&mut app);
+    look(&app, &filter, "the chooser");
+    press(&mut app, "label:Go into this folder >> nth=0");
+    look(&app, &filter, "the chooser, a folder down");
+    press(&mut app, "label:Cancel this move");
+
+    press(&mut app, "label:Share");
+    app.wait_for_within("text:Who will have access", WAIT)
+        .expect("the list");
+    settle(&mut app);
+    assert!(filter.unnamed_fields() >= 1, "the audit sees the field");
+    look(&app, &filter, "sharing");
+    add_person(&mut app, "cara@example.com", "Can comment");
+    press(&mut app, "label:Take this person off >> nth=1");
+    assert!(app.screen().shows("Will lose access"));
+    look(&app, &filter, "sharing, about to change");
+    press(&mut app, "label:Close sharing");
+
+    press(&mut app, "label:Move to trash");
+    assert!(app.screen().matches("label:Undo that").unwrap());
+    look(&app, &filter, "undo");
+
+    *fake.picks.lock().unwrap() = vec![("Quote.txt".to_owned(), b"fake quote".to_vec())];
+    *fake.write_fails.lock().unwrap() = Some("Google Drive is busy right now.".to_owned());
+    press(&mut app, "label:Upload a file to Google Drive");
+    settle(&mut app);
+    assert!(app.screen().matches("label:Forget this upload").unwrap());
+    look(&app, &filter, "an upload that failed");
+    *fake.write_fails.lock().unwrap() = None;
+
+    fake.opens.lock().unwrap().insert(
+        "budget".to_owned(),
+        json!({"refused": "too_big", "message": "Budget is too big.", "link": "https://docs.google.com/document/d/budget/edit"}),
+    );
+    open(&mut app, "Budget.xlsx");
+    assert!(app.screen().matches("label:Open in the browser").unwrap());
+    look(&app, &filter, "a file too big to open");
+
+    for (google, changed) in [(false, false), (false, true), (true, false)] {
+        let fake = Arc::new(Fake::default());
+        *fake.edits.lock().unwrap() = vec![edit("budget", "Budget.xlsx", google, changed)];
+        let (mut app, filter) = audited_at_home(&fake);
+        app.wait_for_within("label:Discard", WAIT).expect("the bar");
+        look(&app, &filter, "an edit's bar");
+        press(&mut app, "label:Discard");
+        assert!(app.screen().matches("label:Discard my edits").unwrap());
+        look(&app, &filter, "asked to discard");
+    }
+
+    let fake = Arc::new(Fake::default());
+    let (mut app, filter) = audited_at_home(&fake);
+    *fake.refuse_list.lock().unwrap() = true;
+    press(&mut app, "label:Shared");
+    settle(&mut app);
+    look(&app, &filter, "a list that failed");
+    *fake.refuse_list.lock().unwrap() = false;
+    *fake.rows.lock().unwrap() = Some(Vec::new());
+    for name in ["My Drive", "Shared", "Recent", "Starred", "Trash"] {
+        press(&mut app, &format!("label:{name}"));
+        look(&app, &filter, name);
+    }
+    app.set_viewport(size(px(300.0), px(700.0)))
+        .expect("the viewport sets");
+    settle(&mut app);
+    look(&app, &filter, "narrow and empty");
+
+    let fake = Arc::new(Fake::default());
+    *fake.status.lock().unwrap() = Some(json!({"signed_in": false}));
+    let (mut app, filter) = audited(&fake, 1000.0, 700.0);
+    settle(&mut app);
+    look(&app, &filter, "signed out");
+
+    let fake = Arc::new(Fake::default());
+    *fake.inline.lock().unwrap() = true;
+    *fake.props.lock().unwrap() = json!({"search": "tkt1"});
+    let (mut app, filter) = audited(&fake, 420.0, 500.0);
+    app.wait_for_within("text:Card file 0", WAIT)
+        .expect("it shows");
+    look(&app, &filter, "the card");
+    let fake = Arc::new(Fake::default());
+    *fake.inline.lock().unwrap() = true;
+    *fake.props.lock().unwrap() = json!({"search": "tkt1"});
+    *fake.card.lock().unwrap() = Some(json!({"rows": [], "saved": false}));
+    let (mut app, filter) = audited(&fake, 420.0, 500.0);
+    app.wait_for_within("text:No files match.", WAIT)
+        .expect("it shows");
+    look(&app, &filter, "an empty card");
+}
+
+#[test]
+fn no_label_in_any_state_holds_a_persons_data() {
+    let mut states = 0;
+    let more = ["cara@example.com", "Quote.txt", "Card file"];
+    let secrets: Vec<&str> = SECRETS.iter().chain(&more).copied().collect();
+    every_state(|_, filter, at| {
+        filter.assert_no_data_in_labels(&secrets, at);
+        states += 1;
+    });
+    assert!(states >= 25, "{states}");
+}
+
+/// The AI has no way to change Drive at all, so nothing on a screen may stage
+/// what a person's press would send: who gets a file and how, a name, a folder.
+#[test]
+fn nothing_a_press_would_send_can_be_reached() {
+    bot_filter::assert_the_copy_works();
+    let mut reached = BTreeSet::new();
+    every_state(|_, filter, at| {
+        filter.assert_stages_nothing(&MAY_REACH, at);
+        reached.extend(filter.reachable().into_iter().map(|(_, name)| name));
+    });
+    // or the audit is looking at nothing
+    assert!(reached.contains("Search Google Drive"), "{reached:?}");
+    assert!(reached.contains("Share"), "{reached:?}");
 }

@@ -246,9 +246,21 @@ fn typed_guests(form: &mut Form, value: &str) {
     form.typing = kept.join(", ");
 }
 
-fn field(m: Cal, name: &'static str, at: Place) -> Input {
+// The Bot's filter leaves a field unnamed, and refuses the AI, when its label
+// runs past 48 characters or holds more than six digits: what it staged here
+// would go at the person's press. Its way in is a draft the person reviews.
+const TITLE: &str = "Title, the name guests will see on their calendars";
+const START_DATE: &str = "Start date, like 2026-11-06";
+const START_TIME: &str = "Start time, like 09:30 or 14:30 or 18:05";
+const END_DATE: &str = "End date, like 2026-11-06";
+const END_TIME: &str = "End time, like 10:30 or 15:30 or 19:05";
+const ZONE: &str = "Time zone, like Asia/Manila or America/Los_Angeles";
+const PLACE: &str = "Place, an address or a room that guests will read";
+const NOTES: &str = "Notes, anything guests should read about this event";
+
+fn field(m: Cal, label: &'static str, name: &'static str, at: Place) -> Input {
     input()
-        .label(name)
+        .label(label)
         .value(move || {
             let mut form = m.editor.form.get();
             at(&mut form).clone()
@@ -290,17 +302,17 @@ fn when_fields(m: Cal) -> impl IntoElement {
         let on = all_day.get();
         let line = view()
             .app_class(Some("flex-row flex-wrap items-center gap-1".into()))
-            .child(field(m, "Start date", |f| &mut f.start_date));
+            .child(field(m, START_DATE, "Start date", |f| &mut f.start_date));
         let line = if on {
             line
         } else {
-            line.child(field(m, "Start time", |f| &mut f.start_time))
+            line.child(field(m, START_TIME, "Start time", |f| &mut f.start_time))
         };
-        let line = line.child(field(m, "End date", |f| &mut f.end_date));
+        let line = line.child(field(m, END_DATE, "End date", |f| &mut f.end_date));
         let line = if on {
             line
         } else {
-            line.child(field(m, "End time", |f| &mut f.end_time))
+            line.child(field(m, END_TIME, "End time", |f| &mut f.end_time))
         };
         view().child(row("When", line)).child(row(
             "All day",
@@ -338,7 +350,8 @@ fn repeat_field(m: Cal) -> impl IntoElement {
                 list.child(
                     view()
                         .app_class(pill(now == *rule))
-                        .label(*name)
+                        // more words than it shows: a choice the AI can't reach
+                        .label(format!("Repeats: {name}"))
                         .on_press(move || self::change(m, |f| f.repeat = (*rule).to_owned()))
                         .child(text(*name).app_class(Some(format!("text-[12px] {INK}").into()))),
                 )
@@ -498,6 +511,13 @@ fn calendar_field(m: Cal) -> impl IntoElement {
                     .app_class(Some(format!("text-[12px] {INK}").into())),
             );
         }
+        if !calendars.iter().any(|c| c.writable) {
+            return row(
+                "Calendar",
+                text("You have no calendar to add this to.")
+                    .app_class(Some(format!("text-[12px] {INK}").into())),
+            );
+        }
         let list = calendars.iter().filter(|c| c.writable).fold(
             view().app_class(Some("flex-row flex-wrap gap-1".into())),
             |list, c| {
@@ -575,27 +595,20 @@ fn presses(b: Bridge, m: Cal) -> impl IntoElement {
         let bar = bar.child(press_text("Cancel", "Cancel", move || e.close(m)));
         if deciding.get() {
             return bar
-                .child(press_text(
-                    "Use the newer one",
-                    "Use the newer one",
-                    move || {
-                        if let Some(d) = e.newer.get_untracked() {
-                            e.fill(Form::of_detail(&d, &Local));
-                            m.told.set(None);
-                        }
-                    },
-                ))
-                .child(press_text(
-                    "Keep my changes",
-                    "Keep my changes",
-                    move || {
-                        if let Some(d) = e.newer.get_untracked() {
-                            e.form.update(|f| f.etag = d.etag.clone());
-                            e.newer.set(None);
-                            m.told.set(None);
-                        }
-                    },
-                ));
+                // fewer words than their labels: which version goes is the person's
+                .child(press_text("Use the newer one", "Use newer", move || {
+                    if let Some(d) = e.newer.get_untracked() {
+                        e.fill(Form::of_detail(&d, &Local));
+                        m.told.set(None);
+                    }
+                }))
+                .child(press_text("Keep my changes", "Keep mine", move || {
+                    if let Some(d) = e.newer.get_untracked() {
+                        e.form.update(|f| f.etag = d.etag.clone());
+                        e.newer.set(None);
+                        m.told.set(None);
+                    }
+                }));
         }
         let b = b.clone();
         bar.child(
@@ -623,20 +636,23 @@ pub(super) fn panel(b: Bridge, m: Cal) -> impl IntoElement {
                     .child(
                         view()
                             .app_class(Some(format!("px-3 py-2 border-b {LINE}").into()))
-                            .child(field(m, "Title", |f| &mut f.title)),
+                            .child(field(m, TITLE, "Title", |f| &mut f.title)),
                     )
                     .child(when_fields(m))
-                    .child(row("Zone", field(m, "Time zone", |f| &mut f.time_zone)))
+                    .child(row(
+                        "Zone",
+                        field(m, ZONE, "Time zone", |f| &mut f.time_zone),
+                    ))
                     .child(repeat_field(m))
                     .child(guest_field(guests, m))
-                    .child(row("Place", field(m, "Place", |f| &mut f.place)))
+                    .child(row("Place", field(m, PLACE, "Place", |f| &mut f.place)))
                     .child(meet_field(m))
                     .child(
                         view()
                             .app_class(Some(format!("px-3 py-2 border-b {LINE}").into()))
                             .child(
                                 input()
-                                    .label("Notes")
+                                    .label(NOTES)
                                     .multiline(true)
                                     .readonly(move || m.editor.saving.get())
                                     .value(move || m.editor.form.with(|f| f.notes.clone()))

@@ -8,7 +8,8 @@ use serde_json::json;
 use super::event::{Calendar, Event};
 use super::time::{self, Span, When};
 use super::{
-    Cal, fetch, load_calendars, open_event, outcome, refresh, run, show_view, tell, today, value,
+    Cal, SIDE_FROM, fetch, load_calendars, open_event, outcome, refresh, run, show_view, tell,
+    today, value,
 };
 use crate::compose::press_send_button;
 use crate::shell::{CHOSEN, DIM, INK, LINE, MUTE, RAIL};
@@ -387,13 +388,67 @@ fn row_view(b: Bridge, m: Cal, at: Position) -> impl IntoElement {
         )
 }
 
+/// What a view with nothing in it says, and the next press where there is one:
+/// New in the side column, or its key when the column doesn't fit. `calendars`
+/// is `None` until the list has come. A hidden calendar's events are there, so
+/// "nothing" would be wrong; with no calendars there's nowhere to put one.
+fn nothing_line(span: Span, calendars: Option<&[Calendar]>, wide: bool) -> String {
+    if calendars.is_some_and(<[Calendar]>::is_empty) {
+        return "No calendars on this account yet. Make one in Google Calendar and it shows here."
+            .to_owned();
+    }
+    if calendars.is_some_and(|c| c.iter().all(|c| !c.shown)) {
+        return if wide {
+            "Every calendar is hidden. Turn one on to see its events.".to_owned()
+        } else {
+            "Every calendar is hidden.".to_owned()
+        };
+    }
+    let line = match span {
+        Span::Day => "Nothing on this day.",
+        Span::Week => "Nothing this week.",
+        Span::Month => "Nothing this month.",
+        Span::Agenda => "Nothing in these days.",
+    };
+    match calendars {
+        Some(c) if c.iter().any(|c| c.writable) && wide => {
+            format!("{line} Press New to add an event.")
+        }
+        Some(c) if c.iter().any(|c| c.writable) => format!("{line} Press c to add an event."),
+        _ => line.to_owned(),
+    }
+}
+
+fn nothing_now(m: Cal) -> String {
+    let wide = window().width.0 >= SIDE_FROM;
+    let read = m.calendars_read.get();
+    m.calendars
+        .with(|c| nothing_line(m.span.get(), read.then_some(c.as_slice()), wide))
+}
+
+/// The line over a day, week or month with no events: the grid stays under it,
+/// and in the flow, so it pushes nothing out of reach.
+pub(super) fn nothing(m: Cal) -> impl IntoElement {
+    let line = computed(move || {
+        let empty =
+            !m.loading.get() && m.events.with(Vec::is_empty) && m.problem.with(Option::is_none);
+        empty.then(|| nothing_now(m))
+    });
+    dynamic(move || match line.get() {
+        Some(line) => view()
+            .app_class(Some(format!("px-3 py-2 border-b {LINE}").into()))
+            .child(text(line).app_class(Some(format!("text-[12px] {MUTE}").into()))),
+        None => view(),
+    })
+}
+
 pub(super) fn agenda(b: Bridge, m: Cal) -> impl IntoElement {
     let empty = dynamic(move || {
         let line = match (m.loading.get(), m.searching.with(Option::is_some)) {
-            (true, _) => "Loading your events…",
-            (false, true) => "No events match that.",
-            (false, false) if m.problem.with(Option::is_some) => "",
-            (false, false) => "Nothing in these days.",
+            (true, _) => "Loading your events…".to_owned(),
+            (false, true) => "No events match that. Try other words.".to_owned(),
+            (false, false) if m.problem.with(Option::is_some) => String::new(),
+            (false, false) => nothing_now(m),
         };
         view()
             .app_class(Some("p-6 items-center".into()))
@@ -488,36 +543,37 @@ fn toggle(b: &Bridge, m: Cal, id: String, shown: bool) {
 fn calendar_rows(b: Bridge, m: Cal) -> impl IntoElement {
     dynamic(move || {
         let calendars = m.calendars.get();
-        calendars.iter().fold(
-            view().app_class(Some("px-3 py-2 gap-1".into())).child(
-                text("Calendars")
-                    .app_class(Some(format!("text-[12px] font-semibold {INK}").into())),
-            ),
-            |list, c| {
-                let (b, id, shown) = (b.clone(), c.id.clone(), c.shown);
-                let colour = tint(&calendars, &c.id);
-                let swatch = if shown { colour } else { "" };
-                list.child(
-                    view()
-                        .app_class(Some("flex-row items-center gap-2 py-[2px]".into()))
-                        .label("Show or hide this calendar")
-                        .accessibility_value(value(format!(
-                            "{}, {}",
-                            c.name,
-                            if shown { "shown" } else { "hidden" }
-                        )))
-                        .on_press(move || toggle(&b, m, id.clone(), !shown))
-                        .child(view().app_class(Some(
-                            format!("w-[12px] h-[12px] rounded-sm border {LINE} {swatch}").into(),
-                        )))
-                        .child(
-                            text(c.name.clone())
-                                .number_of_lines(1)
-                                .app_class(Some(format!("flex-1 text-[12px] {INK}").into())),
-                        ),
-                )
-            },
-        )
+        let head = view().app_class(Some("px-3 py-2 gap-1".into())).child(
+            text("Calendars").app_class(Some(format!("text-[12px] font-semibold {INK}").into())),
+        );
+        if calendars.is_empty() && m.calendars_read.get() {
+            return head
+                .child(text("None yet.").app_class(Some(format!("text-[12px] {MUTE}").into())));
+        }
+        calendars.iter().fold(head, |list, c| {
+            let (b, id, shown) = (b.clone(), c.id.clone(), c.shown);
+            let colour = tint(&calendars, &c.id);
+            let swatch = if shown { colour } else { "" };
+            list.child(
+                view()
+                    .app_class(Some("flex-row items-center gap-2 py-[2px]".into()))
+                    .label("Show or hide this calendar")
+                    .accessibility_value(value(format!(
+                        "{}, {}",
+                        c.name,
+                        if shown { "shown" } else { "hidden" }
+                    )))
+                    .on_press(move || toggle(&b, m, id.clone(), !shown))
+                    .child(view().app_class(Some(
+                        format!("w-[12px] h-[12px] rounded-sm border {LINE} {swatch}").into(),
+                    )))
+                    .child(
+                        text(c.name.clone())
+                            .number_of_lines(1)
+                            .app_class(Some(format!("flex-1 text-[12px] {INK}").into())),
+                    ),
+            )
+        })
     })
 }
 
@@ -543,6 +599,41 @@ pub(super) fn side(b: Bridge, m: Cal) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn calendar(shown: bool, writable: bool) -> Calendar {
+        Calendar {
+            id: "c".to_owned(),
+            name: "Mine".to_owned(),
+            primary: true,
+            writable,
+            shown,
+            time_zone: "Asia/Manila".to_owned(),
+        }
+    }
+
+    #[test]
+    fn an_empty_view_says_why_and_offers_the_press_that_is_on_screen() {
+        let mine = [calendar(true, true)];
+        assert_eq!(
+            nothing_line(Span::Week, Some(&mine), true),
+            "Nothing this week. Press New to add an event."
+        );
+        assert_eq!(
+            nothing_line(Span::Day, Some(&mine), false),
+            "Nothing on this day. Press c to add an event."
+        );
+        assert_eq!(
+            nothing_line(Span::Month, Some(&[calendar(true, false)]), true),
+            "Nothing this month.",
+            "nothing here to add to"
+        );
+        assert_eq!(nothing_line(Span::Week, None, true), "Nothing this week.");
+        assert!(nothing_line(Span::Week, Some(&[]), true).starts_with("No calendars"));
+        assert!(
+            nothing_line(Span::Week, Some(&[calendar(false, true)]), true)
+                .starts_with("Every calendar is hidden")
+        );
+    }
 
     #[test]
     fn a_small_cell_still_has_room_for_one_and_the_more_line() {

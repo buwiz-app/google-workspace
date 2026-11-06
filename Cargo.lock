@@ -781,6 +781,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
 name = "ecdsa"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1729,6 +1735,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nsh-dev"
+version = "0.3.0"
+source = "git+https://github.com/hexuria/nsh?rev=f1461478d3768fb5da872cb697f0b0a48564ee91#f1461478d3768fb5da872cb697f0b0a48564ee91"
+dependencies = [
+ "base64 0.22.1",
+ "dunce",
+ "log",
+ "serde",
+ "serde_json",
+ "tungstenite 0.30.0",
+]
+
+[[package]]
 name = "nsh-engine"
 version = "0.3.0"
 source = "git+https://github.com/hexuria/nsh?rev=f1461478d3768fb5da872cb697f0b0a48564ee91#f1461478d3768fb5da872cb697f0b0a48564ee91"
@@ -1799,11 +1818,15 @@ name = "nsh-testing"
 version = "0.3.0"
 source = "git+https://github.com/hexuria/nsh?rev=f1461478d3768fb5da872cb697f0b0a48564ee91#f1461478d3768fb5da872cb697f0b0a48564ee91"
 dependencies = [
+ "base64 0.22.1",
  "crossbeam-channel",
  "log",
  "nsh-core",
+ "nsh-dev",
  "nsh-engine",
  "regex",
+ "serde",
+ "serde_json",
  "ureq",
 ]
 
@@ -3003,7 +3026,7 @@ dependencies = [
  "rustls-pki-types",
  "tokio",
  "tokio-rustls",
- "tungstenite",
+ "tungstenite 0.28.0",
  "webpki-roots 0.26.11",
 ]
 
@@ -3076,6 +3099,22 @@ dependencies = [
  "sha1 0.10.7",
  "thiserror",
  "utf-8",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.10.3",
+ "sha1 0.11.0",
+ "thiserror",
 ]
 
 [[package]]

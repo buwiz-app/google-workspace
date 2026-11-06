@@ -62,6 +62,8 @@ pub struct Core {
     pub tickets: Mutex<mail::Tickets>,
     /// The Bot has told this process who is signed in.
     pub pushed: std::sync::atomic::AtomicBool,
+    /// Whether it has finished telling.
+    pub settle: mail::Settle,
     /// What a person's actions changed, for Undo.
     pub undos: Mutex<mail::Undos>,
     /// The same for Drive.
@@ -110,6 +112,7 @@ impl Core {
             working: files::Working::default(),
             clock: files::Clock::default(),
             pushed: std::sync::atomic::AtomicBool::new(false),
+            settle: mail::Settle::default(),
         }
     }
 
@@ -153,10 +156,15 @@ impl Core {
         self.run(tool, args)
     }
 
-    /// `buwiz.account.set` or `.clear`. After either, the store keeps only
-    /// the accounts still signed in: subjects and bodies have no business
-    /// outliving the sign-in, and each is fetched again after the next one.
+    /// `buwiz.account.set` or `.clear`. Subjects and bodies have no business
+    /// outliving the sign-in, and each is fetched again after the next one. So
+    /// the account a push ends goes at once: the one a clear names, or the one
+    /// a new sign-in on its label replaced. Once the pushes have stopped,
+    /// [`mail::finish_wipes`] takes any other nobody pushed. Before that an
+    /// account nobody pushed stays: the Bot sends them one at a time, and it
+    /// may be next.
     pub fn account(&self, method: &str, args: &Value) -> Value {
+        let was = self.accounts.subject_of(args);
         let mut result = if method == "buwiz.account.set" {
             self.accounts.set(args)
         } else {
@@ -166,8 +174,10 @@ impl Core {
         if result["isError"] != Value::Bool(true) {
             self.pushed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            if !mail::reconcile(self) {
-                // the caller hears, and the next sync tries again
+            self.sync
+                .wake_after(self.settle.pushed(self.clock.now_ms()));
+            if was.is_some_and(|who| !mail::forget(self, &who)) {
+                // the caller hears, and a later sync tries again
                 result["structuredContent"]["mail_kept"] = Value::Bool(true);
             }
         }

@@ -62,6 +62,8 @@ struct Cal {
     anchor: Signal<NaiveDate>,
     events: Signal<Vec<Event>>,
     calendars: Signal<Vec<Calendar>>,
+    /// The list has come, so an empty one means none.
+    calendars_read: Signal<bool>,
     range_turn: Latest,
     open_turn: Latest,
     loading: Signal<bool>,
@@ -219,7 +221,10 @@ async fn search(b: Bridge, m: Cal, query: String) {
 
 async fn load_calendars(b: Bridge, m: Cal) {
     match read(&b, "gws_cal_list", json!({})).await {
-        Ok(v) => m.calendars.set(calendars_in(&v)),
+        Ok(v) => {
+            m.calendars.set(calendars_in(&v));
+            m.calendars_read.set(true);
+        }
         Err(e) => {
             if let Some(line) = failed(m, e) {
                 m.problem.set(Some(line));
@@ -667,6 +672,14 @@ fn main_area(b: Bridge, m: Cal) -> impl IntoElement {
         .child(header(b, m))
         .child(notice(m))
         .child(dynamic(move || {
+            // the list says so itself, and an open event isn't an empty view
+            if matches!(pane.get(), Pane::Days | Pane::Month) {
+                view().child(grid::nothing(m))
+            } else {
+                view()
+            }
+        }))
+        .child(dynamic(move || {
             let b = pick.clone();
             let body = view().app_class(Some("flex-1".into()));
             match pane.get() {
@@ -857,6 +870,7 @@ pub fn build(bridge: Bridge) -> Root {
             anchor: signal(today()),
             events: signal(Vec::new()),
             calendars: signal(Vec::new()),
+            calendars_read: signal(false),
             range_turn: Latest::new(),
             open_turn: Latest::new(),
             loading: signal(true),

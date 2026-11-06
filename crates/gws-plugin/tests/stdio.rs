@@ -792,6 +792,201 @@ fn a_chats_drive_search_offers_the_files_card_through_the_real_server() {
     let _ = std::fs::remove_dir_all(&data);
 }
 
+/// The routines as the host runs them, through the real server: its query with
+/// a routine's origin, and the turn after it.
+#[cfg(feature = "stub")]
+#[test]
+fn every_routine_finds_its_items_and_its_turn_can_only_read() {
+    use gws_fake_google::{FakeFile, FakeGoogle, GOOGLE_DOC, Seed};
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let google = FakeGoogle::start(Seed::demo(3).with_calendar_around(now));
+    google.seed_file(FakeFile::new("drv-r", "Fake roof quote", GOOGLE_DOC).holding(b"Fake words"));
+    let manifest = manifest_file("routines");
+    let m: Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    let data = std::env::temp_dir().join(format!("gws-stdio-routines-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+        .arg("mcp")
+        .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
+        .env("GWS_STUB_BASE", google.base())
+        .env("GWS_DATA_DIR", &data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut id = 1;
+    let mut ask = |name: &str, args: Value, caller: Value| -> Value {
+        id += 1;
+        writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args, "_meta": {"buwiz/caller": caller}}})).unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["id"], id, "{line}");
+        v["result"].clone()
+    };
+    let provision = provision();
+    ask(
+        "buwiz.provision",
+        provision["params"]["arguments"].clone(),
+        json!({}),
+    );
+    ask(
+        "buwiz.account.set",
+        json!({"account": "google", "label": "default", "subject": FAKE_SUBJECT, "scopes": ["https://www.googleapis.com/auth/gmail.modify", "https://www.googleapis.com/auth/calendar.events", "https://www.googleapis.com/auth/drive"], "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}),
+        json!({}),
+    );
+
+    // words the fake holds, as a person's settings would give them
+    let words = |routine: &str| match routine {
+        "watch-mail" => json!({"query": "from:ana"}),
+        "watch-events" => json!({"query": "signed copy"}),
+        "watch-files" => json!({"query": "roof"}),
+        _ => json!({}),
+    };
+    for r in m["routines"].as_array().unwrap() {
+        let routine = r["id"].as_str().unwrap();
+        let params = words(routine);
+        // what the host sends: `{...query.args, ...params}`, as `items_of` does
+        let mut args = r["query"]["args"].clone();
+        if args.is_null() {
+            args = json!({});
+        }
+        for (k, v) in params.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        let caller = json!({"origin": "routine", "plugin": "app.buwiz.google-workspace", "routine": routine, "instance": "i1", "params": params});
+        let found = ask(r["query"]["tool"].as_str().unwrap(), args, caller);
+        assert_ne!(found["isError"], true, "{routine}: {found}");
+        let answer = &found["structuredContent"];
+        let field = r["query"]["field"].as_str().unwrap();
+        assert!(
+            answer[field].as_str().is_some_and(|t| !t.is_empty()),
+            "{routine}: the host stops at an empty {field}: {answer}"
+        );
+        assert_eq!(
+            found.get("_meta"),
+            None,
+            "{routine} has no one to show it to"
+        );
+        let items = answer["items"].as_array().expect("the host needs items");
+        for item in items {
+            assert!(item["id"].is_string(), "{routine}: {item}");
+        }
+        assert!(!items.is_empty(), "{routine} found nothing to prove");
+    }
+
+    // the turn: it reads, and every draft and write stops, drafts included
+    let turn = json!({"origin": "agent", "plugin": "app.buwiz.google-workspace", "routine": "new-mail", "instance": "i1", "params": {}});
+    let read = ask(
+        "gws_search_mail",
+        json!({"query": "from:ana"}),
+        turn.clone(),
+    );
+    assert_ne!(read["isError"], true, "{read}");
+    let tools = [
+        ("gws_mail_draft_save", json!({"subject": "Stolen"})),
+        ("gws_mail_send", json!({"draft": "d1"})),
+        ("gws_mail_send_arm", json!({})),
+        ("gws_mail_trash", json!({"threads": ["t1"]})),
+        (
+            "gws_event_draft",
+            json!({"title": "Stolen", "start": "2026-11-10T12:00:00+08:00", "end": "2026-11-10T13:00:00+08:00"}),
+        ),
+        ("gws_event_save", json!({"title": "Stolen"})),
+        (
+            "gws_drive_share",
+            json!({"id": "drv-r", "add": [{"email": "ana@example.com", "role": "writer"}], "seen": "x"}),
+        ),
+        ("gws_drive_trash", json!({"ids": ["drv-r"]})),
+    ];
+    for (name, args) in tools {
+        let refused = ask(name, args, turn.clone());
+        assert_eq!(refused["isError"], true, "{name}: {refused}");
+        assert_eq!(
+            refused["structuredContent"]["code"], "permission_denied",
+            "{name}: {refused}"
+        );
+    }
+    drop(ask);
+    drop(stdin);
+    child.wait().unwrap();
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// Accounts as the Bot pushes them, one at a time, through the real server, on
+/// a store that holds them from a run before. The process ends well before the
+/// pushes count as finished, so nothing may have gone.
+#[test]
+fn pushes_one_at_a_time_leave_the_accounts_not_pushed_yet() {
+    for who in [
+        vec!["a@example.com", "b@example.com"],
+        vec!["a@example.com", "b@example.com", "c@example.com"],
+    ] {
+        let manifest = manifest_file(&format!("pushes-{}", who.len()));
+        let data = std::env::temp_dir().join(format!(
+            "gws-stdio-pushes-{}-{}",
+            who.len(),
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data);
+        let paths = gws_store::Paths::in_dir(&data);
+        let provision = provision();
+        let seed = provision["params"]["arguments"]["key"]["seed"]
+            .as_str()
+            .unwrap();
+        let key = gws_store::key_from_seed(seed);
+        let store = gws_store::Store::open(&paths, &key).unwrap();
+        for account in &who {
+            store.set_state(account, "mark", "kept").unwrap();
+        }
+        drop(store);
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_buwiz-gws"))
+            .arg("mcp")
+            .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
+            .env("GWS_DATA_DIR", &data)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        writeln!(stdin, "{provision}").unwrap();
+        stdout.read_line(&mut line).unwrap();
+        for (at, account) in who.iter().enumerate() {
+            let push = json!({"jsonrpc": "2.0", "id": at + 2, "method": "tools/call", "params": {"name": "buwiz.account.set", "arguments": {"account": "google", "label": account, "provider": "google", "subject": account, "scopes": [], "access_token": "fake-access-1", "token_type": "Bearer", "expires_at": 4_000_000_000u64}, "_meta": {"buwiz/caller": {"origin": "agent"}}}});
+            writeln!(stdin, "{push}").unwrap();
+            line.clear();
+            stdout.read_line(&mut line).unwrap();
+            let v: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                v["result"]["structuredContent"],
+                json!({"ok": true}),
+                "{line}"
+            );
+            let store = gws_store::Store::open(&paths, &key).unwrap();
+            for each in &who {
+                assert!(
+                    store.state(each, "mark").unwrap().is_some(),
+                    "{each} went at the push of {account}"
+                );
+            }
+        }
+        drop(stdin);
+        child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&data);
+    }
+}
+
 /// A person's press, through the real server: an app's call from an open the
 /// plugin certified. `_meta` has to reach stdout from a call that was never a
 /// chat's, and the model and a routine must not get so far.

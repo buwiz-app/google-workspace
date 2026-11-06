@@ -248,6 +248,8 @@ fn a_hostile_name_never_gets_out_of_its_folder() {
         google.seed_file(FakeFile::new(&format!("drv-h{n}"), name, DOCX).holding(b"PK"));
     }
     let home = Home::new(&google.base(), "hostile");
+    // a push no longer opens the store, and what's to compare is what's in it
+    drop(home.core.store().unwrap());
     let before: Vec<PathBuf> = every_path(&home.dir)
         .into_iter()
         .filter(|p| !p.starts_with(home.open_dir()))
@@ -942,6 +944,29 @@ fn a_sweep_after_sign_out_leaves_unsaved_work() {
     home.later(LIFE_MS * 3);
     gws::files::sweep(&home.core);
     assert_eq!(fs::read(&edited).unwrap(), b"PK mine");
+}
+
+/// Whatever the pushes do, in whatever order, and whatever is cleared after
+/// the last: what was edited here stays, for its account to come back to.
+#[test]
+fn unsaved_work_stays_through_pushes_and_the_clear_after_them() {
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(a_docx("drv-a"));
+    let home = Home::new(&google.base(), "pushes");
+    let edited = home.open("drv-a");
+    fs::write(&edited, b"PK mine").unwrap();
+    home.sign_out();
+    for (label, who) in [("one", "one@example.com"), ("two", "two@example.com")] {
+        let mut next = push(who);
+        next["label"] = json!(label);
+        home.core.account("buwiz.account.set", &next);
+        gws::mail::finish_wipes(&home.core);
+    }
+    home.later(gws::mail::SETTLE_MS);
+    gws::mail::finish_wipes(&home.core);
+    assert_eq!(fs::read(&edited).unwrap(), b"PK mine");
+    home.core.account("buwiz.account.set", &push(FAKE_EMAIL));
+    assert_eq!(home.edits().len(), 1, "back for the person to answer");
 }
 
 #[test]

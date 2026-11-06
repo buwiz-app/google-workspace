@@ -4,7 +4,7 @@
 //! by a search, and for a thread not yet opened.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -349,10 +349,11 @@ fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
     Ok(ok(json!({"rows": rows, "more": more, "saved": saved})))
 }
 
-/// Wakes the sync, and remembers when a screen last asked for something.
+/// Wakes the sync, remembers when a screen last asked for something, and when
+/// it next has to look whatever else happens.
 #[derive(Default)]
 pub struct Waker {
-    state: Mutex<(bool, Option<Instant>)>,
+    state: Mutex<(bool, Option<Instant>, Option<Instant>)>,
     bell: Condvar,
     stop: AtomicBool,
 }
@@ -377,6 +378,12 @@ impl Waker {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).1 = Some(Instant::now());
     }
 
+    /// Wakes the sync `after` this long, in place of any such time set before.
+    pub(crate) fn wake_after(&self, after: Duration) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).2 = Some(Instant::now() + after);
+        self.bell.notify_all();
+    }
+
     fn wait(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let every = if state.1.is_some_and(|at| at.elapsed() < LINGER) {
@@ -384,6 +391,9 @@ impl Waker {
         } else {
             IDLE
         };
+        let every = state.2.map_or(every, |at| {
+            every.min(at.saturating_duration_since(Instant::now()))
+        });
         if !state.0 {
             state = self
                 .bell
@@ -392,6 +402,52 @@ impl Waker {
                 .0;
         }
         state.0 = false;
+        if state.2.is_some_and(|at| at <= Instant::now()) {
+            state.2 = None;
+        }
+    }
+}
+
+/// How long the Bot's pushes must have stopped before they count as finished.
+/// It sends them one at a time, and can refresh a token between two.
+pub const SETTLE_MS: i64 = 60_000;
+/// Past [`SETTLE_MS`], so the wake lands after the wait is over and not on it.
+const SETTLE_PAD: Duration = Duration::from_millis(50);
+
+/// Whether the Bot's pushes have finished. Only then does an account nobody
+/// pushed count as signed out: until the last one, it may just be next in line.
+pub struct Settle {
+    wait_ms: AtomicI64,
+    last_ms: AtomicI64,
+    /// A push came, and what nobody holds hasn't been cleared since.
+    owed: AtomicBool,
+}
+
+impl Default for Settle {
+    fn default() -> Self {
+        Self {
+            wait_ms: AtomicI64::new(SETTLE_MS),
+            last_ms: AtomicI64::new(0),
+            owed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Settle {
+    /// A test's shorter wait.
+    pub fn wait_for(&self, ms: i64) {
+        self.wait_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// A push came now. Says how long until they may have finished.
+    pub(crate) fn pushed(&self, now_ms: i64) -> Duration {
+        self.last_ms.store(now_ms, Ordering::Relaxed);
+        self.owed.store(true, Ordering::Relaxed);
+        Duration::from_millis(self.wait_ms.load(Ordering::Relaxed).max(0) as u64) + SETTLE_PAD
+    }
+
+    fn quiet(&self, now_ms: i64) -> bool {
+        now_ms - self.last_ms.load(Ordering::Relaxed) >= self.wait_ms.load(Ordering::Relaxed)
     }
 }
 
@@ -442,12 +498,37 @@ pub fn reconcile(core: &Core) -> bool {
     cleared
 }
 
-/// Finishes a wipe that failed earlier, in this run or a past one. Not before
-/// the Bot's first push: until then nobody looks signed in, and everyone's mail
-/// would go.
-fn finish_wipes(core: &Core) {
-    let due = core.paths.as_ref().is_ok_and(|p| p.wipe_pending().exists());
-    if due && core.pushed.load(Ordering::Relaxed) {
+/// A sign-in of `account` ended: unless another holds it, its own mail goes now,
+/// and no one else's, as the Bot may have pushes still to come. False if it
+/// couldn't, and then the marker has it cleared with the rest.
+pub(crate) fn forget(core: &Core, account: &str) -> bool {
+    let cleared = with_store(core, |store| {
+        if !core.accounts.holds(account) {
+            crate::files::forget_account(core, store, account)?;
+            store.forget_account(account)?;
+        }
+        Ok(())
+    })
+    .is_ok();
+    if !cleared
+        && let Ok(paths) = &core.paths
+        && std::fs::write(paths.wipe_pending(), b"").is_err()
+    {
+        eprintln!("buwiz-gws: couldn't keep track of a mail wipe");
+    }
+    cleared
+}
+
+/// Clears what no sign-in holds, once the Bot's pushes have finished, and with
+/// it a wipe that failed earlier, in this run or a past one. Not before the
+/// first push: until then nobody looks signed in, and everyone's mail would go.
+pub fn finish_wipes(core: &Core) {
+    if !core.pushed.load(Ordering::Relaxed) || !core.settle.quiet(core.clock.now_ms()) {
+        return;
+    }
+    let failed = core.paths.as_ref().is_ok_and(|p| p.wipe_pending().exists());
+    // taken first: a push from here on is owed a clear of its own
+    if core.settle.owed.swap(false, Ordering::Relaxed) || failed {
         reconcile(core);
     }
 }
@@ -1075,6 +1156,153 @@ mod tests {
             json!({"account": "google", "label": "default"})
         }
 
+        /// As long after the last push as it takes to count as the last.
+        fn pushes_stop(core: &Core) {
+            core.clock.set(core.clock.now_ms() + SETTLE_MS);
+            finish_wipes(core);
+        }
+
+        const AT: i64 = 1_800_000_000_000;
+
+        fn push(core: &Core, who: &str) {
+            let mut args = sign_in(who);
+            args["label"] = json!(who);
+            let said = core.account("buwiz.account.set", &args);
+            assert_eq!(said["structuredContent"], json!({"ok": true}), "{said}");
+        }
+
+        /// A store that was left holding `who`, each with a mark to look for.
+        fn left_with(paths: &gws_store::Paths, who: &[&str]) {
+            let core = Core::new(&Apis::at("http://127.0.0.1:1"), Ok(paths.clone()));
+            core.unlock("seed");
+            with_store(&core, |s| {
+                who.iter()
+                    .try_for_each(|account| s.set_state(account, "mark", "kept"))
+            })
+            .unwrap();
+        }
+
+        fn marked(core: &Core, who: &str) -> bool {
+            with_store(core, |s| s.state(who, "mark"))
+                .unwrap()
+                .is_some()
+        }
+
+        /// One at a time, with a sync after each as the push wakes one: nothing
+        /// goes while one is still to come, however long a push takes to arrive.
+        fn pushed_one_at_a_time(who: &[&str], tag: &str) {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let paths = dir(tag);
+            left_with(&paths, who);
+            let core = core(&google, &paths);
+            core.clock.set(AT);
+            for (at, account) in who.iter().enumerate() {
+                push(&core, account);
+                let _ = sync(&core);
+                for each in who {
+                    assert!(marked(&core, each), "{each} went at push {at}");
+                }
+                core.clock.set(core.clock.now_ms() + SETTLE_MS - 1);
+                finish_wipes(&core);
+                for each in who {
+                    assert!(marked(&core, each), "{each} went after push {at}");
+                }
+            }
+            pushes_stop(&core);
+            for each in who {
+                assert!(marked(&core, each), "{each} is signed in");
+            }
+        }
+
+        #[test]
+        fn two_accounts_pushed_one_at_a_time_both_stay() {
+            pushed_one_at_a_time(&["a@example.com", "b@example.com"], "two");
+        }
+
+        #[test]
+        fn three_accounts_pushed_one_at_a_time_all_stay() {
+            pushed_one_at_a_time(
+                &["a@example.com", "b@example.com", "c@example.com"],
+                "three",
+            );
+        }
+
+        #[test]
+        fn an_account_nobody_pushed_goes_only_after_the_last_push() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let paths = dir("after-last");
+            let (a, b, gone) = ("a@example.com", "b@example.com", "gone@example.com");
+            left_with(&paths, &[a, b, gone]);
+            let core = core(&google, &paths);
+            core.clock.set(AT);
+            push(&core, a);
+            let _ = sync(&core);
+            assert!(marked(&core, gone) && marked(&core, b));
+            core.clock.set(AT + SETTLE_MS - 1);
+            push(&core, b);
+            core.clock.set(AT + SETTLE_MS);
+            let _ = sync(&core);
+            assert!(marked(&core, gone), "the wait starts over at each push");
+            pushes_stop(&core);
+            assert!(marked(&core, a) && marked(&core, b));
+            assert!(!marked(&core, gone), "nobody pushed it");
+        }
+
+        #[test]
+        fn a_sign_out_takes_its_own_mail_at_once_and_nobody_elses() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let paths = dir("own-only");
+            let (a, b, later) = ("a@example.com", "b@example.com", "later@example.com");
+            left_with(&paths, &[a, b, later]);
+            let core = core(&google, &paths);
+            core.clock.set(AT);
+            push(&core, a);
+            push(&core, b);
+            core.account(
+                "buwiz.account.clear",
+                &json!({"account": "google", "label": a}),
+            );
+            assert!(!marked(&core, a), "it doesn't outlive the sign-in");
+            assert!(marked(&core, b) && marked(&core, later));
+        }
+
+        #[test]
+        fn a_second_sign_in_of_one_account_keeps_it_through_a_sign_out() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let paths = dir("two-labels");
+            left_with(&paths, &[OWNER]);
+            let core = core(&google, &paths);
+            let mut other = sign_in(OWNER);
+            other["label"] = json!("work");
+            core.account("buwiz.account.set", &sign_in(OWNER));
+            core.account("buwiz.account.set", &other);
+            core.account("buwiz.account.clear", &out());
+            assert!(marked(&core, OWNER));
+        }
+
+        /// Nothing else may have to come along for the last clear to happen.
+        #[test]
+        fn the_sync_thread_clears_by_itself_once_the_pushes_stop() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let paths = dir("thread");
+            let (a, gone) = ("a@example.com", "gone@example.com");
+            left_with(&paths, &[a, gone]);
+            let core = Arc::new(core(&google, &paths));
+            core.settle.wait_for(300);
+            let thread = start(core.clone());
+            push(&core, a);
+            assert!(marked(&core, gone), "not yet");
+            let by = Instant::now() + Duration::from_secs(10);
+            while marked(&core, gone) && Instant::now() < by {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let cleared = !marked(&core, gone);
+            core.sync.stop();
+            thread.join().unwrap();
+            assert!(cleared, "nothing woke the clear");
+            assert!(marked(&core, a));
+        }
+
         #[test]
         fn nothing_lands_after_a_sign_out_however_late_it_arrives() {
             let google = FakeGoogle::start(Seed::demo(6));
@@ -1113,7 +1341,10 @@ mod tests {
             let _ = sync(&second);
             assert!(rows(&second) > 0, "the Bot hasn't pushed anything yet");
             second.account("buwiz.account.set", &sign_in("other@example.com"));
-            assert_eq!(rows(&second), 0, "the first push cleared it");
+            let _ = sync(&second);
+            assert!(rows(&second) > 0, "the Bot may have more pushes to come");
+            pushes_stop(&second);
+            assert_eq!(rows(&second), 0, "the last push cleared it");
             assert!(!paths.wipe_pending().exists());
         }
 
@@ -1131,7 +1362,7 @@ mod tests {
             let _ = sync(&second);
             assert!(rows(&second) > 0, "no push yet, so nobody's mail goes");
             second.account("buwiz.account.set", &sign_in(OWNER));
-            let _ = sync(&second);
+            pushes_stop(&second);
             assert!(rows(&second) > 0, "the owner is signed in");
             assert!(!paths.wipe_pending().exists());
         }
@@ -1149,7 +1380,7 @@ mod tests {
             let second = core(&google, &paths);
             let refused = second.account("buwiz.account.set", &json!({"account": "google"}));
             assert_eq!(refused["isError"], true, "{refused}");
-            let _ = sync(&second);
+            pushes_stop(&second);
             assert!(paths.wipe_pending().exists(), "the wipe still waits");
         }
 
@@ -1165,6 +1396,7 @@ mod tests {
             let second = core(&google, &paths);
             assert!(rows(&second) > 0);
             second.account("buwiz.account.clear", &out());
+            pushes_stop(&second);
             assert_eq!(rows(&second), 0);
         }
 

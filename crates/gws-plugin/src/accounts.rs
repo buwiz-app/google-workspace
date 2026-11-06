@@ -89,6 +89,12 @@ impl Accounts {
         self.held().who.values().any(|who| who == subject)
     }
 
+    /// Whose sign-in `args` name, if it's one held here.
+    pub fn subject_of(&self, args: &Value) -> Option<String> {
+        let label = args.get("label").and_then(Value::as_str)?;
+        self.held().who.get(label).cloned()
+    }
+
     /// Whether anyone is signed in, live or expired.
     pub fn any(&self) -> bool {
         !self.held().who.is_empty()

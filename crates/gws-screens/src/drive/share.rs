@@ -320,7 +320,7 @@ fn people(m: Drive) -> impl IntoElement {
             ));
         gone.into_iter().fold(list, |list, p| {
             let id = p.id.clone();
-            let keep = press("Keep this person", &p.who, move || {
+            let keep = press_as("Keep this person", "Keep".to_owned(), &p.who, move || {
                 s.leaving.update(|l| {
                     l.remove(&id);
                 });
@@ -330,7 +330,8 @@ fn people(m: Drive) -> impl IntoElement {
     })
 }
 
-fn role_press(m: Drive, role: &'static str, label: &'static str) -> View {
+/// Fewer words than its label: a role the AI chose would go at the person's Add.
+fn role_press(m: Drive, role: &'static str, label: &'static str, shows: &'static str) -> View {
     let s = m.sharing;
     view()
         .app_class(move || {
@@ -345,7 +346,7 @@ fn role_press(m: Drive, role: &'static str, label: &'static str) -> View {
         })
         .label(label)
         .on_press(move || s.role.set(role))
-        .child(text(label).app_class(Some(format!("text-[12px] {INK}").into())))
+        .child(text(shows).app_class(Some(format!("text-[12px] {INK}").into())))
 }
 
 /// The address and the role of someone new. A folder's people view or edit: what
@@ -355,12 +356,12 @@ fn adder(m: Drive, folder: bool) -> View {
     let roles = ROLES.iter().filter(|r| !folder || **r != "commenter").fold(
         view().app_class(Some("flex-row flex-wrap items-center gap-1".into())),
         |row, role| {
-            let label = match *role {
-                "reader" => "Can view",
-                "commenter" => "Can comment",
-                _ => "Can edit",
+            let (label, shows) = match *role {
+                "reader" => ("Can view", "View"),
+                "commenter" => ("Can comment", "Comment"),
+                _ => ("Can edit", "Edit"),
             };
-            row.child(role_press(m, role, label))
+            row.child(role_press(m, role, label, shows))
         },
     );
     view()

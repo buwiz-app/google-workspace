@@ -110,7 +110,8 @@ impl Store {
     pub fn accounts(&self) -> Result<Vec<String>> {
         let mut q = self.conn.prepare(
             "SELECT account FROM state UNION SELECT account FROM labels \
-             UNION SELECT account FROM threads UNION SELECT account FROM bodies",
+             UNION SELECT account FROM threads UNION SELECT account FROM bodies \
+             UNION SELECT account FROM calendars UNION SELECT account FROM events",
         )?;
         let accounts = q
             .query_map([], |r| r.get(0))?
@@ -123,7 +124,15 @@ impl Store {
     /// unsaved work.
     pub fn forget_account(&self, account: &str) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        for table in ["bodies", "thread_labels", "threads", "labels", "state"] {
+        for table in [
+            "bodies",
+            "thread_labels",
+            "threads",
+            "labels",
+            "events",
+            "calendars",
+            "state",
+        ] {
             tx.execute(&format!("DELETE FROM {table} WHERE account = ?"), [account])?;
         }
         tx.commit()?;

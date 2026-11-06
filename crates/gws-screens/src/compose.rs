@@ -18,11 +18,8 @@ use nsh_core::prelude::*;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::shell::{Job, Latest, MUTE, RETRIES, backoff, sleep};
+use crate::shell::{INK, Job, LINE, Latest, MUTE, RAIL, RETRIES, backoff, sleep};
 
-const INK: &str = "text-[#1c1c1c] dark:text-[#f0f0f0]";
-const LINE: &str = "border-black/10 dark:border-[#2b2b2b]";
-const RAIL: &str = "bg-[#efefec] dark:bg-[#0f0f0f]";
 const FIELD: &str = "border-b px-3 py-1.5 text-[13px]";
 
 /// How long Send can still be taken back.
@@ -37,7 +34,7 @@ const AUTOSAVE: Duration = Duration::from_secs(2);
 const CHUNK: usize = 180 * 1024;
 const ATTACHMENTS_MAX: u64 = 25 * 1024 * 1024;
 /// How long typing rests before asking who it could be.
-const SUGGEST_AFTER: Duration = Duration::from_millis(200);
+pub(crate) const SUGGEST_AFTER: Duration = Duration::from_millis(200);
 
 /// A file in the message: uploaded here, or already in the saved draft.
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -939,7 +936,11 @@ fn suggestions(c: Compose) -> impl IntoElement {
 }
 
 /// The press that sends: the one thing here that should stand out.
-fn press_send_button(label: &'static str, shows: &'static str, press: impl Fn() + 'static) -> View {
+pub(crate) fn press_send_button(
+    label: &'static str,
+    shows: &'static str,
+    press: impl Fn() + 'static,
+) -> View {
     view()
         .app_class(Some("px-4 py-1 rounded-md bg-[#2563eb]".into()))
         .label(label)
@@ -947,7 +948,11 @@ fn press_send_button(label: &'static str, shows: &'static str, press: impl Fn() 
         .child(text(shows).app_class(Some("text-[12px] font-semibold text-white".into())))
 }
 
-fn press_text(label: &'static str, shows: &'static str, press: impl Fn() + 'static) -> View {
+pub(crate) fn press_text(
+    label: &'static str,
+    shows: &'static str,
+    press: impl Fn() + 'static,
+) -> View {
     view()
         .app_class(Some("px-3 py-1".into()))
         .label(label)
@@ -1196,7 +1201,7 @@ async fn read_card(
     Ok(())
 }
 
-fn review_line(label: &'static str, value: String) -> View {
+pub(crate) fn review_line(label: &'static str, value: String) -> View {
     view()
         .app_class(Some("flex-row gap-2 px-3 py-[2px]".into()))
         .child(text(label).app_class(Some(format!("w-[52px] text-[11px] {MUTE}").into())))

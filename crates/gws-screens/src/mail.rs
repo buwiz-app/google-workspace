@@ -7,7 +7,6 @@
 //! The Bot's `agent_hub::filter` tests hold that on the bytes it sends.
 
 use std::collections::HashSet;
-use std::time::Duration;
 
 use buwiz_app::{Bridge, Placement};
 use chrono::{Local, TimeZone as _, Utc};
@@ -16,21 +15,14 @@ use nsh_core::element::{Root, dark, input};
 use nsh_core::prelude::*;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
-use url::Url;
 
 use crate::compose::{self, Compose};
 use crate::reader;
-use crate::shell::{BG, Job, Latest, MUTE, RETRIES, backoff, sleep};
+use crate::shell::{
+    BG, CHOSEN, DIM, INK, Job, LINE, Latest, MUTE, PANEL, POLL, RAIL, link_bar, once, read, sleep,
+};
 
-const INK: &str = "text-[#1c1c1c] dark:text-[#f0f0f0]";
-const RAIL: &str = "bg-[#efefec] dark:bg-[#0f0f0f]";
-const PANEL: &str = "bg-white dark:bg-[#1d1d1d]";
-const LINE: &str = "border-black/10 dark:border-[#2b2b2b]";
-const CHOSEN: &str = "bg-[#e1ebfb] dark:bg-[#15253f]";
-const DIM: &str = "text-[#8a8a8a] dark:text-[#6e6e6e]";
 const ROW_HEIGHT: f32 = 52.0;
-/// How often an open screen asks whether the store changed.
-const POLL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, PartialEq, Default, Debug)]
 pub struct Row {
@@ -227,31 +219,6 @@ struct Mail {
     problem: Signal<Option<String>>,
     seq: Signal<i64>,
     help: Signal<bool>,
-}
-
-/// A write through the bridge, tried once: a person's action can't be sent
-/// again on a guess that the first try did nothing.
-async fn once(b: &Bridge, tool: &str, args: Value) -> Result<Value, String> {
-    b.call(tool, args).await.map_err(|e| {
-        if e.message.contains("Sign in to Google") {
-            "sign-in".to_owned()
-        } else {
-            e.message
-        }
-    })
-}
-
-/// A read through the bridge, tried again while the answer is only busy.
-async fn read(b: &Bridge, tool: &str, args: Value) -> Result<Value, String> {
-    for attempt in 0.. {
-        match b.call(tool, args.clone()).await {
-            Ok(v) => return Ok(v),
-            Err(e) if e.retryable && attempt < RETRIES => sleep(backoff(attempt)).await,
-            Err(e) if e.message.contains("Sign in to Google") => return Err("sign-in".to_owned()),
-            Err(e) => return Err(e.message),
-        }
-    }
-    Err("That didn't work. Try again.".to_owned())
 }
 
 /// What the list shows now, as `gws_mail_list` asks for it.
@@ -1116,68 +1083,6 @@ fn undo_bar(b: Bridge, m: Mail) -> impl IntoElement {
     })
 }
 
-/// Where a link really goes, always shown whole, however long the rest is.
-fn goes_to(link: &str) -> String {
-    let Ok(url) = Url::parse(link) else {
-        return link.to_owned();
-    };
-    match (url.host_str(), url.port()) {
-        (Some(host), Some(port)) => format!("{host}:{port}"),
-        (Some(host), None) => host.to_owned(),
-        (None, _) => url.path().to_owned(),
-    }
-}
-
-/// The confirm a link needs: where it goes, and the address, before it opens.
-fn link_bar(m: Mail) -> impl IntoElement {
-    dynamic(move || match m.link.get() {
-        None => view(),
-        Some(url) => {
-            let target = url.clone();
-            view()
-                .app_class(Some(
-                    format!("flex-row items-center gap-3 px-3 py-2 border-t {LINE} {RAIL}").into(),
-                ))
-                .child(
-                    view()
-                        .app_class(Some("flex-1 gap-[2px]".into()))
-                        .child(
-                            text(format!("Open {}?", goes_to(&url)))
-                                .app_class(Some(format!("text-[12px] {INK}").into())),
-                        )
-                        .child(
-                            text(url.clone())
-                                .number_of_lines(2)
-                                .app_class(Some(format!("text-[11px] {MUTE}").into())),
-                        ),
-                )
-                .child(
-                    view()
-                        .app_class(Some(
-                            "px-3 py-1 rounded-md bg-[#2f6fd6] dark:bg-[#7fb2ff]".into(),
-                        ))
-                        .label("Open this link")
-                        .on_press(move || {
-                            m.link.set(None);
-                            drop(open_url(target.clone()));
-                        })
-                        .child(
-                            text("Open").app_class(Some(
-                                "text-[12px] text-white dark:text-[#10151c]".into(),
-                            )),
-                        ),
-                )
-                .child(
-                    view()
-                        .app_class(Some("px-3 py-1".into()))
-                        .label("Don't open this link")
-                        .on_press(move || m.link.set(None))
-                        .child(text("Cancel").app_class(Some(format!("text-[12px] {INK}").into()))),
-                )
-        }
-    })
-}
-
 fn keys(b: Bridge, m: Mail) {
     let here = move || {
         let chosen = m.chosen.get_untracked()?;
@@ -1613,7 +1518,7 @@ pub fn build(bridge: Bridge) -> Root {
                     )
                     .child(compose::hold_bar(holding.clone(), writer))
                     .child(undo_bar(undoing.clone(), m))
-                    .child(link_bar(m))
+                    .child(link_bar(m.link))
                     .child(dynamic(move || {
                         if m.help.get() {
                             view().child(help_view())
@@ -1628,15 +1533,6 @@ pub fn build(bridge: Bridge) -> Root {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_link_names_its_real_host_however_long_the_rest() {
-        let long = format!("https://real.example/{}", "a/".repeat(500));
-        assert_eq!(goes_to(&long), "real.example");
-        assert_eq!(goes_to("http://127.0.0.1:8822/x?y=1"), "127.0.0.1:8822");
-        assert_eq!(goes_to("https://xn--80ak6aa92e.com/"), "xn--80ak6aa92e.com");
-        assert_eq!(goes_to("mailto:ana@example.com"), "ana@example.com");
-    }
 
     #[test]
     fn the_column_is_the_system_boxes_then_the_persons_labels() {

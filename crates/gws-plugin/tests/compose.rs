@@ -615,6 +615,23 @@ fn suggested(core: &Core, query: &str) -> Vec<String> {
 }
 
 #[test]
+fn calendar_gets_contacts_and_no_one_from_the_mail() {
+    let google = FakeGoogle::start(Seed::demo(12));
+    let core = signed_in(&google, "invitees");
+    core.unlock("a-seed");
+    gws::mail::sync(&core).unwrap();
+    assert_eq!(
+        suggested(&core, "ana"),
+        ["ana@example.com"],
+        "mail knows Ana"
+    );
+    let found =
+        |query: &str| data(core.run("gws_cal_people", &json!({"query": query})))["people"].clone();
+    assert_eq!(found("ana"), json!([]), "Calendar reads no mail");
+    assert_eq!(found("zed")[0]["address"], "zed@contacts.example");
+}
+
+#[test]
 fn suggestions_come_from_mail_and_contacts_and_leave_out_the_person() {
     let google = FakeGoogle::start(Seed::demo(12));
     let core = signed_in(&google, "people");

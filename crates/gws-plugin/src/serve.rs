@@ -376,7 +376,9 @@ mod tests {
         // a draft it fills sends nothing: Send is the person's
         let writes: Vec<&str> = tools::defs()
             .iter()
-            .filter(|d| !d.read_only && d.name != tools::MAIL_DRAFT_SAVE)
+            .filter(|d| {
+                !d.read_only && d.name != tools::MAIL_DRAFT_SAVE && d.name != tools::EVENT_DRAFT
+            })
             .map(|d| d.name)
             .collect();
         for name in [
@@ -388,6 +390,11 @@ mod tests {
             "gws_mail_draft_delete",
             "gws_mail_send_arm",
             "gws_mail_send",
+            "gws_event_save",
+            "gws_event_delete",
+            "gws_event_restore",
+            "gws_event_rsvp",
+            "gws_cal_show",
         ] {
             assert!(writes.contains(&name), "{name}");
         }
@@ -397,6 +404,27 @@ mod tests {
             assert!(!audience_allows(name, Origin::Routine), "{name}");
             assert!(!audience_allows(name, Origin::Unknown), "{name}");
         }
+    }
+
+    /// Exactly these, so a new tool can't reach the model by being left open.
+    #[test]
+    fn the_models_list_is_the_reads_and_drafts_it_was_given() {
+        let mut list: Vec<&str> = tools::defs()
+            .iter()
+            .filter(|d| audience_allows(d.name, Origin::Agent))
+            .map(|d| d.name)
+            .collect();
+        list.sort_unstable();
+        assert_eq!(
+            list,
+            [
+                "gws_event_draft",
+                "gws_mail_draft_save",
+                "gws_read_mail",
+                "gws_search_events",
+                "gws_search_mail"
+            ]
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@
 pub struct Apis {
     pub gmail: String,
     pub people: String,
+    pub calendar: String,
 }
 
 /// Names the stub Google, in a `stub` build.
@@ -17,6 +18,7 @@ impl Apis {
         Self {
             gmail: crate::gmail::GMAIL_API.to_owned(),
             people: crate::gmail::PEOPLE_API.to_owned(),
+            calendar: crate::calendar::CALENDAR_API.to_owned(),
         }
     }
 
@@ -26,6 +28,7 @@ impl Apis {
         Self {
             gmail: format!("{base}/gmail/v1/users/me"),
             people: format!("{base}/people/v1"),
+            calendar: format!("{base}/calendar/v3"),
         }
     }
 
@@ -89,6 +92,10 @@ mod tests {
         assert_eq!(
             Apis::at("http://127.0.0.1:9/").gmail,
             "http://127.0.0.1:9/gmail/v1/users/me"
+        );
+        assert_eq!(
+            Apis::at("http://127.0.0.1:9/").calendar,
+            "http://127.0.0.1:9/calendar/v3"
         );
     }
 }

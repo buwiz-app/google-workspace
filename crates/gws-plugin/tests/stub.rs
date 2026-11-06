@@ -558,7 +558,7 @@ mod mail {
 
     #[test]
     fn hostile_html_arrives_clean() {
-        let google = FakeGoogle::start(Seed { only_grants: None, mails: vec![Mail { html: Some(r#"<p>hi</p><meta http-equiv=refresh content="0;url=https://evil.example/"><img src="https://evil.example/p.png"><a href="https://real.example/">go</a>"#.into()), ..fresh("aaa1") }] });
+        let google = FakeGoogle::start(Seed { mails: vec![Mail { html: Some(r#"<p>hi</p><meta http-equiv=refresh content="0;url=https://evil.example/"><img src="https://evil.example/p.png"><a href="https://real.example/">go</a>"#.into()), ..fresh("aaa1") }], ..Seed::default() });
         let core = signed_in(&google, "hostile");
         core.unlock("a-seed");
         gws::mail::sync(&core).unwrap();

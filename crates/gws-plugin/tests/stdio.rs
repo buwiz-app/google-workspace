@@ -460,6 +460,20 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
             "gws_mail_job",
             "gws_upload_chunk",
             "gws_upload_drop",
+            "gws_search_events",
+            "gws_event_draft",
+            "gws_event_draft_read",
+            "gws_cal_list",
+            "gws_cal_show",
+            "gws_cal_range",
+            "gws_cal_changes",
+            "gws_cal_next",
+            "gws_cal_people",
+            "gws_event_read",
+            "gws_event_save",
+            "gws_event_delete",
+            "gws_event_restore",
+            "gws_event_rsvp",
             "gws_resolve"
         ]
     );
@@ -591,6 +605,66 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
         !stderr.contains(TOKEN),
         "stderr never shows the token: {stderr}"
     );
+}
+
+/// What invites, cancels or answers is the person's. No token is pushed here,
+/// so a call that got through would say to sign in, and reach no Google.
+#[test]
+fn the_model_is_refused_every_calendar_write_and_never_sees_one_on_its_list() {
+    let manifest = manifest_file("calendar-writes");
+    let writes = [
+        "gws_event_save",
+        "gws_event_delete",
+        "gws_event_restore",
+        "gws_event_rsvp",
+        "gws_cal_show",
+    ];
+    let mut lines = vec![
+        json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}),
+        provision(),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+    ];
+    for (n, origin) in [(100, "agent"), (200, "routine")] {
+        for (at, tool) in writes.iter().enumerate() {
+            lines.push(json!({"jsonrpc": "2.0", "id": n + at, "method": "tools/call", "params": {"name": tool, "arguments": {"calendar": "primary", "id": "e", "start": "2026-11-02T09:00:00Z", "end": "2026-11-02T10:00:00Z", "guests": ["ana@example.com"]}, "_meta": {"buwiz/caller": {"origin": origin}}}}));
+        }
+    }
+    let (status, out, err) = run(Some(&manifest), &lines);
+    assert!(status.success(), "{err}");
+    let replies: Vec<Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let reply = |id: usize| replies.iter().find(|r| r["id"] == id).unwrap();
+    let listed = reply(2)["result"]["tools"].as_array().unwrap();
+    let for_model: Vec<&str> = listed
+        .iter()
+        .filter(|t| {
+            t["_meta"]["buwiz/audience"]
+                .as_array()
+                .is_some_and(|a| a.contains(&json!("agent")))
+        })
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        for_model,
+        [
+            "gws_search_mail",
+            "gws_read_mail",
+            "gws_mail_draft_save",
+            "gws_search_events",
+            "gws_event_draft"
+        ]
+    );
+    for n in [100, 200] {
+        for (at, tool) in writes.iter().enumerate() {
+            let answer = &reply(n + at)["result"];
+            assert_eq!(
+                answer["structuredContent"]["code"], "permission_denied",
+                "{tool}: {answer}"
+            );
+        }
+    }
 }
 
 #[test]

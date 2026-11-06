@@ -3660,8 +3660,13 @@ fn assert_budget_panel_stays(app: &Headless) {
 }
 
 fn type_new_name(app: &mut Headless, name: &str) {
-    app.clear("label:New name").unwrap();
-    app.type_text("label:New name", name).unwrap();
+    app.clear("label:New name, as it will show in Google Drive to others")
+        .unwrap();
+    app.type_text(
+        "label:New name, as it will show in Google Drive to others",
+        name,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -3694,7 +3699,10 @@ fn a_late_rename_leaves_the_same_file_opened_again_up() {
     fake.release("write:gws_drive_rename");
     settle(&mut app);
     assert_eq!(
-        app.screen().input_text("label:New name").unwrap().unwrap(),
+        app.screen()
+            .input_text("label:New name, as it will show in Google Drive to others")
+            .unwrap()
+            .unwrap(),
         "Other notes"
     );
 }
@@ -3703,7 +3711,11 @@ fn a_late_rename_leaves_the_same_file_opened_again_up() {
 fn a_late_new_folder_leaves_a_name_being_typed_since_up() {
     let (mut app, fake) = start();
     press(&mut app, "label:New folder");
-    app.type_text("label:Folder name", "Quotes").unwrap();
+    app.type_text(
+        "label:Folder name, as it will show in Google Drive to others",
+        "Quotes",
+    )
+    .unwrap();
     fake.hold("write:gws_drive_folder");
     press(&mut app, "label:Make this folder");
     press(&mut app, "label:Cancel this");
@@ -3713,7 +3725,10 @@ fn a_late_new_folder_leaves_a_name_being_typed_since_up() {
     fake.release("write:gws_drive_folder");
     settle(&mut app);
     assert_eq!(
-        app.screen().input_text("label:New name").unwrap().unwrap(),
+        app.screen()
+            .input_text("label:New name, as it will show in Google Drive to others")
+            .unwrap()
+            .unwrap(),
         "Better notes"
     );
     assert!(app.screen().shows("Made a new folder on Google Drive."));

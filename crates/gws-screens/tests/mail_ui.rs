@@ -2211,8 +2211,11 @@ fn no_autosave_is_left_behind_a_send() {
     app.wait_for_within("label:Take this back", WAIT)
         .expect("the hold shows");
     app.press("label:Take this back").expect("Undo presses");
-    app.wait_for_within("label:Message", WAIT)
-        .expect("the panel's back");
+    app.wait_for_within(
+        "label:Message, the words of this mail as they will be sent",
+        WAIT,
+    )
+    .expect("the panel's back");
     assert_eq!(fake.called("gws_mail_draft_save").len(), 1);
 }
 
@@ -2225,8 +2228,11 @@ fn an_autosave_queued_behind_keep_draft_saves_no_blank_draft() {
     app.press("label:Keep draft").expect("it presses");
     app.wait(PAST_AN_AUTOSAVE).expect("time passes");
     fake.release("gws_mail_draft_save");
-    app.wait_for_gone("label:Message", WAIT)
-        .expect("the panel closes");
+    app.wait_for_gone(
+        "label:Message, the words of this mail as they will be sent",
+        WAIT,
+    )
+    .expect("the panel closes");
     settle(&mut app);
     let saved = fake.called("gws_mail_draft_save");
     assert_eq!(saved.len(), 1, "{saved:?}");

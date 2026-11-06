@@ -884,7 +884,11 @@ pub struct Armed {
 
 struct Press {
     token: String,
+    /// Its place among the presses: only the newest on a draft may send it.
+    order: u64,
     until: Instant,
+    /// The draft it's on, as far as anyone knows yet: a letter not yet saved has none.
+    draft: Option<String>,
     /// The draft and revision it sends: known at once on a card, and after the
     /// save in the panel. Nothing else goes out on it.
     sends: Option<(String, String)>,
@@ -896,17 +900,27 @@ impl Armed {
         self.presses.retain(|p| now < p.until);
     }
 
-    /// The press now sends this. A newer press on a draft replaces any older one.
+    /// Only the newest press on `draft` stands, of those up to `order`.
+    fn newest_only(&mut self, draft: &str, order: u64) {
+        let names = |p: &Press| p.draft.as_deref() == Some(draft);
+        self.presses.retain(|p| !(names(p) && p.order < order));
+    }
+
+    /// The press now sends this. One that's been overtaken on this draft loses
+    /// here, however late its save came back.
     fn bind(&mut self, token: &str, draft: &str, revision: &str) {
-        if !self.presses.iter().any(|p| p.token == token) {
+        let Some(press) = self.presses.iter_mut().find(|p| p.token == token) else {
             return;
-        }
-        let older =
-            |p: &Press| p.token != token && p.sends.as_ref().is_some_and(|sends| sends.0 == draft);
-        self.presses.retain(|p| !older(p));
-        if let Some(press) = self.presses.iter_mut().find(|p| p.token == token) {
-            press.sends = Some((draft.to_owned(), revision.to_owned()));
-            press.until = Instant::now() + BOUND_FOR;
+        };
+        press.draft = Some(draft.to_owned());
+        press.sends = Some((draft.to_owned(), revision.to_owned()));
+        press.until = Instant::now() + BOUND_FOR;
+        let on_it = self
+            .presses
+            .iter()
+            .filter(|p| p.draft.as_deref() == Some(draft));
+        if let Some(newest) = on_it.map(|p| p.order).max() {
+            self.newest_only(draft, newest);
         }
     }
 
@@ -947,13 +961,20 @@ pub(crate) fn in_hold(core: &Core) -> bool {
 pub fn arm(core: &Core, args: &Value) -> Result<Value, Failure> {
     let mut held = armed(core);
     held.next += 1;
-    let token = format!("a{}x{:x}", held.next, nonce());
+    let order = held.next;
+    let token = format!("a{order}x{:x}", nonce());
+    let text = |k: &str| args.get(k).and_then(Value::as_str);
     held.presses.push(Press {
         token: token.clone(),
+        order,
         until: Instant::now() + ARMED_FOR,
+        draft: text("draft").map(str::to_owned),
         sends: None,
     });
-    let text = |k: &str| args.get(k).and_then(Value::as_str);
+    // a press takes over its draft at once, not when its save comes back
+    if let Some(draft) = text("draft") {
+        held.newest_only(draft, order);
+    }
     if let Some((draft, revision)) = text("draft").zip(text("revision")) {
         held.bind(&token, draft, revision);
     }
@@ -1200,16 +1221,21 @@ fn prefixed(prefix: &str, subject: &str) -> String {
 mod tests {
     use super::*;
 
+    fn press(token: &str, order: u64, draft: Option<&str>) -> Press {
+        Press {
+            token: token.to_owned(),
+            order,
+            until: Instant::now() + ARMED_FOR,
+            draft: draft.map(str::to_owned),
+            sends: None,
+        }
+    }
+
     #[test]
     fn a_press_that_knows_its_draft_stands_only_for_the_hold_and_the_send() {
         let mut held = Armed::default();
-        let press = |token: &str| Press {
-            token: token.to_owned(),
-            until: Instant::now() + ARMED_FOR,
-            sends: None,
-        };
-        held.presses.push(press("saving"));
-        held.presses.push(press("bound"));
+        held.presses.push(press("saving", 1, None));
+        held.presses.push(press("bound", 2, None));
         held.bind("bound", "d", "r");
         let left = |p: &Press| p.until.saturating_duration_since(Instant::now());
         assert!(
@@ -1228,13 +1254,42 @@ mod tests {
     #[test]
     fn a_save_with_no_press_behind_it_leaves_the_presses_alone() {
         let mut held = Armed::default();
-        held.presses.push(Press {
-            token: "a".to_owned(),
-            until: Instant::now() + BOUND_FOR,
-            sends: Some(("d".to_owned(), "r".to_owned())),
-        });
+        held.presses.push(press("a", 1, None));
+        held.bind("a", "d", "r");
         held.bind("", "d", "r2");
         assert!(held.holds("d"));
+    }
+
+    /// Its save was out when the newer press came.
+    #[test]
+    fn an_older_press_whose_save_comes_back_late_takes_nothing_from_a_newer_one() {
+        let mut held = Armed::default();
+        held.presses.push(press("older", 1, None));
+        held.presses.push(press("newer", 2, Some("d")));
+        held.bind("newer", "d", "r2");
+        held.bind("older", "d", "r1");
+        assert_eq!(held.take("older"), None, "it lost");
+        assert_eq!(held.take("newer"), Some(("d".to_owned(), "r2".to_owned())));
+    }
+
+    #[test]
+    fn a_newer_press_on_a_draft_stops_an_older_one_before_its_own_save() {
+        let mut held = Armed::default();
+        held.presses.push(press("older", 1, None));
+        held.bind("older", "d", "r1");
+        held.presses.push(press("newer", 2, Some("d")));
+        held.newest_only("d", 2);
+        assert_eq!(held.take("older"), None);
+    }
+
+    #[test]
+    fn a_press_on_another_draft_is_left_alone() {
+        let mut held = Armed::default();
+        held.presses.push(press("other", 1, None));
+        held.bind("other", "e", "r");
+        held.presses.push(press("this", 2, Some("d")));
+        held.newest_only("d", 2);
+        assert!(held.holds("e"));
     }
 
     fn decoded(raw: &str) -> String {

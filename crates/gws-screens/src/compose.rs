@@ -723,7 +723,12 @@ fn press_send(b: Bridge, c: Compose, confirmed: bool) {
     c.said.set(None);
     c.confirming.set(None);
     c.frozen.set(true);
-    let press = b.call("gws_mail_send_arm", json!({}));
+    // a saved letter names its draft now: this press stops any older one on it
+    let on = c.letter.with_untracked(|l| l.draft.clone());
+    let press = b.call(
+        "gws_mail_send_arm",
+        on.map_or_else(|| json!({}), |draft| json!({"draft": draft})),
+    );
     c.run(async move {
         if let Err(why) = send_pressed(&b, c, press, confirmed).await {
             c.said.set(Some(why));

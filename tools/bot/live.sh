@@ -76,7 +76,7 @@ PY
 up() {
   keys; package
   # the stub seeds afresh each start, so the last run's store would hold ids it no longer serves
-  rm -rf "$INST/gws-data"
+  rm -rf "$INST/gws-data" "$INST/home"
   local broker app stub
   broker="$(target "$BOT/broker")/debug/buwiz-broker"; app="$(target "$BOT/app")/debug/buwiz-bot"; stub="$(target "$REPO")/debug/gws-fake-google"
   # the plain build shares this path; it refuses the stub's variable and stops
@@ -92,7 +92,7 @@ up() {
     nohup python3 "$REPO/tools/bot/standin-model.py" "$GWS_MODEL_PORT" "$INST/model" > "$INST/model.log" 2>&1 & echo $! > "$INST/model.pid"
     model=("ANTHROPIC_BASE_URL=http://127.0.0.1:$GWS_MODEL_PORT" ANTHROPIC_API_KEY=standin)
   fi
-  mkdir -p "$INST/broker" "$INST/gws-data"
+  mkdir -p "$INST/broker" "$INST/home/Library/Application Support/app.buwiz.google-workspace"
   # no real model: the mock answers, every model URL is a dead loopback port,
   # and no key rides in from this shell. Unset, the broker reaches the local
   # opencodex proxy on 8080, which holds the owner's credentials.

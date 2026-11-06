@@ -167,11 +167,11 @@ pub(crate) fn demo() -> Vec<FakeFile> {
         FakeFile::folder("drv-photos", "Photos").modified(ago(12)),
         FakeFile::new("drv-quote", "Roof quote.docx", DOCX)
             .inside("drv-reyes")
-            .holding(b"PK fake docx")
+            .holding(include_bytes!("roof-quote.docx"))
             .modified(ago(2)),
         FakeFile::new("drv-budget", "Budget 2026.xlsx", XLSX)
             .inside("drv-reyes")
-            .holding(b"PK fake xlsx")
+            .holding(include_bytes!("budget.xlsx"))
             .modified(ago(3)),
         FakeFile::new("drv-contract", "Signed contract.pdf", "application/pdf")
             .inside("drv-reyes")
@@ -568,8 +568,7 @@ impl Query {
             Self::TextHas(w) => {
                 has(&f.name, w)
                     || has(&f.description, w)
-                    || (!f.mime.starts_with("image/")
-                        && has(&String::from_utf8_lossy(&f.content), w))
+                    || std::str::from_utf8(&f.content).is_ok_and(|text| has(text, w))
             }
             Self::NameIs(w) => f.name == *w,
             Self::MimeIs(w) => f.mime == *w,

@@ -369,13 +369,14 @@ fn press_class(on: bool) -> String {
 }
 
 fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
+    // the highlight is a binding on each row, not read here: a rebuild on the
+    // chosen label would drop the pressed row, and the load it started with it
     let list = dynamic(move || {
-        let chosen = m.label.get();
         m.labels
             .get()
             .into_iter()
             .fold(view().app_class(Some("gap-[1px]".into())), |column, l| {
-                let (id, on, b) = (l.id.clone(), l.id == chosen, b.clone());
+                let (id, row, b) = (l.id.clone(), l.id.clone(), b.clone());
                 let count = if l.unread > 0 {
                     l.unread.to_string()
                 } else {
@@ -383,7 +384,7 @@ fn label_rail(b: Bridge, m: Mail) -> impl IntoElement {
                 };
                 column.child(
                     view()
-                        .app_class(Some(press_class(on).into()))
+                        .app_class(move || Some(press_class(m.label.with(|c| *c == row)).into()))
                         .label("Open this label")
                         .accessibility_value(Some(AccessibilityValue {
                             text: Some(l.name.clone().into()),

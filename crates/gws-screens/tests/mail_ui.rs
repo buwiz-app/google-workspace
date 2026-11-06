@@ -2,12 +2,13 @@
 //! window and no plugin. A fake host answers the screen's tool calls, and can
 //! hold an answer back so a test can make answers arrive out of order.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use buwiz_app::{Bridge, BuwizError, Done, Host, Listener};
 use nsh_core::prelude::*;
+use nsh_core::{MountItem, NodeId};
 use nsh_engine::EngineConfig;
 use nsh_testing::Headless;
 use serde_json::{Map, Value, json};
@@ -45,11 +46,21 @@ fn list(args: &Value) -> Value {
 /// A thread's answer: `t1` alone says it has blocked images, which is how a
 /// test sees whose answer the reader took.
 fn thread(id: &str) -> Value {
-    json!({"page": format!("<p>{id}</p>"), "links": [], "images": i64::from(id == "t1")})
+    let attachments = if id == "t2" {
+        json!([
+            {"name": "Roof quote.docx", "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "size": 2048, "id": "att-1", "part": "1", "message": "m7"},
+            {"name": "Inline logo.png", "mime": "image/png", "size": 80, "id": null, "message": "m7"},
+        ])
+    } else {
+        json!([])
+    };
+    json!({"page": format!("<p>{id}</p>"), "links": [], "images": i64::from(id == "t1"), "attachments": attachments})
 }
 
 #[derive(Default)]
 struct Fake {
+    /// In place of an attachment opening.
+    attachment_answer: Mutex<Option<Value>>,
     /// What the screen opens with, and where: a card is `inline`.
     props: Mutex<Value>,
     inline: Mutex<bool>,
@@ -285,6 +296,16 @@ impl Host for Fake {
                 (tool.to_owned(), json!({"upload": "up1", "size": *held}))
             }
             "gws_upload_drop" => (tool.to_owned(), json!({"dropped": true})),
+            "gws_mail_attachment_open" => (
+                tool.to_owned(),
+                self.attachment_answer
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(
+                        || json!({"opened": true, "name": "Roof quote.docx", "kind": "word"}),
+                    ),
+            ),
             "gws_mail_thread" => {
                 let id = args["thread"].as_str().unwrap_or_default();
                 (id.to_owned(), thread(id))
@@ -1545,6 +1566,137 @@ fn nothing_can_be_attached_once_send_is_pressed() {
         "the press does nothing at all"
     );
     fake.release("gws_mail_draft_save");
+}
+
+// --- Attachments -------------------------------------------------------------
+
+/// Opens the conversation that has files on it.
+fn with_attachments() -> (Headless, Arc<Fake>) {
+    let (mut app, fake) = start();
+    app.press("text:Subject 2").expect("the row presses");
+    app.wait_for_within("text:Roof quote.docx", WAIT)
+        .expect("its files show");
+    settle(&mut app);
+    (app, fake)
+}
+
+#[test]
+fn an_attachment_row_opens_with_a_press_and_says_what_it_needs_to() {
+    let (mut app, fake) = with_attachments();
+    assert!(fake.called("gws_mail_attachment_open").is_empty());
+    app.press("label:Open this attachment").expect("it presses");
+    settle(&mut app);
+    assert_eq!(
+        fake.called("gws_mail_attachment_open"),
+        [json!({"message": "m7", "part": "1"})]
+    );
+    assert!(!app.screen().shows("Opening…"), "the answer put it away");
+}
+
+#[test]
+fn an_inline_file_with_no_id_shows_with_no_press() {
+    let (app, _) = with_attachments();
+    assert!(app.screen().shows("Inline logo.png"));
+    assert_eq!(app.screen().count("label:Open this attachment").unwrap(), 1);
+}
+
+#[test]
+fn a_refused_attachment_says_why() {
+    let (mut app, fake) = with_attachments();
+    *fake.attachment_answer.lock().unwrap() = Some(
+        json!({"refused": "unsupported", "message": "This kind of file can't be opened here."}),
+    );
+    app.press("label:Open this attachment").expect("it presses");
+    settle(&mut app);
+    assert!(
+        app.screen()
+            .shows("This kind of file can't be opened here.")
+    );
+}
+
+#[test]
+fn no_label_on_an_attachment_holds_its_name() {
+    let (app, _) = with_attachments();
+    for secret in ["Roof", "quote", "docx", "logo"] {
+        assert!(
+            !app.screen()
+                .matches(&format!("label:/(?i){secret}/"))
+                .unwrap(),
+            "a label holds {secret}"
+        );
+    }
+}
+
+#[test]
+fn another_conversation_has_no_files_left_from_the_last() {
+    let (mut app, _) = with_attachments();
+    app.press("text:Subject 3").expect("the row presses");
+    settle(&mut app);
+    assert!(!app.screen().shows("Roof quote.docx"));
+}
+
+/// A view's parent, its left edge there and its width, as the engine gave them.
+type Placed = (Option<NodeId>, f32, f32);
+
+/// Mail's two columns are fixed and it has no narrow form, so this stops where
+/// the reader still has room: the press has to stay whole in what's left of it.
+#[test]
+fn the_open_press_stays_whole_as_the_reader_narrows() {
+    let views: Arc<Mutex<HashMap<NodeId, Placed>>> = Arc::default();
+    let def = gws_screens::screens()
+        .iter()
+        .find(|s| s.id == "gws.mail")
+        .expect("Mail");
+    let root = (def.build)(Bridge::new(Arc::new(Fake::default())));
+    let mut app = Headless::start(EngineConfig::new(root)).expect("the engine starts");
+    // from the first view on, so each one's way up to the screen is known
+    let seen = views.clone();
+    app.observe(move |_, batch| {
+        let mut views = seen.lock().unwrap();
+        for item in &batch.items {
+            match item {
+                MountItem::Insert { parent, child, .. } => {
+                    views.entry(*child).or_default().0 = Some(*parent);
+                }
+                MountItem::Frame { id, frame } => {
+                    let view = views.entry(*id).or_default();
+                    (view.1, view.2) = (frame.origin.x.0, frame.size.width.0);
+                }
+                _ => {}
+            }
+        }
+    });
+    app.set_viewport(size(px(1000.0), px(600.0)))
+        .expect("the viewport sets");
+    app.wait_for_within("text:Subject 2", WAIT)
+        .expect("the inbox");
+    app.press("text:Subject 2").expect("the row presses");
+    app.wait_for_within("text:Roof quote.docx", WAIT)
+        .expect("its files show");
+    settle(&mut app);
+    for width in [900.0, 800.0, 700.0, 640.0, 620.0] {
+        app.set_viewport(size(px(width), px(600.0)))
+            .expect("the viewport sets");
+        settle(&mut app);
+        let id = app
+            .screen()
+            .press_target("label:Open this attachment")
+            .unwrap()
+            .unwrap_or_else(|| panic!("it went at {width}"));
+        let views = views.lock().unwrap();
+        let mut at = id;
+        let mut left = 0.0;
+        while let Some((parent, x, _)) = views.get(&at) {
+            left += x;
+            let Some(parent) = parent else { break };
+            at = *parent;
+        }
+        let right = left + views[&id].2;
+        assert!(
+            left >= -0.5 && right <= width + 0.5,
+            "at {width} it runs from {left} to {right}"
+        );
+    }
 }
 
 /// The first try may still be going, so a spent press says nothing about the mail.

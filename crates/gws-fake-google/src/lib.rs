@@ -14,6 +14,7 @@ mod drive;
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
@@ -60,6 +61,9 @@ struct Request {
     kind: String,
     /// The `If-Match`.
     if_match: String,
+    /// `X-Upload-Content-Type`, `X-Upload-Content-Length` and `Content-Range`,
+    /// by their lower-case names: Drive's resumable upload reads them.
+    upload: BTreeMap<String, String>,
     body: Vec<u8>,
 }
 
@@ -119,6 +123,7 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
     let (method, target) = (parts.next()?.to_owned(), parts.next()?.to_owned());
     let (mut authorization, mut kind, mut if_match, mut length) =
         (String::new(), String::new(), String::new(), 0usize);
+    let mut upload = BTreeMap::new();
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
@@ -133,6 +138,14 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
                 if_match = v.trim().to_owned();
             } else if k.eq_ignore_ascii_case("content-length") {
                 length = v.trim().parse().unwrap_or(0);
+            } else if [
+                "x-upload-content-type",
+                "x-upload-content-length",
+                "content-range",
+            ]
+            .contains(&k.to_lowercase().as_str())
+            {
+                upload.insert(k.to_lowercase(), v.trim().to_owned());
             }
         }
     }
@@ -144,6 +157,7 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         authorization,
         kind,
         if_match,
+        upload,
         body,
     })
 }
@@ -411,7 +425,9 @@ fn snippet(m: &Mail) -> String {
     m.text.replace('\n', " ").chars().take(120).collect()
 }
 
-fn payload(m: &Mail, full: bool) -> Value {
+/// `read` goes into each attachment's id, which Gmail doesn't promise to keep:
+/// a read counts up once [`FakeGoogle::attachment_ids_change`] says so.
+fn payload(m: &Mail, full: bool, read: u64) -> Value {
     if !full {
         return json!({"mimeType": "multipart/alternative", "headers": headers(m)});
     }
@@ -420,15 +436,15 @@ fn payload(m: &Mail, full: bool) -> Value {
     if let Some(html) = &m.html {
         parts.push(json!({"mimeType": "text/html", "headers": [{"name": "Content-Type", "value": "text/html; charset=utf-8"}], "body": {"data": b64(html.as_bytes()), "size": html.len()}}));
     }
-    let body = json!({"mimeType": "multipart/alternative", "parts": parts});
+    let body = json!({"partId": "0", "mimeType": "multipart/alternative", "parts": parts});
     if m.attachments.is_empty() {
         return json!({"mimeType": "multipart/alternative", "headers": headers(m), "parts": body["parts"]});
     }
     let mut mixed = vec![body];
     for (i, (name, mime, bytes)) in m.attachments.iter().enumerate() {
-        mixed.push(json!({"mimeType": mime, "filename": name, "headers": [{"name": "Content-Disposition", "value": format!("attachment; filename=\"{name}\"")}], "body": {"attachmentId": format!("att-{}-{i}", m.id), "size": bytes.len()}}));
+        mixed.push(json!({"partId": (i + 1).to_string(), "mimeType": mime, "filename": name, "headers": [{"name": "Content-Disposition", "value": format!("attachment; filename=\"{name}\"")}], "body": {"attachmentId": format!("att-{}-{read}-{i}", m.id), "size": bytes.len()}}));
     }
-    json!({"mimeType": "multipart/mixed", "headers": headers(m), "parts": mixed})
+    json!({"partId": "", "mimeType": "multipart/mixed", "headers": headers(m), "parts": mixed})
 }
 
 #[derive(Default)]
@@ -438,6 +454,8 @@ struct Account {
     writes_left: Option<usize>,
     wrote: bool,
     reads_fail_after_write: bool,
+    /// Reads so far, once attachment ids change with each.
+    reads: Option<AtomicU64>,
     /// `(draft id, message id, raw message, thread)`.
     drafts: Vec<(String, String, String, Option<String>)>,
     next_draft: u64,
@@ -727,7 +745,7 @@ impl Account {
         match format {
             "minimal" => {}
             "metadata" => {
-                let mut p = payload(m, false);
+                let mut p = payload(m, false, 0);
                 if !wanted.is_empty() {
                     let kept: Vec<Value> = p["headers"]
                         .as_array()
@@ -746,7 +764,11 @@ impl Account {
                 }
                 v["payload"] = p;
             }
-            _ => v["payload"] = payload(m, true),
+            _ => {
+                let read = self.reads.as_ref();
+                let read = read.map_or(0, |n| n.fetch_add(1, Ordering::Relaxed));
+                v["payload"] = payload(m, true, read);
+            }
         }
         v
     }
@@ -1223,7 +1245,9 @@ impl Account {
         }
         // a live run's way to force Drive's failures: `?list=<status>&after=<n>`
         // lets n more pages of a list through and fails the rest, `?changes=`
-        // does the same to the changes feed, and `?works` ends both
+        // and `?uploads=` do the same to the changes feed and to writes, and
+        // `?works` ends all three. `?touch=<id>` changes a file behind the
+        // plugin's back, for a conflict
         if path == "/__drive" {
             let after = r.param("after").and_then(|n| n.parse().ok()).unwrap_or(0);
             if let Some(status) = r.param("list").and_then(|s| s.parse().ok()) {
@@ -1232,8 +1256,15 @@ impl Account {
             if let Some(status) = r.param("changes").and_then(|s| s.parse().ok()) {
                 self.drive.fail_changes(after, status);
             }
+            if let Some(status) = r.param("uploads").and_then(|s| s.parse().ok()) {
+                self.drive.fail_uploads(after, status);
+            }
             if r.param("works").is_some() {
                 self.drive.works();
+            }
+            if let Some(id) = r.param("touch") {
+                self.drive
+                    .edit(&id, |f| f.content.extend_from_slice(b" changed elsewhere"));
             }
             return Reply::json(200, json!({}));
         }
@@ -1242,6 +1273,12 @@ impl Account {
         }
         if path == "/token" {
             return self.token(&r);
+        }
+        // an upload's address is its own ticket: it takes bytes with no token
+        if r.method == "PUT"
+            && let Some(rest) = path.strip_prefix("/upload/drive/v3/")
+        {
+            return self.drive.upload(&r, rest);
         }
         if !r.authorization.starts_with("Bearer fake-") {
             return Reply::json(
@@ -1260,6 +1297,9 @@ impl Account {
         }
         if path.starts_with("/people/v1/") {
             return self.people(&r);
+        }
+        if let Some(rest) = path.strip_prefix("/upload/drive/v3/") {
+            return self.drive.upload(&r, rest);
         }
         if let Some(rest) = path
             .strip_prefix("/upload")
@@ -1333,6 +1373,7 @@ impl FakeGoogle {
             waits.pass(&r);
             shared.lock().unwrap().handle(r)
         });
+        account.lock().unwrap().drive.base = format!("http://127.0.0.1:{port}");
         Self {
             port,
             account,
@@ -1481,6 +1522,49 @@ impl FakeGoogle {
     pub fn remove_file(&self, id: &str) {
         let done = self.account.lock().unwrap().drive.remove(id);
         assert!(done, "no file {id}");
+    }
+
+    /// A file as Drive holds it now.
+    pub fn drive_file(&self, id: &str) -> Option<FakeFile> {
+        self.account.lock().unwrap().drive.held(id)
+    }
+
+    /// Every file on the fake Drive.
+    pub fn drive_files(&self) -> Vec<FakeFile> {
+        self.account.lock().unwrap().drive.all()
+    }
+
+    /// Someone else's edit, behind the plugin's back: the words change, and
+    /// `version` and `md5Checksum` move with them.
+    pub fn change_on_drive(&self, id: &str, content: &[u8]) {
+        self.edit_file(id, |f| f.content = content.to_vec());
+    }
+
+    /// From here on an attachment has a new id on each read, and every one of
+    /// them still fetches it.
+    pub fn attachment_ids_change(&self) {
+        self.account.lock().unwrap().reads = Some(AtomicU64::new(1));
+    }
+
+    /// The next piece of an upload has only its first `n` bytes kept, and the
+    /// 308 says so. Google says this can happen to any piece.
+    pub fn drive_keeps_short(&self, n: usize) {
+        self.account.lock().unwrap().drive.keep_short = Some(n);
+    }
+
+    /// The answer to the piece that finishes an upload can't be read, and the
+    /// bytes are on Drive all the same.
+    pub fn drive_garbles_the_last_answer(&self) {
+        self.account.lock().unwrap().drive.garble_last = true;
+    }
+
+    /// `left` more upload sessions start, and then each gets `status`.
+    pub fn drive_uploads_fail_after(&self, left: usize, status: u16) {
+        self.account
+            .lock()
+            .unwrap()
+            .drive
+            .fail_uploads(left, status);
     }
 
     /// Rows in a page of a Drive list, whatever was asked for: Google may

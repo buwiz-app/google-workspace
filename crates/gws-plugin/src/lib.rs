@@ -14,6 +14,7 @@ pub mod calendar;
 pub mod clean;
 pub mod compose;
 pub mod drive;
+pub mod files;
 pub mod gmail;
 pub mod js;
 pub mod mail;
@@ -75,6 +76,14 @@ pub struct Core {
     pub warm: std::sync::atomic::AtomicBool,
     /// How saves too slow for their caller came out.
     pub jobs: Mutex<compose::Jobs>,
+    /// Drive's long calls: an open file's bytes, each way.
+    pub transfers: files::Transfers,
+    /// Which files are on their way, each way.
+    pub working: files::Working,
+    /// The last hash of each open file.
+    pub hashes: files::Hashes,
+    /// What an open file's 24 hours are counted by.
+    pub clock: files::Clock,
 }
 
 impl Core {
@@ -99,6 +108,10 @@ impl Core {
             gates: Mutex::default(),
             warm: std::sync::atomic::AtomicBool::new(false),
             jobs: Mutex::default(),
+            transfers: files::Transfers::new(&apis.drive),
+            working: files::Working::default(),
+            hashes: files::Hashes::default(),
+            clock: files::Clock::default(),
             pushed: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -107,6 +120,14 @@ impl Core {
     pub fn unlock(&self, seed: &str) {
         *self.store_key.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(gws_store::key_from_seed(seed));
+    }
+
+    /// The store's key, once the Bot has given it.
+    pub(crate) fn key(&self) -> Option<String> {
+        self.store_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Whether the Bot has provisioned this process.
@@ -122,6 +143,7 @@ impl Core {
         mail::run(self, tool, args)
             .or_else(|| calendar::run(self, tool, args))
             .or_else(|| drive::run(self, tool, args))
+            .or_else(|| files::run(self, tool, args))
             .unwrap_or_else(|| tools::run(&self.gmail, &self.accounts, tool, args))
     }
 

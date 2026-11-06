@@ -89,6 +89,11 @@ impl Accounts {
         self.held().who.values().any(|who| who == subject)
     }
 
+    /// Whether anyone is signed in, live or expired.
+    pub fn any(&self) -> bool {
+        !self.held().who.is_empty()
+    }
+
     /// The live token and whose it is, read together: from two reads a switch
     /// in between would file one account's mail under another.
     pub fn session(&self) -> Option<(Bearer, String)> {

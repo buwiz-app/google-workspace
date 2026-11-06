@@ -576,6 +576,11 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
             "gws_drive_file",
             "gws_drive_preview",
             "gws_drive_card",
+            "gws_file_open",
+            "gws_file_edits",
+            "gws_file_upload",
+            "gws_file_discard",
+            "gws_mail_attachment_open",
             "gws_resolve"
         ]
     );
@@ -865,6 +870,177 @@ fn a_chats_drive_search_offers_the_files_card_through_the_real_server() {
         None,
         "a routine has no one to show it to"
     );
+    drop(ask);
+    drop(stdin);
+    child.wait().unwrap();
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// A person's press, through the real server: an app's call from an open the
+/// plugin certified. `_meta` has to reach stdout from a call that was never a
+/// chat's, and the model and a routine must not get so far.
+#[cfg(feature = "stub")]
+#[test]
+fn a_press_gets_its_document_through_the_real_server_and_the_model_gets_nothing() {
+    use gws_fake_google::{FakeFile, FakeGoogle, Seed};
+
+    const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(FakeFile::new("drv-open", "../../Roof quote.docx", DOCX).holding(b"PK fake"));
+    google.seed_file(
+        FakeFile::new("drv-doc", "Notes", gws_fake_google::GOOGLE_DOC).holding(b"PK doc"),
+    );
+    let manifest = manifest_file("drive-open");
+    let data = std::env::temp_dir().join(format!("gws-stdio-open-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data);
+    let mut child = plugin()
+        .arg("mcp")
+        .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
+        .env("GWS_STUB_BASE", google.base())
+        .env("GWS_DATA_DIR", &data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut id = 1;
+    let mut ask = |name: &str, args: Value, caller: Value| -> Value {
+        id += 1;
+        writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args, "_meta": {"buwiz/caller": caller}}})).unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["id"], id, "{line}");
+        v["result"].clone()
+    };
+    let provision = provision();
+    ask(
+        "buwiz.provision",
+        provision["params"]["arguments"].clone(),
+        json!({}),
+    );
+    ask(
+        "buwiz.account.set",
+        json!({"account": "google", "label": "default", "subject": FAKE_SUBJECT, "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}),
+        json!({}),
+    );
+    let certified = |ask: &mut dyn FnMut(&str, Value, Value) -> Value, app: &str, open_id: &str| {
+        let plan = gws::manifest::unsigned(gws::manifest::RELEASE_KEY_ID);
+        let entry = buwiz_plugin::manifest::app(&plan, app).unwrap();
+        let not_after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 3_600_000;
+        let opened = ask(
+            "buwiz.session.open",
+            json!({"app": app, "open_id": open_id, "ks_pub": buwiz_plugin::b64::encode(&[2; 32]), "perms_sha256": buwiz_plugin::manifest::permissions_digest(entry).unwrap(), "not_after": not_after}),
+            Value::Null,
+        );
+        assert_ne!(opened["isError"], true, "{opened}");
+        json!({"origin": "app", "plugin": "app.buwiz.google-workspace", "app": app, "open_id": open_id, "ts": 1})
+    };
+    let open_id = buwiz_plugin::b64::encode(&[9; 16]);
+    let press = certified(&mut ask, "drive", &open_id);
+
+    let opened = ask("gws_file_open", json!({"id": "drv-open"}), press.clone());
+    let document = &opened["_meta"]["buwiz/document"];
+    let path = std::path::PathBuf::from(
+        document["path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{opened}")),
+    );
+    let folder = path.parent().unwrap();
+    assert_eq!(folder.file_name().unwrap(), "drv-open");
+    assert!(
+        folder.starts_with(std::fs::canonicalize(&data).unwrap()),
+        "{path:?}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"PK fake");
+    assert_eq!(document["name"], "Roof quote.docx");
+    assert_eq!(document["mime"], DOCX);
+    assert_eq!(opened["structuredContent"]["opened"], true);
+    assert!(
+        !opened["structuredContent"]
+            .to_string()
+            .contains("gws-stdio"),
+        "{opened}"
+    );
+
+    // a Google file, which takes the other way down the same call
+    let exported = ask("gws_file_open", json!({"id": "drv-doc"}), press.clone());
+    assert_eq!(
+        exported["_meta"]["buwiz/document"]["name"], "Notes.docx",
+        "{exported}"
+    );
+
+    // the rest of the round trip, as the screen drives it
+    std::fs::write(&path, b"PK edited").unwrap();
+    let edits = ask("gws_file_edits", json!({}), press.clone());
+    assert_eq!(
+        edits["structuredContent"]["files"][0]["id"], "drv-open",
+        "{edits}"
+    );
+    let sent = ask(
+        "gws_file_upload",
+        json!({"id": "drv-open", "mode": "update"}),
+        press.clone(),
+    );
+    assert_eq!(sent["structuredContent"]["uploaded"], true, "{sent}");
+    assert_eq!(google.drive_file("drv-open").unwrap().content, b"PK edited");
+
+    // discard is answered on the loop itself, not on a thread of its own
+    let dropped = ask("gws_file_discard", json!({"id": "drv-doc"}), press.clone());
+    assert_eq!(dropped["structuredContent"]["discarded"], true, "{dropped}");
+    assert!(!data.join("open/drv-doc").exists());
+
+    // Mail's screen isn't Drive's: a certified open reaches only what its app holds
+    let mail_id = buwiz_plugin::b64::encode(&[8; 16]);
+    let mail = certified(&mut ask, "mail", &mail_id);
+    let wrong = ask("gws_file_open", json!({"id": "drv-open"}), mail);
+    assert_eq!(
+        wrong["structuredContent"]["code"], "permission_denied",
+        "{wrong}"
+    );
+
+    // an open nobody certified is nobody's
+    let forged = json!({"origin": "app", "plugin": "app.buwiz.google-workspace", "app": "drive", "open_id": "forged", "ts": 1});
+    let denied = ask("gws_file_open", json!({"id": "drv-open"}), forged);
+    assert_eq!(
+        denied["structuredContent"]["code"], "permission_denied",
+        "{denied}"
+    );
+
+    let writes = google.writes().len();
+    let cases = [
+        ("gws_file_open", json!({"id": "drv-open"})),
+        ("gws_file_edits", json!({})),
+        (
+            "gws_file_upload",
+            json!({"id": "drv-open", "mode": "replace"}),
+        ),
+        ("gws_file_discard", json!({"id": "drv-open"})),
+        (
+            "gws_mail_attachment_open",
+            json!({"message": "m1", "part": "1"}),
+        ),
+    ];
+    for caller in [
+        json!({"origin": "agent"}),
+        json!({"origin": "routine", "routine": "r1"}),
+    ] {
+        for (tool, args) in &cases {
+            let answer = ask(tool, args.clone(), caller.clone());
+            assert_eq!(
+                answer["structuredContent"]["code"], "permission_denied",
+                "{tool}: {answer}"
+            );
+            assert_eq!(answer.get("_meta"), None, "{tool}");
+        }
+    }
+    assert_eq!(google.writes().len(), writes);
     drop(ask);
     drop(stdin);
     child.wait().unwrap();

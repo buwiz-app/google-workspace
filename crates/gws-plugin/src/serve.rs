@@ -400,6 +400,10 @@ mod tests {
             "gws_event_restore",
             "gws_event_rsvp",
             "gws_cal_show",
+            "gws_file_open",
+            "gws_file_upload",
+            "gws_file_discard",
+            "gws_mail_attachment_open",
         ] {
             assert!(writes.contains(&name), "{name}");
         }
@@ -432,6 +436,18 @@ mod tests {
                 "gws_search_mail"
             ]
         );
+        for name in [
+            tools::FILE_OPEN,
+            tools::FILE_EDITS,
+            tools::FILE_UPLOAD,
+            tools::FILE_DISCARD,
+            tools::MAIL_ATTACHMENT_OPEN,
+        ] {
+            assert!(tools::has(name), "{name}");
+            assert!(!list.contains(&name), "{name}");
+            assert!(!audience_allows(name, Origin::Routine), "{name}");
+            assert!(audience_allows(name, Origin::App), "{name}");
+        }
     }
 
     #[test]

@@ -197,6 +197,9 @@ struct Mail {
     /// Conversations picked with `x`, which actions take over the open one.
     picked: Signal<Vec<String>>,
     jobs: Signal<UnboundedSender<Job>>,
+    /// What runs beside the jobs: an attachment can take half a minute to come,
+    /// and an archive pressed meanwhile mustn't wait behind it.
+    beside: Signal<UnboundedSender<Job>>,
     compose: Compose,
     /// The label picker is open.
     labeling: Signal<bool>,
@@ -207,6 +210,10 @@ struct Mail {
     page: Signal<Option<String>>,
     links: Signal<Vec<String>>,
     images: Signal<i64>,
+    /// The open conversation's attachments.
+    attachments: Signal<Vec<Attachment>>,
+    /// Why an attachment didn't open.
+    attachment_said: Signal<Option<String>>,
     status: Signal<String>,
     saved: Signal<bool>,
     signed_out: Signal<bool>,
@@ -219,6 +226,40 @@ struct Mail {
     problem: Signal<Option<String>>,
     seq: Signal<i64>,
     help: Signal<bool>,
+}
+
+/// A file on a mail in the open conversation.
+#[derive(Clone, PartialEq, Debug)]
+struct Attachment {
+    /// The message that holds it. One that's inline in its mail has no id of
+    /// its own, and so no way to open.
+    message: String,
+    /// Which part of the message: what opens it, as `id` can change between reads.
+    part: String,
+    id: String,
+    name: String,
+    mime: String,
+}
+
+fn attachments_in(v: &Value) -> Vec<Attachment> {
+    let text = |a: &Value, key: &str| {
+        a.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    v.get("attachments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|a| Attachment {
+            message: text(a, "message"),
+            part: text(a, "part"),
+            id: text(a, "id"),
+            name: text(a, "name"),
+            mime: text(a, "mime"),
+        })
+        .collect()
 }
 
 /// What the list shows now, as `gws_mail_list` asks for it.
@@ -542,6 +583,8 @@ async fn open_ticket(b: Bridge, m: Mail, ticket: String) {
 async fn show(b: Bridge, m: Mail, thread: String) {
     let turn = m.open_turn.ask();
     m.page.set(None);
+    m.attachments.set(Vec::new());
+    m.attachment_said.set(None);
     let answer = read(&b, "gws_mail_thread", json!({"thread": thread})).await;
     // the person opened another, or left: this one must not replace it
     if !m.open_turn.counts(turn) {
@@ -559,6 +602,7 @@ async fn show(b: Bridge, m: Mail, thread: String) {
             );
             m.images
                 .set(v.get("images").and_then(Value::as_i64).unwrap_or(0));
+            m.attachments.set(attachments_in(&v));
             m.page.set(Some(
                 v.get("page")
                     .and_then(Value::as_str)
@@ -1011,8 +1055,83 @@ fn reader_pane(b: Bridge, m: Mail) -> impl IntoElement {
         }))
 }
 
+/// A press on an attachment: it opens in the Bot's viewer, from the answer's
+/// `_meta`, which never reaches here. The call starts at the press, as who
+/// pressed is judged by that moment.
+fn open_attachment(b: &Bridge, m: Mail, a: &Attachment) {
+    let call = b.call(
+        "gws_mail_attachment_open",
+        json!({"message": a.message, "part": a.part}),
+    );
+    m.attachment_said.set(Some("Opening…".to_owned()));
+    let job = Box::pin(async move {
+        m.attachment_said.set(match call.await {
+            Ok(v) if v.get("refused").is_some() => Some(
+                v.get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("That didn't work.")
+                    .to_owned(),
+            ),
+            Ok(_) => None,
+            Err(e) if e.code == "timeout" => {
+                Some("This attachment is taking a while. Press it again in a moment.".to_owned())
+            }
+            Err(e) => Some(e.message),
+        });
+    });
+    m.beside.with_untracked(|beside| drop(beside.send(job)));
+}
+
+fn attachment_row(b: Bridge, m: Mail, a: Attachment) -> View {
+    let row = view()
+        .app_class(Some(
+            "flex-row flex-wrap items-center gap-2 px-3 py-1".into(),
+        ))
+        .child(text(a.name.clone()).number_of_lines(1).app_class(Some(
+            format!("flex-1 min-w-[80px] text-[12px] {INK}").into(),
+        )));
+    if a.message.is_empty() || a.id.is_empty() {
+        return row;
+    }
+    row.child(
+        view()
+            .app_class(Some("px-3 py-1".into()))
+            .label("Open this attachment")
+            .accessibility_value(Some(AccessibilityValue {
+                text: Some(a.name.clone().into()),
+                ..AccessibilityValue::default()
+            }))
+            .on_press(move || open_attachment(&b, m, &a))
+            .child(text("Open").app_class(Some(format!("text-[12px] {INK}").into()))),
+    )
+}
+
+/// The conversation's files, under the page. Past a few they scroll, so the
+/// page keeps its room.
+fn attachments(b: Bridge, m: Mail) -> impl IntoElement {
+    dynamic(move || {
+        let files = m.attachments.get();
+        if files.is_empty() {
+            return view();
+        }
+        let list = files.into_iter().fold(view(), |list, a| {
+            list.child(attachment_row(b.clone(), m, a))
+        });
+        let said = m.attachment_said.get().map_or_else(view, |line| {
+            view()
+                .app_class(Some("px-3 py-1".into()))
+                .child(text(line).app_class(Some(format!("text-[11px] {MUTE}").into())))
+        });
+        view()
+            .app_class(Some(format!("border-t {LINE}").into()))
+            .child(said)
+            .child(scroll().app_class(Some("max-h-[120px]".into())).child(list))
+    })
+}
+
 fn reading(b: Bridge, m: Mail) -> impl IntoElement {
     let picking = b.clone();
+    let files = b.clone();
     let bar = dynamic(move || {
         if m.chosen.with(Option::is_none) && m.picked.with(Vec::is_empty) {
             return view();
@@ -1046,7 +1165,8 @@ fn reading(b: Bridge, m: Mail) -> impl IntoElement {
                 .child(reader::view(
                     move || reader::seal(&page, dark()),
                     move |n| m.link.set(m.links.with_untracked(|l| l.get(n).cloned())),
-                )),
+                ))
+                .child(attachments(files.clone(), m)),
             None if m.chosen.get().is_some() => view()
                 .app_class(Some("flex-1 items-center justify-center".into()))
                 .child(text("Opening…").app_class(Some(format!("text-[13px] {MUTE}").into()))),
@@ -1450,6 +1570,7 @@ pub fn build(bridge: Bridge) -> Root {
             };
         }
         let (jobs, mut waiting) = unbounded_channel::<Job>();
+        let (beside, mut alongside) = unbounded_channel::<Job>();
         let (writer, writing) = Compose::new();
         let m = Mail {
             compose: writer,
@@ -1469,9 +1590,12 @@ pub fn build(bridge: Bridge) -> Root {
             undo: signal(None),
             labeling: signal(false),
             jobs: signal_with(jobs, SignalEquals::Never),
+            beside: signal_with(beside, SignalEquals::Never),
             page: signal(None),
             links: signal(Vec::new()),
             images: signal(0),
+            attachments: signal(Vec::new()),
+            attachment_said: signal(None),
             status: signal(String::new()),
             saved: signal(false),
             signed_out: signal(false),
@@ -1489,6 +1613,12 @@ pub fn build(bridge: Bridge) -> Root {
         b.spawn(async move {
             while let Some(job) = waiting.recv().await {
                 job.await;
+            }
+        });
+        let spawner = b.clone();
+        b.spawn(async move {
+            while let Some(job) = alongside.recv().await {
+                spawner.spawn(job);
             }
         });
         if let Some(ticket) = prop("thread") {

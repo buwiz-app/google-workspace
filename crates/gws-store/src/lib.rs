@@ -20,6 +20,7 @@ use sha2::{Digest as _, Sha256};
 pub mod calendar;
 pub mod drive;
 pub mod mail;
+pub mod open;
 
 pub const DATA_DIR_ENV: &str = "GWS_DATA_DIR";
 /// How long a locked store is waited for.
@@ -56,6 +57,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
          CREATE INDEX drive_listed_in_order ON drive_listed(account, view, at);
          CREATE INDEX drive_listed_by_file ON drive_listed(account, file);",
     ),
+    // a stored mail view has no message id on its attachments: fetched again, it does
+    (
+        6,
+        "CREATE TABLE opened(id TEXT PRIMARY KEY, account TEXT NOT NULL, name TEXT NOT NULL, mime TEXT NOT NULL, google INTEGER NOT NULL, attachment INTEGER NOT NULL, hash TEXT NOT NULL, version TEXT NOT NULL, md5 TEXT NOT NULL, opened_ms INTEGER NOT NULL);
+         DELETE FROM bodies;",
+    ),
+    // nor has it the part of each attachment, which is what opens one now
+    (7, "DELETE FROM bodies;"),
 ];
 
 /// Why the store didn't open or answer: a stable `code` and a message for people.
@@ -157,8 +166,9 @@ impl Paths {
         self.dir.join("wipe-pending")
     }
 
-    /// Where this install keeps open Drive files and attachments. Their edits
-    /// can't be fetched again, so only an uninstall ever removes them.
+    /// Where this install keeps open Drive files and attachments, as
+    /// `<id>/<name>` below it. An edit here can't be fetched again, so a sign-out
+    /// leaves one, and only the person's own press or an uninstall removes it.
     pub fn open_dir(&self, key: &str) -> PathBuf {
         self.dir.join(format!("open-{}", install_id(key)))
     }
@@ -504,6 +514,24 @@ mod tests {
             sides.iter().all(|s| !std::path::Path::new(s).exists()),
             "no stale journal for a later store"
         );
+    }
+
+    /// One kept from before has no part on its attachments, and none would open.
+    #[test]
+    fn a_stored_mail_view_from_before_parts_goes() {
+        let dir = Dir::new("parts");
+        let paths = Paths::in_dir(&dir.0);
+        let store = Store::open(&paths, &key()).unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "INSERT INTO bodies(account, thread, view, size, used) VALUES('a', 't', '{}', 2, 1);
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&paths, &key()).unwrap();
+        assert_eq!(store.view("a", "t", 2).unwrap(), None);
     }
 
     #[test]

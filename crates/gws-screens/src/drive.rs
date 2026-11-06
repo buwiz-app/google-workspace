@@ -1,6 +1,7 @@
 //! Drive: a side column, a header and a folder as a list or a grid, with a
-//! file's details beside them. Read only: nothing here writes to Drive, and a
-//! file opens its details, as opening one in the Bot's viewer is a later slice.
+//! file's details beside them. A press on a file opens it in the Bot's viewer;
+//! `edits.rs` has that, and the only presses here that write to Drive. The
+//! details stay a press away, on each row's own Details.
 //!
 //! The label rule is Mail's (see the top of `mail.rs`): a press or a row has a
 //! fixed `label`, and what's the person's own goes in `accessibility_value` and
@@ -8,6 +9,7 @@
 
 mod card;
 mod detail;
+mod edits;
 mod file;
 mod list;
 
@@ -28,7 +30,8 @@ use crate::shell::{
     Account, BG, CHOSEN, DIM, INK, Job, LINE, Latest, MUTE, PANEL, POLL, RAIL, account_of, line_of,
     read, sleep,
 };
-use file::{Crumb, Facts, Preview, Row, path_in, rows_in, storage_line};
+use edits::{Said, load_edits};
+use file::{Crumb, Edit, Facts, Preview, Row, path_in, rows_in, storage_line};
 
 /// How wide the screen must be for the side column to fit beside the rows.
 /// Under this its presses go in a row of their own, so none is lost.
@@ -100,6 +103,15 @@ struct Drive {
     picked: Signal<HashSet<String>>,
     /// The file in the details pane.
     open: Signal<Option<Row>>,
+    /// What's open on this Mac and edited, by what `gws_file_edits` said last.
+    edits: Signal<Vec<Edit>>,
+    /// Files a press is working on, by id.
+    pressed: Signal<HashSet<String>>,
+    /// What became of the last press on a file.
+    said: Signal<Option<Said>>,
+    /// The file whose Discard is being asked about.
+    discarding: Signal<Option<String>>,
+    file_turn: Latest,
     facts: Signal<FactsState>,
     preview: Signal<Preview>,
     storage: Signal<Option<String>>,
@@ -329,6 +341,8 @@ async fn watch(b: Bridge, m: Drive) {
                 load_about(b.clone(), m).await;
             }
         }
+        // the viewer saves in place and says nothing, so this is how an edit shows
+        load_edits(b.clone(), m).await;
         sleep(POLL).await;
     }
 }
@@ -427,13 +441,15 @@ fn show_details(b: &Bridge, m: Drive, row: Row) {
     fetch(m, read_preview(b.clone(), m, id, turn));
 }
 
-/// A folder opens; a file, and a folder in Trash, which has no way in until
-/// it's restored, show their details.
+/// A folder goes in and a file opens. What's in Trash has no way in until it's
+/// restored, so it shows its details.
 fn open_row(b: &Bridge, m: Drive, row: Row) {
-    if row.is_folder() && !row.trashed {
+    if row.trashed {
+        show_details(b, m, row);
+    } else if row.is_folder() {
         enter_folder(b, m, &row);
     } else {
-        show_details(b, m, row);
+        edits::open_file(b, m, row);
     }
 }
 
@@ -449,6 +465,14 @@ fn open_at(b: &Bridge, m: Drive, index: usize) {
     };
     pick_only(m, row.id.clone());
     open_row(b, m, row);
+}
+
+fn details_at(b: &Bridge, m: Drive, index: usize) {
+    let Some(row) = m.rows.with_untracked(|r| r.get(index).cloned()) else {
+        return;
+    };
+    pick_only(m, row.id.clone());
+    show_details(b, m, row);
 }
 
 /// Where a move of `by` from `at` lands, `across` to a line. A move down from
@@ -556,16 +580,21 @@ fn keys(b: Bridge, m: Drive) {
             });
         }
     }
-    on_key_with("enter", options, move |_| {
-        if !free() {
-            return;
-        }
-        let row = m.cursor.get_untracked().and_then(|id| {
+    let chosen = move || {
+        m.cursor.get_untracked().and_then(|id| {
             m.rows
                 .with_untracked(|r| r.iter().find(|r| r.id == id).cloned())
-        });
-        if let Some(row) = row {
+        })
+    };
+    let details = b.clone();
+    on_key_with("enter", options, move |_| {
+        if let Some(row) = chosen().filter(|_| free()) {
             open_row(&b, m, row);
+        }
+    });
+    on_key_with("i", options, move |_| {
+        if let Some(row) = chosen().filter(|_| free()) {
+            show_details(&details, m, row);
         }
     });
     on_key_with("/", options, move |_| {
@@ -793,6 +822,7 @@ fn rows_and_details(b: Bridge, m: Drive) -> impl IntoElement {
 fn screen(b: Bridge, m: Drive) -> impl IntoElement {
     let wide = computed(|| window().width.0 >= SIDE_FROM);
     let (top, trail, head, line, body) = (b.clone(), b.clone(), b.clone(), b.clone(), b.clone());
+    let (said, edited) = (b.clone(), b.clone());
     let main = view()
         .app_class(Some(format!("flex-1 min-w-0 {PANEL}").into()))
         .child(dynamic(move || {
@@ -805,6 +835,8 @@ fn screen(b: Bridge, m: Drive) -> impl IntoElement {
         .child(header(head, m))
         .child(breadcrumb(trail, m))
         .child(notice(line, m))
+        .child(edits::said_line(said, m))
+        .child(edits::bars(edited, m))
         .child(rows_and_details(body, m));
     view()
         .app_class(Some("flex-1 flex-row".into()))
@@ -870,6 +902,11 @@ pub fn build(bridge: Bridge) -> Root {
             anchor: signal(None),
             picked: signal(HashSet::new()),
             open: signal(None),
+            edits: signal(Vec::new()),
+            pressed: signal(HashSet::new()),
+            said: signal(None),
+            discarding: signal(None),
+            file_turn: Latest::new(),
             facts: signal(FactsState::Reading),
             preview: signal(Preview::Reading),
             storage: signal(None),

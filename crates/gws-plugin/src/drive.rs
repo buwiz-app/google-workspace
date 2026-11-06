@@ -1,5 +1,6 @@
 //! Drive: Google's API (`drive/v3`), a changes sync that rides on Mail's, and
 //! the tools. It reads and nothing else: this file makes no call that writes.
+//! What writes is in `files.rs`, and only a person's press gets there.
 //!
 //! A list comes from the store, and reaches Google for the next page when the
 //! store runs out, so a lost connection shows the files already seen. A page
@@ -63,9 +64,9 @@ const STATUS: &str = "drive_status";
 const ROOT: &str = "drive_root";
 const ABOUT: &str = "drive_about";
 const FOLDER: &str = "application/vnd.google-apps.folder";
-const DOC: &str = "application/vnd.google-apps.document";
-const SHEET: &str = "application/vnd.google-apps.spreadsheet";
-const SLIDES: &str = "application/vnd.google-apps.presentation";
+pub(crate) const DOC: &str = "application/vnd.google-apps.document";
+pub(crate) const SHEET: &str = "application/vnd.google-apps.spreadsheet";
+pub(crate) const SLIDES: &str = "application/vnd.google-apps.presentation";
 const TEXT: &str = "text/plain";
 const IMAGES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 /// What a row needs. With no `fields`, Google gives four of these and no more.
@@ -111,7 +112,7 @@ pub fn quoted(text: &str) -> String {
 }
 
 /// A Drive id: what the API hands out, so it's safe in a path as it is.
-fn id_ok(id: &str) -> bool {
+pub(crate) fn id_ok(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 256
         && id
@@ -150,7 +151,7 @@ fn reason_of(body: &[u8]) -> (String, String) {
 /// What a status that isn't a success means. A 403 can be the sign-in's scope,
 /// Google asking us to slow down, or this one file: only the first two say
 /// anything about Drive as a whole.
-fn refusal_of(status: u16, body: &[u8]) -> Result<Answer, Failure> {
+pub(crate) fn refusal_of(status: u16, body: &[u8]) -> Result<Answer, Failure> {
     let (reason, why) = reason_of(body);
     match status {
         400 => Ok(Answer::Invalid(js::slice_utf16(&why, 300))),
@@ -358,12 +359,14 @@ fn flag(v: &Value, key: &str) -> bool {
 }
 
 /// What a file is, for the screen's icon and for what can be done with it.
-fn kind_of(mime: &str) -> &'static str {
+pub(crate) fn kind_of(mime: &str) -> &'static str {
     match mime {
         FOLDER => "folder",
         DOC => "doc",
         SHEET => "sheet",
         SLIDES => "slides",
+        "application/vnd.ms-powerpoint"
+        | "application/vnd.openxmlformats-officedocument.presentationml.presentation" => "slides",
         "application/pdf" => "pdf",
         "application/msword"
         | "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "word",
@@ -911,7 +914,7 @@ fn person_of(p: &Value) -> Value {
     json!({"name": cap_bytes(&name, HEADER_MAX), "email": text(p, "emailAddress"), "role": text(p, "role")})
 }
 
-fn id_of(args: &Value) -> Result<String, Value> {
+pub(crate) fn id_of(args: &Value) -> Result<String, Value> {
     let id = js::trim(&js::string_or_empty(args.get("id"))).to_owned();
     if id_ok(&id) {
         Ok(id)

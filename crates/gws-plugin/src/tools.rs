@@ -99,6 +99,11 @@ pub const DRIVE_PREVIEW: &str = "gws_drive_preview";
 pub const DRIVE_CARD: &str = "gws_drive_card";
 pub const SEARCH_DRIVE: &str = "gws_search_drive";
 pub const READ_DOC_TEXT: &str = "gws_read_doc_text";
+pub const FILE_OPEN: &str = "gws_file_open";
+pub const FILE_EDITS: &str = "gws_file_edits";
+pub const FILE_UPLOAD: &str = "gws_file_upload";
+pub const FILE_DISCARD: &str = "gws_file_discard";
+pub const MAIL_ATTACHMENT_OPEN: &str = "gws_mail_attachment_open";
 
 /// A write: the person's, on a screen, and never the model's.
 fn write(name: &'static str, description: &'static str, input_schema: Value) -> Def {
@@ -464,6 +469,37 @@ pub fn defs() -> Vec<Def> {
             audience: APP_ONLY,
             open_world: true,
         },
+        write(
+            FILE_OPEN,
+            "Download a Drive file to this Mac for the Bot's viewer, a Google file as docx, xlsx or pptx. A person's press alone.",
+            json!({"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}),
+        ),
+        Def {
+            name: FILE_EDITS,
+            description: "The files open here that hold edits, and whether Drive moved too.",
+            input_schema: json!({"type": "object", "properties": {}}),
+            read_only: true,
+            audience: APP_ONLY,
+            open_world: true,
+        },
+        write(
+            FILE_UPLOAD,
+            "Send an edited file back to Drive. A person's alone: update is refused if Drive changed, a Google file or an attachment takes only copy.",
+            json!({"type": "object", "properties": {"id": {"type": "string"}, "mode": {"type": "string", "enum": ["update", "copy", "replace"]}}, "required": ["id", "mode"]}),
+        ),
+        Def {
+            name: FILE_DISCARD,
+            description: "Remove a file's copy from this Mac. Drive hears nothing of it.",
+            input_schema: json!({"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}),
+            read_only: false,
+            audience: APP_ONLY,
+            open_world: false,
+        },
+        write(
+            MAIL_ATTACHMENT_OPEN,
+            "Download a mail's attachment to this Mac for the Bot's viewer. A person's press alone. An edit can only be saved to Drive as a new file.",
+            json!({"type": "object", "properties": {"message": {"type": "string"}, "part": {"type": "string"}}, "required": ["message", "part"]}),
+        ),
         Def {
             name: RESOLVE,
             description: "Resolve the /gws command.",

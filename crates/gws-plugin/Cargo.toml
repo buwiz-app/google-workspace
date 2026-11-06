@@ -37,8 +37,9 @@ url = "2"
 # Google's REST APIs: blocking, on the tool's own thread; rustls with ring and
 # Mozilla's roots (webpki-roots), no OpenSSL in the HTTP path, no gzip
 ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
+# what tells an edit from what Drive sent
+sha2 = "0.10"
 
 [dev-dependencies]
 gws-fake-google = { path = "../gws-fake-google" }
 ed25519-dalek = "2.2"
-sha2 = "0.10"

@@ -1168,10 +1168,41 @@ impl Account {
     }
 }
 
+/// Where a test stops one request before it does anything, so that what must not
+/// happen in a gap can be made to land in it, with no sleeping.
+#[derive(Default)]
+struct Door {
+    state: Mutex<DoorState>,
+    moved: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct DoorState {
+    /// The method, and what ends the path.
+    holding: Option<(String, String)>,
+    arrived: bool,
+}
+
+impl Door {
+    fn pass(&self, r: &Request) {
+        let mut state = self.state.lock().unwrap();
+        let held = |h: &(String, String)| r.method == h.0 && r.path().ends_with(&h.1);
+        if !state.holding.as_ref().is_some_and(held) {
+            return;
+        }
+        state.arrived = true;
+        self.moved.notify_all();
+        while state.holding.is_some() {
+            state = self.moved.wait(state).unwrap();
+        }
+    }
+}
+
 /// A whole fake Google account on a port of its own.
 pub struct FakeGoogle {
     port: u16,
     account: Arc<Mutex<Account>>,
+    door: Arc<Door>,
 }
 
 impl FakeGoogle {
@@ -1187,9 +1218,39 @@ impl FakeGoogle {
             only_grants: seed.only_grants,
             ..Account::default()
         }));
-        let shared = account.clone();
-        let port = listen(port, move |r| shared.lock().unwrap().handle(r));
-        Self { port, account }
+        let (shared, door) = (account.clone(), Arc::new(Door::default()));
+        let waits = door.clone();
+        let port = listen(port, move |r| {
+            waits.pass(&r);
+            shared.lock().unwrap().handle(r)
+        });
+        Self {
+            port,
+            account,
+            door,
+        }
+    }
+
+    /// Stops requests of `method` whose path ends in `path`, before they do
+    /// anything, until [`Self::release`].
+    pub fn hold(&self, method: &str, path: &str) {
+        let mut state = self.door.state.lock().unwrap();
+        state.holding = Some((method.to_owned(), path.to_owned()));
+        state.arrived = false;
+    }
+
+    /// Until a held request has come.
+    pub fn wait_for_held(&self) {
+        let mut state = self.door.state.lock().unwrap();
+        while !state.arrived {
+            state = self.door.moved.wait(state).unwrap();
+        }
+    }
+
+    /// Lets what's held go on.
+    pub fn release(&self) {
+        self.door.state.lock().unwrap().holding = None;
+        self.door.moved.notify_all();
     }
 
     /// `http://127.0.0.1:<port>`: what `GWS_STUB_BASE` names.

@@ -742,3 +742,134 @@ fn a_sent_draft_leaves_drafts_at_the_next_check() {
     gws::mail::sync(&core).unwrap();
     assert_eq!(drafts(), json!([]));
 }
+
+/// The model's draft, shown on a card, with the person's press on it.
+fn armed_card(core: &Core) -> (Value, Value) {
+    let shown = data(core.run_for_model("gws_mail_draft_save", &lunch()));
+    let press = data(core.run(
+        "gws_mail_send_arm",
+        &json!({"draft": shown["draft"], "revision": shown["revision"]}),
+    ));
+    (shown, press["armed"].clone())
+}
+
+fn rewrite(shown: &Value) -> Value {
+    json!({"draft": shown["draft"], "to": ["eve@example.com"], "body": "Rewritten"})
+}
+
+fn send_args(shown: &Value, armed: &Value) -> Value {
+    json!({"draft": shown["draft"], "revision": shown["revision"], "message_id": shown["message_id"], "armed": armed})
+}
+
+#[test]
+fn a_press_stops_the_model_rewriting_the_draft_until_undo() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "armed");
+    let (shown, armed) = armed_card(&core);
+    let writes = google.writes().len();
+    let refused = core.run_for_model("gws_mail_draft_save", &rewrite(&shown));
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(refused.to_string().contains("in hand"), "{refused}");
+    assert_eq!(google.writes().len(), writes, "nothing reached Google");
+
+    data(core.run("gws_mail_send_disarm", &json!({"armed": armed})));
+    data(core.run_for_model("gws_mail_draft_save", &rewrite(&shown)));
+    let spent = core.run("gws_mail_send", &send_args(&shown, &armed));
+    assert!(
+        spent["structuredContent"]["refused"].is_string(),
+        "Undo spent the press: {spent}"
+    );
+    assert_eq!(google.sent(), []);
+}
+
+/// The worst case: send has looked at the draft and is on its way to `drafts/send`.
+#[test]
+fn a_model_save_in_the_gap_before_the_send_does_not_change_what_goes() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "gap");
+    let (shown, armed) = armed_card(&core);
+    google.hold("POST", "/drafts/send");
+    std::thread::scope(|threads| {
+        let sending = threads.spawn(|| core.run("gws_mail_send", &send_args(&shown, &armed)));
+        google.wait_for_held();
+        let refused = core.run_for_model("gws_mail_draft_save", &rewrite(&shown));
+        assert_eq!(refused["isError"], true, "{refused}");
+        google.release();
+        data(sending.join().unwrap());
+    });
+    let sent = google.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].to, "ana@example.com", "what the person saw");
+    assert_eq!(sent[0].body, "Noon?\nThe usual place.");
+}
+
+/// The other way round: the model's PUT is out when the send starts.
+#[test]
+fn a_send_does_not_start_under_a_model_save_on_its_way() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "inflight");
+    let shown = data(core.run_for_model("gws_mail_draft_save", &lunch()));
+    let put = format!("/drafts/{}", shown["draft"].as_str().unwrap());
+    google.hold("PUT", &put);
+    std::thread::scope(|threads| {
+        let saving = threads.spawn(|| core.run_for_model("gws_mail_draft_save", &rewrite(&shown)));
+        google.wait_for_held();
+        let press = data(core.run(
+            "gws_mail_send_arm",
+            &json!({"draft": shown["draft"], "revision": shown["revision"]}),
+        ));
+        let refused = core.run("gws_mail_send", &send_args(&shown, &press["armed"]));
+        assert_eq!(refused["structuredContent"]["refused"], "busy", "{refused}");
+        google.release();
+        data(saving.join().unwrap());
+    });
+    assert_eq!(google.sent(), []);
+}
+
+/// A lost answer's second try, with the first still at Google.
+#[test]
+fn a_second_try_behind_a_send_still_going_does_not_say_it_stayed() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "second");
+    let (shown, armed) = armed_card(&core);
+    google.hold("POST", "/drafts/send");
+    std::thread::scope(|threads| {
+        let first = threads.spawn(|| core.run("gws_mail_send", &send_args(&shown, &armed)));
+        google.wait_for_held();
+        let second = core.run("gws_mail_send", &send_args(&shown, &armed));
+        assert_eq!(second["structuredContent"]["refused"], "busy", "{second}");
+        google.release();
+        data(first.join().unwrap());
+    });
+    assert_eq!(google.sent().len(), 1);
+}
+
+/// A person's save never overtakes a send: it waits, and finds the mail gone.
+#[test]
+fn a_person_save_behind_a_send_waits_and_writes_nothing() {
+    let google = FakeGoogle::start(Seed::demo(2));
+    let core = signed_in(&google, "behind");
+    let (shown, armed) = armed_card(&core);
+    let mut edit = lunch();
+    edit["draft"] = shown["draft"].clone();
+    edit["message_id"] = shown["message_id"].clone();
+    edit["to"] = json!(["ben@example.com"]);
+    google.hold("POST", "/drafts/send");
+    std::thread::scope(|threads| {
+        let sending = threads.spawn(|| core.run("gws_mail_send", &send_args(&shown, &armed)));
+        google.wait_for_held();
+        let saving = threads.spawn(|| core.run("gws_mail_draft_save", &edit));
+        // a save that didn't wait lands here. The fix can't fail on this wait: it
+        // only gives the wrong order the time to show
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        google.release();
+        data(sending.join().unwrap());
+        let answer = saving.join().unwrap();
+        assert_eq!(
+            answer["structuredContent"]["refused"], "already_sent",
+            "{answer}"
+        );
+    });
+    let sent = google.sent();
+    assert_eq!((sent.len(), sent[0].to.as_str()), (1, "ana@example.com"));
+}

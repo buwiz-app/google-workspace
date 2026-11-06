@@ -3,8 +3,8 @@
 //! has a new revision, and refuses until it's read again.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::MutexGuard;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use crate::accounts::Bearer;
 use crate::gmail::{self, Failure};
 use crate::mail::Subject;
-use crate::tools::{MAIL_DRAFT_SAVE, fail, ok};
+use crate::tools::{fail, failed, ok};
 use crate::{Core, js};
 
 /// The most recipients one message takes.
@@ -562,19 +562,58 @@ fn model_drafts(core: &Core) -> MutexGuard<'_, HashSet<String>> {
     core.model_drafts.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// What makes one draft's writes and its send take turns: a send's look at the
+/// draft and the send itself must have nothing land between them.
+fn gate(core: &Core, draft: &str) -> Arc<Mutex<()>> {
+    let mut gates = core.gates.lock().unwrap_or_else(|e| e.into_inner());
+    gates.retain(|_, gate| Arc::strong_count(gate) > 1);
+    gates.entry(draft.to_owned()).or_default().clone()
+}
+
+/// The turn, if nobody has it now.
+fn try_turn(gate: &Mutex<()>) -> Option<MutexGuard<'_, ()>> {
+    match gate.try_lock() {
+        Ok(turn) => Some(turn),
+        Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
+}
+
 /// `gws_mail_draft_save` from the model: a new draft, or one it wrote and the
-/// person hasn't touched. Every other draft is the person's work.
+/// person hasn't touched. Every other draft is the person's work, and so is one
+/// they've pressed Send on: their yes is to what they saw.
 pub fn save_for_model(core: &Core, args: &Value) -> Value {
     if !upload_ids(args).is_empty() || !kept(args).is_empty() {
         return fail("not_allowed", "Only a person attaches files.");
     }
     let held = js::string_or_empty(args.get("draft"));
-    if !held.is_empty() && !model_drafts(core).contains(&held) {
+    if held.is_empty() {
+        return save_as_model(core, args);
+    }
+    let in_hand = || {
+        fail(
+            "not_allowed",
+            "The person has that draft in hand. Leave it as it is.",
+        )
+    };
+    // the turn is held to the end of the PUT: a send can't start under it
+    let gate = gate(core, &held);
+    let Some(_turn) = try_turn(&gate) else {
+        return in_hand();
+    };
+    if armed(core).holds(&held) {
+        return in_hand();
+    }
+    if !model_drafts(core).contains(&held) {
         return fail(
             "not_allowed",
             "That draft is the person's. Write a new one instead.",
         );
     }
+    save_as_model(core, args)
+}
+
+fn save_as_model(core: &Core, args: &Value) -> Value {
     // what ties a save to a screen and a press is the app's alone
     let mut args = args.clone();
     if let Some(args) = args.as_object_mut() {
@@ -582,7 +621,8 @@ pub fn save_for_model(core: &Core, args: &Value) -> Value {
             args.remove(key);
         }
     }
-    let result = core.run(MAIL_DRAFT_SAVE, &args);
+    core.sync.seen();
+    let result = write_draft(core, &args).unwrap_or_else(failed);
     if let Some(code) = result
         .pointer("/structuredContent/refused")
         .and_then(Value::as_str)
@@ -602,8 +642,19 @@ pub fn save_for_model(core: &Core, args: &Value) -> Value {
     result
 }
 
-/// `gws_mail_draft_save`: writes a draft, or replaces one. Sends nothing.
+/// `gws_mail_draft_save`: writes a draft, or replaces one. Sends nothing. It
+/// waits its turn: a person's save behind a send finds what became of it.
 pub fn save(core: &Core, args: &Value) -> Result<Value, Failure> {
+    let held = js::string_or_empty(args.get("draft"));
+    if held.is_empty() {
+        return write_draft(core, args);
+    }
+    let gate = gate(core, &held);
+    let _turn = gate.lock().unwrap_or_else(|e| e.into_inner());
+    write_draft(core, args)
+}
+
+fn write_draft(core: &Core, args: &Value) -> Result<Value, Failure> {
     let auth = session(core)?;
     let draft = match Draft::of(args) {
         Ok(draft) => draft,
@@ -793,13 +844,10 @@ pub fn delete(core: &Core, args: &Value) -> Result<Value, Failure> {
 }
 
 /// Who may be written to, when a test against a real account says: nobody but
-/// this address, checked before a request leaves.
+/// this address, checked before a request leaves. It's in every build, as that
+/// test needs a real one, and all it can do is narrow who mail goes to.
 fn only_to() -> Option<String> {
-    if cfg!(feature = "stub") {
-        std::env::var("GWS_ONLY_TO").ok().filter(|a| !a.is_empty())
-    } else {
-        None
-    }
+    std::env::var("GWS_ONLY_TO").ok().filter(|a| !a.is_empty())
 }
 
 fn outside<'a>(allowed: &str, recipients: impl Iterator<Item = &'a str>) -> Option<&'a str> {
@@ -835,6 +883,15 @@ impl Armed {
         }
     }
 
+    /// Whether a press still in force names this draft.
+    fn holds(&mut self, draft: &str) -> bool {
+        self.presses.retain(|p| p.at.elapsed() < ARMED_FOR);
+        let names = |sends: &(String, String)| sends.0 == draft;
+        self.presses
+            .iter()
+            .any(|p| p.sends.as_ref().is_some_and(names))
+    }
+
     /// Spends the press, whatever comes of it: what it sends, if it's still good.
     fn take(&mut self, token: &str) -> Option<(String, String)> {
         self.presses.retain(|p| p.at.elapsed() < ARMED_FOR);
@@ -860,6 +917,12 @@ pub fn arm(core: &Core, args: &Value) -> Result<Value, Failure> {
         sends: text("draft").zip(text("revision")),
     });
     Ok(ok(json!({"armed": token})))
+}
+
+/// `gws_mail_send_disarm`: Undo. The press is spent, so the draft is free again.
+pub fn disarm(core: &Core, args: &Value) -> Result<Value, Failure> {
+    armed(core).take(&js::string_or_empty(args.get("armed")));
+    Ok(ok(json!({"disarmed": true})))
 }
 
 /// `gws_mail_draft_of`: the draft in a conversation, for the Drafts list, whose
@@ -921,6 +984,17 @@ pub fn send(core: &Core, args: &Value) -> Result<Value, Failure> {
     if !gmail::id_ok(&id) || revision.is_empty() {
         return Ok(fail("invalid_args", "That isn't a draft."));
     }
+    // held to the end, so what's read here is what goes. A save under way is about
+    // to change it, and a first try still going may yet send it: neither is a
+    // refusal that says the mail stayed
+    let gate = gate(core, &id);
+    let Some(_turn) = try_turn(&gate) else {
+        armed(core).take(&js::string_or_empty(args.get("armed")));
+        return Ok(refusal(
+            "busy",
+            "This draft is being changed or sent. Read it again before sending.",
+        ));
+    };
     let Some(held) = core.gmail.draft(&auth, &id)? else {
         return Ok(if in_sent(core, &auth, &message_id)? {
             ok(json!({"sent": true, "already": true}))

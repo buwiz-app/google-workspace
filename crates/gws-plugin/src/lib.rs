@@ -56,6 +56,8 @@ pub struct Core {
     pub uploads: Mutex<compose::Uploads>,
     /// Sends a person's press has allowed, each good for one.
     pub armed: Mutex<compose::Armed>,
+    /// One write or send at a time on a draft, by its id.
+    pub gates: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
     /// Google's asked-for warm-up of its contact search is done.
     pub warm: std::sync::atomic::AtomicBool,
     /// How saves too slow for their caller came out.
@@ -76,6 +78,7 @@ impl Core {
             model_drafts: Mutex::default(),
             uploads: Mutex::default(),
             armed: Mutex::default(),
+            gates: Mutex::default(),
             warm: std::sync::atomic::AtomicBool::new(false),
             jobs: Mutex::default(),
             pushed: std::sync::atomic::AtomicBool::new(false),

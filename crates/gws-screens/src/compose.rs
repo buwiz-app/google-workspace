@@ -27,6 +27,8 @@ const FIELD: &str = "border-b px-3 py-1.5 text-[13px]";
 
 /// How long Send can still be taken back.
 const HOLD: Duration = Duration::from_secs(5);
+/// What a Send with no answer says, however the second try came out.
+const UNSURE: &str = "There's no word on whether this went. Look in Sent before sending it again.";
 /// How often the hold looks to see if it was undone.
 const TICK: Duration = Duration::from_millis(100);
 /// How many times a slow save is asked after: past the plugin's own ten minutes.
@@ -204,6 +206,8 @@ pub struct Compose {
     stage: Signal<Option<Stage>>,
     /// The letter a Send took, until it's gone or undone.
     held: Signal<Option<Letter>>,
+    /// The press behind that Send, for Undo to give back.
+    pressed: Signal<Value>,
     hold: Latest,
     jobs: Signal<UnboundedSender<Job>>,
     next: Signal<u64>,
@@ -231,6 +235,7 @@ impl Compose {
             confirming: signal(None),
             stage: signal(None),
             held: signal(None),
+            pressed: signal(Value::Null),
             hold: Latest::new(),
             jobs: signal_with(jobs, SignalEquals::Never),
             next: signal(0),
@@ -299,20 +304,28 @@ pub async fn work(mut waiting: UnboundedReceiver<Job>) {
 pub async fn autosave(b: Bridge, c: Compose) {
     loop {
         sleep(AUTOSAVE).await;
-        let idle = c.open.get_untracked() && c.dirty() && !c.saving.get_untracked();
-        if idle
-            && c.letter
-                .with_untracked(|l| !l.blank() && l.files.is_empty())
-        {
+        if save_due(c) && !c.saving.get_untracked() {
             c.saving.set(true);
             let b = b.clone();
             c.run(async move {
-                // an address half typed isn't one yet: leaving says so, not this
-                let _ = save(&b, c, &Value::Null).await;
+                // what's ahead in the queue may have sent the letter or put it away
+                if save_due(c) {
+                    // an address half typed isn't one yet: leaving says so, not this
+                    let _ = save(&b, c, &Value::Null).await;
+                }
                 c.saving.set(false);
             });
         }
     }
+}
+
+/// Whether what's in the panel still wants saving by [`autosave`].
+fn save_due(c: Compose) -> bool {
+    c.open.get_untracked()
+        && c.dirty()
+        && !c.frozen.get_untracked()
+        && c.letter
+            .with_untracked(|l| !l.blank() && l.files.is_empty())
 }
 
 /// A tool's answer as a screen gets it, from a result that came by way of a job.
@@ -757,6 +770,7 @@ async fn hold_and_send(b: &Bridge, c: Compose, armed: Value) -> Result<(), Strin
         "message_id": letter.message_id, "armed": armed,
     });
     c.held.set(Some(letter));
+    c.pressed.set(armed);
     c.close();
     c.stage.set(Some(Stage::Waiting));
     let turn = c.hold.ask();
@@ -771,7 +785,8 @@ async fn hold_and_send(b: &Bridge, c: Compose, armed: Value) -> Result<(), Strin
     c.stage.set(Some(Stage::Sending));
     let mut answer = b.call("gws_mail_send", args.clone()).await;
     // an answer lost on the way: asking again finds it in Sent, and it can't go
-    // twice, as the press it needs is spent
+    // twice, as the press it needs is spent. Anything short of that says nothing:
+    // the first try may still be going
     let lost = matches!(&answer, Err(e) if e.retryable);
     if lost {
         answer = b.call("gws_mail_send", args).await;
@@ -782,6 +797,7 @@ async fn hold_and_send(b: &Bridge, c: Compose, armed: Value) -> Result<(), Strin
             c.stage.set(Some(Stage::Sent));
             return Ok(());
         }
+        _ if lost => UNSURE,
         (Ok(v), Some(_)) => v
             .get("message")
             .and_then(Value::as_str)
@@ -815,7 +831,16 @@ async fn bring_back(b: &Bridge, c: Compose) {
 fn undo(b: Bridge, c: Compose) {
     c.hold.ask();
     c.stage.set(None);
-    c.run(async move { bring_back(&b, c).await });
+    // made at the press, as arming is: the Bot judges a call by its moment
+    let given_back = b.call(
+        "gws_mail_send_disarm",
+        json!({"armed": c.pressed.get_untracked()}),
+    );
+    c.run(async move {
+        // one that fails leaves the draft closed to the AI until the press runs out
+        let _ = given_back.await;
+        bring_back(&b, c).await;
+    });
 }
 
 /// The address being typed: what's after the last comma.
@@ -1206,6 +1231,11 @@ fn review_line(label: &'static str, value: String) -> View {
 /// The Send press on a card: its own call first, as in the panel. A draft that
 /// changed since it showed is refused by revision, and shown again as it is.
 fn send_reviewed(b: Bridge, c: Compose, ticket: String, review: Signal<Option<Review>>) {
+    // a double click is one press
+    if c.frozen.get_untracked() {
+        return;
+    }
+    c.frozen.set(true);
     let shown = c
         .letter
         .with_untracked(|l| json!({"draft": l.draft, "revision": l.revision}));
@@ -1215,6 +1245,7 @@ fn send_reviewed(b: Bridge, c: Compose, ticket: String, review: Signal<Option<Re
             Ok(v) => v.get("armed").cloned().unwrap_or(Value::Null),
             Err(e) => {
                 c.said.set(Some(e.message));
+                c.frozen.set(false);
                 return;
             }
         };
@@ -1228,6 +1259,7 @@ fn send_reviewed(b: Bridge, c: Compose, ticket: String, review: Signal<Option<Re
                 c.said.set(Some(why));
             }
         }
+        c.frozen.set(false);
     });
 }
 

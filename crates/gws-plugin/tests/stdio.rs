@@ -574,6 +574,19 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
         )["structuredContent"],
         json!({"ok": true})
     );
+    // through the real server: a tool that never leaves this Mac goes a short
+    // way, and a card has to survive it
+    let draft = call(
+        &mut ask,
+        "gws_event_draft",
+        json!({"title": "Lunch", "start": "2026-11-10T12:00:00+08:00", "end": "2026-11-10T13:00:00+08:00"}),
+    );
+    assert_eq!(draft["_meta"]["buwiz/open"]["app"], "calendar", "{draft}");
+    assert_eq!(
+        draft["_meta"]["buwiz/open"]["props"]["draft"],
+        draft["structuredContent"]["ticket"]
+    );
+
     let r = call(&mut ask, "gws_search_mail", json!({"query": "x"}));
     assert_eq!(
         (r["structuredContent"].clone(), r["isError"].clone()),

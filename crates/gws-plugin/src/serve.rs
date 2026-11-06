@@ -262,11 +262,17 @@ fn run(plugin: Gws, manifest: Served) -> std::io::Result<()> {
                 }
                 // what never leaves this Mac answers here, whatever is running:
                 // a full cap can't stop a screen knowing where it stands
+                // a routine's turn has no one to show a card to
+                let chat = caller.origin == Origin::Agent && caller.routine.is_none();
                 if tools::is_local(&name) {
-                    write(
-                        &out,
-                        &json!({"jsonrpc": "2.0", "id": id, "result": answer(|| core.run(&name, &args))}),
-                    );
+                    let result = answer(|| {
+                        if chat {
+                            core.run_for_chat(&name, &args)
+                        } else {
+                            core.run(&name, &args)
+                        }
+                    });
+                    write(&out, &json!({"jsonrpc": "2.0", "id": id, "result": result}));
                     continue;
                 }
                 if running.len() >= MAX_RUNNING {
@@ -283,8 +289,6 @@ fn run(plugin: Gws, manifest: Served) -> std::io::Result<()> {
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(key.clone(), cancelled.clone());
                 let (core, out, cancels) = (core.clone(), out.clone(), cancels.clone());
-                // a routine's turn has no one to show a card to
-                let chat = caller.origin == Origin::Agent && caller.routine.is_none();
                 let model = matches!(caller.origin, Origin::Agent | Origin::Routine);
                 running.push(std::thread::spawn(move || {
                     let result = answer(|| {

@@ -257,9 +257,14 @@ fn account_press(name: String, on: impl Fn() + 'static) -> View {
         )
 }
 
+/// What a failed switch adds once the account it failed on has left the list.
+const SIGN_IN_AGAIN: &str = "Sign in to it again on this app's page.";
+
 /// The account this screen shows, with the others under it once pressed. With
-/// one account there's nothing to choose, so nothing shows. `changed` starts the
-/// screen over on the account it switched to.
+/// one account there's nothing to choose, so nothing shows, unless a switch just
+/// failed: the account it failed on has usually left the list, and the person
+/// still has to hear why. `changed` starts the screen over on the account it
+/// switched to.
 ///
 /// The call is made in the press, or the Bot can't tell it's the person's, and
 /// what follows goes through `run`, the screen's own queue: a task started here
@@ -273,7 +278,12 @@ pub(crate) fn chooser(
     dynamic(move || {
         let rows = c.rows.get();
         if rows.len() < 2 {
-            return view();
+            let Some(why) = c.said.get() else {
+                return view();
+            };
+            return view()
+                .app_class(Some(format!("px-2 py-2 border-t {LINE}").into()))
+                .child(said_line(format!("{why} {SIGN_IN_AGAIN}")));
         }
         let toggle = move || {
             c.said.set(None);
@@ -317,14 +327,16 @@ pub(crate) fn chooser(
             }
         }
         if let Some(why) = c.said.get() {
-            column = column.child(
-                text(why)
-                    .number_of_lines(3)
-                    .app_class(Some(format!("px-2 text-[12px] {MUTE}").into())),
-            );
+            column = column.child(said_line(why));
         }
         column
     })
+}
+
+fn said_line(why: String) -> impl IntoElement {
+    text(why)
+        .number_of_lines(4)
+        .app_class(Some(format!("px-2 text-[12px] {MUTE}").into()))
 }
 
 #[derive(Clone, PartialEq)]

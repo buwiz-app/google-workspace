@@ -2433,6 +2433,27 @@ fn a_switch_the_bot_could_not_make_says_so_and_stays_where_it_was() {
 }
 
 #[test]
+fn a_failed_switch_still_says_why_once_that_account_leaves_the_list() {
+    let (mut app, fake) = two_accounts();
+    *fake.switch_fails.lock().unwrap() = true;
+    app.press(&format!("text:{ONE}"))
+        .expect("the account row opens");
+    app.wait_for_within(&format!("text:{TWO}"), WAIT)
+        .expect("the other account shows");
+    app.press(&format!("text:{TWO}")).expect("it presses");
+    app.wait_for_within("text:Buwiz Bot couldn't switch to that account.", WAIT)
+        .expect("it says so");
+    // the account check finds the sign-in gone, so one account is left
+    *fake.accounts.lock().unwrap() = vec![(ONE.to_owned(), true)];
+    app.wait_for_within(
+        "text:Buwiz Bot couldn't switch to that account. Sign in to it again on this app's page.",
+        Duration::from_secs(20),
+    )
+    .expect("the person still hears why, and what to do");
+    assert!(!app.screen().matches("label:Switch account").unwrap());
+}
+
+#[test]
 fn a_letter_names_its_account_and_a_switch_waits_for_it() {
     let (mut app, fake) = two_accounts();
     write_one(&mut app);

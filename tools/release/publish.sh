@@ -111,7 +111,7 @@ if [ "$EXISTS" = 1 ]; then
   gh release upload "$TAG" -R "$GH_REPO" --clobber "$OUT/$BIN_ASSET" "$OUT/plugin.json"
 else
   gh release create "$TAG" -R "$GH_REPO" --target "$COMMIT" ${PRERELEASE[@]+"${PRERELEASE[@]}"} --title "buwiz-gws $VERSION" \
-    --notes "Google Workspace plugin $VERSION (app.buwiz.google-workspace), Buwiz mini app protocol 1.0: Gmail with the Google account you sign in to in Buwiz Bot. Install it by asking Buwiz Bot's agent to install https://github.com/$GH_REPO" \
+    --notes "Google Workspace plugin $VERSION (app.buwiz.google-workspace), Buwiz mini app protocol 1.0: Gmail, Calendar and Drive with the Google account you sign in to in Buwiz Bot. Install it by asking Buwiz Bot's agent to install https://github.com/$GH_REPO" \
     "$OUT/$BIN_ASSET" "$OUT/manifest.signed.json" "$OUT/plugin.json"
 fi
 echo "published $TAG" >&2

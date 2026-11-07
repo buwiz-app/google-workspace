@@ -149,13 +149,19 @@ impl Core {
         if let Some(refused) = accounts::stale(self, args) {
             return refused;
         }
-        accounts::run(self, tool, args)
+        let result = accounts::run(self, tool, args)
             .or_else(|| mail::run(self, tool, args))
             .or_else(|| calendar::run(self, tool, args))
             .or_else(|| drive::run(self, tool, args))
             .or_else(|| drive::write::run(self, tool, args))
             .or_else(|| files::run(self, tool, args))
-            .unwrap_or_else(|| tools::run(&self.gmail, &self.accounts, tool, args))
+            .unwrap_or_else(|| tools::run(&self.gmail, &self.accounts, tool, args));
+        // nobody signed out: the Bot can't refresh the token right now, so the
+        // sign-in card and the screens' sign-in guide would both be wrong
+        if result["structuredContent"]["code"] == "account_required" && self.accounts.lapsed() {
+            return tools::failed(gmail::Failure::Plain(tools::GOOGLE_UNREACHED.to_owned()));
+        }
+        result
     }
 
     /// A tool the model called, from a chat or a routine.

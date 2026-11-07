@@ -206,6 +206,8 @@ pub(crate) struct Chooser {
     open: Signal<bool>,
     busy: Signal<bool>,
     said: Signal<Option<String>>,
+    /// What's said is a sign-in that's gone, not a Bot that couldn't do it now.
+    needs_sign_in: Signal<bool>,
 }
 
 impl Chooser {
@@ -216,6 +218,7 @@ impl Chooser {
             open: signal(false),
             busy: signal(false),
             said: signal(None),
+            needs_sign_in: signal(false),
         }
     }
 
@@ -281,9 +284,14 @@ pub(crate) fn chooser(
             let Some(why) = c.said.get() else {
                 return view();
             };
+            let line = if c.needs_sign_in.get() {
+                format!("{why} {SIGN_IN_AGAIN}")
+            } else {
+                why
+            };
             return view()
                 .app_class(Some(format!("px-2 py-2 border-t {LINE}").into()))
-                .child(said_line(format!("{why} {SIGN_IN_AGAIN}")));
+                .child(said_line(line));
         }
         let toggle = move || {
             c.said.set(None);
@@ -313,14 +321,21 @@ pub(crate) fn chooser(
                             Some(why.to_owned())
                         };
                         match answer {
-                            Ok(v) if failed(&v).is_some() => c.said.set(failed(&v)),
+                            Ok(v) if failed(&v).is_some() => {
+                                let code = v.pointer("/account_use/code").and_then(Value::as_str);
+                                c.needs_sign_in.set(code == Some("needs_signin"));
+                                c.said.set(failed(&v));
+                            }
                             Ok(_) => {
                                 c.open.set(false);
                                 if c.check(&b).await {
                                     changed(&b);
                                 }
                             }
-                            Err(e) => c.said.set(Some(e.message)),
+                            Err(e) => {
+                                c.needs_sign_in.set(false);
+                                c.said.set(Some(e.message));
+                            }
                         }
                     }));
                 }));

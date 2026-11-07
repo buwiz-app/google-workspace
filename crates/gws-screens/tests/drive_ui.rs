@@ -3741,7 +3741,15 @@ fn a_late_rename_leaves_a_panel_opened_since_up() {
     fake.release("write:gws_drive_rename");
     settle(&mut app);
     assert_budget_panel_stays(&app);
-    assert!(app.screen().shows("Renamed."), "it went through");
+    assert!(
+        app.screen().shows("Your earlier rename went through."),
+        "it went through"
+    );
+    assert!(
+        !app.screen().shows("Renamed."),
+        "this panel's file wasn't renamed"
+    );
+    assert!(app.screen().matches("label:Undo that").unwrap());
 }
 
 #[test]
@@ -3808,7 +3816,10 @@ fn a_late_move_leaves_a_panel_opened_since_up() {
     fake.release("write:gws_drive_move");
     settle(&mut app);
     assert_budget_panel_stays(&app);
-    assert!(app.screen().shows("Moved."), "it went through");
+    assert!(
+        app.screen().shows("Your earlier move went through."),
+        "it went through"
+    );
 }
 
 #[test]

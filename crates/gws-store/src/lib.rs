@@ -11,7 +11,7 @@
 
 use std::fs;
 use std::os::unix::fs::DirBuilderExt as _;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension as _, params};
@@ -117,6 +117,33 @@ pub struct Paths {
     pub dir: PathBuf,
 }
 
+/// Where `path` really is: links followed as far as it exists, and anything
+/// past that with its `.` and `..` worked out.
+fn real(path: &Path) -> PathBuf {
+    let mut plain = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                plain.pop();
+            }
+            other => plain.push(other),
+        }
+    }
+    let mut past = Vec::new();
+    let mut at = plain.as_path();
+    loop {
+        if let Ok(found) = at.canonicalize() {
+            return past.iter().rev().fold(found, |path, name| path.join(name));
+        }
+        let (Some(up), Some(name)) = (at.parent(), at.file_name()) else {
+            return plain;
+        };
+        past.push(name);
+        at = up;
+    }
+}
+
 impl Paths {
     pub fn in_dir(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
@@ -144,7 +171,7 @@ impl Paths {
     ) -> Result<Self> {
         let paths = Self::from_vars(data.clone(), home.clone())?;
         let default = Self::from_vars(None, home).ok();
-        if tested && default.is_some_and(|d| d.dir == paths.dir) {
+        if tested && default.is_some_and(|d| real(&d.dir) == real(&paths.dir)) {
             return Err(error(
                 "data_dir",
                 "Under cargo, GWS_DATA_DIR must name a folder of a test's own.",
@@ -506,6 +533,34 @@ mod tests {
         assert!(Paths::resolved(Some("/tmp/t".into()), home(), true).is_ok());
         assert!(Paths::resolved(None, home(), false).is_ok(), "an install");
         assert!(Paths::resolved(Some(own.into()), home(), false).is_ok());
+    }
+
+    /// The same folder by another name is still that folder.
+    #[test]
+    fn a_test_cant_reach_the_persons_folder_by_a_link_or_a_detour() {
+        let base = std::env::temp_dir().join(format!("gws-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let own = base.join("home/Library/Application Support/app.buwiz.google-workspace");
+        std::fs::create_dir_all(&own).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&own, &link).unwrap();
+        let home = || Some(base.join("home").into_os_string());
+        let refused = |data: PathBuf| Paths::resolved(Some(data.into()), home(), true).is_err();
+        assert!(refused(link.clone()), "a link");
+        assert!(
+            refused(own.join("..").join(own.file_name().unwrap())),
+            "a detour"
+        );
+        assert!(refused(base.join(
+            "home/../home/Library/Application Support/app.buwiz.google-workspace"
+        )));
+        assert!(!refused(base.join("other")), "a folder of its own");
+        let _ = std::fs::remove_dir_all(&base);
+        // nothing there yet, as on a first run
+        let gone = PathBuf::from("/nowhere/u");
+        let by_detour = "/nowhere/u/x/../Library/Application Support/app.buwiz.google-workspace";
+        let at = Paths::resolved(Some(by_detour.into()), Some(gone.into_os_string()), true);
+        assert!(at.is_err());
     }
 
     #[test]

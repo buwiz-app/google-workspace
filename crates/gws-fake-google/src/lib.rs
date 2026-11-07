@@ -1420,11 +1420,19 @@ impl FakeGoogle {
 
     /// Until a held request has come.
     pub fn wait_for_held(&self) {
-        let by = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        self.wait_for_held_within(std::time::Duration::from_secs(30));
+    }
+
+    fn wait_for_held_within(&self, limit: std::time::Duration) {
+        let by = std::time::Instant::now() + limit;
         let mut state = self.door.state.lock().unwrap();
         while !state.arrived {
             let left = by.saturating_duration_since(std::time::Instant::now());
-            assert!(!left.is_zero(), "the held request never came");
+            if left.is_zero() {
+                // let go first: a panic under the lock poisons it for the release
+                drop(state);
+                panic!("the held request never came");
+            }
             state = self.door.moved.wait_timeout(state, left).unwrap().0;
         }
     }
@@ -1604,6 +1612,12 @@ impl FakeGoogle {
         self.account.lock().unwrap().drive.keep_short = Some(n);
     }
 
+    /// The answer to the piece that finishes an upload can be read, and names
+    /// an id no file could have.
+    pub fn drive_names_a_bad_id_last(&self) {
+        self.account.lock().unwrap().drive.bad_id_last = true;
+    }
+
     /// The answer to the piece that finishes an upload can't be read, and the
     /// bytes are on Drive all the same.
     pub fn drive_garbles_the_last_answer(&self) {
@@ -1680,6 +1694,18 @@ impl FakeGoogle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A deadline that panicked under the lock would poison the release after it.
+    #[test]
+    fn a_wait_that_runs_out_leaves_the_door_working() {
+        let google = FakeGoogle::start(Seed::demo(1));
+        google.hold("GET", "/never");
+        let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            google.wait_for_held_within(std::time::Duration::from_millis(10));
+        }));
+        assert!(waited.is_err(), "it gave up");
+        google.release();
+    }
 
     #[test]
     fn dates_read_like_mail_dates() {

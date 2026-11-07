@@ -206,6 +206,8 @@ pub(crate) struct Chooser {
     open: Signal<bool>,
     busy: Signal<bool>,
     said: Signal<Option<String>>,
+    /// What's said is a sign-in that's gone, not a Bot that couldn't do it now.
+    needs_sign_in: Signal<bool>,
 }
 
 impl Chooser {
@@ -216,6 +218,7 @@ impl Chooser {
             open: signal(false),
             busy: signal(false),
             said: signal(None),
+            needs_sign_in: signal(false),
         }
     }
 
@@ -257,9 +260,14 @@ fn account_press(name: String, on: impl Fn() + 'static) -> View {
         )
 }
 
+/// What a failed switch adds once the account it failed on has left the list.
+const SIGN_IN_AGAIN: &str = "Sign in to it again on this app's page.";
+
 /// The account this screen shows, with the others under it once pressed. With
-/// one account there's nothing to choose, so nothing shows. `changed` starts the
-/// screen over on the account it switched to.
+/// one account there's nothing to choose, so nothing shows, unless a switch just
+/// failed: the account it failed on has usually left the list, and the person
+/// still has to hear why. `changed` starts the screen over on the account it
+/// switched to.
 ///
 /// The call is made in the press, or the Bot can't tell it's the person's, and
 /// what follows goes through `run`, the screen's own queue: a task started here
@@ -273,7 +281,17 @@ pub(crate) fn chooser(
     dynamic(move || {
         let rows = c.rows.get();
         if rows.len() < 2 {
-            return view();
+            let Some(why) = c.said.get() else {
+                return view();
+            };
+            let line = if c.needs_sign_in.get() {
+                format!("{why} {SIGN_IN_AGAIN}")
+            } else {
+                why
+            };
+            return view()
+                .app_class(Some(format!("px-2 py-2 border-t {LINE}").into()))
+                .child(said_line(line));
         }
         let toggle = move || {
             c.said.set(None);
@@ -303,28 +321,37 @@ pub(crate) fn chooser(
                             Some(why.to_owned())
                         };
                         match answer {
-                            Ok(v) if failed(&v).is_some() => c.said.set(failed(&v)),
+                            Ok(v) if failed(&v).is_some() => {
+                                let code = v.pointer("/account_use/code").and_then(Value::as_str);
+                                c.needs_sign_in.set(code == Some("needs_signin"));
+                                c.said.set(failed(&v));
+                            }
                             Ok(_) => {
                                 c.open.set(false);
                                 if c.check(&b).await {
                                     changed(&b);
                                 }
                             }
-                            Err(e) => c.said.set(Some(e.message)),
+                            Err(e) => {
+                                c.needs_sign_in.set(false);
+                                c.said.set(Some(e.message));
+                            }
                         }
                     }));
                 }));
             }
         }
         if let Some(why) = c.said.get() {
-            column = column.child(
-                text(why)
-                    .number_of_lines(3)
-                    .app_class(Some(format!("px-2 text-[12px] {MUTE}").into())),
-            );
+            column = column.child(said_line(why));
         }
         column
     })
+}
+
+fn said_line(why: String) -> impl IntoElement {
+    text(why)
+        .number_of_lines(4)
+        .app_class(Some(format!("px-2 text-[12px] {MUTE}").into()))
 }
 
 #[derive(Clone, PartialEq)]

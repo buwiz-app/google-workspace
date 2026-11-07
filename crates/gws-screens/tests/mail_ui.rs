@@ -109,6 +109,8 @@ struct Fake {
     save_refused: Mutex<Option<String>>,
     /// The plugin asks for a switch and the Bot can't make it.
     switch_fails: Mutex<bool>,
+    /// A failed switch's code, when it isn't a sign-in that's gone.
+    switch_code: Mutex<Option<&'static str>>,
     save_timeout: Mutex<bool>,
     /// What a save says it now holds as uploads.
     kept: Mutex<Value>,
@@ -206,7 +208,7 @@ impl Host for Fake {
             }
             "gws_account_use" if *self.switch_fails.lock().unwrap() => (
                 tool.to_owned(),
-                json!({"switched": true, "account_use": {"code": "needs_signin", "message": "Buwiz Bot couldn't switch to that account."}}),
+                json!({"switched": true, "account_use": {"code": self.switch_code.lock().unwrap().unwrap_or("needs_signin"), "message": "Buwiz Bot couldn't switch to that account."}}),
             ),
             "gws_account_use" => {
                 self.switch_to(args["label"].as_str().unwrap());
@@ -2430,6 +2432,55 @@ fn a_switch_the_bot_could_not_make_says_so_and_stays_where_it_was() {
     app.wait_for_within("text:Buwiz Bot couldn't switch to that account.", WAIT)
         .expect("it says so");
     assert!(app.screen().shows(ONE), "still this one");
+}
+
+#[test]
+fn a_failed_switch_still_says_why_once_that_account_leaves_the_list() {
+    let (mut app, fake) = two_accounts();
+    *fake.switch_fails.lock().unwrap() = true;
+    app.press(&format!("text:{ONE}"))
+        .expect("the account row opens");
+    app.wait_for_within(&format!("text:{TWO}"), WAIT)
+        .expect("the other account shows");
+    app.press(&format!("text:{TWO}")).expect("it presses");
+    app.wait_for_within("text:Buwiz Bot couldn't switch to that account.", WAIT)
+        .expect("it says so");
+    // the account check finds the sign-in gone, so one account is left
+    *fake.accounts.lock().unwrap() = vec![(ONE.to_owned(), true)];
+    app.wait_for_within(
+        "text:Buwiz Bot couldn't switch to that account. Sign in to it again on this app's page.",
+        Duration::from_secs(20),
+    )
+    .expect("the person still hears why, and what to do");
+    assert!(!app.screen().matches("label:Switch account").unwrap());
+}
+
+#[test]
+fn a_switch_the_bot_couldnt_make_now_doesnt_ask_for_a_sign_in() {
+    let (mut app, fake) = two_accounts();
+    *fake.switch_fails.lock().unwrap() = true;
+    *fake.switch_code.lock().unwrap() = Some("busy");
+    app.press(&format!("text:{ONE}"))
+        .expect("the account row opens");
+    app.wait_for_within(&format!("text:{TWO}"), WAIT)
+        .expect("the other account shows");
+    app.press(&format!("text:{TWO}")).expect("it presses");
+    app.wait_for_within("text:Buwiz Bot couldn't switch to that account.", WAIT)
+        .expect("it says so");
+    *fake.accounts.lock().unwrap() = vec![(ONE.to_owned(), true)];
+    let by = std::time::Instant::now() + Duration::from_secs(20);
+    while app.screen().matches("label:Switch account").unwrap() && std::time::Instant::now() < by {
+        settle(&mut app);
+    }
+    assert!(!app.screen().matches("label:Switch account").unwrap());
+    assert!(
+        app.screen()
+            .shows("Buwiz Bot couldn't switch to that account.")
+    );
+    assert!(
+        !app.screen().shows("Sign in to it again"),
+        "nothing says the sign-in went"
+    );
 }
 
 #[test]

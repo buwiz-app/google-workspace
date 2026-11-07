@@ -670,9 +670,12 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
         )["structuredContent"],
         json!({"ok": true})
     );
-    assert_eq!(
-        call(&mut ask, "gws_read_mail", json!({"id": "18f1a"}))["structuredContent"],
-        required
+    // still their sign-in, which only a clear ends: the Bot is refreshing it
+    let lapsed = call(&mut ask, "gws_read_mail", json!({"id": "18f1a"}));
+    assert_eq!(lapsed["isError"], true);
+    assert!(
+        lapsed.to_string().contains("Can't reach Google"),
+        "{lapsed}"
     );
     // pushed fresh, then cleared (a sign-out or a failed refresh)
     assert_eq!(

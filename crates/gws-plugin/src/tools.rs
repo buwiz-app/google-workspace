@@ -12,6 +12,9 @@ use crate::gmail::{self, BODY_MAX, Failure, Gmail};
 use crate::js;
 
 pub const SIGN_IN: &str = "Sign in to Google in Buwiz Bot";
+/// A signed-in person's token has lapsed, and the Bot is still trying to refresh it.
+pub const GOOGLE_UNREACHED: &str =
+    "Can't reach Google right now. This comes back by itself once it can.";
 
 /// A tool result: `structuredContent` and its JSON as the text.
 pub fn ok(structured: Value) -> Value {

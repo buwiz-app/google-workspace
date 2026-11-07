@@ -307,6 +307,38 @@ fn status_says_who_is_signed_in_and_never_the_token() {
 }
 
 #[test]
+fn a_lapsed_token_is_still_the_sign_in_until_the_bot_ends_it() {
+    let google = FakeGoogle::start(Seed::default());
+    let core = signed_in(&google, "lapsed");
+    let scopes = json!(["https://www.googleapis.com/auth/gmail.modify"]);
+    core.account(
+        "buwiz.account.set",
+        &json!({"account": "google", "label": "default", "subject": "owner@example.com",
+            "scopes": scopes, "access_token": "old", "token_type": "Bearer", "expires_at": 1000}),
+    );
+
+    let status = core.run("gws_status", &json!({}));
+    assert_eq!(status["structuredContent"]["signed_in"], true);
+    assert_eq!(status["structuredContent"]["subject"], "owner@example.com");
+    let list = core.run("gws_mail_list", &json!({"label": "INBOX"}));
+    assert_eq!(list["isError"], true);
+    assert_ne!(list["structuredContent"]["code"], "account_required");
+    assert!(list.to_string().contains("Can't reach Google"), "{list}");
+
+    // the Bot's clear still ends it
+    core.account(
+        "buwiz.account.clear",
+        &json!({"account": "google", "label": "default"}),
+    );
+    assert_eq!(
+        core.run("gws_status", &json!({}))["structuredContent"]["signed_in"],
+        false
+    );
+    let list = core.run("gws_mail_list", &json!({"label": "INBOX"}));
+    assert_eq!(list["structuredContent"]["code"], "account_required");
+}
+
+#[test]
 fn each_command_opens_its_own_screen() {
     let google = FakeGoogle::start(Seed::default());
     let core = signed_in(&google, "resolve");
@@ -446,7 +478,7 @@ fn sign_out() -> Value {
 fn an_expired_sign_in_still_takes_its_mail_with_it() {
     let google = FakeGoogle::start(Seed::demo(6));
     let core = with_mail(&google, "lapsed-sign-out", 1);
-    assert!(core.accounts.signed_in().is_none(), "the token has expired");
+    assert!(core.accounts.google().is_none(), "the token has expired");
     core.account("buwiz.account.clear", &sign_out());
     assert_eq!(rows(&core, OWNER), 0);
 }

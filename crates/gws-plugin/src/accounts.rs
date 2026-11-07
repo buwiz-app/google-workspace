@@ -244,12 +244,20 @@ impl Accounts {
             .map(|a| Bearer(a.authorization()))
     }
 
-    /// Who is signed in and what the sign-in covers.
+    /// Who is signed in and what the sign-in covers. A token that has lapsed is
+    /// still their sign-in: the Bot ends one with a clear, and until it does
+    /// it's trying to refresh this one.
     pub fn signed_in(&self) -> Option<(String, Vec<String>)> {
-        self.held()
-            .tokens
-            .get(GOOGLE)
+        let held = self.held();
+        let live = held.tokens.get(GOOGLE);
+        let label = |label: &String| held.tokens.labelled(GOOGLE, label);
+        live.or_else(|| held.who.keys().find_map(label))
             .map(|a| (a.subject.clone(), a.scopes.clone()))
+    }
+
+    /// Someone's signed in, and their token has lapsed.
+    pub fn lapsed(&self) -> bool {
+        self.signed_in().is_some() && self.google().is_none()
     }
 }
 

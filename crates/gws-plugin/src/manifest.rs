@@ -239,7 +239,7 @@ pub fn unsigned(key_id: &str) -> Value {
         "short": SHORT,
         "version": env!("CARGO_PKG_VERSION"),
         "title": TITLE,
-        "description": "Your Gmail in Buwiz Bot, with the Google account you sign in to.",
+        "description": "Your Gmail, Calendar and Drive in Buwiz Bot, with the Google account you sign in to.",
         "publisher": { "id": "app.buwiz", "key_id": key_id, "name": "Goldcoders" },
         "commands": [
             { "name": "gws", "description": "Open Mail, Calendar or Drive", "args": "[mail, calendar or drive]", "resolve": tools::RESOLVE },
@@ -666,6 +666,17 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), list.len(), "ids are unique");
+    }
+
+    #[test]
+    fn the_package_says_what_the_app_is_and_agrees_with_the_manifest() {
+        let package: Value =
+            serde_json::from_str(include_str!("../../../package/plugin.json")).unwrap();
+        let said = package["description"].as_str().unwrap();
+        assert_eq!(unsigned(RELEASE_KEY_ID)["description"], said);
+        for app in ["Gmail", "Calendar", "Drive"] {
+            assert!(said.contains(app), "{said}");
+        }
     }
 
     #[test]

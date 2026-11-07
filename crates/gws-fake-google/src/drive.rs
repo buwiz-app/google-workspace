@@ -759,6 +759,7 @@ pub(crate) struct Drive {
     pub(crate) keep_short: Option<usize>,
     /// The answer to the last piece is no JSON.
     pub(crate) garble_last: bool,
+    pub(crate) bad_id_last: bool,
 }
 
 impl Drive {
@@ -1025,6 +1026,10 @@ impl Drive {
         let reply = self.write(session);
         if std::mem::take(&mut self.garble_last) {
             return Reply(200, "application/json", b"<html>".to_vec(), Vec::new());
+        }
+        if std::mem::take(&mut self.bad_id_last) {
+            let body = json!({"id": "../not-an-id"}).to_string().into_bytes();
+            return Reply(200, "application/json", body, Vec::new());
         }
         reply
     }

@@ -124,8 +124,14 @@ fn move_here(b: &Bridge, m: Drive, row: &Row) {
     let call = b.call("gws_drive_move", json!({"id": row.id, "to": to}));
     let opening = m.opening.now();
     answer_write(b, m, call, move |b, m, v| {
+        // the same as a rename: what's up now may be another file
+        let said = if m.opening.counts(opening) {
+            "Moved."
+        } else {
+            "Your earlier move went through."
+        };
         stop_opening(m, opening);
-        keep_undo(m, v, "Moved.");
+        keep_undo(m, v, said);
         landed(b, m, v);
     });
 }

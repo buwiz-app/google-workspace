@@ -400,9 +400,11 @@ fn upload(core: &Core, args: &Value) -> Result<Value, Failure> {
         Sent::Done(v) => Answer::Done(v),
         Sent::Refused(answer) => answer,
     });
-    // Drive has it, whatever its answer says: calling that a failure would have
-    // the next press make a second file. It shows when the changes sync brings it
-    if matches!(&answer, Ok(Answer::Done(v)) if file_of(v).is_none()) {
+    // an answer that couldn't be read at all: Drive has it, and calling that a
+    // failure would have the next press make a second file. It shows when the
+    // changes sync brings it. An answer that can be read and names no good file
+    // is no answer to trust, and goes on to say so
+    if matches!(&answer, Ok(Answer::Done(Value::Null))) {
         core.sync.wake();
         return Ok(ok(json!({"files": []})));
     }

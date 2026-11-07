@@ -655,6 +655,20 @@ fn chunks(core: &Core, name: &str, mime: &str, bytes: &[u8]) -> Value {
     }
 }
 
+/// It can be read, and what it names can't be trusted: that's said, not a row lost.
+#[test]
+fn an_upload_answered_with_a_bad_id_says_so() {
+    let google = drive();
+    let core = signed_in(&google, "upload-bad-id");
+    let upload = chunks(&core, "Roof quote.pdf", "application/pdf", b"%PDF fake");
+    google.drive_names_a_bad_id_last();
+    let done = core.run(
+        "gws_drive_upload",
+        &json!({"upload": upload, "parent": "drv-clients"}),
+    );
+    assert_eq!(done["isError"], true, "{done}");
+}
+
 #[test]
 fn an_upload_whose_last_answer_cant_be_read_is_no_failure() {
     let google = drive();

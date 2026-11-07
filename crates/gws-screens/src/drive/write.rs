@@ -232,8 +232,14 @@ fn commit(b: &Bridge, m: Drive) {
         Some(Acting::Rename(row)) => {
             let call = b.call("gws_drive_rename", json!({"id": row.id, "name": name}));
             answer_write(b, m, call, move |b, m, v| {
+                // what's up now may be another file: Undo stays, in words that don't name it
+                let said = if m.opening.counts(opening) {
+                    "Renamed."
+                } else {
+                    "Your earlier rename went through."
+                };
                 stop_opening(m, opening);
-                keep_undo(m, v, "Renamed.");
+                keep_undo(m, v, said);
                 landed(b, m, v);
             });
         }

@@ -41,17 +41,20 @@ pub enum Ahead {
 
 impl Store {
     /// Threads since `since` that have no view, newest first. Spam and Trash
-    /// wait for an open, and so does a thread there was nothing to keep of,
-    /// until it changes.
+    /// wait for an open, and so does a thread there was nothing to keep of, or
+    /// whose view missed a picture [`TRIES_MAX`] rounds running, until it
+    /// changes.
     pub fn unviewed_since(&self, account: &str, since: i64, take: usize) -> Result<Vec<String>> {
         let mut q = self.conn.prepare(
             "SELECT t.id FROM threads t WHERE t.account = ?1 AND t.at >= ?2 \
              AND NOT EXISTS (SELECT 1 FROM bodies b WHERE b.account = t.account AND b.thread = t.id) \
              AND NOT EXISTS (SELECT 1 FROM thread_labels l WHERE l.account = t.account AND l.thread = t.id AND l.label IN ('SPAM', 'TRASH')) \
-             AND NOT EXISTS (SELECT 1 FROM ahead_passed p WHERE p.account = t.account AND p.thread = t.id AND p.at = t.at AND p.messages = t.messages) \
+             AND NOT EXISTS (SELECT 1 FROM ahead_passed p WHERE p.account = t.account AND p.thread = t.id AND p.at = t.at AND p.messages = t.messages AND p.misses >= ?4) \
              ORDER BY t.at DESC, t.id LIMIT ?3",
         )?;
-        let rows = q.query_map(params![account, since, take as i64], |r| r.get(0))?;
+        let rows = q.query_map(params![account, since, take as i64, TRIES_MAX], |r| {
+            r.get(0)
+        })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -72,10 +75,26 @@ impl Store {
     /// back.
     pub fn pass_thread(&self, account: &str, thread: &str, row: (i64, i64)) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO ahead_passed(account, thread, at, messages) VALUES(?, ?, ?, ?)",
-            params![account, thread, row.0, row.1],
+            "INSERT OR REPLACE INTO ahead_passed(account, thread, at, messages, misses) VALUES(?, ?, ?, ?, ?)",
+            params![account, thread, row.0, row.1, TRIES_MAX],
         )?;
         Ok(())
+    }
+
+    /// The view of `thread`, read at `row`, missed a picture or its twin check
+    /// for time or a failure, and wasn't kept. After [`TRIES_MAX`] such rounds
+    /// with the row unchanged it's passed as [`Store::pass_thread`] passes
+    /// one: true then. A change starts the count over.
+    pub fn missed_thread(&self, account: &str, thread: &str, row: (i64, i64)) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "INSERT INTO ahead_passed(account, thread, at, messages, misses) VALUES(?1, ?2, ?3, ?4, 1) \
+             ON CONFLICT(account, thread) DO UPDATE SET \
+             misses = CASE WHEN at = excluded.at AND messages = excluded.messages THEN misses + 1 ELSE 1 END, \
+             at = excluded.at, messages = excluded.messages \
+             RETURNING misses >= ?5",
+            params![account, thread, row.0, row.1, TRIES_MAX],
+            |r| r.get(0),
+        )?)
     }
 
     /// The bytes of the views of threads since `since`.
@@ -344,6 +363,24 @@ mod tests {
         s.remove_thread("me", "a").unwrap();
         s.forget_account("me").unwrap();
         assert!(s.accounts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_thread_whose_view_keeps_missing_is_passed_after_three_rounds_until_it_changes() {
+        let s = store("missed");
+        s.put_thread("me", &thread("a", 10, &["INBOX"])).unwrap();
+        for round in 1..TRIES_MAX {
+            assert!(!s.missed_thread("me", "a", (10, 1)).unwrap(), "{round}");
+            assert_eq!(s.unviewed_since("me", 0, 5).unwrap(), ["a"], "{round}");
+        }
+        assert!(s.missed_thread("me", "a", (10, 1)).unwrap());
+        assert!(s.unviewed_since("me", 0, 5).unwrap().is_empty(), "passed");
+        s.put_thread("me", &thread("a", 11, &["INBOX"])).unwrap();
+        assert_eq!(s.unviewed_since("me", 0, 5).unwrap(), ["a"], "new mail");
+        assert!(
+            !s.missed_thread("me", "a", (11, 1)).unwrap(),
+            "the count starts over"
+        );
     }
 
     #[test]

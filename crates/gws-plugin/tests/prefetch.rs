@@ -985,3 +985,27 @@ fn a_picture_that_failed_to_come_keeps_no_view_and_a_later_round_keeps_it() {
     let page = kept["page"].as_str().unwrap();
     assert_eq!(page.matches("data:image/png;base64,").count(), 1, "{page}");
 }
+
+#[test]
+fn a_picture_that_never_comes_leaves_its_thread_to_the_open_after_three_rounds() {
+    let google = seeded(vec![with_pictures(1, 1, 1, 1024), mail(2, 2)]);
+    let core = synced(&google, "pictures-never");
+    google.attachment_reads_fail(true);
+    let reads_of_1 = || {
+        thread_reads(&google)
+            .iter()
+            .filter(|t| t.contains(&id(1)))
+            .count()
+    };
+    for round in 1..=3 {
+        gws::prefetch::run(&core).unwrap();
+        assert_eq!(reads_of_1(), round, "read again in round {round}");
+    }
+    assert!(has_view(&core, &id(2)), "older mail still comes");
+    gws::prefetch::run(&core).unwrap();
+    assert_eq!(reads_of_1(), 3, "left to its open after three misses");
+    assert!(
+        !has_view(&core, &id(1)),
+        "nothing kept short of its picture"
+    );
+}

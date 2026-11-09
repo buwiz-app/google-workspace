@@ -226,8 +226,12 @@ fn bodies(
             break;
         }
         // nor is one with a picture or a twin check missed for time or a
-        // failure, which an open doesn't keep either: a later round tries it
+        // failure, which an open doesn't keep either: a later round tries it,
+        // and after a few misses running it's left to its open
         if made != Made::Whole {
+            with_own_store(core, account, |store| {
+                store.missed_thread(account, &id, row_read)
+            })?;
             continue;
         }
         let view = view.to_string();

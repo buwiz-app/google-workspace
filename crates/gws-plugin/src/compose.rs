@@ -353,7 +353,7 @@ fn drop_kept(core: &Core, got: &Gathered) {
 
 /// An address alone, from `a@b.c` or `Name <a@b.c>`, if it's a plain one: what
 /// passes here is safe in a header and between quotes in a Gmail query.
-fn address(text: &str) -> Option<String> {
+pub(crate) fn address(text: &str) -> Option<String> {
     let text = text.trim();
     let bare = match text.rsplit_once('<') {
         Some((_, rest)) => rest.strip_suffix('>')?,

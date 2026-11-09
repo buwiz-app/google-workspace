@@ -29,13 +29,13 @@ const PARAMS_MAX: usize = 32;
 const NESTING_MAX: usize = 8;
 const EVENTS_MAX: usize = 64;
 const ATTENDEES_MAX: usize = 500;
-const ADDRESS_MAX: usize = 320;
 /// How far a part is looked for inside a mail.
 const DEPTH_MAX: usize = 16;
 /// The longest an event may run: a DURATION past this is no invite.
 const DAYS_MAX: i64 = 3660;
 
 const NOT_YET: &str = "Not in your Calendar yet.";
+const DIFFERS: &str = "This invite doesn't match the event in your Calendar.";
 
 /// What an invite asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +142,8 @@ impl Event {
             "all_day": matches!(self.start, Time::Day(_)),
             "place": self.place,
             "organizer": self.organizer.shown(),
+            // what Calendar's copy has to match before an answer goes
+            "organizer_address": self.organizer.address,
         });
         if self.method == Method::Reply {
             let (who, response) = self.answer()?;
@@ -366,7 +368,7 @@ fn in_zone(wall: NaiveDateTime, tzid: &str, defined: &[Defined]) -> Option<DateT
     if let Some(zone) = iana {
         return on_clock(&zone, wall);
     }
-    let offsets = &defined.iter().find(|d| d.id == tzid)?.offsets;
+    let offsets = &defined.iter().find(|d| d.id == name)?.offsets;
     let first = *offsets.first()?;
     if offsets.iter().any(|o| *o != first) {
         return None;
@@ -425,19 +427,14 @@ fn duration_of(v: &str) -> Option<TimeDelta> {
     (secs <= DAYS_MAX * 86_400).then(|| TimeDelta::seconds(secs))
 }
 
+/// A `mailto:` value's address, if it's a plain one, as Compose takes them.
 fn mailto(v: &str) -> String {
     let v = v.trim();
-    let address = match v.get(..7) {
-        Some(scheme) if scheme.eq_ignore_ascii_case("mailto:") => v[7..].trim(),
-        _ => return String::new(),
-    };
-    let fine = address.len() <= ADDRESS_MAX
-        && address.contains('@')
-        && !address.chars().any(|c| c.is_whitespace() || c.is_control());
-    if fine {
-        address.to_owned()
-    } else {
-        String::new()
+    match v.get(..7) {
+        Some(scheme) if scheme.eq_ignore_ascii_case("mailto:") && !v[7..].contains('<') => {
+            crate::compose::address(&v[7..]).unwrap_or_default()
+        }
+        _ => String::new(),
     }
 }
 
@@ -464,6 +461,8 @@ pub fn read(ics: &str) -> Option<Event> {
     if ics.len() > ICS_MAX {
         return None;
     }
+    // Outlook and Windows tools start a file with a byte-order mark
+    let ics = ics.strip_prefix('\u{feff}').unwrap_or(ics);
     let mut stack: Vec<String> = Vec::new();
     let (mut method, mut calendars) = (None, 0);
     let mut events: Vec<Vec<Line>> = Vec::new();
@@ -628,7 +627,53 @@ fn invite_part(message: &Value) -> Option<String> {
     calendar.or(file)
 }
 
-/// A part's `body.data` as text, if it holds no more than [`ICS_MAX`].
+/// A part's charset, from its Content-Type; UTF-8 when it names none.
+fn charset_of(part: &Value) -> String {
+    let headers = part.get("headers").and_then(Value::as_array);
+    let kind = headers.into_iter().flatten().find(|h| {
+        h.get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|n| n.eq_ignore_ascii_case("content-type"))
+    });
+    let kind = kind
+        .and_then(|h| h.get("value"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    kind.split(';')
+        .find_map(|p| p.trim().strip_prefix("charset="))
+        .map_or_else(
+            || "utf-8".to_owned(),
+            |c| c.trim().trim_matches('"').to_owned(),
+        )
+}
+
+/// What windows-1252 puts at 0x80 to 0x9F, where Latin-1 has controls.
+const CP1252: [char; 32] = [
+    '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž', '\u{8f}',
+    '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
+];
+
+/// `bytes` in `charset`; `None` for a charset this doesn't read.
+fn decoded(bytes: &[u8], charset: &str) -> Option<String> {
+    Some(match charset {
+        "utf-8" | "utf8" | "us-ascii" | "ascii" => String::from_utf8_lossy(bytes).into_owned(),
+        "iso-8859-1" | "latin1" | "latin-1" | "iso8859-1" => {
+            bytes.iter().map(|&b| char::from(b)).collect()
+        }
+        "windows-1252" | "cp1252" => bytes
+            .iter()
+            .map(|&b| match b {
+                0x80..=0x9f => CP1252[usize::from(b - 0x80)],
+                _ => char::from(b),
+            })
+            .collect(),
+        _ => return None,
+    })
+}
+
+/// A part's `body.data` as text in its charset, if it holds no more than
+/// [`ICS_MAX`].
 fn text_of(part: &Value) -> Option<String> {
     let data = part.pointer("/body/data")?.as_str()?;
     if data.len() > ICS_MAX / 3 * 4 + 8 {
@@ -646,55 +691,69 @@ fn text_of(part: &Value) -> Option<String> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(clean)
         .ok()?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    decoded(&bytes, &charset_of(part))
+}
+
+/// The newest message in `messages` with an invite part, and where that is.
+fn newest(messages: &[Value]) -> Option<(usize, String)> {
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, m)| invite_part(m).map(|at| (i, at)))
 }
 
 /// Brings the bytes of the newest invite in `thread` (a `format=full` thread)
-/// into its part, as Gmail sends a named part by attachment id. What can't be
-/// fetched stays out: the thread opens without its card.
-pub fn fill(core: &Core, auth: &Bearer, thread: &mut Value) {
-    let messages = thread.get_mut("messages").and_then(Value::as_array_mut);
-    if let Some(m) = messages
-        .into_iter()
-        .flatten()
-        .rev()
-        .find(|m| invite_part(m).is_some())
-    {
-        fill_message(core, auth, m);
+/// into its part, as Gmail sends a named part by attachment id. False when
+/// they were wanted and didn't come: then the view is no answer to keep, as
+/// it would say "no invite" for good.
+pub fn fill(core: &Core, auth: &Bearer, thread: &mut Value) -> bool {
+    let Some(messages) = thread.get_mut("messages").and_then(Value::as_array_mut) else {
+        return true;
+    };
+    match newest(messages) {
+        Some((i, at)) => fill_at(core, auth, &mut messages[i], &at),
+        None => true,
     }
 }
 
-fn fill_message(core: &Core, auth: &Bearer, message: &mut Value) {
-    let Some(at) = invite_part(message) else {
-        return;
-    };
+fn fill_message(core: &Core, auth: &Bearer, message: &mut Value) -> bool {
+    match invite_part(message) {
+        Some(at) => fill_at(core, auth, message, &at),
+        None => true,
+    }
+}
+
+fn fill_at(core: &Core, auth: &Bearer, message: &mut Value, at: &str) -> bool {
     let id = js::string_or_empty(message.get("id"));
-    let Some(part) = message.pointer_mut(&at) else {
-        return;
+    let Some(part) = message.pointer_mut(at) else {
+        return true;
     };
     let size = part.pointer("/body/size").and_then(Value::as_u64);
     let attachment = part.pointer("/body/attachmentId").and_then(Value::as_str);
+    // one too big is no invite whenever it's asked, so that answer stands
     let wanted = part.pointer("/body/data").is_none() && size.is_some_and(|s| s <= ICS_MAX as u64);
     let (true, Some(attachment)) = (wanted, attachment) else {
-        return;
+        return true;
     };
-    if let Ok(Some(bytes)) = core.gmail.attachment(auth, &id, attachment)
-        && bytes.len() <= ICS_MAX
-    {
-        part["body"]["data"] =
-            json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes));
+    match core.gmail.attachment(auth, &id, attachment) {
+        Ok(Some(bytes)) if bytes.len() <= ICS_MAX => {
+            part["body"]["data"] =
+                json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes));
+            true
+        }
+        Ok(Some(_)) => true,
+        _ => false,
     }
 }
 
 /// The thread view's `invite`: the newest message's that has one, or null.
 pub fn of(messages: &[Value]) -> Value {
-    let Some(m) = messages.iter().rev().find(|m| invite_part(m).is_some()) else {
+    let Some((i, at)) = newest(messages) else {
         return Value::Null;
     };
-    let event = invite_part(m)
-        .and_then(|at| m.pointer(&at))
-        .and_then(text_of)
-        .and_then(|ics| read(&ics));
+    let m = &messages[i];
+    let event = m.pointer(&at).and_then(text_of).and_then(|ics| read(&ics));
     let id = js::string_or_empty(m.get("id"));
     event.and_then(|e| e.json(&id)).unwrap_or(Value::Null)
 }
@@ -705,7 +764,9 @@ fn refusal(code: &str, why: &str) -> Value {
     ok(json!({"refused": code, "message": why}))
 }
 
-/// The invite in thread `id`: from its saved view, else from Gmail.
+/// The invite in thread `id`: from its saved view, else from Gmail. A view
+/// saved before invites were read has no `invite` at all, which is "not read
+/// yet", not "none".
 fn of_thread(core: &Core, auth: &Bearer, account: &str, id: &str) -> Result<Value, Failure> {
     let saved = with_store(core, |store| store.view(account, id, now_ms()))?;
     if let Some(invite) = saved
@@ -753,6 +814,38 @@ fn mine<'a>(event: &'a Value, account: &str) -> Option<&'a Value> {
     })
 }
 
+/// A side of a Calendar event as the invite writes it: a UTC moment, or a date.
+fn side_of(event: &Value, key: &str) -> Option<String> {
+    let side = event.get(key)?;
+    if let Some(day) = side.get("date").and_then(Value::as_str) {
+        return Some(day.to_owned());
+    }
+    let at = DateTime::parse_from_rfc3339(side.get("dateTime")?.as_str()?).ok()?;
+    Some(
+        at.with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::Secs, true),
+    )
+}
+
+/// Whether Calendar's event is the one the invite describes: same organiser,
+/// same start. A UID alone is the sender's to write, so a forged or stale
+/// `.ics` could name an event the person is already a guest of.
+fn matches(invite: &Value, event: &Value) -> bool {
+    let organizer = event
+        .pointer("/organizer/email")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let named = invite
+        .get("organizer_address")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let start = invite.get("start").and_then(Value::as_str);
+    !named.is_empty()
+        && organizer.eq_ignore_ascii_case(named)
+        && start.is_some()
+        && side_of(event, "start").as_deref() == start
+}
+
 /// `gws_mail_invite`: the invite, and for an invitation whether Calendar has
 /// its event and what the person answered there.
 fn look(core: &Core, args: &Value) -> Result<Value, Failure> {
@@ -769,16 +862,17 @@ fn look(core: &Core, args: &Value) -> Result<Value, Failure> {
     }
     let uid = js::string_or_empty(invite.get("uid"));
     let calendar = match in_calendar(core, &auth, &account, &uid)? {
-        None => json!({"found": false, "guest": false, "response": null}),
+        None => json!({"found": false, "matches": false, "guest": false, "response": null}),
         Some((_, event)) => {
             let me = mine(&event, &account);
-            json!({"found": true, "guest": me.is_some(), "response": me.and_then(|a| a.get("responseStatus"))})
+            json!({"found": true, "matches": matches(&invite, &event), "guest": me.is_some(), "response": me.and_then(|a| a.get("responseStatus"))})
         }
     };
     Ok(ok(json!({"invite": invite, "calendar": calendar})))
 }
 
 /// `gws_mail_invite_reply`: the person's Yes, No or Maybe, through Calendar.
+/// It always tells the organiser: that's what answering an invite is for.
 fn reply(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (auth, account) = signed_in(core)?;
     let message = js::trim(&js::string_or_empty(args.get("message"))).to_owned();
@@ -807,10 +901,11 @@ fn reply(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some((calendar, event)) = in_calendar(core, &auth, &account, &uid)? else {
         return Ok(refusal("not_found", NOT_YET));
     };
-    calendar::rsvp(
-        core,
-        &json!({"calendar": calendar, "id": event.get("id"), "response": response}),
-    )
+    if !matches(&invite, &event) {
+        return Ok(refusal("changed", DIFFERS));
+    }
+    let args = json!({"calendar": calendar, "id": event.get("id"), "response": response});
+    calendar::rsvp_with(core, &args, Some(event), true)
 }
 
 /// Runs an invite tool; `None` for any other tool.
@@ -1063,6 +1158,73 @@ mod tests {
             "mailto:ana at example\r\nUID",
         );
         assert_eq!(read(&odd).unwrap().organizer.address, "");
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_no_part_of_the_invite() {
+        let e = read(&format!("\u{feff}{GOOGLE}")).unwrap();
+        assert_eq!(e.title, "Roof inspection");
+    }
+
+    #[test]
+    fn a_tzid_with_spaces_finds_the_zone_the_ics_defines() {
+        let ics = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VTIMEZONE\r\nTZID:Office time\r\nBEGIN:STANDARD\r\nTZOFFSETTO:+0800\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART;TZID=\" Office time \":20261110T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(read(ics).unwrap().start, at("2026-11-10T02:00:00Z"));
+    }
+
+    fn part_in(charset: &str, bytes: &[u8]) -> Value {
+        json!({"mimeType": "text/calendar", "headers": [{"name": "Content-Type", "value": format!("text/calendar; charset=\"{charset}\"; method=REQUEST")}], "body": {"data": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)}})
+    }
+
+    #[test]
+    fn a_part_reads_in_the_charset_it_names() {
+        let ics = |title: &[u8]| {
+            let mut out = b"BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20261110T020000Z\r\nSUMMARY:".to_vec();
+            out.extend_from_slice(title);
+            out.extend_from_slice(b"\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
+            out
+        };
+        let title = |p: Value| of(&[message("m1", json!([p]))])["title"].clone();
+        // "Café “Tuesday”" as Outlook writes it in windows-1252
+        assert_eq!(
+            title(part_in("windows-1252", &ics(b"Caf\xe9 \x93Tuesday\x94"))),
+            "Caf\u{e9} \u{201c}Tuesday\u{201d}"
+        );
+        assert_eq!(title(part_in("ISO-8859-1", &ics(b"Caf\xe9"))), "Caf\u{e9}");
+        assert_eq!(title(part_in("utf-8", &ics("Café".as_bytes()))), "Café");
+        assert_eq!(title(part_in("x-klingon", &ics(b"Cafe"))), Value::Null);
+    }
+
+    #[test]
+    fn calendars_event_matches_only_with_the_invites_organiser_and_start() {
+        let e = read(GOOGLE).unwrap().json("m1").unwrap();
+        let event = |organizer: &str, start: Value| json!({"organizer": {"email": organizer}, "start": start});
+        let at = json!({"dateTime": "2026-11-10T10:00:00+08:00"});
+        assert!(matches(&e, &event("ANA@example.com", at.clone())));
+        assert!(!matches(&e, &event("mallory@evil.example", at)));
+        assert!(!matches(
+            &e,
+            &event(
+                "ana@example.com",
+                json!({"dateTime": "2026-11-10T11:00:00+08:00"})
+            )
+        ));
+        assert!(!matches(
+            &e,
+            &event("ana@example.com", json!({"date": "2026-11-10"}))
+        ));
+        let all_day = read(APPLE).unwrap().json("m1").unwrap();
+        assert!(matches(
+            &all_day,
+            &event("cara@example.com", json!({"date": "2026-11-24"}))
+        ));
+        // an invite naming no organiser can't be checked, so it answers nothing
+        let mut nobody = e.clone();
+        nobody["organizer_address"] = json!("");
+        assert!(!matches(
+            &nobody,
+            &event("", json!({"dateTime": "2026-11-10T02:00:00Z"}))
+        ));
     }
 
     fn message(id: &str, parts: Value) -> Value {

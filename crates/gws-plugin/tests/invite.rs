@@ -59,7 +59,7 @@ fn the_thread_view_carries_the_invites_event_from_its_ics() {
     let view = data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
     assert_eq!(
         view["invite"],
-        json!({"message": INVITE, "uid": "fake-roof-inspection@google.com", "method": "request", "title": "Roof inspection", "start": "2026-11-10T02:00:00Z", "end": "2026-11-10T03:00:00Z", "all_day": false, "place": "12 Mabini St", "organizer": "Ana Reyes"})
+        json!({"message": INVITE, "uid": "fake-roof-inspection@google.com", "method": "request", "title": "Roof inspection", "start": "2026-11-10T02:00:00Z", "end": "2026-11-10T03:00:00Z", "all_day": false, "place": "12 Mabini St", "organizer": "Ana Reyes", "organizer_address": "ana@example.com"})
     );
     // a mail with none says so, so a saved view tells "none" from "not read yet"
     let other = data(core.run("gws_mail_thread", &json!({"thread": "000019f00000001e"})));
@@ -75,7 +75,7 @@ fn calendar_has_the_invites_event_and_the_person_has_not_answered() {
         assert_eq!(got["invite"]["title"], "Roof inspection", "{args}");
         assert_eq!(
             got["calendar"],
-            json!({"found": true, "guest": true, "response": "needsAction"}),
+            json!({"found": true, "matches": true, "guest": true, "response": "needsAction"}),
             "{args}"
         );
     }
@@ -214,4 +214,130 @@ fn a_broken_ics_is_no_invite() {
     assert_eq!(view["invite"], Value::Null);
     let got = data(core.run("gws_mail_invite", &json!({"message": mail.id})));
     assert_eq!(got["invite"], Value::Null);
+}
+
+/// The rich invite's `.ics` with `change` made to it.
+fn rich_ics(change: impl Fn(String) -> String) -> String {
+    change("BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nDTSTART:20261110T020000Z\r\nDTEND:20261110T030000Z\r\nUID:fake-roof-inspection@google.com\r\nORGANIZER;CN=Ana Reyes:mailto:ana@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:owner@example.com\r\nSUMMARY:Roof inspection\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".to_owned())
+}
+
+#[test]
+fn an_invite_that_didnt_come_is_asked_for_again_not_kept_as_none() {
+    let google = FakeGoogle::start(rich());
+    let core = signed_in(&google, "refetch");
+    google.attachments_fail(true);
+    let view = data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
+    assert_eq!(view["invite"], Value::Null);
+    google.attachments_fail(false);
+    let view = data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
+    assert_eq!(view["invite"]["title"], "Roof inspection");
+    let got = data(core.run("gws_mail_invite", &json!({"thread": INVITE})));
+    assert_eq!(got["invite"]["title"], "Roof inspection");
+}
+
+#[test]
+fn a_view_saved_before_invites_were_read_is_read_again() {
+    let google = FakeGoogle::start(rich());
+    let core = signed_in(&google, "old-view");
+    data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
+    {
+        let held = core.store().unwrap();
+        let old = json!({"id": INVITE, "page": "<p>old</p>", "links": [], "images": 0, "attachments": []});
+        held.as_ref()
+            .unwrap()
+            .put_view(FAKE_EMAIL, INVITE, &old.to_string(), 1)
+            .unwrap();
+    }
+    let got = data(core.run("gws_mail_invite", &json!({"thread": INVITE})));
+    assert_eq!(got["invite"]["title"], "Roof inspection");
+}
+
+#[test]
+fn a_forged_or_stale_invite_naming_a_real_event_answers_nothing() {
+    let forged = [
+        rich_ics(|s| s.replace("mailto:ana@example.com", "mailto:mallory@evil.example")),
+        rich_ics(|s| s.replace("20261110T0", "20261111T0")),
+    ];
+    for (n, ics) in forged.iter().enumerate() {
+        let google = FakeGoogle::start(rich());
+        let mail = mail_with(ics, 10 + n as u64);
+        google.deliver(mail.clone());
+        let core = signed_in(&google, &format!("forged-{n}"));
+        let got = data(core.run("gws_mail_invite", &json!({"message": mail.id})));
+        assert_eq!(got["calendar"]["found"], true, "{n}");
+        assert_eq!(got["calendar"]["matches"], false, "{n}");
+        let refused = data(core.run(
+            "gws_mail_invite_reply",
+            &json!({"message": mail.id, "response": "accepted"}),
+        ));
+        assert_eq!(refused["refused"], "changed", "{n}");
+        assert!(google.calendar_writes().is_empty(), "{n}");
+    }
+    // the invite as it was sent still answers
+    let google = FakeGoogle::start(rich());
+    let mail = mail_with(&rich_ics(|s| s), 20);
+    google.deliver(mail.clone());
+    let core = signed_in(&google, "forged-none");
+    data(core.run(
+        "gws_mail_invite_reply",
+        &json!({"message": mail.id, "response": "accepted"}),
+    ));
+    assert_eq!(google.calendar_writes().len(), 1);
+}
+
+#[test]
+fn the_organiser_hears_even_when_the_persons_copy_lists_no_one_else() {
+    let mut seed = rich();
+    for c in &mut seed.calendars {
+        for e in &mut c.events {
+            e["attendees"] = json!([{"email": FAKE_EMAIL, "responseStatus": "needsAction"}]);
+        }
+    }
+    let google = FakeGoogle::start(seed);
+    let core = signed_in(&google, "alone");
+    data(core.run(
+        "gws_mail_invite_reply",
+        &json!({"message": INVITE, "response": "accepted"}),
+    ));
+    let writes = google.calendar_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].send_updates.as_deref(), Some("all"));
+    // Calendar's own answer keeps its rule: nobody else listed, nobody told
+    data(core.run(
+        "gws_event_rsvp",
+        &json!({"calendar": FAKE_EMAIL, "id": "roofinspection", "response": "declined"}),
+    ));
+    let writes = google.calendar_writes();
+    assert_eq!(writes[1].send_updates.as_deref(), Some("none"));
+}
+
+#[test]
+fn a_series_past_a_page_of_changed_instances_is_answered_on_the_series() {
+    let mut seed = rich();
+    let master = seed
+        .calendars
+        .iter_mut()
+        .find(|c| c.primary)
+        .unwrap()
+        .events
+        .pop()
+        .unwrap();
+    let primary = seed.calendars.iter_mut().find(|c| c.primary).unwrap();
+    for n in 0..7 {
+        let mut instance = master.clone();
+        instance["id"] = json!(format!("roofinspection_{n}"));
+        instance["recurringEventId"] = json!("roofinspection");
+        primary.events.push(instance);
+    }
+    primary.events.push(master);
+    let google = FakeGoogle::start(seed);
+    google.calendar_page(3);
+    let core = signed_in(&google, "pages");
+    data(core.run(
+        "gws_mail_invite_reply",
+        &json!({"message": INVITE, "response": "accepted"}),
+    ));
+    let writes = google.calendar_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].event, "roofinspection");
 }

@@ -47,6 +47,8 @@ const SEARCH_MAX: i64 = 25;
 const NEXT_LOOK: i64 = 50;
 /// How many deletes can still be undone.
 const DELETES_MAX: usize = 20;
+/// The most pages an event's UID is looked for on.
+const UID_PAGES: usize = 20;
 const SEQ: &str = "cal_seq";
 const STATUS: &str = "cal_status";
 
@@ -274,18 +276,31 @@ impl CalendarApi {
         uid: &str,
     ) -> Result<Option<Value>, Failure> {
         let path = format!("calendars/{}/events", segment(calendar));
-        let query = [("iCalUID", uid.to_owned()), ("maxResults", "10".to_owned())];
-        let Answer::Done(v) = self.get(auth, &path, &query)? else {
-            return Ok(None);
-        };
-        let items = v.get("items").and_then(Value::as_array);
-        let live: Vec<&Value> = items
-            .into_iter()
-            .flatten()
-            .filter(|e| text(e, "status") != "cancelled")
-            .collect();
-        let master = live.iter().find(|e| text(e, "recurringEventId").is_empty());
-        Ok(master.or(live.first()).map(|e| (*e).clone()))
+        // a series with many changed instances can run to pages, and the
+        // series itself may be on any of them
+        let (mut first, mut page) = (None, None::<String>);
+        for _ in 0..UID_PAGES {
+            let mut query = vec![("iCalUID", uid.to_owned()), ("maxResults", PAGE.to_owned())];
+            query.extend(page.take().map(|p| ("pageToken", p)));
+            let Answer::Done(v) = self.get(auth, &path, &query)? else {
+                return Ok(first);
+            };
+            let items = v.get("items").and_then(Value::as_array);
+            for e in items.into_iter().flatten() {
+                if text(e, "status") == "cancelled" {
+                    continue;
+                }
+                if text(e, "recurringEventId").is_empty() {
+                    return Ok(Some(e.clone()));
+                }
+                first = first.or_else(|| Some(e.clone()));
+            }
+            match v.get("nextPageToken").and_then(Value::as_str) {
+                Some(next) => page = Some(next.to_owned()),
+                None => break,
+            }
+        }
+        Ok(first)
     }
 
     pub fn insert(
@@ -1531,9 +1546,20 @@ fn restore(core: &Core, args: &Value) -> Result<Value, Failure> {
     finish(core, &auth, &account, &calendar, &id, &written)
 }
 
-/// A guest's answer, which the organiser hears of. An invite in Mail is
-/// answered here too ([`crate::invite`]).
-pub(crate) fn rsvp(core: &Core, args: &Value) -> Result<Value, Failure> {
+/// A guest's answer: everyone else on the event hears of it.
+fn rsvp(core: &Core, args: &Value) -> Result<Value, Failure> {
+    rsvp_with(core, args, None, false)
+}
+
+/// [`rsvp`], from `known` when the caller has just read the event, and with
+/// `sendUpdates=all` whoever else the person's copy lists when `always`: an
+/// invite answered from Mail ([`crate::invite`]) is for its organiser.
+pub(crate) fn rsvp_with(
+    core: &Core,
+    args: &Value,
+    known: Option<Value>,
+    always: bool,
+) -> Result<Value, Failure> {
     let (auth, account) = signed_in(core)?;
     let Some((calendar, id)) = ids(args) else {
         return Ok(bad_args("That isn't an event."));
@@ -1542,11 +1568,11 @@ pub(crate) fn rsvp(core: &Core, args: &Value) -> Result<Value, Failure> {
     if !["accepted", "declined", "tentative"].contains(&response.as_str()) {
         return Ok(bad_args("A reply is accepted, declined or tentative."));
     }
-    let Some(live) = core
-        .calendar
-        .event(&auth, &calendar, &id)?
-        .filter(|v| text(v, "status") != "cancelled")
-    else {
+    let live = match known {
+        Some(event) => Some(event),
+        None => core.calendar.event(&auth, &calendar, &id)?,
+    };
+    let Some(live) = live.filter(|v| text(v, "status") != "cancelled") else {
         return Ok(gone());
     };
     // a reply to one instance is the plain reading: `all` has to be said
@@ -1580,7 +1606,7 @@ pub(crate) fn rsvp(core: &Core, args: &Value) -> Result<Value, Failure> {
     }
     let etag = text(&event, "etag");
     let write = Write {
-        notify: !guests_of(&event, &account).is_empty(),
+        notify: always || !guests_of(&event, &account).is_empty(),
         if_match: &etag,
     };
     let answer = core

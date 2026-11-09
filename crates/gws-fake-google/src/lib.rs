@@ -527,6 +527,7 @@ struct Account {
     wrote: bool,
     reads_fail_after_write: bool,
     draft_reads_fail: bool,
+    attachments_fail: bool,
     /// Reads so far, once attachment ids change with each.
     reads: Option<AtomicU64>,
     /// `(draft id, message id, raw message, thread)`.
@@ -1006,6 +1007,10 @@ impl Account {
                 Some(m) => Reply::json(200, self.resource(m, &format, &wanted)),
                 None => not_found(),
             },
+            ("GET", ["messages", _, "attachments", _]) if self.attachments_fail => Reply::json(
+                500,
+                json!({"error": {"code": 500, "message": "Backend error"}}),
+            ),
             ("GET", ["messages", id, "attachments", att]) => {
                 let at = att.rsplit('-').next().and_then(|i| i.parse::<usize>().ok());
                 let held = self
@@ -1582,6 +1587,11 @@ impl FakeGoogle {
     /// Whether reading a draft fails.
     pub fn draft_reads_fail(&self, fail: bool) {
         self.account.lock().unwrap().draft_reads_fail = fail;
+    }
+
+    /// Attachment reads fail, as Gmail's backend sometimes does.
+    pub fn attachments_fail(&self, fail: bool) {
+        self.account.lock().unwrap().attachments_fail = fail;
     }
 
     /// From now on a token covers `scope` alone, and writes need more.

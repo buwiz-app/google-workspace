@@ -127,7 +127,7 @@ fn settle(app: &mut Headless) {
 }
 
 fn in_calendar(response: &str) -> Value {
-    json!({"invite": invite("request"), "calendar": {"found": true, "guest": true, "response": response}})
+    json!({"invite": invite("request"), "calendar": {"found": true, "matches": true, "guest": true, "response": response}})
 }
 
 #[test]
@@ -197,6 +197,27 @@ fn an_invite_not_in_calendar_shows_with_its_buttons_off() {
     );
     assert!(app.screen().shows("Roof inspection"));
     assert!(app.screen().shows("Not in your Calendar yet."));
+    for label in ["Answer yes", "Answer no", "Answer maybe"] {
+        assert!(
+            !app.screen().enabled(&format!("label:{label}")).unwrap(),
+            "{label}"
+        );
+    }
+    let _ = app.press("label:Answer yes");
+    settle(&mut app);
+    assert!(fake.called("gws_mail_invite_reply").is_empty());
+}
+
+#[test]
+fn an_invite_unlike_its_calendar_event_shows_with_its_buttons_off() {
+    let (mut app, _, fake) = opened(
+        json!({"invite": invite("request"), "calendar": {"found": true, "matches": false, "guest": true, "response": "needsAction"}}),
+    );
+    assert!(app.screen().shows("Roof inspection"));
+    assert!(
+        app.screen()
+            .shows("This invite doesn't match the event in your Calendar.")
+    );
     for label in ["Answer yes", "Answer no", "Answer maybe"] {
         assert!(
             !app.screen().enabled(&format!("label:{label}")).unwrap(),

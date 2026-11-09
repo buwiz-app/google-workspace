@@ -636,7 +636,17 @@ impl Calendars {
                 .iter()
                 .filter(|e| !is_cancelled(e) && ical_uid(e) == uid)
                 .collect();
-            return Reply::json(200, json!({"items": items, "timeZone": held.time_zone}));
+            let start: usize = r
+                .param("pageToken")
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(0);
+            let max = self.page.unwrap_or(250);
+            let page: Vec<&&Value> = items.iter().skip(start).take(max).collect();
+            let mut v = json!({"items": page, "timeZone": held.time_zone});
+            if start + max < items.len() {
+                v["nextPageToken"] = json!((start + max).to_string());
+            }
+            return Reply::json(200, v);
         }
         if r.param("singleEvents").as_deref() != Some("true") {
             return error(400, "The stub lists events with singleEvents=true only.");

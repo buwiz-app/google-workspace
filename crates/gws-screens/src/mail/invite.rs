@@ -69,17 +69,20 @@ enum Calendar {
     Missing,
     /// There, but the person isn't on its guest list.
     NotAGuest,
+    /// An event with the invite's UID whose organiser or start isn't the
+    /// invite's: a forged or stale `.ics`, which can't answer it.
+    Differs,
     /// There, with the person's answer so far.
     Guest(String),
 }
 
 fn calendar_of(v: &Value) -> Calendar {
-    match (v.get("found"), v.get("guest")) {
-        (Some(Value::Bool(true)), Some(Value::Bool(true))) => {
-            Calendar::Guest(text_in(v, "response"))
-        }
-        (Some(Value::Bool(true)), _) => Calendar::NotAGuest,
-        _ => Calendar::Missing,
+    let yes = |key: &str| v.get(key) == Some(&Value::Bool(true));
+    match (yes("found"), yes("matches"), yes("guest")) {
+        (false, ..) => Calendar::Missing,
+        (true, false, _) => Calendar::Differs,
+        (true, true, true) => Calendar::Guest(text_in(v, "response")),
+        (true, true, false) => Calendar::NotAGuest,
     }
 }
 
@@ -225,8 +228,17 @@ fn shown(b: &Bridge, m: Mail, state: Signal<Option<Card>>, card: &Card) -> View 
     }
     words = words.child(line(about(invite), MUTE));
     if invite.method == "request" {
-        if card.calendar == Calendar::Missing {
-            words = words.child(line("Not in your Calendar yet.".to_owned(), DIM));
+        match card.calendar {
+            Calendar::Missing => {
+                words = words.child(line("Not in your Calendar yet.".to_owned(), DIM));
+            }
+            Calendar::Differs => {
+                words = words.child(line(
+                    "This invite doesn't match the event in your Calendar.".to_owned(),
+                    DIM,
+                ));
+            }
+            _ => {}
         }
         words = words.child(answers(b, m, state, card));
     }
@@ -306,12 +318,21 @@ mod tests {
             Calendar::Missing
         );
         assert_eq!(
-            calendar_of(&json!({"found": true, "guest": false})),
+            calendar_of(&json!({"found": true, "matches": true, "guest": false})),
             Calendar::NotAGuest
         );
         assert_eq!(
-            calendar_of(&json!({"found": true, "guest": true, "response": "tentative"})),
+            calendar_of(
+                &json!({"found": true, "matches": true, "guest": true, "response": "tentative"})
+            ),
             Calendar::Guest("tentative".to_owned())
+        );
+        // a guest of an event the invite doesn't describe answers nothing
+        assert_eq!(
+            calendar_of(
+                &json!({"found": true, "matches": false, "guest": true, "response": "needsAction"})
+            ),
+            Calendar::Differs
         );
     }
 

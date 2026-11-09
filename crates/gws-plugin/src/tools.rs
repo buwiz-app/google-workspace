@@ -119,6 +119,9 @@ pub const FILE_DISCARD: &str = "gws_file_discard";
 pub const MAIL_ATTACHMENT_OPEN: &str = "gws_mail_attachment_open";
 pub const MAIL_INVITE: &str = "gws_mail_invite";
 pub const MAIL_INVITE_REPLY: &str = "gws_mail_invite_reply";
+pub const MAIL_PICTURES: &str = "gws_mail_pictures";
+pub const MAIL_PICTURE_SENDER_ADD: &str = "gws_mail_picture_sender_add";
+pub const MAIL_PICTURE_SENDER_REMOVE: &str = "gws_mail_picture_sender_remove";
 
 /// A write: the person's, on a screen, and never the model's.
 fn write(name: &'static str, description: &'static str, input_schema: Value) -> Def {
@@ -571,6 +574,27 @@ pub fn defs() -> Vec<Def> {
             "Download a mail's attachment to this Mac for the Bot's viewer. A person's press alone. An edit can only be saved to Drive as a new file.",
             json!({"type": "object", "properties": {"message": {"type": "string"}, "part": {"type": "string"}}, "required": ["message", "part"]}),
         ),
+        write(
+            MAIL_PICTURES,
+            "Fetch a conversation's web pictures from this Mac and show them in it. A person's press alone: the sender can see the mail was opened.",
+            json!({"type": "object", "properties": {"thread": {"type": "string"}, "trusted": {"type": "boolean"}}, "required": ["thread"]}),
+        ),
+        Def {
+            name: MAIL_PICTURE_SENDER_ADD,
+            description: "Always show pictures from this sender. A person's press alone.",
+            input_schema: json!({"type": "object", "properties": {"address": {"type": "string"}}, "required": ["address"]}),
+            read_only: false,
+            audience: APP_ONLY,
+            open_world: false,
+        },
+        Def {
+            name: MAIL_PICTURE_SENDER_REMOVE,
+            description: "Stop always showing pictures from this sender. A person's press alone.",
+            input_schema: json!({"type": "object", "properties": {"address": {"type": "string"}}, "required": ["address"]}),
+            read_only: false,
+            audience: APP_ONLY,
+            open_world: false,
+        },
         Def {
             name: MAIL_INVITE,
             description: "The invite in a mail, read from its .ics, and whether Calendar has its event and what the person answered.",

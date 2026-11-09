@@ -78,9 +78,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
         9,
         "CREATE TABLE sign_ins(label TEXT NOT NULL PRIMARY KEY, subject TEXT NOT NULL) WITHOUT ROWID;",
     ),
-    // held for lane 2 (#22) and lane 4 (#23): each merge puts its own here
-    (10, "SELECT 1;"),
-    (11, "SELECT 1;"),
+    // a stored mail view shows every message open: fetched again, it folds
+    (10, "DELETE FROM bodies;"),
     // recent mail ahead of time: small attachments by their mail's date, the
     // bytes last so a sum of sizes needn't read them; which views have had
     // theirs looked at, and how often; threads there was nothing to keep of
@@ -663,6 +662,28 @@ mod tests {
                  ALTER TABLE bodies DROP COLUMN tries;
                  ALTER TABLE drive_files DROP COLUMN can;
                  PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&paths, &key()).unwrap();
+        assert_eq!(store.view("a", "t", 2).unwrap(), None);
+    }
+
+    /// One kept from before folds shows every message open.
+    #[test]
+    fn a_stored_mail_view_from_before_folds_goes() {
+        let dir = Dir::new("folds");
+        let paths = Paths::in_dir(&dir.0);
+        let store = Store::open(&paths, &key()).unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "INSERT INTO bodies(account, thread, view, size, used) VALUES('a', 't', '{}', 2, 1);
+                 DROP TABLE attachment_bytes;
+                 DROP TABLE ahead_passed;
+                 ALTER TABLE bodies DROP COLUMN fetched;
+                 ALTER TABLE bodies DROP COLUMN tries;
+                 PRAGMA user_version = 9;",
             )
             .unwrap();
         drop(store);

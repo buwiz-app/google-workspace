@@ -7,7 +7,15 @@ use crate::{FAKE_EMAIL, Mail, NOW_MS, Seed};
 
 const ICS: &str = "BEGIN:VCALENDAR\r\nPRODID:-//Google Inc//Google Calendar 70.9054//EN\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nDTSTART:20261110T020000Z\r\nDTEND:20261110T030000Z\r\nUID:fake-roof-inspection@google.com\r\nORGANIZER;CN=Ana Reyes:mailto:ana@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;CN=You:mailto:owner@example.com\r\nSUMMARY:Roof inspection\r\nLOCATION:12 Mabini St\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 const PDF: &str = "%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 200]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n4 0 obj<</Length 44>>stream\nBT /F1 18 Tf 40 100 Td (Fake receipt) Tj ET\nendstream endobj\n5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n";
-pub(crate) const PHOTO: &[u8] = include_bytes!("site-photo.png");
+const PHOTO: &[u8] = include_bytes!("site-photo.png");
+/// A 1×1 PNG, a second web picture that differs from the first.
+const DOT: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0,
+    0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
 /// An empty zip: the end-of-directory record and nothing else.
 const ZIP: &[u8] = b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
@@ -153,9 +161,12 @@ impl Seed {
         )];
         rich.push(news);
 
-        rich.reverse();
-        rich.extend(std::mem::take(&mut self.mails));
-        self.mails = rich;
+        self.mails.extend(rich);
+        self.newest_first();
+        self.pictures = vec![
+            ("hero.png".into(), PHOTO.to_vec()),
+            ("roof2.png".into(), DOT.to_vec()),
+        ];
         self
     }
 }
@@ -164,7 +175,9 @@ impl Seed {
 mod tests {
     use serde_json::Value;
 
-    use crate::{Mail, Seed, file_bytes, payload};
+    use std::io::{Read, Write};
+
+    use crate::{FakeGoogle, Mail, Seed, file_bytes, payload};
 
     fn rich(subject: &str) -> Mail {
         Seed::default()
@@ -261,5 +274,71 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    fn ids(part: &Value, out: &mut Vec<String>) {
+        out.push(part["partId"].as_str().unwrap().to_owned());
+        for p in part["parts"].as_array().into_iter().flatten() {
+            ids(p, out);
+        }
+    }
+
+    #[test]
+    fn every_part_of_every_rich_mail_has_its_own_id() {
+        for m in Seed::default().with_rich_mail("http://127.0.0.1:1").mails {
+            let mut seen = Vec::new();
+            ids(&payload(&m, true, 0), &mut seen);
+            let mut unique = seen.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(unique.len(), seen.len(), "{}: {seen:?}", m.subject);
+        }
+        let mut seen = Vec::new();
+        ids(&payload(&rich("Five roofs"), true, 0), &mut seen);
+        assert_eq!(seen, ["", "0", "0.0", "0.1", "1"]);
+    }
+
+    /// The status line and body of a plain GET to the stub.
+    fn get(google: &FakeGoogle, path: &str) -> (String, Vec<u8>) {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", google.port)).unwrap();
+        write!(
+            s,
+            "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut all = Vec::new();
+        s.read_to_end(&mut all).unwrap();
+        let split = all.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&all[..split])
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+        (head, all[split + 4..].to_vec())
+    }
+
+    #[test]
+    fn the_newsletter_pictures_are_served_each_its_own_and_only_with_rich_mail() {
+        let rich = FakeGoogle::start(Seed::default().with_rich_mail("http://127.0.0.1:1"));
+        let (ok, hero) = get(&rich, "/pictures/hero.png");
+        let (_, roof) = get(&rich, "/pictures/roof2.png");
+        assert!(ok.contains(" 200"), "{ok}");
+        assert!(hero.starts_with(b"\x89PNG") && roof.starts_with(b"\x89PNG"));
+        assert_ne!(hero, roof);
+        assert!(get(&rich, "/pictures/other.png").0.contains(" 404"));
+        let plain = FakeGoogle::start(Seed::demo(2));
+        assert!(get(&plain, "/pictures/hero.png").0.contains(" 404"));
+    }
+
+    #[test]
+    fn rich_and_hostile_mail_together_stay_newest_first() {
+        for seed in [
+            Seed::demo(6).with_rich_mail("s").with_hostile("s"),
+            Seed::demo(6).with_hostile("s").with_rich_mail("s"),
+        ] {
+            let at: Vec<i64> = seed.mails.iter().map(|m| m.at).collect();
+            assert!(at.windows(2).all(|w| w[0] >= w[1]), "{at:?}");
+            assert!(seed.mails.iter().any(|m| m.subject == "Hostile test mail"));
+        }
     }
 }

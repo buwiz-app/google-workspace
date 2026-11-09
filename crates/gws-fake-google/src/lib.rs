@@ -262,6 +262,9 @@ pub struct Seed {
     pub only_grants: Option<String>,
     pub calendars: Vec<FakeCalendar>,
     pub files: Vec<FakeFile>,
+    /// What the stub serves at `/pictures/<name>`, as a web server would: a
+    /// newsletter's pictures. Empty unless a seed adds some.
+    pub pictures: Vec<(String, Vec<u8>)>,
 }
 
 const PEOPLE: [(&str, &str); 8] = [
@@ -361,26 +364,29 @@ pub const HOSTILE_HTML: &str = r##"<meta http-equiv="refresh" content="0;url={st
 <p><a href="{stub}/__clicked" style="font-size:24px">REAL LINK</a></p>"##;
 
 impl Seed {
-    /// Adds the hostile mail, newest of all.
+    /// Adds the hostile mail, an hour after the demo's newest.
     pub fn with_hostile(mut self, stub: &str) -> Self {
-        self.mails.insert(
-            0,
-            Mail {
-                id: "0000000000hostile".into(),
-                thread: "0000000000hostile".into(),
-                labels: vec!["INBOX".into(), "UNREAD".into()],
-                from: "Mallory Fake <mallory@evil.example>".into(),
-                to: FAKE_EMAIL.into(),
-                subject: "Hostile test mail".into(),
-                at: NOW_MS + 3_600_000,
-                text: "plain".into(),
-                html: Some(HOSTILE_HTML.replace("{stub}", stub)),
-                attachments: Vec::new(),
-                message_id: String::new(),
-                inline: Vec::new(),
-            },
-        );
+        self.mails.push(Mail {
+            id: "0000000000hostile".into(),
+            thread: "0000000000hostile".into(),
+            labels: vec!["INBOX".into(), "UNREAD".into()],
+            from: "Mallory Fake <mallory@evil.example>".into(),
+            to: FAKE_EMAIL.into(),
+            subject: "Hostile test mail".into(),
+            at: NOW_MS + 3_600_000,
+            text: "plain".into(),
+            html: Some(HOSTILE_HTML.replace("{stub}", stub)),
+            attachments: Vec::new(),
+            message_id: String::new(),
+            inline: Vec::new(),
+        });
+        self.newest_first();
         self
+    }
+
+    /// Mails newest first, as Gmail lists them, whichever seeds added them.
+    pub(crate) fn newest_first(&mut self) {
+        self.mails.sort_by_key(|m| std::cmp::Reverse(m.at));
     }
 }
 
@@ -444,48 +450,60 @@ fn payload(m: &Mail, full: bool, read: u64) -> Value {
     if !full {
         return json!({"mimeType": "multipart/alternative", "headers": headers(m)});
     }
-    let file = |i: usize, part: String, name: &str, mime: &str, size: usize, headers: Value| json!({"partId": part, "mimeType": mime, "filename": name, "headers": headers, "body": {"attachmentId": format!("att-{}-{read}-{i}", m.id), "size": size}});
-    let text = json!({"partId": "0.0", "mimeType": "text/plain", "headers": [{"name": "Content-Type", "value": "text/plain; charset=utf-8"}], "body": {"data": b64(m.text.as_bytes()), "size": m.text.len()}});
+    let file = |i: usize, name: &str, mime: &str, size: usize, headers: Value| json!({"mimeType": mime, "filename": name, "headers": headers, "body": {"attachmentId": format!("att-{}-{read}-{i}", m.id), "size": size}});
+    let text = json!({"mimeType": "text/plain", "headers": [{"name": "Content-Type", "value": "text/plain; charset=utf-8"}], "body": {"data": b64(m.text.as_bytes()), "size": m.text.len()}});
     let mut alternative = vec![text];
     if let Some(html) = &m.html {
-        alternative.push(json!({"partId": "0.1", "mimeType": "text/html", "headers": [{"name": "Content-Type", "value": "text/html; charset=utf-8"}], "body": {"data": b64(html.as_bytes()), "size": html.len()}}));
+        alternative.push(json!({"mimeType": "text/html", "headers": [{"name": "Content-Type", "value": "text/html; charset=utf-8"}], "body": {"data": b64(html.as_bytes()), "size": html.len()}}));
     }
     let mut mixed = Vec::new();
     for (i, (name, mime, bytes)) in m.attachments.iter().enumerate() {
         if mime == "text/calendar" {
-            let part = format!("0.{}", alternative.len());
-            alternative.push(file(i, part, name, mime, bytes.len(), json!([{"name": "Content-Type", "value": "text/calendar; charset=\"UTF-8\"; method=REQUEST"}])));
+            alternative.push(file(i, name, mime, bytes.len(), json!([{"name": "Content-Type", "value": "text/calendar; charset=\"UTF-8\"; method=REQUEST"}])));
         } else {
-            let part = (mixed.len() + 1).to_string();
-            mixed.push(file(i, part, name, mime, bytes.len(), json!([{"name": "Content-Disposition", "value": format!("attachment; filename=\"{name}\"")}])));
+            mixed.push(file(i, name, mime, bytes.len(), json!([{"name": "Content-Disposition", "value": format!("attachment; filename=\"{name}\"")}])));
         }
     }
-    let body = json!({"partId": "0", "mimeType": "multipart/alternative", "parts": alternative});
-    let body = if m.inline.is_empty() {
-        body
-    } else {
+    let mut body = json!({"mimeType": "multipart/alternative", "parts": alternative});
+    if !m.inline.is_empty() {
         let mut related = vec![body];
         for (n, (cid, name, mime, bytes)) in m.inline.iter().enumerate() {
             let headers = json!([{"name": "Content-ID", "value": format!("<{cid}>")}, {"name": "Content-Disposition", "value": format!("inline; filename=\"{name}\"")}]);
             related.push(file(
                 m.attachments.len() + n,
-                format!("0.{}", n + 1),
                 name,
                 mime,
                 bytes.len(),
                 headers,
             ));
         }
-        json!({"partId": "0", "mimeType": "multipart/related", "parts": related})
-    };
-    if mixed.is_empty() {
-        let mut only = body;
-        only["partId"] = json!("");
-        only["headers"] = headers(m);
-        return only;
+        body = json!({"mimeType": "multipart/related", "parts": related});
     }
-    mixed.insert(0, body);
-    json!({"partId": "", "mimeType": "multipart/mixed", "headers": headers(m), "parts": mixed})
+    let mut root = if mixed.is_empty() {
+        body
+    } else {
+        mixed.insert(0, body);
+        json!({"mimeType": "multipart/mixed", "parts": mixed})
+    };
+    root["headers"] = headers(m);
+    number(&mut root, "");
+    root
+}
+
+/// Gives every part Gmail's `partId`: the root is "", its parts "0", "1", …,
+/// and theirs "0.0", "0.1", ….
+fn number(part: &mut Value, id: &str) {
+    part["partId"] = json!(id);
+    if let Some(parts) = part.get_mut("parts").and_then(Value::as_array_mut) {
+        for (i, p) in parts.iter_mut().enumerate() {
+            let child = if id.is_empty() {
+                i.to_string()
+            } else {
+                format!("{id}.{i}")
+            };
+            number(p, &child);
+        }
+    }
 }
 
 /// File `i` of a mail, as [`payload`] numbers them.
@@ -502,6 +520,8 @@ fn file_bytes(m: &Mail, i: usize) -> Option<&Vec<u8>> {
 #[derive(Default)]
 struct Account {
     mails: Vec<Mail>,
+    /// What `/pictures/<name>` serves.
+    pictures: Vec<(String, Vec<u8>)>,
     /// How many more writes go through; `None` is no limit.
     writes_left: Option<usize>,
     wrote: bool,
@@ -1354,10 +1374,9 @@ impl Account {
         // a newsletter's pictures on the web: `/pictures/<name>.png`, with no
         // token, as any web server serves them
         if let Some(name) = path.strip_prefix("/pictures/") {
-            return if name.ends_with(".png") && !name.contains('/') {
-                Reply(200, "image/png", rich::PHOTO.to_vec(), Vec::new())
-            } else {
-                Reply::json(404, json!({}))
+            return match self.pictures.iter().find(|(n, _)| n == name) {
+                Some((_, bytes)) => Reply(200, "image/png", bytes.clone(), Vec::new()),
+                None => Reply::json(404, json!({})),
             };
         }
         if path == "/o/oauth2/v2/auth" {
@@ -1457,6 +1476,7 @@ impl FakeGoogle {
             only_grants: seed.only_grants,
             calendars: calendar::Calendars::new(seed.calendars),
             drive: drive::Drive::new(seed.files),
+            pictures: seed.pictures,
             ..Account::default()
         }));
         let (shared, door) = (account.clone(), Arc::new(Door::default()));

@@ -6,6 +6,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use buwiz_app::{Bridge, BuwizError, Done, Host, Listener};
 use nsh_core::prelude::*;
 use nsh_core::{MountItem, NodeId};
@@ -22,6 +24,8 @@ use bot_filter::Filter;
 /// passing test nothing.
 const WAIT: Duration = Duration::from_secs(30);
 const PAGE: usize = 30;
+/// A real picture: one transparent pixel.
+const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABpfZFQAAAAABJRU5ErkJggg==";
 /// Past the next autosave, however the screen's clock falls.
 const PAST_AN_AUTOSAVE: Duration = Duration::from_millis(2500);
 
@@ -55,6 +59,23 @@ fn thread(id: &str) -> Value {
             {"name": "Roof quote.docx", "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "size": 2048, "id": "att-1", "part": "1", "message": "m7"},
             {"name": "Inline logo.png", "mime": "image/png", "size": 80, "id": null, "message": "m7"},
         ])
+    } else if id == "t5" {
+        json!([
+            {"name": "IMG_4250.png", "mime": "image/png", "size": 2_202_009, "id": "att-1", "part": "1", "message": "m5"},
+            {"name": "site.png", "mime": "image/png", "size": 13_696, "id": "att-2", "part": "2", "message": "m5"},
+            {"name": "dressed.png", "mime": "image/png", "size": 500, "id": "att-3", "part": "3", "message": "m5"},
+            {"name": "receipt.pdf", "mime": "application/pdf", "size": 90_000, "id": "att-4", "part": "4", "message": "m5"},
+            {"name": "scan.png", "mime": "image/png", "size": 2_000_000, "id": "att-5", "part": "5", "message": "m5"},
+            {"name": "scan.png", "mime": "image/png", "size": 2_100_000, "id": "att-6", "part": "6", "message": "m5"},
+        ])
+    } else if id == "t8" {
+        // small enough to come in the message itself, with no attachment id
+        json!([{"name": "small.png", "mime": "image/png", "size": 200, "id": null, "part": "1", "message": "m8"}])
+    } else if id == "t6" {
+        // more than the cards' room holds
+        (1..=16)
+            .map(|n| json!({"name": format!("p{n}.png"), "mime": "image/png", "size": 1000, "id": format!("att-{n}"), "part": n.to_string(), "message": "m6"}))
+            .collect()
     } else {
         json!([])
     };
@@ -78,6 +99,8 @@ struct Fake {
     signed_out: Mutex<bool>,
     /// In place of an attachment opening.
     attachment_answer: Mutex<Option<Value>>,
+    /// What a save answers; with none, the tool isn't there, as before lane 5a.
+    save_answer: Mutex<Option<Value>>,
     /// What the screen opens with, and where: a card is `inline`.
     props: Mutex<Value>,
     inline: Mutex<bool>,
@@ -366,6 +389,23 @@ impl Host for Fake {
                     .unwrap_or_else(
                         || json!({"opened": true, "name": "Roof quote.docx", "kind": "word"}),
                     ),
+            ),
+            "gws_mail_attachment_save" if self.save_answer.lock().unwrap().is_some() => (
+                tool.to_owned(),
+                self.save_answer.lock().unwrap().clone().unwrap(),
+            ),
+            // a real picture for part 2, one that only says it is for part 3
+            "gws_mail_attachment_preview" => (
+                tool.to_owned(),
+                match args["part"].as_str() {
+                    Some("3") => {
+                        json!({"preview": format!("data:image/png;base64,{}", STANDARD.encode(b"<svg onload=alert(1)>"))})
+                    }
+                    Some("4") => {
+                        json!({"refused": "unsupported", "message": "This file has no preview."})
+                    }
+                    _ => json!({"preview": format!("data:image/png;base64,{PNG}")}),
+                },
             ),
             "gws_mail_thread" => {
                 let id = args["thread"].as_str().unwrap_or_default();
@@ -1817,6 +1857,159 @@ fn another_conversation_has_no_files_left_from_the_last() {
     app.press("text:Subject 3").expect("the row presses");
     settle(&mut app);
     assert!(!app.screen().shows("Roof quote.docx"));
+}
+
+/// Opens a conversation by its row, and waits for its cards.
+fn open_cards(n: usize, first: &str) -> (Headless, Arc<Fake>) {
+    let (mut app, fake) = start();
+    app.press(&format!("text:Subject {n}"))
+        .expect("the row presses");
+    app.wait_for_within(&format!("text:{first}"), WAIT)
+        .expect("its cards show");
+    settle(&mut app);
+    (app, fake)
+}
+
+#[test]
+fn a_card_shows_its_kind_and_size() {
+    let (app, _) = open_cards(5, "IMG_4250.png");
+    for line in ["Image · 2.1 MB", "Image · 14 KB", "PDF · 88 KB"] {
+        assert!(
+            app.screen().shows(line),
+            "{line}: {:?}",
+            app.screen().texts()
+        );
+    }
+    assert!(app.screen().shows("PDF"), "the PDF's mark");
+}
+
+#[test]
+fn the_same_name_twice_is_two_cards() {
+    let (app, _) = open_cards(5, "IMG_4250.png");
+    assert_eq!(app.screen().count("text:scan.png").unwrap(), 2);
+    assert!(app.screen().shows("Image · 1.9 MB"));
+    assert!(app.screen().shows("Image · 2.0 MB"));
+}
+
+#[test]
+fn a_picture_shows_only_for_a_small_real_image() {
+    let (app, fake) = open_cards(5, "IMG_4250.png");
+    let asked: Vec<Value> = fake
+        .called("gws_mail_attachment_preview")
+        .into_iter()
+        .map(|a| a["part"].clone())
+        .collect();
+    // the big ones and the PDF are never asked for
+    assert_eq!(asked, [json!("2"), json!("3")]);
+    assert!(
+        fake.called("gws_mail_attachment_preview")
+            .iter()
+            .all(|a| a["message"] == "m5")
+    );
+    // and what only says it's a picture shows its mark
+    assert_eq!(
+        app.screen()
+            .count("label:Preview of this attachment")
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn pictures_are_asked_for_one_at_a_time_and_only_for_cards_in_view() {
+    let (mut app, fake) = start();
+    fake.hold("gws_mail_attachment_preview");
+    app.press("text:Subject 6").expect("the row presses");
+    app.wait_for_within("text:p1.png", WAIT)
+        .expect("its cards show");
+    settle(&mut app);
+    assert_eq!(
+        fake.called("gws_mail_attachment_preview").len(),
+        1,
+        "one at a time"
+    );
+    settle(&mut app);
+    assert_eq!(
+        fake.called("gws_mail_attachment_preview").len(),
+        1,
+        "still one"
+    );
+    fake.release("gws_mail_attachment_preview");
+    app.wait(Duration::from_secs(2)).expect("time passes");
+    let first = fake.called("gws_mail_attachment_preview").len();
+    assert!(
+        (2..16).contains(&first),
+        "{first} asked, with only some in view"
+    );
+    app.scroll("text:p1.png", px(2000.0))
+        .expect("the cards scroll");
+    app.wait(Duration::from_secs(2)).expect("time passes");
+    let after = fake.called("gws_mail_attachment_preview");
+    assert!(after.len() > first, "scrolled into view, they're asked for");
+    let parts: BTreeSet<String> = after
+        .iter()
+        .map(|a| a["part"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(parts.len(), after.len(), "none asked for twice");
+}
+
+#[test]
+fn a_small_file_with_no_attachment_id_still_opens_saves_and_shows_its_picture() {
+    let (mut app, fake) = open_cards(8, "small.png");
+    assert_eq!(
+        fake.called("gws_mail_attachment_preview"),
+        [json!({"message": "m8", "part": "1"})]
+    );
+    assert_eq!(
+        app.screen()
+            .count("label:Preview of this attachment")
+            .unwrap(),
+        1
+    );
+    app.press("label:Open this attachment").expect("it presses");
+    settle(&mut app);
+    assert_eq!(
+        fake.called("gws_mail_attachment_open"),
+        [json!({"message": "m8", "part": "1"})]
+    );
+    assert!(app.screen().matches("label:Save this attachment").unwrap());
+}
+
+#[test]
+fn save_calls_the_tool_with_the_files_ids_and_says_it_saved() {
+    let (mut app, fake) = with_attachments();
+    *fake.save_answer.lock().unwrap() = Some(json!({"saved": true}));
+    app.press("label:Save this attachment").expect("it presses");
+    settle(&mut app);
+    assert_eq!(
+        fake.called("gws_mail_attachment_save"),
+        [json!({"message": "m7", "part": "1"})]
+    );
+    assert!(app.screen().shows("Saved to Downloads."));
+    assert!(fake.called("gws_mail_attachment_open").is_empty());
+}
+
+#[test]
+fn a_refused_save_says_why() {
+    let (mut app, fake) = with_attachments();
+    *fake.save_answer.lock().unwrap() =
+        Some(json!({"refused": "update_bot", "message": "Update Buwiz Bot to open this here."}));
+    app.press("label:Save this attachment").expect("it presses");
+    settle(&mut app);
+    assert!(app.screen().shows("Update Buwiz Bot to open this here."));
+    assert!(!app.screen().shows("Saved to Downloads."));
+}
+
+#[test]
+fn a_save_the_plugin_cant_do_yet_says_its_error() {
+    let (mut app, _) = with_attachments();
+    app.press("label:Save this attachment").expect("it presses");
+    settle(&mut app);
+    assert!(
+        app.screen().shows("not faked: gws_mail_attachment_save"),
+        "{:?}",
+        app.screen().texts()
+    );
 }
 
 /// A view's parent, its left edge there and its width, as the engine gave them.

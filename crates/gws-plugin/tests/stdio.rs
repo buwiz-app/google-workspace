@@ -595,6 +595,7 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
             "gws_mail_pictures",
             "gws_mail_picture_sender_add",
             "gws_mail_picture_sender_remove",
+            "gws_mail_attachment_preview",
             "gws_resolve"
         ]
     );
@@ -1236,6 +1237,10 @@ fn a_press_gets_its_document_through_the_real_server_and_the_model_gets_nothing(
         ("gws_file_discard", json!({"id": "drv-open"})),
         (
             "gws_mail_attachment_open",
+            json!({"message": "m1", "part": "1"}),
+        ),
+        (
+            "gws_mail_attachment_preview",
             json!({"message": "m1", "part": "1"}),
         ),
         (

@@ -952,6 +952,8 @@ pub fn view_of(thread: &Value) -> Value {
     let hidden = fold::hidden(&open);
     // each message, its history folded, and what its row says: the words
     // before the fold
+    // and the Content-IDs of the pictures that went in, whose cards go
+    let mut shown: Vec<HashSet<String>> = Vec::with_capacity(list.len());
     let (mut parts, snippets): (Vec<Part>, Vec<String>) = list
         .iter()
         .map(|m| {
@@ -960,7 +962,22 @@ pub fn view_of(thread: &Value) -> Value {
                 Some(h) => {
                     // the pictures picked for it go in first, so what folds
                     // folds with them
-                    let c = clean::clean_with(&h, &|url| pictures::inline(m, url));
+                    let put = std::cell::RefCell::new(HashSet::new());
+                    let c = clean::clean_with(&h, &|url| {
+                        let data = pictures::inline(m, url);
+                        if data.is_some() {
+                            put.borrow_mut().insert(url.to_owned());
+                        }
+                        data
+                    });
+                    // what the cleaner turned down stays out
+                    let put = put.into_inner();
+                    shown.push(
+                        put.iter()
+                            .filter(|url| !c.images.contains(url))
+                            .filter_map(|url| gmail::cid_of(url))
+                            .collect(),
+                    );
                     let quoted = fold::quotes(&c.html).unwrap_or_default();
                     let snippet = gmail::snippet_of(if quoted.regions.is_empty() {
                         &text
@@ -970,6 +987,7 @@ pub fn view_of(thread: &Value) -> Value {
                     (Part::Html(c, quoted.regions, text), snippet)
                 }
                 None => {
+                    shown.push(HashSet::new());
                     let cut = fold::plain_cut(&text);
                     let snippet = gmail::snippet_of(&text[..cut.unwrap_or(text.len())]);
                     (Part::Text(text, cut), snippet)
@@ -1008,15 +1026,18 @@ pub fn view_of(thread: &Value) -> Value {
         escape(&gmail::cap_bytes(&subject, gmail::HEADER_MAX))
     );
     // an attachment is fetched from its own message, so it says which that is
-    let attachments: Vec<Value> = list
-        .iter()
-        .flat_map(|m| {
-            gmail::attachments(m).into_iter().map(|mut a| {
-                a["message"] = m.get("id").cloned().unwrap_or(Value::Null);
-                a
+    let files = |shown: &[HashSet<String>]| -> Vec<Value> {
+        list.iter()
+            .zip(shown)
+            .flat_map(|(m, shown)| {
+                gmail::attachments(m, shown).into_iter().map(|mut a| {
+                    a["message"] = m.get("id").cloned().unwrap_or(Value::Null);
+                    a
+                })
             })
-        })
-        .collect();
+            .collect()
+    };
+    let mut attachments = files(&shown);
     // what's counted is what's sent: the markup, as JSON
     let mut size = sent(&title)
         + meta.iter().map(|(b, a)| sent(b) + sent(a)).sum::<usize>()
@@ -1035,6 +1056,17 @@ pub fn view_of(thread: &Value) -> Value {
                 size += part.size();
             }
         }
+    }
+    // a message given way to text shows no pictures, so its cards come back
+    let mut lost = false;
+    for (part, shown) in parts.iter().zip(&mut shown) {
+        if !matches!(part, Part::Html(..)) && !shown.is_empty() {
+            shown.clear();
+            lost = true;
+        }
+    }
+    if lost {
+        attachments = files(&shown);
     }
     let (mut page, mut links, mut images) = (title, Vec::new(), 0);
     for ((before, after), part) in meta.iter().zip(parts) {
@@ -1138,6 +1170,12 @@ fn day(at: &str) -> String {
     }
 }
 
+/// What a saved view was made by. A view of an older shape is made again: a
+/// migration that clears them all (as 6, 7 and 10 did) runs once, and this
+/// holds for each change after. Raise it whenever `view_of` or what it lists
+/// changes.
+pub const VIEW_VERSION: i64 = 3;
+
 fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (auth, account) = signed_in(core)?;
     let id = js::trim(&js::string_or_empty(args.get("thread"))).to_owned();
@@ -1156,16 +1194,23 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     }
     if let Some(saved) = with_store(core, |store| store.view(&account, &id, now_ms()))?
         && let Ok(view) = serde_json::from_str::<Value>(&saved)
+        && view.get("view_version").and_then(Value::as_i64) == Some(VIEW_VERSION)
     {
         return Ok(pictures::answer(core, &account, view));
     }
     let Some(mut full) = core.gmail.thread_full(&auth, &id)? else {
         return Ok(fail("not_found", "That conversation is gone."));
     };
-    let view = pictures::view(core, &auth, &account, &mut full);
-    with_own_store(core, &account, |store| {
-        store.put_view(&account, &id, &view.to_string(), now_ms())
-    })?;
+    let told = core.gmail.mark_twins(&auth, &mut full);
+    let (mut view, whole) = pictures::view(core, &auth, &account, &mut full);
+    view["view_version"] = VIEW_VERSION.into();
+    // a twin check or a picture cut short isn't kept, so the next open can
+    // finish it
+    if told && whole {
+        with_own_store(core, &account, |store| {
+            store.put_view(&account, &id, &view.to_string(), now_ms())
+        })?;
+    }
     Ok(pictures::answer(core, &account, view))
 }
 
@@ -1828,6 +1873,44 @@ mod tests {
             {"mimeType": "text/plain", "body": {"data": b64(&format!("plain {id}"))}},
             {"mimeType": "text/html", "body": {"data": b64(html)}},
         ]}})
+    }
+
+    /// [`message`] with a picture by Content-ID that the view put in.
+    fn with_picture(id: &str, html: &str) -> Value {
+        let mut m = message(id, &format!("<img src=\"cid:dot\">{html}"));
+        let alternative = m["payload"].take();
+        m["payload"] = json!({"mimeType": "multipart/related", "headers": alternative["headers"].clone(), "parts": [
+            alternative,
+            {"partId": "1", "mimeType": "image/png", "filename": "dot.png", "headers": [{"name": "Content-ID", "value": "<dot>"}], "body": {"attachmentId": "x", "size": 70}},
+        ]});
+        m["gwsPictures"] = json!({"cid:dot": "data:image/png;base64,iVBORw0KGgo="});
+        m
+    }
+
+    #[test]
+    fn a_message_given_way_to_text_gets_its_pictures_cards_back() {
+        let small = view_of(&json!({"id": "t", "messages": [with_picture("one", "<p>Hi</p>")]}));
+        assert!(small["page"].as_str().unwrap().contains("data:image/png"));
+        assert_eq!(small["attachments"], json!([]), "shown, it's the letter's");
+        // markup enough to give way, and words few enough to fit then
+        let big = "<b>.</b>".repeat(120_000);
+        let view = view_of(&json!({"id": "t", "messages": [
+            with_picture("old", &big),
+            with_picture("new", "<p>Hi</p>"),
+        ]}));
+        let page = view["page"].as_str().unwrap();
+        assert_eq!(
+            page.matches("data:image/png").count(),
+            1,
+            "the newest shows it"
+        );
+        let cards: Vec<&Value> = view["attachments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| &a["message"])
+            .collect();
+        assert_eq!(cards, [&json!("old")], "the oldest went to text");
     }
 
     #[test]

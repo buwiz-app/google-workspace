@@ -328,7 +328,7 @@ fn image_type(bytes: &[u8]) -> Option<&'static str> {
 /// Whether `url` is an image held in the address itself, of an allowed type,
 /// and really that type: a file's type is whatever its uploader said, and an
 /// address that goes anywhere would tell a stranger the file was looked at.
-pub(super) fn allowed_image(url: &str) -> bool {
+pub(crate) fn allowed_image(url: &str) -> bool {
     let Some((mime, data)) = url
         .strip_prefix("data:")
         .and_then(|rest| rest.split_once(";base64,"))
@@ -343,7 +343,7 @@ pub(super) fn allowed_image(url: &str) -> bool {
             .is_ok_and(|bytes| image_type(&bytes) == Some(mime))
 }
 
-pub(super) fn size_text(bytes: u64) -> String {
+pub(crate) fn size_text(bytes: u64) -> String {
     let n = bytes as f64;
     if n >= GB {
         format!("{:.1} GB", n / GB)

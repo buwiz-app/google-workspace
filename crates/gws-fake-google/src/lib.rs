@@ -531,6 +531,25 @@ fn number(part: &mut Value, id: &str) {
     }
 }
 
+/// Puts each small file's bytes in its part, in place of its attachment id.
+fn carry_data(m: &Mail, part: &mut Value, max: usize) {
+    let at = part
+        .pointer("/body/attachmentId")
+        .and_then(Value::as_str)
+        .and_then(|id| id.rsplit('-').next()?.parse::<usize>().ok());
+    if let Some(bytes) = at.and_then(|i| file_bytes(m, i)).filter(|b| b.len() <= max) {
+        part["body"] = json!({"data": b64(bytes), "size": bytes.len()});
+    }
+    for p in part
+        .get_mut("parts")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        carry_data(m, p, max);
+    }
+}
+
 /// File `i` of a mail, as [`payload`] numbers them.
 fn file_bytes(m: &Mail, i: usize) -> Option<&Vec<u8>> {
     match m.attachments.get(i) {
@@ -554,7 +573,10 @@ struct Account {
     writes_left: Option<usize>,
     wrote: bool,
     reads_fail_after_write: bool,
+    /// Files this size and under come in `body.data`, with no attachment id.
+    data_in_parts: Option<usize>,
     draft_reads_fail: bool,
+    attachment_reads_fail: bool,
     /// Reads so far, once attachment ids change with each.
     reads: Option<AtomicU64>,
     /// `(draft id, message id, raw message, thread)`.
@@ -872,6 +894,9 @@ impl Account {
                 let read = self.reads.as_ref();
                 let read = read.map_or(0, |n| n.fetch_add(1, Ordering::Relaxed));
                 v["payload"] = payload(m, true, read);
+                if let Some(max) = self.data_in_parts {
+                    carry_data(m, &mut v["payload"], max);
+                }
                 // Gmail's own verdict on the sender goes on top, as it does
                 let results = authentication_results(m, !self.forged.contains(&m.id));
                 if let Some(h) = v["payload"]["headers"].as_array_mut() {
@@ -971,6 +996,15 @@ impl Account {
             .unwrap_or(100)
             .min(500);
         if self.reads_fail_after_write && self.wrote && r.method == "GET" && format == "metadata" {
+            return Reply::json(
+                500,
+                json!({"error": {"code": 500, "message": "Backend error"}}),
+            );
+        }
+        if self.attachment_reads_fail
+            && r.method == "GET"
+            && matches!(segs.as_slice(), ["messages", _, "attachments", _])
+        {
             return Reply::json(
                 500,
                 json!({"error": {"code": 500, "message": "Backend error"}}),
@@ -1615,6 +1649,11 @@ impl FakeGoogle {
         self.account.lock().unwrap().reads_fail_after_write = true;
     }
 
+    /// Whether reading an attachment fails, as a passing outage does.
+    pub fn attachment_reads_fail(&self, fail: bool) {
+        self.account.lock().unwrap().attachment_reads_fail = fail;
+    }
+
     /// Whether reading a draft fails.
     pub fn draft_reads_fail(&self, fail: bool) {
         self.account.lock().unwrap().draft_reads_fail = fail;
@@ -1728,6 +1767,12 @@ impl FakeGoogle {
     /// them still fetches it.
     pub fn attachment_ids_change(&self) {
         self.account.lock().unwrap().reads = Some(AtomicU64::new(1));
+    }
+
+    /// From here on a file of `max` bytes or fewer comes in its part's
+    /// `body.data`, with no attachment id, as Gmail can send a small one.
+    pub fn small_files_in_parts(&self, max: usize) {
+        self.account.lock().unwrap().data_in_parts = Some(max);
     }
 
     /// The next piece of an upload has only its first `n` bytes kept, and the

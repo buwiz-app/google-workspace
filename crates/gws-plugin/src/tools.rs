@@ -117,6 +117,7 @@ pub const FILE_EDITS: &str = "gws_file_edits";
 pub const FILE_UPLOAD: &str = "gws_file_upload";
 pub const FILE_DISCARD: &str = "gws_file_discard";
 pub const MAIL_ATTACHMENT_OPEN: &str = "gws_mail_attachment_open";
+pub const MAIL_ATTACHMENT_PREVIEW: &str = "gws_mail_attachment_preview";
 pub const MAIL_ATTACHMENT_SAVE: &str = "gws_mail_attachment_save";
 pub const MAIL_PICTURES: &str = "gws_mail_pictures";
 pub const MAIL_PICTURE_SENDER_ADD: &str = "gws_mail_picture_sender_add";
@@ -598,6 +599,14 @@ pub fn defs() -> Vec<Def> {
             read_only: false,
             audience: APP_ONLY,
             open_world: false,
+        },
+        Def {
+            name: MAIL_ATTACHMENT_PREVIEW,
+            description: "A small picture on a mail, as image bytes for its card. Never another kind of file.",
+            input_schema: json!({"type": "object", "properties": {"message": {"type": "string"}, "part": {"type": "string"}}, "required": ["message", "part"]}),
+            read_only: true,
+            audience: APP_ONLY,
+            open_world: true,
         },
         Def {
             name: RESOLVE,

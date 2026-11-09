@@ -1069,14 +1069,14 @@ fn download(
 }
 
 /// A part of a mail, as [`gmail::attachments`] names it: `1`, `0.2`, `root`.
-fn part_ok(part: &str) -> bool {
+pub(crate) fn part_ok(part: &str) -> bool {
     !part.is_empty()
         && part.len() <= PART_ID_MAX
         && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
 }
 
 /// An attachment id: Gmail's, which can be longer than any file name.
-fn attachment_ok(id: &str) -> bool {
+pub(crate) fn attachment_ok(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= ATTACHMENT_ID_MAX
         && id
@@ -1119,11 +1119,12 @@ fn listed_part(
     auth: &Bearer,
     message: &str,
     part: &str,
-) -> Result<Option<(String, String, String)>, Failure> {
+) -> Result<Option<(String, String, Bytes)>, Failure> {
     let Some(mail) = core.gmail.full(auth, message)? else {
         return Ok(None);
     };
-    let listed = gmail::attachments(&mail);
+    // any card a view may show, so none of its pictures is left out
+    let listed = gmail::attachments(&mail, &Default::default());
     let Some(found) = listed
         .iter()
         .find(|a| a.get("part").and_then(Value::as_str) == Some(part))
@@ -1137,7 +1138,34 @@ fn listed_part(
             .unwrap_or_default()
             .to_owned()
     };
-    Ok(Some((text("name"), text("mime"), text("id"))))
+    // a small file can come in its own part, with no id to fetch it by
+    let bytes = match text("id") {
+        id if id.is_empty() => Bytes::InPart(gmail::part_bytes(&mail, part)),
+        id => Bytes::Fetch(id),
+    };
+    Ok(Some((text("name"), text("mime"), bytes)))
+}
+
+/// Where a listed part's bytes are.
+enum Bytes {
+    /// In the message already, if they decode.
+    InPart(Option<Vec<u8>>),
+    /// At the attachment API, by this id.
+    Fetch(String),
+}
+
+/// A listed part's bytes: from the message, else fetched. None when it's gone.
+fn bytes_of(
+    core: &Core,
+    auth: &Bearer,
+    message: &str,
+    bytes: Bytes,
+) -> Result<Option<Vec<u8>>, Failure> {
+    match bytes {
+        Bytes::InPart(bytes) => Ok(bytes),
+        Bytes::Fetch(id) if attachment_ok(&id) => core.gmail.attachment(auth, message, &id),
+        Bytes::Fetch(_) => Ok(None),
+    }
 }
 
 fn attachment_gone() -> Value {
@@ -1277,10 +1305,7 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
         Way::SaveOnly => return Ok(save_instead(core)),
         Way::Viewer | Way::System => {}
     }
-    if !attachment_ok(&attachment) {
-        return Ok(attachment_gone());
-    }
-    let Some(bytes) = core.gmail.attachment(&auth, &message, &attachment)? else {
+    let Some(bytes) = bytes_of(core, &auth, &message, attachment)? else {
         return Ok(attachment_gone());
     };
     let Some(kind) = handoff::checked(kind, &bytes) else {
@@ -1439,10 +1464,7 @@ fn save_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
             let Some((title, _, attachment)) = listed_part(core, &auth, &message, &part)? else {
                 return Ok(attachment_gone());
             };
-            if !attachment_ok(&attachment) {
-                return Ok(attachment_gone());
-            }
-            let Some(bytes) = core.gmail.attachment(&auth, &message, &attachment)? else {
+            let Some(bytes) = bytes_of(core, &auth, &message, attachment)? else {
                 return Ok(attachment_gone());
             };
             (title, bytes)

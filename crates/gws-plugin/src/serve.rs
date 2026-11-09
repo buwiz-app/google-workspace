@@ -454,6 +454,7 @@ mod tests {
             tools::FILE_UPLOAD,
             tools::FILE_DISCARD,
             tools::MAIL_ATTACHMENT_OPEN,
+            tools::MAIL_ATTACHMENT_PREVIEW,
             tools::MAIL_ATTACHMENT_SAVE,
             tools::MAIL_PICTURES,
             tools::MAIL_PICTURE_SENDER_ADD,

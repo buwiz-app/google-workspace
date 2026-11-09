@@ -1369,7 +1369,7 @@ fn an_attachments_hostile_name_stays_in_its_folder() {
 fn read_again(home: &Home) -> Value {
     let auth = home.core.accounts.google().unwrap();
     let mail = home.core.gmail.full(&auth, "18f1aa").unwrap().unwrap();
-    gws::gmail::attachments(&mail)[0].clone()
+    gws::gmail::attachments(&mail, &Default::default())[0].clone()
 }
 
 #[test]
@@ -1686,7 +1686,7 @@ fn the_rich_mails_photo_pdf_zip_and_invite_each_hand_over() {
     let mut seen = Vec::new();
     for message in ["000019f00000001e", "000019f000000014"] {
         let mail = home.core.gmail.full(&auth, message).unwrap().unwrap();
-        for listed in gws::gmail::attachments(&mail) {
+        for listed in gws::gmail::attachments(&mail, &Default::default()) {
             let answer = home.core.run(
                 "gws_mail_attachment_open",
                 &json!({"message": message, "part": listed["part"]}),

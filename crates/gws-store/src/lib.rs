@@ -21,6 +21,7 @@ pub mod calendar;
 pub mod drive;
 pub mod mail;
 pub mod open;
+pub mod pictures;
 
 pub const DATA_DIR_ENV: &str = "GWS_DATA_DIR";
 /// How long a locked store is waited for.
@@ -76,6 +77,13 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         9,
         "CREATE TABLE sign_ins(label TEXT NOT NULL PRIMARY KEY, subject TEXT NOT NULL) WITHOUT ROWID;",
+    ),
+    // the senders whose web pictures always show; a stored view has neither
+    // the pictures inside its mail nor the sender they'd be trusted by
+    (
+        11,
+        "CREATE TABLE picture_senders(account TEXT NOT NULL, address TEXT NOT NULL, added INTEGER NOT NULL, PRIMARY KEY(account, address)) WITHOUT ROWID;
+         DELETE FROM bodies;",
     ),
 ];
 
@@ -625,6 +633,7 @@ mod tests {
             .execute_batch(
                 "INSERT INTO bodies(account, thread, view, size, used) VALUES('a', 't', '{}', 2, 1);
                  DROP TABLE sign_ins;
+                 DROP TABLE picture_senders;
                  ALTER TABLE drive_files DROP COLUMN can;
                  PRAGMA user_version = 6;",
             )

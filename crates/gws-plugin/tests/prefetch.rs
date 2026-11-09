@@ -771,7 +771,7 @@ fn a_round_counts_what_came_not_what_was_kept() {
 #[test]
 fn a_wake_during_a_round_brings_one_more_after_it() {
     let google = seeded(vec![mail(1, 2)]);
-    let core = synced(&google, "again");
+    let core = synced(&google, "follow-up");
     google.hold("GET", &format!("/threads/{}", id(1)));
     gws::prefetch::kick(&core);
     google.wait_for_held();

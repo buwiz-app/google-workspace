@@ -1578,10 +1578,14 @@ fn upload(core: &Core, args: &Value) -> Result<Value, Failure> {
         (_, answer) => return Ok(write_refused(answer)),
     };
     let target = (mode != "copy").then_some(id.as_str());
-    let place = match core
-        .transfers
-        .session(&auth, target, &metadata, &row.mime, length, "id")?
-    {
+    let place = match core.transfers.session(
+        &auth,
+        target,
+        &metadata,
+        &row.mime,
+        length,
+        UPLOADED_FIELDS,
+    )? {
         Ok(place) => place,
         Err(answer) => return Ok(write_refused(answer)),
     };
@@ -1598,6 +1602,9 @@ fn upload(core: &Core, args: &Value) -> Result<Value, Failure> {
     // with its row, for the person to answer
     if hash_of(&path).is_ok_and(|now| now == sent) {
         let _ = remove(core, &id);
+    } else if target.is_some() {
+        // Drive has it either way: a row that won't update meets a conflict
+        let _ = written_over(core, &row, &sent, &done);
     }
     // the new revision or copy shows when the changes sync brings it
     core.sync.wake();
@@ -1607,6 +1614,28 @@ fn upload(core: &Core, args: &Value) -> Result<Value, Failure> {
         answer["id"] = id.into();
     }
     Ok(ok(answer))
+}
+
+/// What an upload's last answer holds: enough to know the revision it made.
+const UPLOADED_FIELDS: &str = "id,version,md5Checksum";
+
+/// A file written over on Drive whose copy here was kept, since it changed
+/// while it went: the row now says what Drive holds, so the next update is no
+/// conflict with the person's own upload, and what's here still reads as
+/// edited. An answer that doesn't say leaves the row as it was, and a press
+/// then meets a conflict rather than a guess.
+fn written_over(core: &Core, row: &Opened, sent: &str, done: &Value) -> Result<(), Failure> {
+    let text = |key: &str| done.get(key).and_then(Value::as_str);
+    let (Some(version), Some(md5)) = (text("version"), text("md5Checksum")) else {
+        return Ok(());
+    };
+    let now = Opened {
+        hash: sent.to_owned(),
+        version: version.to_owned(),
+        md5: md5.to_owned(),
+        ..row.clone()
+    };
+    with_own_store(core, &row.account, |store| store.put_opened(&now))
 }
 
 /// `gws_file_discard`: this Mac's copy goes, and Drive hears nothing of it. Another

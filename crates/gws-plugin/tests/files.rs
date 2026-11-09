@@ -592,11 +592,20 @@ fn an_edit_saved_while_an_upload_goes_stays_for_the_person() {
         b"PK edited again",
         "not deleted unsent"
     );
+    let edits = home.edits();
+    assert_eq!(edits.len(), 1, "still edited, for the person to answer");
     assert_eq!(
-        home.edits().len(),
-        1,
-        "still edited, for the person to answer"
+        edits[0]["changed_on_drive"], false,
+        "the revision Drive has is the person's own"
     );
+    // the next press goes as an update, and not as a conflict with itself
+    let was = google.drive_file("drv-a").unwrap().version;
+    let answer = home.upload("drv-a", "update");
+    assert_eq!(data(answer)["mode"], "update");
+    let now = google.drive_file("drv-a").unwrap();
+    assert_eq!(now.content, b"PK edited again");
+    assert_eq!(now.version, was + 1);
+    assert!(!home.folder("drv-a").exists(), "sent, so it goes");
 }
 
 #[test]

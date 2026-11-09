@@ -601,8 +601,9 @@ fn a_round_downloads_at_most_its_share_and_the_next_goes_on() {
     let google = seeded(vec![big]);
     let core = synced(&google, "share");
     gws::prefetch::run(&core).unwrap();
-    // twelve make 48 MB; a thirteenth would pass the round's 50
-    assert_eq!(attachment_reads(&google), 12);
+    // 4 MiB comes as 5.3 of base64: nine make 48 MiB, and a tenth would pass
+    // the round's 50
+    assert_eq!(attachment_reads(&google), 9);
     assert!(!fetched(&core, &id(1)));
     gws::prefetch::run(&core).unwrap();
     assert_eq!(attachment_reads(&google), 14);
@@ -711,4 +712,112 @@ fn a_thread_google_no_longer_has_is_read_once() {
         .count();
     assert_eq!(gone, 1);
     assert!(has_view(&core, &id(1)));
+}
+
+/// Below the Core's own turning of a sign-in card into the same words: the
+/// tools themselves say Google can't be reached.
+#[test]
+fn lapsed_with_nothing_kept_the_tools_say_google_cant_be_reached() {
+    let google = seeded(vec![with_file(1, 2, "receipt.docx", b"PK".to_vec())]);
+    let core = synced(&google, "unreached");
+    core.account("buwiz.account.set", &sign_in(1000));
+    let thread = gws::mail::run(&core, "gws_mail_thread", &json!({"thread": id(1)})).unwrap();
+    assert!(
+        thread.to_string().contains("Can't reach Google"),
+        "{thread}"
+    );
+    assert_ne!(thread["structuredContent"]["code"], "account_required");
+    let file = gws::files::run(
+        &core,
+        "gws_mail_attachment_open",
+        &json!({"message": id(1), "part": "1"}),
+    )
+    .unwrap();
+    assert!(file.to_string().contains("Can't reach Google"), "{file}");
+}
+
+#[test]
+fn a_part_google_named_no_id_for_is_tried_again() {
+    let google = seeded(vec![with_file(1, 2, "receipt.docx", b"PK no id".to_vec())]);
+    let core = synced(&google, "no-id");
+    google.attachment_ids_missing(true);
+    gws::prefetch::run(&core).unwrap();
+    assert!(!has_file(&core, &id(1), "1"));
+    assert!(!fetched(&core, &id(1)), "not done with it");
+    google.attachment_ids_missing(false);
+    gws::prefetch::run(&core).unwrap();
+    assert!(has_file(&core, &id(1), "1"));
+}
+
+#[test]
+fn a_round_counts_what_came_not_what_was_kept() {
+    let three = "x".repeat(3 * 1024 * 1024);
+    let google = seeded(
+        (1..=20)
+            .map(|n| {
+                let mut m = mail(n, n as i64);
+                m.text = three.clone();
+                m
+            })
+            .collect(),
+    );
+    let core = synced(&google, "came");
+    gws::prefetch::run(&core).unwrap();
+    // each read is 4 MB of base64, though the view kept of it is a line:
+    // twelve make 48 MiB, and the thirteenth passes the round's 50
+    assert_eq!(thread_reads(&google).len(), 13);
+}
+
+#[test]
+fn a_wake_during_a_round_brings_one_more_after_it() {
+    let google = seeded(vec![mail(1, 2)]);
+    let core = synced(&google, "again");
+    google.hold("GET", &format!("/threads/{}", id(1)));
+    gws::prefetch::kick(&core);
+    google.wait_for_held();
+    // new mail lands while the round waits on Google, and the person's wake asks again
+    google.deliver(mail(2, 1));
+    gws::mail::sync(&core).unwrap();
+    gws::prefetch::kick(&core);
+    google.release();
+    let by = Instant::now() + Duration::from_secs(20);
+    while !has_view(&core, &id(2)) && Instant::now() < by {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(has_view(&core, &id(1)) && has_view(&core, &id(2)));
+}
+
+#[test]
+fn a_sign_out_ends_the_wait_after_a_failure() {
+    let google = seeded(vec![mail(1, 2)]);
+    let core = synced(&google, "wait-out");
+    google.thread_reads_fail_after(0, 500);
+    assert!(gws::prefetch::run(&core).is_err());
+    google.thread_reads_work();
+    core.account(
+        "buwiz.account.clear",
+        &json!({"account": "google", "label": "default"}),
+    );
+    assert!(gws::prefetch::run(&core).is_err(), "nobody to round for");
+    core.account("buwiz.account.set", &sign_in(4_000_000_000));
+    gws::mail::sync(&core).unwrap();
+    let before = thread_reads(&google).len();
+    gws::prefetch::run(&core).unwrap();
+    assert_eq!(thread_reads(&google).len(), before + 1, "no wait left over");
+}
+
+#[test]
+fn another_account_has_no_wait_from_the_last_ones_failure() {
+    let google = seeded(vec![mail(1, 2)]);
+    let core = synced(&google, "wait-switch");
+    google.thread_reads_fail_after(0, 500);
+    assert!(gws::prefetch::run(&core).is_err());
+    google.thread_reads_work();
+    let mut other = sign_in(4_000_000_000);
+    other["subject"] = json!("other@example.com");
+    core.account("buwiz.account.set", &other);
+    gws::mail::sync(&core).unwrap();
+    let before = thread_reads(&google).len();
+    gws::prefetch::run(&core).unwrap();
+    assert_eq!(thread_reads(&google).len(), before + 1);
 }

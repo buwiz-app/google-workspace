@@ -506,6 +506,16 @@ fn number(part: &mut Value, id: &str) {
     }
 }
 
+/// Takes the attachment id off every part, as a read Google sent short.
+fn strip_ids(part: &mut Value) {
+    if let Some(body) = part.get_mut("body").and_then(Value::as_object_mut) {
+        body.remove("attachmentId");
+    }
+    if let Some(parts) = part.get_mut("parts").and_then(Value::as_array_mut) {
+        parts.iter_mut().for_each(strip_ids);
+    }
+}
+
 /// File `i` of a mail, as [`payload`] numbers them.
 fn file_bytes(m: &Mail, i: usize) -> Option<&Vec<u8>> {
     match m.attachments.get(i) {
@@ -531,6 +541,8 @@ struct Account {
     thread_reads: Option<(usize, u16)>,
     /// Every attachment read answers 404, as for an id gone stale.
     attachments_gone: bool,
+    /// Whole reads name no attachment ids.
+    ids_missing: bool,
     /// Reads so far, once attachment ids change with each.
     reads: Option<AtomicU64>,
     /// `(draft id, message id, raw message, thread)`.
@@ -848,6 +860,9 @@ impl Account {
                 let read = self.reads.as_ref();
                 let read = read.map_or(0, |n| n.fetch_add(1, Ordering::Relaxed));
                 v["payload"] = payload(m, true, read);
+                if self.ids_missing {
+                    strip_ids(&mut v["payload"]);
+                }
             }
         }
         v
@@ -1794,6 +1809,11 @@ impl FakeGoogle {
     /// a 429 is Gmail saying it's busy.
     pub fn thread_reads_fail_after(&self, left: usize, status: u16) {
         self.account.lock().unwrap().thread_reads = Some((left, status));
+    }
+
+    /// Whether whole reads leave out each part's attachment id.
+    pub fn attachment_ids_missing(&self, missing: bool) {
+        self.account.lock().unwrap().ids_missing = missing;
     }
 
     /// Whether every attachment read answers 404.

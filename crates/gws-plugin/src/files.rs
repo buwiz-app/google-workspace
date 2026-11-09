@@ -989,7 +989,7 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
                 (kept.name, kind, kept.bytes)
             }
             None => {
-                let auth = auth.ok_or(Failure::AccountRequired)?;
+                let auth = auth.ok_or_else(crate::mail::unreached)?;
                 let Some(mail) = core.gmail.full(&auth, &message)? else {
                     return Ok(gone());
                 };

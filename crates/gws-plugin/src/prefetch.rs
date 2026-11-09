@@ -43,6 +43,10 @@ const ID_MAX: usize = 4096;
 #[derive(Default)]
 pub struct Running {
     busy: AtomicBool,
+    /// Asked for while one was on its way: one more goes after it.
+    again: AtomicBool,
+    /// Whose the last round was: another's starts with no wait.
+    account: std::sync::Mutex<String>,
     /// No round before this, by the Core's clock.
     not_before: AtomicI64,
     backoff: AtomicI64,
@@ -57,15 +61,28 @@ impl Drop for Done<'_> {
     }
 }
 
-/// Starts a round on its own thread, unless one is still going.
+/// Starts a round on its own thread. One still going takes it as one more to
+/// run after it, so a wake the person caused isn't lost to it.
 pub fn kick(core: &Arc<Core>) {
-    if core.prefetch.busy.swap(true, Ordering::AcqRel) {
+    let running = &core.prefetch;
+    running.again.store(true, Ordering::Release);
+    if running.busy.swap(true, Ordering::AcqRel) {
         return;
     }
     let core = core.clone();
     std::thread::spawn(move || {
-        let _done = Done(&core.prefetch.busy);
-        let _ = run(&core);
+        let running = &core.prefetch;
+        loop {
+            let done = Done(&running.busy);
+            while running.again.swap(false, Ordering::AcqRel) {
+                let _ = run(&core);
+            }
+            drop(done);
+            // one asked for after the last look, and before busy went
+            if !running.again.load(Ordering::Acquire) || running.busy.swap(true, Ordering::AcqRel) {
+                return;
+            }
+        }
     });
 }
 
@@ -75,12 +92,28 @@ pub fn kick(core: &Arc<Core>) {
 pub fn run(core: &Core) -> Result<(), Failure> {
     let now = core.clock.now_ms();
     let running = &core.prefetch;
+    // a wait is one account's: signed out or another's, it's over
+    let fresh = |running: &Running| {
+        running.backoff.store(0, Ordering::Release);
+        running.not_before.store(0, Ordering::Release);
+    };
+    let Some((account, _)) = core.accounts.signed_in() else {
+        fresh(running);
+        return Err(Failure::AccountRequired);
+    };
+    {
+        let mut last = running.account.lock().unwrap_or_else(|e| e.into_inner());
+        if *last != account {
+            fresh(running);
+            *last = account;
+        }
+    }
     if now < running.not_before.load(Ordering::Acquire) {
         return Ok(());
     }
     let result = round(core, now);
     let wait = match &result {
-        Ok(()) => 0,
+        Ok(()) | Err(Failure::AccountRequired) => 0,
         Err(_) => {
             (running.backoff.load(Ordering::Acquire) * 2).clamp(BACKOFF_MIN_MS, BACKOFF_MAX_MS)
         }
@@ -125,8 +158,8 @@ fn bodies(core: &Core, account: &str, since: i64, spent: &mut i64) -> Result<(),
             with_own_store(core, account, |store| store.remove_thread(account, &id))?;
             continue;
         };
+        *spent += came(&full);
         let view = view.to_string();
-        *spent += view.len() as i64;
         // what was read is what the row says, or the next sync has news of it
         let Some(row) = row_of(&full) else {
             with_own_store(core, account, |store| store.pass_thread(account, &id))?;
@@ -192,6 +225,7 @@ fn attachments(core: &Core, account: &str, since: i64, spent: &mut i64) -> Resul
             with_own_store(core, account, |store| store.tried(account, &thread))?;
             continue;
         };
+        *spent += came(&full);
         let inline = inline_parts(&full);
         let messages = full.get("messages").and_then(Value::as_array);
         let mut whole = true;
@@ -212,10 +246,15 @@ fn attachments(core: &Core, account: &str, since: i64, spent: &mut i64) -> Resul
             let text = |key: &str| found.get(key).and_then(Value::as_str).unwrap_or_default();
             let (id, mime, name) = (text("id"), text("mime"), text("name"));
             let size = found.get("size").and_then(Value::as_i64).unwrap_or(-1);
-            if !id_ok(id) || !(0..ATTACHMENT_MAX).contains(&size) || !opens(mime, name) {
+            if size >= ATTACHMENT_MAX || !opens(mime, name) {
                 continue;
             }
-            if *spent + size > ROUND_MAX {
+            // Google said too little to fetch it by: another read may say more
+            if !id_ok(id) || size < 0 {
+                whole = false;
+                continue;
+            }
+            if *spent + encoded(size) > ROUND_MAX {
                 return Ok(());
             }
             // full of newer mail's: nothing older is worth asking for
@@ -227,7 +266,7 @@ fn attachments(core: &Core, account: &str, since: i64, spent: &mut i64) -> Resul
                 whole = false;
                 continue;
             };
-            *spent += bytes.len() as i64;
+            *spent += encoded(bytes.len() as i64);
             // the size was Google's word; what counts is what came
             if bytes.len() as i64 >= ATTACHMENT_MAX {
                 continue;
@@ -309,6 +348,18 @@ fn inline_parts(thread: &Value) -> HashSet<(String, String)> {
         }
     }
     out
+}
+
+/// How much of the round a whole read took: its JSON as Gmail sends it, not
+/// the view kept of it.
+fn came(full: &Value) -> i64 {
+    full.to_string().len() as i64
+}
+
+/// How much of the round `n` bytes of attachment take: Gmail sends them as
+/// base64 inside JSON.
+fn encoded(n: i64) -> i64 {
+    (n * 4 + 2) / 3
 }
 
 /// An attachment kept ahead, for an open to use before it asks Google. Its name

@@ -413,26 +413,34 @@ impl Waker {
 
     /// Until a wake or the time to look again, and which it was.
     pub(crate) fn wait(&self) -> Woken {
+        let start = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let every = if state.1.is_some_and(|at| at.elapsed() < LINGER) {
-            ACTIVE
-        } else {
-            IDLE
-        };
-        let every = state.2.map_or(every, |at| {
-            every.min(at.saturating_duration_since(Instant::now()))
-        });
-        if state.0.is_none() {
+        loop {
+            let every = if state.1.is_some_and(|at| at.elapsed() < LINGER) {
+                ACTIVE
+            } else {
+                IDLE
+            };
+            let due = state.2.map_or(start + every, |at| at.min(start + every));
+            let now = Instant::now();
+            let woken = match state.0.take() {
+                Some(by) => Some(by),
+                // a condvar can wake for nothing: only a time that's come is the timer's
+                None if now >= due => Some(Woken::Timer),
+                None => None,
+            };
+            if let Some(by) = woken {
+                if state.2.is_some_and(|at| at <= now) {
+                    state.2 = None;
+                }
+                return by;
+            }
             state = self
                 .bell
-                .wait_timeout(state, every)
+                .wait_timeout(state, due - now)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
-        if state.2.is_some_and(|at| at <= Instant::now()) {
-            state.2 = None;
-        }
-        state.0.take().unwrap_or(Woken::Timer)
     }
 }
 
@@ -639,7 +647,7 @@ pub(crate) fn reader(core: &Core) -> Result<(Option<Bearer>, String), Failure> {
 }
 
 /// What a call to Google comes to with no live token.
-fn unreached() -> Failure {
+pub(crate) fn unreached() -> Failure {
     Failure::Offline(crate::tools::GOOGLE_UNREACHED.to_owned())
 }
 
@@ -1200,8 +1208,8 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     {
         return Ok(ok(view));
     }
-    // read as the sign-in the Bot can't refresh just now: it says so itself
-    let auth = auth.ok_or(Failure::AccountRequired)?;
+    // the sign-in is there, and the Bot can't refresh its token just now
+    let auth = auth.ok_or_else(unreached)?;
     let Some((_, view)) = read_view(core, &auth, &id)? else {
         return Ok(fail("not_found", "That conversation is gone."));
     };
@@ -1281,6 +1289,25 @@ mod tests {
         assert_eq!(waker.wait(), Woken::Person);
         waker.wake_after(Duration::from_millis(10));
         assert_eq!(waker.wait(), Woken::Timer);
+    }
+
+    #[test]
+    fn a_wake_for_nothing_isnt_the_timer() {
+        let waker = Waker::default();
+        waker.wake_after(Duration::from_millis(400));
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                waker.bell.notify_all();
+            });
+            assert_eq!(waker.wait(), Woken::Timer);
+        });
+        assert!(
+            start.elapsed() >= Duration::from_millis(400),
+            "woke at {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

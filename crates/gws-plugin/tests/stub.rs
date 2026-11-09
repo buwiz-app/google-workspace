@@ -556,6 +556,7 @@ mod mail {
             html: None,
             attachments: Vec::new(),
             message_id: String::new(),
+            inline: Vec::new(),
         }
     }
 

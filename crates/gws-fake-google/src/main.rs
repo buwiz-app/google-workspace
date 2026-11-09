@@ -1,4 +1,4 @@
-//! `gws-fake-google [--port <n>] [--mails <n>] [--files <n>] [--hostile]`: the stub
+//! `gws-fake-google [--port <n>] [--mails <n>] [--files <n>] [--hostile] [--rich]`: the stub
 //! Google on 127.0.0.1 for a test Bot. `--files` adds a folder of that many. Prints `base=http://127.0.0.1:<port>`, then serves until killed.
 
 fn main() {
@@ -19,6 +19,9 @@ fn main() {
         .with_drive();
     if let Some(files) = value("--files") {
         seed = seed.with_big_folder("drv-big", "Big folder", files);
+    }
+    if args.iter().any(|a| a == "--rich") {
+        seed = seed.with_rich_mail(&format!("http://127.0.0.1:{port}"));
     }
     if args.iter().any(|a| a == "--hostile") {
         seed = seed.with_hostile(&format!("http://127.0.0.1:{port}"));

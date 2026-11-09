@@ -1526,3 +1526,366 @@ fn what_cant_be_viewed_or_found_on_a_mail_is_refused() {
     assert_eq!(refusal(&missing), "not_found");
     assert!(!home.open_dir().exists());
 }
+
+// --- What the Bot can take, and Save ----------------------------------------
+
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR fake";
+const PDF: &[u8] = b"%PDF-1.4\n%fake\n";
+const EVERYTHING: [&str; 6] = ["word", "sheet", "image", "pdf", "open_with", "save"];
+
+/// The Bot's `initialize`, saying it can do `what`.
+fn bot_can(home: &Home, what: &[&str]) {
+    home.core.documents.heard(&json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {"experimental": {"buwiz/documents": what}}}}));
+}
+
+fn save_attachment(home: &Home, n: usize) -> Value {
+    home.core.run(
+        "gws_mail_attachment_save",
+        &json!({"message": "18f1aa", "part": (n + 1).to_string()}),
+    )
+}
+
+/// What a refusal says to the person.
+fn says(answer: &Value) -> String {
+    answer["structuredContent"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("nothing said: {answer}"))
+        .to_owned()
+}
+
+/// The one hand-off an answer carries, by its key, and the path in it.
+fn handed(answer: &Value) -> (String, PathBuf) {
+    let meta = answer["_meta"]
+        .as_object()
+        .unwrap_or_else(|| panic!("no _meta: {answer}"));
+    assert_eq!(meta.len(), 1, "{answer}");
+    let (key, value) = meta.iter().next().unwrap();
+    (key.clone(), PathBuf::from(value["path"].as_str().unwrap()))
+}
+
+fn fetches(google: &FakeGoogle) -> usize {
+    google
+        .log()
+        .iter()
+        .filter(|s| s.target.contains("/attachments/"))
+        .count()
+}
+
+fn name_on_disk(path: &Path) -> &str {
+    path.file_name().unwrap().to_str().unwrap()
+}
+
+#[test]
+fn each_kind_of_attachment_takes_its_own_way_to_the_bot() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("IMG_4250.png", "image/png", PNG),
+        ("receipt.pdf", "application/pdf", PDF),
+        ("report.docx", DOCX, b"PK report"),
+        ("site-plans.zip", "application/zip", b"PK\x05\x06"),
+        ("invite.ics", "application/ics", b"BEGIN:VCALENDAR"),
+        ("notes.txt", "text/plain", b"hello"),
+        ("tool.exe", "application/x-msdownload", b"MZ"),
+        ("page.html", "text/html", b"<p>"),
+    ]));
+    let home = Home::new(&google.base(), "ways");
+    bot_can(&home, &EVERYTHING);
+    for (n, key, mime, name) in [
+        (0, "buwiz/document", Some("image/png"), "IMG_4250.png"),
+        (1, "buwiz/document", Some("application/pdf"), "receipt.pdf"),
+        (2, "buwiz/document", Some(DOCX), "report.docx"),
+        (3, "buwiz/open_with", None, "site-plans.zip"),
+        (4, "buwiz/open_with", None, "invite.ics"),
+        (5, "buwiz/open_with", None, "notes.txt"),
+    ] {
+        let answer = open_attachment(&home, n);
+        let (got, path) = handed(&answer);
+        assert_eq!(got, key, "{name}: {answer}");
+        assert_eq!(name_on_disk(&path), name);
+        assert_eq!(path.ancestors().nth(2).unwrap(), real(&home.open_dir()));
+        assert_eq!(
+            answer["_meta"][key].get("mime").and_then(Value::as_str),
+            mime
+        );
+        assert_eq!(answer["structuredContent"]["opened"], true);
+        assert!(
+            !answer["structuredContent"]
+                .to_string()
+                .contains("gws-files"),
+            "no path but in _meta: {answer}"
+        );
+    }
+    let before = fetches(&google);
+    for n in [6, 7] {
+        let answer = open_attachment(&home, n);
+        assert_eq!(refusal(&answer), "unsupported", "{answer}");
+        assert_eq!(
+            says(&answer),
+            "This kind of file can't open here. Save it instead."
+        );
+        assert_eq!(answer.get("_meta"), None);
+    }
+    assert_eq!(fetches(&google), before, "nothing fetched for a refusal");
+}
+
+#[test]
+fn the_rich_mails_photo_pdf_zip_and_invite_each_hand_over() {
+    let google = FakeGoogle::start(Seed::default().with_rich_mail("http://127.0.0.1:1"));
+    let home = Home::new(&google.base(), "rich");
+    bot_can(&home, &EVERYTHING);
+    let auth = home.core.accounts.google().unwrap();
+    let mut seen = Vec::new();
+    for message in ["000019f00000001e", "000019f000000014"] {
+        let mail = home.core.gmail.full(&auth, message).unwrap().unwrap();
+        for listed in gws::gmail::attachments(&mail) {
+            let answer = home.core.run(
+                "gws_mail_attachment_open",
+                &json!({"message": message, "part": listed["part"]}),
+            );
+            let (key, path) = handed(&answer);
+            seen.push((name_on_disk(&path).to_owned(), key));
+        }
+    }
+    let seen: Vec<(&str, &str)> = seen.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    assert_eq!(
+        seen,
+        [
+            ("IMG_4250.png", "buwiz/document"),
+            ("receipt.pdf", "buwiz/document"),
+            ("site-plans.zip", "buwiz/open_with"),
+            ("invite.ics", "buwiz/open_with"),
+            ("invite.ics", "buwiz/open_with"),
+        ]
+    );
+}
+
+#[test]
+fn with_no_viewer_for_it_an_image_goes_to_the_computers_app() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("IMG_4250.png", "image/png", PNG),
+        ("report.docx", DOCX, b"PK report"),
+    ]));
+    let home = Home::new(&google.base(), "openwith");
+    bot_can(&home, &["open_with"]);
+    for n in 0..2 {
+        assert_eq!(handed(&open_attachment(&home, n)).0, "buwiz/open_with");
+    }
+    bot_can(&home, &["image"]);
+    assert_eq!(
+        handed(&open_attachment(&home, 0)).0,
+        "buwiz/document",
+        "opened again, the way this Bot takes it"
+    );
+}
+
+#[test]
+fn a_disguised_file_cant_pass_as_an_image_or_a_pdf() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("IMG_1.png", "image/png", b"<html><script>"),
+        ("bill.pdf", "application/octet-stream", b"MZ\x90\0"),
+        ("photo.jpg", "image/jpeg", PNG),
+        ("scan.png", "image/png", PDF),
+    ]));
+    let home = Home::new(&google.base(), "disguised");
+    bot_can(&home, &EVERYTHING);
+    for n in [0, 1, 3] {
+        let answer = open_attachment(&home, n);
+        assert_eq!(refusal(&answer), "unsupported", "{n}: {answer}");
+        assert_eq!(
+            says(&answer),
+            "This kind of file can't open here. Save it instead."
+        );
+        assert_eq!(answer.get("_meta"), None);
+    }
+    assert!(!home.open_dir().exists(), "nothing stays");
+    // a PNG sent as a JPEG is a PNG, and its name says so
+    let answer = open_attachment(&home, 2);
+    assert_eq!(answer["_meta"]["buwiz/document"]["mime"], "image/png");
+    assert_eq!(name_on_disk(&path_in(&answer)), "photo.jpg.png");
+}
+
+#[test]
+fn the_name_on_disk_ends_as_its_bytes_are() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("Scan", "application/pdf", PDF),
+        ("IMG_9.PNG", "application/octet-stream", PNG),
+        ("../plans", "application/zip", b"PK"),
+        ("schedule.ics.exe", "application/ics", b"BEGIN:VCALENDAR"),
+    ]));
+    let home = Home::new(&google.base(), "diskname");
+    bot_can(&home, &EVERYTHING);
+    for (n, name) in [
+        (0, "Scan.pdf"),
+        (1, "IMG_9.PNG"),
+        (2, "plans.zip"),
+        (3, "schedule.ics.exe.ics"),
+    ] {
+        assert_eq!(name_on_disk(&handed(&open_attachment(&home, n)).1), name);
+    }
+}
+
+#[test]
+fn save_hands_over_every_kind_as_it_came() {
+    let all: Vec<(&str, &str, &[u8])> = vec![
+        ("IMG_4250.png", "image/png", PNG),
+        ("receipt.pdf", "application/pdf", PDF),
+        ("report.docx", DOCX, b"PK report"),
+        ("site-plans.zip", "application/zip", b"PK\x05\x06"),
+        ("tool.exe", "application/x-msdownload", b"MZ"),
+        ("IMG_1.png", "image/png", b"<html>"),
+        ("Scan", "application/octet-stream", PDF),
+        ("../../evil", "", b"x"),
+    ];
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(all.clone()));
+    let home = Home::new(&google.base(), "save");
+    bot_can(&home, &EVERYTHING);
+    // an open edit of the same part stays as it is
+    let edited = path_in(&open_attachment(&home, 2));
+    fs::write(&edited, b"PK mine").unwrap();
+    let names = [
+        "IMG_4250.png",
+        "receipt.pdf",
+        "report.docx",
+        "site-plans.zip",
+        "tool.exe",
+        "IMG_1.png",
+        "Scan.pdf",
+        "evil",
+    ];
+    for (n, (_, _, bytes)) in all.iter().enumerate() {
+        let answer = save_attachment(&home, n);
+        assert_eq!(data(answer.clone())["saved"], true, "{answer}");
+        assert_eq!(answer["structuredContent"]["name"], names[n]);
+        let (key, path) = handed(&answer);
+        assert_eq!(key, "buwiz/save");
+        assert_eq!(answer["_meta"]["buwiz/save"]["name"], names[n]);
+        assert_eq!(name_on_disk(&path), names[n]);
+        assert_eq!(fs::read(&path).unwrap(), *bytes);
+        assert_eq!(path.ancestors().nth(2).unwrap(), real(&home.open_dir()));
+        assert_ne!(path.parent(), edited.parent(), "a folder of its own");
+    }
+    assert_eq!(fs::read(&edited).unwrap(), b"PK mine");
+    assert_eq!(home.edits().len(), 1, "the edit, and no saved copy");
+}
+
+#[test]
+fn each_press_a_bot_cant_answer_says_to_update_it() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("IMG_4250.png", "image/png", PNG),
+        ("receipt.pdf", "application/pdf", PDF),
+        ("site-plans.zip", "application/zip", b"PK"),
+        ("report.docx", DOCX, b"PK report"),
+        ("budget.xlsx", XLSX, b"PK budget"),
+    ]));
+    let home = Home::new(&google.base(), "update");
+    let open = "Update Buwiz Bot to open this here.";
+    // an older Bot, which says nothing: what it always took still opens
+    for n in 0..3 {
+        let answer = open_attachment(&home, n);
+        assert_eq!(refusal(&answer), "needs_update", "{answer}");
+        assert_eq!(says(&answer), open);
+        assert_eq!(answer.get("_meta"), None);
+    }
+    let answer = save_attachment(&home, 0);
+    assert_eq!(says(&answer), "Update Buwiz Bot to save this here.");
+    assert_eq!(answer.get("_meta"), None);
+    assert_eq!(fetches(&google), 0, "nothing fetched in vain");
+    assert_eq!(handed(&open_attachment(&home, 3)).0, "buwiz/document");
+    assert_eq!(handed(&open_attachment(&home, 4)).0, "buwiz/document");
+    // a Bot that says, and lacks the view and the app for each in turn
+    for (lacks, n) in [
+        ("image", 0),
+        ("pdf", 1),
+        ("open_with", 2),
+        ("sheet", 4),
+        ("word", 3),
+    ] {
+        let what: Vec<&str> = EVERYTHING
+            .iter()
+            .copied()
+            .filter(|w| *w != lacks && *w != "open_with")
+            .collect();
+        bot_can(&home, &what);
+        let answer = open_attachment(&home, n);
+        assert_eq!(refusal(&answer), "needs_update", "{lacks}: {answer}");
+        assert_eq!(says(&answer), open, "{lacks}");
+        assert_eq!(answer.get("_meta"), None);
+    }
+    assert_eq!(fetches(&google), 2, "only the two the older Bot opened");
+    bot_can(&home, &["word", "sheet", "image", "pdf", "open_with"]);
+    assert_eq!(
+        says(&save_attachment(&home, 0)),
+        "Update Buwiz Bot to save this here."
+    );
+}
+
+#[test]
+fn an_image_or_pdf_never_shows_as_edited() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("IMG_4250.png", "image/png", PNG),
+        ("receipt.pdf", "application/pdf", PDF),
+        ("site-plans.zip", "application/zip", b"PK"),
+    ]));
+    let home = Home::new(&google.base(), "readonly");
+    bot_can(&home, &EVERYTHING);
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        let path = handed(&open_attachment(&home, n)).1;
+        fs::write(&path, b"changed on this Mac").unwrap();
+        ids.push(
+            path.parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    assert_eq!(home.edits(), Vec::<Value>::new());
+    for id in &ids {
+        assert_eq!(refusal(&home.upload(id, "copy")), "not_edited", "{id}");
+    }
+    assert_eq!(drive_writes(&google), Vec::<String>::new());
+}
+
+#[test]
+fn images_pdfs_and_saved_copies_go_at_24_hours_and_at_sign_out() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("IMG_4250.png", "image/png", PNG),
+        ("receipt.pdf", "application/pdf", PDF),
+    ]));
+    let home = Home::new(&google.base(), "readonlygone");
+    bot_can(&home, &EVERYTHING);
+    let opened = |home: &Home| {
+        let paths = [
+            path_in(&open_attachment(home, 0)),
+            path_in(&open_attachment(home, 1)),
+            handed(&save_attachment(home, 0)).1,
+        ];
+        // even changed, none of them is the person's work
+        for path in &paths {
+            fs::write(path, b"changed").unwrap();
+        }
+        paths
+    };
+    let paths = opened(&home);
+    home.later(LIFE_MS);
+    gws::files::sweep(&home.core);
+    for path in &paths {
+        assert!(!path.exists(), "{path:?}");
+    }
+    let paths = opened(&home);
+    home.sign_out();
+    for path in &paths {
+        assert!(!path.exists(), "{path:?}");
+    }
+    assert_eq!(every_path(&home.open_dir()), Vec::<PathBuf>::new());
+}

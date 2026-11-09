@@ -310,6 +310,7 @@ fn run(plugin: Gws, manifest: Served) -> std::io::Result<()> {
                 }));
             }
             Route::Initialize => {
+                core.documents.heard(&message);
                 if let Some(reply) = server.handle(&message) {
                     write(&out, &negotiated(reply, &message));
                 }
@@ -404,6 +405,7 @@ mod tests {
             "gws_file_upload",
             "gws_file_discard",
             "gws_mail_attachment_open",
+            "gws_mail_attachment_save",
             "gws_drive_upload",
             "gws_drive_folder",
             "gws_drive_rename",
@@ -449,6 +451,7 @@ mod tests {
             tools::FILE_UPLOAD,
             tools::FILE_DISCARD,
             tools::MAIL_ATTACHMENT_OPEN,
+            tools::MAIL_ATTACHMENT_SAVE,
             tools::DRIVE_ACCESS,
             tools::DRIVE_UPLOAD,
             tools::DRIVE_FOLDER,

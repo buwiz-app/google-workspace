@@ -61,6 +61,7 @@ pub const APPS: [App; 3] = [
             tools::UPLOAD_CHUNK,
             tools::UPLOAD_DROP,
             tools::MAIL_ATTACHMENT_OPEN,
+            tools::MAIL_ATTACHMENT_SAVE,
         ],
         card: true,
         files: true,
@@ -401,6 +402,7 @@ mod tests {
             tools::FILE_UPLOAD,
             tools::FILE_DISCARD,
             tools::MAIL_ATTACHMENT_OPEN,
+            tools::MAIL_ATTACHMENT_SAVE,
         ] {
             let def = tools::defs().into_iter().find(|d| d.name == name).unwrap();
             assert_eq!(def.audience, tools::APP_ONLY, "{name}");

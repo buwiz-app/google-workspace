@@ -16,6 +16,7 @@ pub mod compose;
 pub mod drive;
 pub mod files;
 pub mod gmail;
+pub mod handoff;
 pub mod js;
 pub mod mail;
 pub mod manifest;
@@ -88,6 +89,8 @@ pub struct Core {
     pub hashes: files::Hashes,
     /// What an open file's 24 hours are counted by.
     pub clock: files::Clock,
+    /// What the Bot said at `initialize` it can do with a file.
+    pub documents: handoff::Documents,
 }
 
 impl Core {
@@ -117,6 +120,7 @@ impl Core {
             working: files::Working::default(),
             hashes: files::Hashes::default(),
             clock: files::Clock::default(),
+            documents: handoff::Documents::default(),
             pushed: std::sync::atomic::AtomicBool::new(false),
             settle: mail::Settle::default(),
         }

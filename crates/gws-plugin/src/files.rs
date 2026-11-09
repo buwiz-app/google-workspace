@@ -15,6 +15,11 @@
 //! sign in again. An edited attachment is the same: it has no file on Drive to
 //! go back to, so its answers are a new file in My Drive, or discard.
 //!
+//! An attachment can also be an image, a PDF or a kind the computer's own app
+//! opens (`handoff.rs` says which way each goes), or a copy for Downloads. Those
+//! are only looked at: they never count as edited, so they go as anything
+//! unedited does.
+//!
 //! We never write over a Google Doc, Sheet or Slides: Google says an update
 //! replaces "the full contents of the document", and doesn't say what becomes
 //! of comments and suggestions. They take `copy` alone.
@@ -39,9 +44,11 @@ use sha2::{Digest as _, Sha256};
 use crate::accounts::Bearer;
 use crate::drive::{self, Answer, DOC, SHEET, SLIDES, id_ok, kind_of, refusal_of};
 use crate::gmail::{self, Failure};
+use crate::handoff::{self, Way};
 use crate::mail::{signed_in, with_own_store, with_store};
 use crate::tools::{
-    FILE_DISCARD, FILE_EDITS, FILE_OPEN, FILE_UPLOAD, MAIL_ATTACHMENT_OPEN, failed, ok,
+    FILE_DISCARD, FILE_EDITS, FILE_OPEN, FILE_UPLOAD, MAIL_ATTACHMENT_OPEN, MAIL_ATTACHMENT_SAVE,
+    failed, ok,
 };
 use crate::{Core, js};
 
@@ -77,11 +84,13 @@ const ATTACHMENT_ID_MAX: usize = 4096;
 const ATTACHMENT: &str = "att-";
 /// Where a download waits to be whole. No safe name starts with a dot.
 const PART: &str = ".part";
-const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-const XLSX: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-const PPTX: &str = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+pub(crate) const DOCX: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+pub(crate) const XLSX: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+pub(crate) const PPTX: &str =
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 /// What a file says when it says nothing: a mail's parts often do.
-const NO_TYPE: [&str; 2] = ["", "application/octet-stream"];
+pub(crate) const NO_TYPE: [&str; 2] = ["", "application/octet-stream"];
 /// What can be opened, with its extensions: what the Bot's Word and Spreadsheet
 /// views take, as its own check does. Anything else stays on Drive, since the Bot
 /// would refuse it and the person would see nothing happen.
@@ -459,6 +468,22 @@ fn unsupported() -> Value {
     refusal("unsupported", "This kind of file can't be opened here.")
 }
 
+/// An attachment no Bot opens, which can still be saved.
+fn save_instead() -> Value {
+    refusal(
+        "unsupported",
+        "This kind of file can't open here. Save it instead.",
+    )
+}
+
+/// A press this Bot can't answer, said so, since a newer one could.
+fn needs_update(what: &str) -> Value {
+    refusal(
+        "needs_update",
+        &format!("Update Buwiz Bot to {what} this here."),
+    )
+}
+
 /// A refused read, in the tool's terms.
 fn read_refused(answer: Answer) -> Value {
     match answer {
@@ -596,7 +621,12 @@ pub fn safe_name(name: &str) -> String {
 /// and a Doc's export gets its `.docx`.
 fn file_name(name: &str, mime: &str) -> String {
     let name = safe_name(name);
-    let Some((_, exts)) = TYPES.iter().find(|(m, _)| *m == mime) else {
+    let exts = TYPES
+        .iter()
+        .find(|(m, _)| *m == mime)
+        .map(|(_, exts)| *exts)
+        .or_else(|| handoff::by_mime(mime).map(|kind| kind.exts));
+    let Some(exts) = exts else {
         return name;
     };
     let fits = extension(&name).is_some_and(|e| exts.contains(&e.to_lowercase().as_str()));
@@ -672,17 +702,29 @@ fn path_of(core: &Core, row: &Opened) -> Result<PathBuf, Failure> {
     Ok(folder_of(core, &row.id)?.join(&row.name))
 }
 
+/// An attachment only looked at: an image, a PDF, a kind only the computer's
+/// own app opens, or a copy on its way to Downloads. It has no edit to keep, so
+/// it never waits for an answer and goes as anything unedited does.
+fn read_only(row: &Opened) -> bool {
+    row.attachment && !TYPES.iter().any(|(mime, _)| *mime == row.mime)
+}
+
 /// Whether the file holds what came. Only a hash can say: the viewer's save
 /// can leave the size alone, and a reopened file its time. One that's here but
 /// can't be read counts as edited: nothing goes on a guess.
 fn is_edited(core: &Core, path: &Path, row: &Opened) -> bool {
-    file_here(path) && core.hashes.run(path).map_or(true, |hash| hash != row.hash)
+    !read_only(row)
+        && file_here(path)
+        && core.hashes.run(path).map_or(true, |hash| hash != row.hash)
 }
 
 /// [`is_edited`] for a poll: the file is read only if its stamps moved. They're
 /// taken before the read, so a save during it shows next time, and kept only
 /// once settled, so a save in the same tick can't hide behind them.
 fn seems_edited(core: &Core, path: &Path, row: &Opened) -> bool {
+    if read_only(row) {
+        return false;
+    }
     let Ok(meta) = fs::metadata(path) else {
         return false;
     };
@@ -763,6 +805,9 @@ fn reopen(core: &Core, row: &Opened) -> Result<Value, Failure> {
     };
     with_own_store(core, &row.account, |store| store.put_opened(&again))?;
     let path = fs::canonicalize(path_of(core, row)?).map_err(|_| cant_save())?;
+    if row.attachment {
+        return Ok(handed(core, &path, row));
+    }
     Ok(opened(&path, &row.name, &row.mime))
 }
 
@@ -771,20 +816,17 @@ fn moved(row: &Opened, live: &Value) -> bool {
     text("version") != row.version || text("md5Checksum") != row.md5
 }
 
-/// Takes a `.part` that's whole to its place and records it. A sign-out while
-/// it came refuses the record, and then nothing stays.
-fn keep(core: &Core, dir: &Path, row: &Opened) -> Result<Value, Failure> {
+/// Takes a `.part` that's whole to its place and records it, and says where it
+/// is. A sign-out while it came refuses the record, and then nothing stays.
+fn keep(core: &Core, dir: &Path, row: &Opened) -> Result<PathBuf, Failure> {
     let done = land(&dir.join(PART), dir, &row.name).and_then(|path| {
         with_own_store(core, &row.account, |store| store.put_opened(row))?;
         Ok(path)
     });
-    match done {
-        Ok(path) => Ok(opened(&path, &row.name, &row.mime)),
-        Err(e) => {
-            let _ = remove(core, &row.id);
-            Err(e)
-        }
+    if done.is_err() {
+        let _ = remove(core, &row.id);
     }
+    done
 }
 
 fn start_part(core: &Core, id: &str) -> Result<PathBuf, Failure> {
@@ -918,7 +960,8 @@ fn download(
         md5: text("md5Checksum").to_owned(),
         opened_ms: core.clock.now_ms(),
     };
-    keep(core, &dir, &row)
+    let path = keep(core, &dir, &row)?;
+    Ok(opened(&path, &row.name, &row.mime))
 }
 
 /// A part of a mail, as [`gmail::attachments`] names it: `1`, `0.2`, `root`.
@@ -946,16 +989,91 @@ fn attachment_folder(message: &str, part: &str) -> String {
     format!("{ATTACHMENT}{message}-{}", &hash[..32])
 }
 
-/// `gws_mail_attachment_open`. The name, the type and the id to fetch by all
-/// come from a fresh read of the message, so what lands is that part's. The name
-/// is still a stranger's.
-fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (auth, account) = signed_in(core)?;
+/// Where a copy on its way to Downloads waits: beside the open one and never in
+/// its folder, which can hold the person's edit.
+fn save_folder(message: &str, part: &str) -> String {
+    let hash = format!("{:x}", Sha256::digest(format!("save\n{part}").as_bytes()));
+    format!("{ATTACHMENT}{message}-{}", &hash[..32])
+}
+
+/// The answer that hands an attachment over, the way its kind goes to this
+/// Bot. Only `_meta` has the path, as for [`opened`].
+fn handed(core: &Core, path: &Path, row: &Opened) -> Value {
+    let Some(kind) = handoff::by_mime(&row.mime) else {
+        return save_instead();
+    };
+    match handoff::way(&core.documents, kind) {
+        Way::Viewer => opened(path, &row.name, &row.mime),
+        Way::System => {
+            let mut answer =
+                ok(json!({"opened": true, "name": row.name, "kind": kind_of(&row.mime)}));
+            answer["_meta"] = json!({"buwiz/open_with": {"path": path}});
+            answer
+        }
+        Way::Update => needs_update("open"),
+    }
+}
+
+/// The attachment `part` of `message`, as a fresh read of it says: its name, its
+/// type and the id to fetch it by. The name is still a stranger's.
+fn listed_part(
+    core: &Core,
+    auth: &Bearer,
+    message: &str,
+    part: &str,
+) -> Result<Option<(String, String, String)>, Failure> {
+    let Some(mail) = core.gmail.full(auth, message)? else {
+        return Ok(None);
+    };
+    let listed = gmail::attachments(&mail);
+    let Some(found) = listed
+        .iter()
+        .find(|a| a.get("part").and_then(Value::as_str) == Some(part))
+    else {
+        return Ok(None);
+    };
+    let text = |key: &str| {
+        found
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    Ok(Some((text("name"), text("mime"), text("id"))))
+}
+
+fn attachment_gone() -> Value {
+    refusal("not_found", "That attachment is gone from the mail.")
+}
+
+/// `message` and `part` from a screen's arguments, if they can be one.
+fn attachment_args(args: &Value) -> Option<(String, String)> {
     let message = js::trim(&js::string_or_empty(args.get("message"))).to_owned();
     let part = js::trim(&js::string_or_empty(args.get("part"))).to_owned();
-    if !gmail::id_ok(&message) || !part_ok(&part) {
+    (gmail::id_ok(&message) && part_ok(&part)).then_some((message, part))
+}
+
+/// The bytes, as `dir/.part`.
+fn write_part(dir: &Path, bytes: &[u8]) -> Result<(), Failure> {
+    let write = || -> std::io::Result<()> {
+        let mut part = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join(PART))?;
+        part.write_all(bytes)
+    };
+    write().map_err(|_| cant_save())
+}
+
+/// `gws_mail_attachment_open`. The name, the type and the id to fetch by all
+/// come from a fresh read of the message, so what lands is that part's. An
+/// image or a PDF is one only if its bytes say so.
+fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
+    let (auth, account) = signed_in(core)?;
+    let Some((message, part)) = attachment_args(args) else {
         return Ok(bad_args("That isn't an attachment."));
-    }
+    };
     let id = attachment_folder(&message, &part);
     let Some(_turn) = turn(core, &id) else {
         return Ok(busy());
@@ -977,43 +1095,32 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
             ));
         }
     }
-    let gone = || refusal("not_found", "That attachment is gone from the mail.");
-    let Some(mail) = core.gmail.full(&auth, &message)? else {
-        return Ok(gone());
+    let Some((title, mime, attachment)) = listed_part(core, &auth, &message, &part)? else {
+        return Ok(attachment_gone());
     };
-    let listed = gmail::attachments(&mail);
-    let Some(found) = listed
-        .iter()
-        .find(|a| a.get("part").and_then(Value::as_str) == Some(&part))
-    else {
-        return Ok(gone());
+    let Some(kind) = handoff::declared(&mime, extension(&title)) else {
+        return Ok(save_instead());
     };
-    let text = |key: &str| found.get(key).and_then(Value::as_str).unwrap_or_default();
-    let (title, mime, attachment) = (text("name"), text("mime"), text("id"));
-    let Some(kind) = openable(mime, title) else {
-        return Ok(unsupported());
-    };
-    if !attachment_ok(attachment) {
-        return Ok(gone());
+    // nothing comes down that this Bot couldn't show
+    if handoff::way(&core.documents, kind) == Way::Update {
+        return Ok(needs_update("open"));
     }
-    let Some(bytes) = core.gmail.attachment(&auth, &message, attachment)? else {
-        return Ok(gone());
+    if !attachment_ok(&attachment) {
+        return Ok(attachment_gone());
+    }
+    let Some(bytes) = core.gmail.attachment(&auth, &message, &attachment)? else {
+        return Ok(attachment_gone());
+    };
+    let Some(kind) = handoff::checked(kind, &bytes) else {
+        return Ok(save_instead());
     };
     let dir = start_part(core, &id)?;
-    let write = || -> std::io::Result<()> {
-        let mut part = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(dir.join(PART))?;
-        part.write_all(&bytes)
-    };
-    write().map_err(|_| cant_save())?;
+    write_part(&dir, &bytes)?;
     let row = Opened {
         id,
         account,
-        name: file_name(title, kind),
-        mime: kind.to_owned(),
+        name: file_name(&title, kind.mime),
+        mime: kind.mime.to_owned(),
         google: false,
         attachment: true,
         hash: format!("{:x}", Sha256::digest(&bytes)),
@@ -1021,7 +1128,62 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
         md5: String::new(),
         opened_ms: core.clock.now_ms(),
     };
-    keep(core, &dir, &row)
+    let path = keep(core, &dir, &row)?;
+    Ok(handed(core, &path, &row))
+}
+
+/// The name a saved copy has: the stranger's, made safe, and ending as an
+/// image or a PDF does when its bytes are one. Nothing else is told by them.
+fn saved_name(title: &str, bytes: &[u8]) -> String {
+    match handoff::sniffed(bytes) {
+        Some(kind) => file_name(title, kind.mime),
+        None => safe_name(title),
+    }
+}
+
+/// `gws_mail_attachment_save`: any attachment, fetched as an open is, for the
+/// Bot to copy to Downloads. Its copy here is only looked at, and goes as an
+/// unedited open does.
+fn save_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
+    let (auth, account) = signed_in(core)?;
+    let Some((message, part)) = attachment_args(args) else {
+        return Ok(bad_args("That isn't an attachment."));
+    };
+    if !core.documents.can(handoff::SAVE) {
+        return Ok(needs_update("save"));
+    }
+    let id = save_folder(&message, &part);
+    let Some(_turn) = turn(core, &id) else {
+        return Ok(busy());
+    };
+    let Some((title, _, attachment)) = listed_part(core, &auth, &message, &part)? else {
+        return Ok(attachment_gone());
+    };
+    if !attachment_ok(&attachment) {
+        return Ok(attachment_gone());
+    }
+    let Some(bytes) = core.gmail.attachment(&auth, &message, &attachment)? else {
+        return Ok(attachment_gone());
+    };
+    let dir = start_part(core, &id)?;
+    write_part(&dir, &bytes)?;
+    let row = Opened {
+        id,
+        account,
+        name: saved_name(&title, &bytes),
+        // never one an edit is kept for
+        mime: NO_TYPE[1].to_owned(),
+        google: false,
+        attachment: true,
+        hash: format!("{:x}", Sha256::digest(&bytes)),
+        version: String::new(),
+        md5: String::new(),
+        opened_ms: core.clock.now_ms(),
+    };
+    let path = keep(core, &dir, &row)?;
+    let mut answer = ok(json!({"saved": true, "name": row.name}));
+    answer["_meta"] = json!({"buwiz/save": {"path": path, "name": row.name}});
+    Ok(answer)
 }
 
 /// `gws_file_edits`: what's here and edited, with whether Drive moved too. Found
@@ -1256,6 +1418,7 @@ pub fn run(core: &Core, tool: &str, args: &Value) -> Option<Value> {
         FILE_UPLOAD => upload(core, args),
         FILE_DISCARD => discard(core, args),
         MAIL_ATTACHMENT_OPEN => open_attachment(core, args),
+        MAIL_ATTACHMENT_SAVE => save_attachment(core, args),
         _ => return None,
     };
     core.sync.seen();
@@ -1325,6 +1488,11 @@ mod tests {
         assert_eq!(file_name("Budget.2026", XLSX), "Budget.2026.xlsx");
         assert_eq!(file_name("invoice.html", DOCX), "invoice.html.docx");
         assert_eq!(file_name("Photo.jpeg", "image/jpeg"), "Photo.jpeg");
+        assert_eq!(file_name("Photo", "image/png"), "Photo.png");
+        assert_eq!(file_name("receipt.PDF", "application/pdf"), "receipt.PDF");
+        assert_eq!(file_name("plans.exe", "application/zip"), "plans.exe.zip");
+        assert_eq!(saved_name("Scan", b"%PDF-1.4"), "Scan.pdf");
+        assert_eq!(saved_name("../tool.exe", b"MZ"), "tool.exe");
     }
 
     #[test]

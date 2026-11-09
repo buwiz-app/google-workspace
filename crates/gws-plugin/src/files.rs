@@ -532,7 +532,7 @@ fn extension(name: &str) -> Option<&str> {
 
 /// The type a file opens as, from what it says it is or, when it says nothing,
 /// from its name. `None` is a kind no viewer takes.
-fn openable(mime: &str, name: &str) -> Option<&'static str> {
+pub(crate) fn openable(mime: &str, name: &str) -> Option<&'static str> {
     if NO_TYPE.contains(&mime) {
         let ext = extension(name)?.to_lowercase();
         return TYPES
@@ -950,7 +950,8 @@ fn attachment_folder(message: &str, part: &str) -> String {
 /// come from a fresh read of the message, so what lands is that part's. The name
 /// is still a stranger's.
 fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (auth, account) = signed_in(core)?;
+    // a kept copy opens with no connection: only Google needs a live token
+    let (auth, account) = crate::mail::reader(core)?;
     let message = js::trim(&js::string_or_empty(args.get("message"))).to_owned();
     let part = js::trim(&js::string_or_empty(args.get("part"))).to_owned();
     if !gmail::id_ok(&message) || !part_ok(&part) {
@@ -988,6 +989,7 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
                 (kept.name, kind, kept.bytes)
             }
             None => {
+                let auth = auth.ok_or(Failure::AccountRequired)?;
                 let Some(mail) = core.gmail.full(&auth, &message)? else {
                     return Ok(gone());
                 };

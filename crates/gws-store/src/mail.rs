@@ -113,7 +113,8 @@ impl Store {
              UNION SELECT account FROM threads UNION SELECT account FROM bodies \
              UNION SELECT account FROM calendars UNION SELECT account FROM events \
              UNION SELECT account FROM drive_files UNION SELECT account FROM drive_views \
-             UNION SELECT account FROM opened UNION SELECT account FROM attachment_bytes",
+             UNION SELECT account FROM opened UNION SELECT account FROM attachment_bytes \
+             UNION SELECT account FROM ahead_passed",
         )?;
         let accounts = q
             .query_map([], |r| r.get(0))?
@@ -153,6 +154,7 @@ impl Store {
         for table in [
             "bodies",
             "attachment_bytes",
+            "ahead_passed",
             "thread_labels",
             "threads",
             "labels",
@@ -176,6 +178,7 @@ impl Store {
             "thread_labels WHERE account = ? AND thread = ?",
             "bodies WHERE account = ? AND thread = ?",
             "attachment_bytes WHERE account = ? AND thread = ?",
+            "ahead_passed WHERE account = ? AND thread = ?",
         ] {
             tx.execute(&format!("DELETE FROM {table}"), params![account, id])?;
         }

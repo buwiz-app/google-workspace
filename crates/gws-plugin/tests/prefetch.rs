@@ -103,6 +103,22 @@ fn attachment_reads(google: &FakeGoogle) -> usize {
         .count()
 }
 
+/// What the last sync said, once one has run.
+fn synced_at(core: &Core) -> Option<String> {
+    let held = core.store().unwrap();
+    let status = held
+        .as_ref()
+        .unwrap()
+        .state(FAKE_EMAIL, "mail_status")
+        .unwrap();
+    status.filter(|s| s == "ok")
+}
+
+/// The Core's clock, `ms` on: past a failed round's wait.
+fn later(core: &Core, ms: i64) {
+    core.clock.set(core.clock.now_ms() + ms);
+}
+
 fn data(answer: Value) -> Value {
     assert_ne!(answer["isError"], true, "{answer}");
     answer["structuredContent"].clone()
@@ -112,9 +128,17 @@ fn data(answer: Value) -> Value {
 fn recent_threads_arrive_without_an_open_and_old_ones_dont() {
     let google = seeded(vec![mail(1, 1), mail(2, 29), mail(3, 31), mail(4, 90)]);
     let core = synced(&google, "recent");
-    // the background sync does it, as it would with a screen open
     let worker = gws::mail::start(core.clone());
+    // a wake the person didn't cause, as a model's write makes: a sync, no round
     core.sync.wake();
+    let by = Instant::now() + Duration::from_secs(20);
+    while synced_at(&core).is_none() && Instant::now() < by {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(thread_reads(&google).is_empty(), "no round for that wake");
+    // the person's own: a round
+    core.sync.wake_by_person();
     let by = Instant::now() + Duration::from_secs(20);
     while !(has_view(&core, &id(1)) && has_view(&core, &id(2))) && Instant::now() < by {
         std::thread::sleep(Duration::from_millis(20));
@@ -170,6 +194,10 @@ fn a_round_stops_at_a_busy_answer_and_the_next_goes_on() {
     assert!(!has_view(&core, &id(3)));
 
     google.thread_reads_work();
+    // straight after a busy answer, a round asks Google nothing
+    gws::prefetch::run(&core).unwrap();
+    assert_eq!(thread_reads(&google).len(), 3, "it waits");
+    later(&core, gws::prefetch::BACKOFF_MIN_MS);
     gws::prefetch::run(&core).unwrap();
     assert!((1..=5).all(|n| has_view(&core, &id(n))));
     assert_eq!(thread_reads(&google).len(), 6, "only the three left");
@@ -183,6 +211,7 @@ fn a_round_stops_at_a_failure_too() {
     assert!(gws::prefetch::run(&core).is_err());
     assert_eq!(thread_reads(&google).len(), 1);
     google.thread_reads_work();
+    later(&core, gws::prefetch::BACKOFF_MIN_MS);
     gws::prefetch::run(&core).unwrap();
     assert!((1..=3).all(|n| has_view(&core, &id(n))));
 }
@@ -196,22 +225,31 @@ fn an_open_during_a_round_doesnt_wait_for_it() {
         let round = s.spawn(|| gws::prefetch::run(&core));
         google.wait_for_held();
         // the round is stuck on Google: the person's open goes straight past it
-        let view = data(core.run("gws_mail_thread", &json!({"thread": id(2)})));
+        let open = s.spawn(|| core.run("gws_mail_thread", &json!({"thread": id(2)})));
+        let by = Instant::now() + Duration::from_secs(10);
+        while !open.is_finished() && Instant::now() < by {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let waited = !open.is_finished();
+        let still_held = !round.is_finished();
+        // let go before judging, so a failure ends rather than hangs
+        google.release();
+        assert!(!waited, "the open waited for the round");
+        assert!(still_held, "the round was still waiting on Google");
+        let view = data(open.join().unwrap());
         assert!(
             view["page"]
                 .as_str()
                 .unwrap()
                 .contains("Fake mail number 2.")
         );
-        assert!(!round.is_finished(), "the round was still waiting");
-        google.release();
         round.join().unwrap().unwrap();
     });
     assert!(has_view(&core, &id(1)));
 }
 
 #[test]
-fn attachments_under_5_mb_are_kept_and_larger_ones_arent() {
+fn attachments_under_5_mb_that_open_are_kept_and_the_rest_arent() {
     let mut with_files = mail(1, 2);
     with_files.html = Some("<p>See <img src=\"cid:logo\"></p>".to_owned());
     with_files.attachments = vec![
@@ -224,6 +262,16 @@ fn attachments_under_5_mb_are_kept_and_larger_ones_arent() {
             "scan.docx".to_owned(),
             DOCX.to_owned(),
             vec![0; 5 * 1024 * 1024],
+        ),
+        (
+            "run.sh".to_owned(),
+            "application/x-sh".to_owned(),
+            b"#!/bin/sh".to_vec(),
+        ),
+        (
+            "photo.png".to_owned(),
+            PNG.to_owned(),
+            b"\x89PNG photo".to_vec(),
         ),
     ];
     with_files.inline = vec![(
@@ -252,9 +300,14 @@ fn attachments_under_5_mb_are_kept_and_larger_ones_arent() {
             .to_owned()
     };
     assert!(has_file(&core, &id(1), &part_of("receipt.docx")));
+    assert!(has_file(&core, &id(1), &part_of("photo.png")), "a picture");
     assert!(
-        has_file(&core, &id(1), &part_of("logo.png")),
-        "an inline picture too"
+        !has_file(&core, &id(1), &part_of("logo.png")),
+        "a picture inside the mail is the page's own"
+    );
+    assert!(
+        !has_file(&core, &id(1), &part_of("run.sh")),
+        "what can't open isn't worth the room"
     );
     assert!(
         !has_file(&core, &id(1), &part_of("scan.docx")),
@@ -305,8 +358,23 @@ fn a_kept_attachment_is_still_checked_as_a_fetched_one_is() {
     )];
     let google = seeded(vec![with_file]);
     let core = synced(&google, "checked");
-    gws::prefetch::run(&core).unwrap();
-    assert!(has_file(&core, &id(1), "1"));
+    // kept by an older round, or by anything else that put it there
+    {
+        let held = core.store().unwrap();
+        let saved = gws_store::prefetch::Saved {
+            thread: id(1),
+            at: NOW,
+            message: id(1),
+            part: "1".to_owned(),
+            name: "run.sh".to_owned(),
+            mime: "application/x-sh".to_owned(),
+            bytes: b"#!/bin/sh".to_vec(),
+        };
+        held.as_ref()
+            .unwrap()
+            .put_attachment(FAKE_EMAIL, &saved, 1)
+            .unwrap();
+    }
     let answer = core.run(
         "gws_mail_attachment_open",
         &json!({"message": id(1), "part": "1"}),
@@ -379,4 +447,268 @@ fn offline_a_reopened_mail_shows_the_saved_list_and_threads() {
             );
         }
     }
+}
+
+/// Two sign-ins, both lapsed, and the Bot made the second active: only its
+/// saved mail shows, never the first's.
+#[test]
+fn offline_only_the_active_accounts_saved_mail_shows() {
+    use gws_store::mail::{Label, Thread};
+    let dir = std::env::temp_dir().join(format!("gws-ahead-two-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let core = Core::new(
+        &Apis::at("http://127.0.0.1:9"),
+        Ok(gws_store::Paths::in_dir(dir)),
+    );
+    core.unlock("seed");
+    let list = json!([
+        {"account": "google", "label": "default", "active": false},
+        {"account": "google", "label": "work", "active": true},
+    ]);
+    for (label, who) in [
+        ("default", "first@example.com"),
+        ("work", "second@example.com"),
+    ] {
+        let mut push = sign_in(1000);
+        push["label"] = json!(label);
+        push["subject"] = json!(who);
+        push["accounts"] = list.clone();
+        let set = core.account("buwiz.account.set", &push);
+        assert_ne!(set["isError"], true, "{set}");
+    }
+    {
+        let held = core.store().unwrap();
+        let store = held.as_ref().unwrap();
+        for (who, thread, words) in [
+            ("first@example.com", "1f00", "First's mail"),
+            ("second@example.com", "2f00", "Second's mail"),
+        ] {
+            let row = Thread {
+                id: thread.into(),
+                subject: words.into(),
+                at: NOW,
+                messages: 1,
+                labels: vec!["INBOX".into()],
+                ..Thread::default()
+            };
+            store.put_thread(who, &row).unwrap();
+            store
+                .put_view(
+                    who,
+                    thread,
+                    &json!({"id": thread, "page": words}).to_string(),
+                    1,
+                )
+                .unwrap();
+            let label = Label {
+                id: format!("Label_{thread}"),
+                name: words.into(),
+                kind: "user".into(),
+                unread: 0,
+                total: 1,
+            };
+            store.put_labels(who, &[label]).unwrap();
+        }
+    }
+    let list = data(core.run("gws_mail_list", &json!({"label": "INBOX"})));
+    let ids: Vec<&str> = list["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["2f00"], "{list}");
+    let view = data(core.run("gws_mail_thread", &json!({"thread": "2f00"})));
+    assert_eq!(view["page"], "Second's mail");
+    let first = core.run("gws_mail_thread", &json!({"thread": "1f00"}));
+    assert!(!first.to_string().contains("First's mail"), "{first}");
+    let labels = data(core.run("gws_mail_labels", &json!({})));
+    assert_eq!(labels["labels"][0]["name"], "Second's mail", "{labels}");
+    assert_eq!(labels["labels"].as_array().unwrap().len(), 1);
+    // a screen's write for the active account isn't taken for a stale one
+    let marked = core.run(
+        "gws_mail_mark",
+        &json!({"threads": ["2f00"], "read": true, "as_account": "second@example.com"}),
+    );
+    assert_ne!(
+        marked["structuredContent"]["refused"], "account_changed",
+        "{marked}"
+    );
+    assert!(!marked.to_string().contains("You switched"), "{marked}");
+
+    // the Bot says no sign-in is active: nobody's mail, and no guess
+    let mut none = sign_in(1000);
+    none["label"] = json!("work");
+    none["subject"] = json!("second@example.com");
+    none["accounts"] = json!([
+        {"account": "google", "label": "default", "active": false},
+        {"account": "google", "label": "work", "active": false},
+    ]);
+    core.account("buwiz.account.set", &none);
+    let list = core.run("gws_mail_list", &json!({"label": "INBOX"}));
+    assert_eq!(list["isError"], true, "{list}");
+    assert!(!list.to_string().contains("1f00") && !list.to_string().contains("2f00"));
+}
+
+fn with_file(n: u64, days_ago: i64, name: &str, bytes: Vec<u8>) -> Mail {
+    let mut m = mail(n, days_ago);
+    m.attachments = vec![(name.to_owned(), DOCX.to_owned(), bytes)];
+    m
+}
+
+fn fetched(core: &Core, thread: &str) -> bool {
+    let held = core.store().unwrap();
+    let left = held
+        .as_ref()
+        .unwrap()
+        .views_unfetched_since(FAKE_EMAIL, 0, 100)
+        .unwrap();
+    !left.iter().any(|(t, _, _)| t == thread)
+}
+
+#[test]
+fn offline_a_kept_attachment_still_opens() {
+    let google = seeded(vec![with_file(1, 2, "receipt.docx", b"PK kept".to_vec())]);
+    let core = synced(&google, "offline-file");
+    gws::prefetch::run(&core).unwrap();
+    assert!(has_file(&core, &id(1), "1"));
+    drop(core);
+    let core = plugin("http://127.0.0.1:9", "offline-file", false);
+    core.account("buwiz.account.set", &sign_in(1000));
+    let opened = core.run(
+        "gws_mail_attachment_open",
+        &json!({"message": id(1), "part": "1"}),
+    );
+    let path = opened["_meta"]["buwiz/document"]["path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{opened}"));
+    assert_eq!(std::fs::read(path).unwrap(), b"PK kept");
+}
+
+#[test]
+fn a_round_downloads_at_most_its_share_and_the_next_goes_on() {
+    let four = 4 * 1024 * 1024;
+    let mut big = mail(1, 1);
+    big.attachments = (0..14)
+        .map(|n| {
+            (
+                format!("part{n}.docx"),
+                DOCX.to_owned(),
+                vec![n as u8; four],
+            )
+        })
+        .collect();
+    let google = seeded(vec![big]);
+    let core = synced(&google, "share");
+    gws::prefetch::run(&core).unwrap();
+    // twelve make 48 MB; a thirteenth would pass the round's 50
+    assert_eq!(attachment_reads(&google), 12);
+    assert!(!fetched(&core, &id(1)));
+    gws::prefetch::run(&core).unwrap();
+    assert_eq!(attachment_reads(&google), 14);
+    assert!(fetched(&core, &id(1)));
+}
+
+#[test]
+fn with_the_budget_full_of_newer_mail_nothing_older_is_downloaded() {
+    let google = seeded(vec![with_file(1, 3, "old.docx", b"PK old".to_vec())]);
+    let core = synced(&google, "room");
+    {
+        let held = core.store().unwrap();
+        held.as_ref()
+            .unwrap()
+            .conn()
+            .execute_batch(&format!(
+                "INSERT INTO attachment_bytes(account, message, part, thread, at, name, mime, size, used, bytes) VALUES('{FAKE_EMAIL}', 'newer', '1', 'newer', {NOW}, 'n.docx', 'x', {}, 1, x'00')",
+                gws_store::prefetch::ATTACHMENTS_MAX
+            ))
+            .unwrap();
+    }
+    gws::prefetch::run(&core).unwrap();
+    assert!(has_view(&core, &id(1)));
+    assert_eq!(attachment_reads(&google), 0, "no download to throw away");
+    assert!(has_file(&core, "newer", "1"), "the newer mail's stays");
+}
+
+#[test]
+fn a_sign_out_during_a_round_ends_it_before_the_next_call() {
+    let google = seeded(vec![with_file(1, 2, "receipt.docx", b"PK".to_vec())]);
+    let core = synced(&google, "gone-mid");
+    // the view is kept by an open, so the round reads only for the attachment
+    data(core.run("gws_mail_thread", &json!({"thread": id(1)})));
+    google.hold("GET", &format!("/threads/{}", id(1)));
+    std::thread::scope(|s| {
+        let round = s.spawn(|| gws::prefetch::run(&core));
+        google.wait_for_held();
+        core.account(
+            "buwiz.account.clear",
+            &json!({"account": "google", "label": "default"}),
+        );
+        google.release();
+        assert!(round.join().unwrap().is_err());
+    });
+    assert_eq!(attachment_reads(&google), 0, "no call after the sign-out");
+}
+
+#[test]
+fn an_attachment_that_didnt_come_is_tried_again() {
+    let google = seeded(vec![with_file(1, 2, "receipt.docx", b"PK again".to_vec())]);
+    let core = synced(&google, "again");
+    google.attachments_gone(true);
+    gws::prefetch::run(&core).unwrap();
+    assert!(!has_file(&core, &id(1), "1"));
+    assert!(!fetched(&core, &id(1)), "not done with it");
+    google.attachments_gone(false);
+    gws::prefetch::run(&core).unwrap();
+    assert!(has_file(&core, &id(1), "1"));
+    assert!(fetched(&core, &id(1)));
+}
+
+#[test]
+fn with_the_views_full_no_thread_is_downloaded() {
+    let google = seeded(vec![mail(1, 1), mail(2, 2)]);
+    let core = synced(&google, "views-full");
+    {
+        let held = core.store().unwrap();
+        held.as_ref()
+            .unwrap()
+            .conn()
+            .execute_batch(&format!(
+                "INSERT INTO bodies(account, thread, view, size, used) VALUES('{FAKE_EMAIL}', '{}', '{{}}', {}, 1)",
+                id(2),
+                gws_store::mail::BODIES_MAX
+            ))
+            .unwrap();
+    }
+    gws::prefetch::run(&core).unwrap();
+    assert!(
+        thread_reads(&google).is_empty(),
+        "{:?}",
+        thread_reads(&google)
+    );
+}
+
+#[test]
+fn a_thread_google_no_longer_has_is_read_once() {
+    let google = seeded(vec![mail(1, 1)]);
+    let core = synced(&google, "vanished");
+    {
+        let held = core.store().unwrap();
+        let row = gws_store::mail::Thread {
+            id: "1a99".into(),
+            at: NOW,
+            messages: 1,
+            labels: vec!["INBOX".into()],
+            ..Default::default()
+        };
+        held.as_ref().unwrap().put_thread(FAKE_EMAIL, &row).unwrap();
+    }
+    gws::prefetch::run(&core).unwrap();
+    gws::prefetch::run(&core).unwrap();
+    let gone = thread_reads(&google)
+        .iter()
+        .filter(|t| t.contains("/threads/1a99"))
+        .count();
+    assert_eq!(gone, 1);
+    assert!(has_view(&core, &id(1)));
 }

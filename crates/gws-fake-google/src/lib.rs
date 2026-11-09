@@ -529,6 +529,8 @@ struct Account {
     draft_reads_fail: bool,
     /// How many more whole-thread reads go through, and what each after gets.
     thread_reads: Option<(usize, u16)>,
+    /// Every attachment read answers 404, as for an id gone stale.
+    attachments_gone: bool,
     /// Reads so far, once attachment ids change with each.
     reads: Option<AtomicU64>,
     /// `(draft id, message id, raw message, thread)`.
@@ -1008,6 +1010,7 @@ impl Account {
                 Some(m) => Reply::json(200, self.resource(m, &format, &wanted)),
                 None => not_found(),
             },
+            ("GET", ["messages", _, "attachments", _]) if self.attachments_gone => not_found(),
             ("GET", ["messages", id, "attachments", att]) => {
                 let at = att.rsplit('-').next().and_then(|i| i.parse::<usize>().ok());
                 let held = self
@@ -1791,6 +1794,11 @@ impl FakeGoogle {
     /// a 429 is Gmail saying it's busy.
     pub fn thread_reads_fail_after(&self, left: usize, status: u16) {
         self.account.lock().unwrap().thread_reads = Some((left, status));
+    }
+
+    /// Whether every attachment read answers 404.
+    pub fn attachments_gone(&self, gone: bool) {
+        self.account.lock().unwrap().attachments_gone = gone;
     }
 
     /// Ends the failures above.

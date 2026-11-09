@@ -218,7 +218,7 @@ fn act(core: &Core, tool: &str, args: &Value) -> Result<Value, Failure> {
         // a failed read here is only a stale row: the sync below mends it
         let _ = fetch_rows(core, &auth, &account, &changed);
     }
-    core.sync.wake();
+    core.sync.wake_by_person();
     match failure {
         Some(e) if undo.is_none() => Err(e),
         Some(_) => Ok(ok(
@@ -287,7 +287,7 @@ fn undo(core: &Core, args: &Value) -> Result<Value, Failure> {
         undo.threads.remove(0);
     }
     let _ = fetch_rows(core, &auth, &account, &ids);
-    core.sync.wake();
+    core.sync.wake_by_person();
     Ok(ok(json!({"done": ids.len()})))
 }
 
@@ -353,11 +353,21 @@ fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
     Ok(ok(json!({"rows": rows, "more": more, "saved": saved})))
 }
 
+/// What a sync woke for. Mail is kept ahead only after the timer's or a
+/// person's: a wake from anything else, a write the model or a routine made
+/// among them, must not start a round of downloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Woken {
+    Timer,
+    Person,
+    Other,
+}
+
 /// Wakes the sync, remembers when a screen last asked for something, and when
 /// it next has to look whatever else happens.
 #[derive(Default)]
 pub struct Waker {
-    state: Mutex<(bool, Option<Instant>, Option<Instant>)>,
+    state: Mutex<(Option<Woken>, Option<Instant>, Option<Instant>)>,
     bell: Condvar,
     stop: AtomicBool,
 }
@@ -374,7 +384,21 @@ impl Waker {
     }
 
     pub fn wake(&self) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).0 = true;
+        self.woken(Woken::Other);
+    }
+
+    /// [`Self::wake`] for what the person did on a screen.
+    pub fn wake_by_person(&self) {
+        self.woken(Woken::Person);
+    }
+
+    fn woken(&self, by: Woken) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // a person's wake still waiting isn't lost to another
+        if state.0 != Some(Woken::Person) {
+            state.0 = Some(by);
+        }
+        drop(state);
         self.bell.notify_all();
     }
 
@@ -388,7 +412,8 @@ impl Waker {
         self.bell.notify_all();
     }
 
-    fn wait(&self) {
+    /// Until a wake or the time to look again, and which it was.
+    pub(crate) fn wait(&self) -> Woken {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let every = if state.1.is_some_and(|at| at.elapsed() < LINGER) {
             ACTIVE
@@ -398,17 +423,17 @@ impl Waker {
         let every = state.2.map_or(every, |at| {
             every.min(at.saturating_duration_since(Instant::now()))
         });
-        if !state.0 {
+        if state.0.is_none() {
             state = self
                 .bell
                 .wait_timeout(state, every)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
-        state.0 = false;
         if state.2.is_some_and(|at| at <= Instant::now()) {
             state.2 = None;
         }
+        state.0.take().unwrap_or(Woken::Timer)
     }
 }
 
@@ -459,12 +484,12 @@ impl Settle {
 pub fn start(core: Arc<Core>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         loop {
-            core.sync.wait();
+            let woken = core.sync.wait();
             if core.sync.stopping() {
                 return;
             }
             if core.provisioned() {
-                if sync(&core).is_ok() {
+                if sync(&core).is_ok() && woken != Woken::Other {
                     crate::prefetch::kick(&core);
                 }
                 crate::files::sweep(&core);
@@ -605,7 +630,8 @@ pub(crate) fn signed_in(core: &Core) -> Result<(Bearer, String), Failure> {
 /// Whose saved mail a screen reads, with their token while it's live. A lapsed
 /// one is still their sign-in: with no connection the Bot can't refresh it, and
 /// what's saved is still theirs to read. No token means Google can't be asked.
-fn reader(core: &Core) -> Result<(Option<Bearer>, String), Failure> {
+/// Only the active sign-in's mail: with no active one, nobody's.
+pub(crate) fn reader(core: &Core) -> Result<(Option<Bearer>, String), Failure> {
     if let Some((auth, account)) = core.accounts.session() {
         return Ok((Some(auth), account));
     }
@@ -1192,6 +1218,18 @@ pub fn run(core: &Core, tool: &str, args: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wake_says_what_caused_it_and_a_persons_isnt_lost() {
+        let waker = Waker::default();
+        waker.wake();
+        assert_eq!(waker.wait(), Woken::Other);
+        waker.wake_by_person();
+        waker.wake();
+        assert_eq!(waker.wait(), Woken::Person);
+        waker.wake_after(Duration::from_millis(10));
+        assert_eq!(waker.wait(), Woken::Timer);
+    }
 
     #[test]
     fn a_row_names_who_the_persons_last_message_went_to() {

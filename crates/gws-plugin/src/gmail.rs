@@ -49,6 +49,9 @@ pub enum Failure {
     Plain(String),
 }
 
+/// What an attachment whose bytes won't decode fails with: a try again
+/// brings the same.
+pub const DAMAGED: &str = "That attachment came back damaged.";
 /// What a whole read of a thread came to.
 #[derive(Debug)]
 pub enum Whole {
@@ -743,11 +746,7 @@ impl Gmail {
         let data = v.get("data").and_then(Value::as_str).unwrap_or_default();
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(data.trim_end_matches('='))
-            .map_err(|_| {
-                Refused::Other(Failure::Plain(
-                    "That attachment came back damaged.".to_owned(),
-                ))
-            })?;
+            .map_err(|_| Refused::Other(Failure::Plain(DAMAGED.to_owned())))?;
         Ok(Some(bytes))
     }
 
@@ -1317,41 +1316,45 @@ fn part_header<'a>(part: &'a Value, name: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
 }
 
-/// A part's `body.data` (base64url, padded or not) as text in its
-/// charset: UTF-8 (invalid bytes replaced), or Latin-1 when it says so.
-fn decode_part(part: &Value) -> String {
-    let data = part
-        .pointer("/body/data")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let clean: String = data
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '=')
-        .map(|c| match c {
-            '+' => '-',
-            '/' => '_',
-            c => c,
-        })
-        .collect();
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(clean)
-        .unwrap_or_default();
+/// A part's charset, from its Content-Type, lower case; empty when it names none.
+pub(crate) fn part_charset(part: &Value) -> String {
     let ctype = part_header(part, "content-type")
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let charset = ctype
+    ctype
         .split(';')
         .find_map(|p| p.trim().strip_prefix("charset="))
-        .map(|c| c.trim_matches('"').to_owned())
-        .unwrap_or_default();
-    if matches!(
-        charset.as_str(),
-        "iso-8859-1" | "latin1" | "latin-1" | "windows-1252" | "cp1252"
-    ) {
-        bytes.iter().map(|&b| char::from(b)).collect()
-    } else {
-        String::from_utf8_lossy(&bytes).into_owned()
+        .map(|c| c.trim().trim_matches('"').to_owned())
+        .unwrap_or_default()
+}
+
+/// What windows-1252 puts at 0x80 to 0x9F, where Latin-1 has controls.
+const CP1252: [char; 32] = [
+    '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž', '\u{8f}',
+    '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
+];
+
+/// `bytes` as text in `charset`: Latin-1 or windows-1252 when it says so,
+/// else UTF-8 with invalid bytes replaced.
+pub(crate) fn in_charset(bytes: &[u8], charset: &str) -> String {
+    match charset {
+        "iso-8859-1" | "iso8859-1" | "latin1" | "latin-1" => {
+            bytes.iter().map(|&b| char::from(b)).collect()
+        }
+        "windows-1252" | "cp1252" => bytes
+            .iter()
+            .map(|&b| match b {
+                0x80..=0x9f => CP1252[usize::from(b - 0x80)],
+                _ => char::from(b),
+            })
+            .collect(),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
     }
+}
+
+/// A part's `body.data` as text in its charset.
+fn decode_part(part: &Value) -> String {
+    in_charset(&data_of(part).unwrap_or_default(), &part_charset(part))
 }
 
 /// `&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&nbsp;` and numeric
@@ -1486,6 +1489,17 @@ pub fn cap_bytes(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_windows_1252_body_keeps_its_curly_quotes() {
+        let body =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"\x93Noon?\x94 \x96 Ana\x92s");
+        let message = serde_json::json!({"payload": {"mimeType": "text/plain", "headers": [{"name": "Content-Type", "value": "text/plain; charset=windows-1252"}], "body": {"data": body}}});
+        assert_eq!(
+            super::body(&message),
+            "\u{201c}Noon?\u{201d} \u{2013} Ana\u{2019}s"
+        );
+    }
+
     use super::*;
     use serde_json::json;
 

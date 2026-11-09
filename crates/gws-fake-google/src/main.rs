@@ -1,5 +1,7 @@
 //! `gws-fake-google [--port <n>] [--mails <n>] [--files <n>] [--hostile] [--rich]`: the stub
-//! Google on 127.0.0.1 for a test Bot. `--files` adds a folder of that many. Prints `base=http://127.0.0.1:<port>`, then serves until killed.
+//! Google on 127.0.0.1 for a test Bot. `--files` adds a folder of that many. `--rich` adds the
+//! reader's hard cases, and the invite's event in the primary calendar, unanswered. Prints
+//! `base=http://127.0.0.1:<port>`, then serves until killed.
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

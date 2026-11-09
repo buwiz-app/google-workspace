@@ -1307,6 +1307,11 @@ pub(crate) fn read_view(
     let mut asks = |size: u64| gate(size.saturating_mul(4).div_ceil(3));
     let (mut view, made) = pictures::view_within(core, auth, account, &mut full, &mut asks);
     view["view_version"] = VIEW_VERSION.into();
+    // an `.ics` Gmail sends apart is the invite card's to fetch, so a slow or
+    // refused one never holds up the thread: until then it's pending, never
+    // none. A read ahead keeps the same
+    let invite = crate::invite::fill(None, &mut full)?;
+    view["invite"] = invite.unwrap_or_else(crate::invite::pending);
     // a twin check cut short is a picture missed: the next read may finish it
     let made = if told { made } else { Made::Missed };
     Ok(Viewed::Read { full, view, made })

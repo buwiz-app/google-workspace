@@ -619,6 +619,9 @@ struct Account {
     /// Files this size and under come in `body.data`, with no attachment id.
     data_in_parts: Option<usize>,
     draft_reads_fail: bool,
+    attachments_fail: Option<u16>,
+    /// Attachment reads answer with bytes that won't decode.
+    attachments_damaged: bool,
     /// How many more whole-thread reads go through, and what each after gets.
     thread_reads: Option<(usize, u16)>,
     /// Every attachment read answers 404, as for an id gone stale.
@@ -1139,6 +1142,17 @@ impl Account {
                 None => not_found(),
             },
             ("GET", ["messages", _, "attachments", _]) if self.attachments_gone => not_found(),
+            ("GET", ["messages", _, "attachments", _]) if self.attachments_damaged => {
+                Reply::json(200, json!({"size": 4, "data": "!!not base64!!"}))
+            }
+            ("GET", ["messages", _, "attachments", _]) if self.attachments_fail.is_some() => {
+                let code = self.attachments_fail.unwrap_or(500);
+                let why = match code {
+                    403 => "Request had insufficient authentication scopes.",
+                    _ => "Backend error",
+                };
+                Reply::json(code, json!({"error": {"code": code, "message": why}}))
+            }
             ("GET", ["messages", id, "attachments", att]) => {
                 let at = att.rsplit('-').next().and_then(|i| i.parse::<usize>().ok());
                 let held = self
@@ -1766,6 +1780,47 @@ impl FakeGoogle {
     /// Whether reading a draft fails.
     pub fn draft_reads_fail(&self, fail: bool) {
         self.account.lock().unwrap().draft_reads_fail = fail;
+    }
+
+    /// Attachment reads fail, as Gmail's backend sometimes does.
+    pub fn attachments_fail(&self, fail: bool) {
+        self.account.lock().unwrap().attachments_fail = fail.then_some(500);
+    }
+
+    /// Attachment reads answer `status`, as a lapsed sign-in's 401 does.
+    pub fn attachments_answer(&self, status: u16) {
+        self.account.lock().unwrap().attachments_fail = Some(status);
+    }
+
+    /// Calendar writes a PATCH and answers it with nothing of the event.
+    pub fn calendar_patch_answers_empty(&self, empty: bool) {
+        self.account.lock().unwrap().calendars.patch_answers_empty = empty;
+    }
+
+    /// Calendar refuses a PATCH with `status`, writing nothing; `None` lets
+    /// them through.
+    pub fn calendar_patch_refuses(&self, status: Option<u16>) {
+        self.account.lock().unwrap().calendars.patch_refuses = status;
+    }
+
+    /// Calendar writes a new event and answers 500.
+    pub fn calendar_insert_answers_500(&self, fail: bool) {
+        self.account.lock().unwrap().calendars.insert_answers_500 = fail;
+    }
+
+    /// Calendar writes a PATCH and answers 500.
+    pub fn calendar_patch_answers_500(&self, fail: bool) {
+        self.account.lock().unwrap().calendars.patch_answers_500 = fail;
+    }
+
+    /// Calendar writes a PATCH and answers 200 with a body cut off mid-way.
+    pub fn calendar_patch_answers_junk(&self, junk: bool) {
+        self.account.lock().unwrap().calendars.patch_answers_junk = junk;
+    }
+
+    /// Attachment reads answer with bytes that won't decode.
+    pub fn attachments_damaged(&self, damaged: bool) {
+        self.account.lock().unwrap().attachments_damaged = damaged;
     }
 
     /// From now on a token covers `scope` alone, and writes need more.

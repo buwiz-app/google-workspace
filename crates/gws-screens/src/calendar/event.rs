@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::time::{self, When};
 
-fn text(v: &Value, k: &str) -> String {
+pub(crate) fn text(v: &Value, k: &str) -> String {
     v.get(k)
         .and_then(Value::as_str)
         .unwrap_or_default()

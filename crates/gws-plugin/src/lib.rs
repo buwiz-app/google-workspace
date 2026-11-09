@@ -19,6 +19,7 @@ pub mod files;
 pub mod fold;
 pub mod gmail;
 pub mod handoff;
+pub mod invite;
 pub mod js;
 pub mod mail;
 pub mod manifest;
@@ -169,6 +170,7 @@ impl Core {
             .or_else(|| drive::run(self, tool, args))
             .or_else(|| drive::write::run(self, tool, args))
             .or_else(|| files::run(self, tool, args))
+            .or_else(|| invite::run(self, tool, args))
             .or_else(|| attachment_preview::run(self, tool, args))
             .or_else(|| pictures::run(self, tool, args))
             .unwrap_or_else(|| tools::run(&self.gmail, &self.accounts, tool, args));

@@ -88,6 +88,17 @@ pub(crate) struct Calendars {
     /// A read of a whole calendar fails, as a dropped connection would.
     pub(crate) whole_reads_fail: bool,
     pub(crate) writes: Vec<CalendarWrite>,
+    /// A PATCH is written, and answered with nothing of the event.
+    pub(crate) patch_answers_empty: bool,
+    /// A PATCH is written, and answered 200 with a body that isn't JSON.
+    pub(crate) patch_answers_junk: bool,
+    /// A PATCH is written, and answered 500, as a backend that fell over
+    /// after the write would.
+    pub(crate) patch_answers_500: bool,
+    /// An insert is written, and answered 500.
+    pub(crate) insert_answers_500: bool,
+    /// A PATCH is refused with this status, and nothing is written.
+    pub(crate) patch_refuses: Option<u16>,
 }
 
 fn error(code: u16, message: &str) -> Reply {
@@ -442,6 +453,14 @@ fn text(v: &Value, key: &str) -> String {
     v[key].as_str().unwrap_or_default().to_owned()
 }
 
+/// An event's `iCalUID`: its own, else what Google makes of its id.
+fn ical_uid(event: &Value) -> String {
+    match event["iCalUID"].as_str() {
+        Some(uid) => uid.to_owned(),
+        None => format!("{}@google.com", text(event, "id")),
+    }
+}
+
 /// What Google adds to an attendee list: a response, and who `self` is.
 fn tidy_attendees(event: &mut Value) {
     for a in event["attendees"].as_array_mut().into_iter().flatten() {
@@ -619,6 +638,28 @@ impl Calendars {
         let Some(at) = self.at(calendar) else {
             return not_found();
         };
+        // how an invite finds its event: by the UID its .ics carries, a series
+        // as its master
+        if let Some(uid) = r.param("iCalUID") {
+            let deleted = r.param("showDeleted").as_deref() == Some("true");
+            let held = &self.list[at].about;
+            let items: Vec<&Value> = held
+                .events
+                .iter()
+                .filter(|e| (deleted || !is_cancelled(e)) && ical_uid(e) == uid)
+                .collect();
+            let start: usize = r
+                .param("pageToken")
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(0);
+            let max = self.page.unwrap_or(250);
+            let page: Vec<&&Value> = items.iter().skip(start).take(max).collect();
+            let mut v = json!({"items": page, "timeZone": held.time_zone});
+            if start + max < items.len() {
+                v["nextPageToken"] = json!((start + max).to_string());
+            }
+            return Reply::json(200, v);
+        }
         if r.param("singleEvents").as_deref() != Some("true") {
             return error(400, "The stub lists events with singleEvents=true only.");
         }
@@ -751,6 +792,9 @@ impl Calendars {
         event["id"] = json!(id);
         self.add(at, event);
         self.record(r, calendar, &id, sent);
+        if self.insert_answers_500 {
+            return error(500, "Backend Error");
+        }
         match self.list[at].event(&id) {
             Some(event) => Reply::json(200, event),
             None => not_found(),
@@ -767,6 +811,9 @@ impl Calendars {
         let Some(mut held) = self.list[at].event(id) else {
             return not_found();
         };
+        if let Some(code) = self.patch_refuses {
+            return error(code, "The caller does not have permission");
+        }
         if !r.if_match.is_empty() && r.if_match != text(&held, "etag") {
             return error(412, "Precondition Failed");
         }
@@ -787,6 +834,20 @@ impl Calendars {
         }
         self.apply(at, id, &change);
         self.record(r, calendar, id, sent);
+        if self.patch_answers_empty {
+            return Reply::json(200, json!({}));
+        }
+        if self.patch_answers_500 {
+            return error(500, "Backend Error");
+        }
+        if self.patch_answers_junk {
+            return Reply(
+                200,
+                "application/json",
+                b"{\"kind\": \"calendar#ev".to_vec(),
+                Vec::new(),
+            );
+        }
         match self.list[at].event(id) {
             Some(event) => Reply::json(200, event),
             None => not_found(),

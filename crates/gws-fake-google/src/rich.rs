@@ -1,9 +1,12 @@
 //! Mail as a real inbox has it, for a live run of the reader: a long back and
 //! forth with quoted history, a Google Calendar invite (whose `invite.ics`
 //! comes twice, as Google sends it), a photo and a PDF, and a newsletter with
-//! remote and embedded images.
+//! remote and embedded images. The invite's event is in the person's primary
+//! calendar too, by the UID its `invite.ics` carries, waiting for an answer.
 
-use crate::{FAKE_EMAIL, Mail, NOW_MS, Seed};
+use serde_json::{Value, json};
+
+use crate::{FAKE_EMAIL, FakeCalendar, Mail, NOW_MS, Seed};
 
 const ICS: &str = "BEGIN:VCALENDAR\r\nPRODID:-//Google Inc//Google Calendar 70.9054//EN\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nDTSTART:20261110T020000Z\r\nDTEND:20261110T030000Z\r\nUID:fake-roof-inspection@google.com\r\nORGANIZER;CN=Ana Reyes:mailto:ana@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;CN=You:mailto:owner@example.com\r\nSUMMARY:Roof inspection\r\nLOCATION:12 Mabini St\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 const PDF: &str = "%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 200]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n4 0 obj<</Length 44>>stream\nBT /F1 18 Tf 40 100 Td (Fake receipt) Tj ET\nendstream endobj\n5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n";
@@ -16,6 +19,8 @@ const DOT: &[u8] = &[
     0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
     0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 ];
+/// The invite's UID, as its `.ics` and Calendar both hold it.
+pub(crate) const INVITE_UID: &str = "fake-roof-inspection@google.com";
 /// An empty zip: the end-of-directory record and nothing else.
 const ZIP: &[u8] = b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
@@ -92,10 +97,36 @@ fn back_and_forth() -> Vec<Mail> {
         .collect()
 }
 
+/// The Roof inspection as Ana's Calendar sent it: she organises, the person is
+/// a guest who hasn't answered.
+fn roof_inspection() -> Value {
+    json!({
+        "id": "roofinspection",
+        "iCalUID": INVITE_UID,
+        "summary": "Roof inspection",
+        "location": "12 Mabini St",
+        "start": {"dateTime": "2026-11-10T10:00:00+08:00", "timeZone": "Asia/Manila"},
+        "end": {"dateTime": "2026-11-10T11:00:00+08:00", "timeZone": "Asia/Manila"},
+        "organizer": {"email": "ana@example.com", "displayName": "Ana Reyes"},
+        "attendees": [
+            {"email": "ana@example.com", "displayName": "Ana Reyes", "organizer": true, "responseStatus": "accepted"},
+            {"email": FAKE_EMAIL, "responseStatus": "needsAction"}
+        ]
+    })
+}
+
 impl Seed {
-    /// Adds the reader's hard cases, newest of all. `stub` serves the
-    /// newsletter's web pictures at `/pictures/`.
+    /// Adds the reader's hard cases, newest of all, and the invite's event to
+    /// the primary calendar, which it makes if there is none. `stub` serves
+    /// the newsletter's web pictures at `/pictures/`.
     pub fn with_rich_mail(mut self, stub: &str) -> Self {
+        if !self.calendars.iter().any(|c| c.primary) {
+            self.calendars
+                .push(FakeCalendar::new(FAKE_EMAIL, "Owner", true, "Asia/Manila"));
+        }
+        if let Some(primary) = self.calendars.iter_mut().find(|c| c.primary) {
+            primary.events.push(roof_inspection());
+        }
         let mut rich = back_and_forth();
 
         let mut invite = mail(20, 20, "Ana Reyes <calendar-notification@google.com>", "Invitation: Roof inspection @ Tue Nov 10, 2026 10am - 11am (PHT)", 8,
@@ -247,6 +278,30 @@ mod tests {
                 .unwrap()
                 .contains("http://127.0.0.1:1/pictures/hero.png")
         );
+    }
+
+    #[test]
+    fn the_invites_event_waits_in_the_primary_calendar_by_its_uid() {
+        let seed = Seed::default().with_rich_mail("http://127.0.0.1:1");
+        let primary = seed.calendars.iter().find(|c| c.primary).unwrap();
+        let event = primary
+            .events
+            .iter()
+            .find(|e| e["iCalUID"] == super::INVITE_UID)
+            .unwrap();
+        assert!(super::ICS.contains(&format!("UID:{}", super::INVITE_UID)));
+        let me = event["attendees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["email"] == crate::FAKE_EMAIL)
+            .unwrap();
+        assert_eq!(me["responseStatus"], "needsAction");
+        // one calendar's event, not a second primary beside the demo's
+        let around = Seed::default()
+            .with_calendar_around(super::NOW_MS)
+            .with_rich_mail("http://127.0.0.1:1");
+        assert_eq!(around.calendars.iter().filter(|c| c.primary).count(), 1);
     }
 
     #[test]

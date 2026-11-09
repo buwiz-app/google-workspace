@@ -6,6 +6,8 @@
 //! them out: it drops values, and a row with several texts goes out unnamed.
 //! The Bot's `agent_hub::filter` tests hold that on the bytes it sends.
 
+mod invite;
+
 use std::collections::HashSet;
 
 use buwiz_app::{Bridge, Placement};
@@ -259,6 +261,9 @@ struct Mail {
     problem: Signal<Option<String>>,
     seq: Signal<i64>,
     help: Signal<bool>,
+    /// Each conversation's invite card, kept out of the page so showing the
+    /// page again leaves it be.
+    invite: Signal<invite::Cards>,
 }
 
 /// A file on a mail in the open conversation.
@@ -636,6 +641,7 @@ async fn show(b: Bridge, m: Mail, thread: String) {
                     .collect(),
             );
             pictures::opened(&b, m, &v, turn);
+            invite::opened(&b, m, &thread);
             m.attachments.set(attachments_in(&v));
             m.page.set(Some(
                 v.get("page")
@@ -661,6 +667,7 @@ fn switched(b: &Bridge, m: Mail) {
     m.chosen.set(None);
     m.picked.set(Vec::new());
     m.undo.set(None);
+    m.invite.set(invite::Cards::new());
     m.open_turn.ask();
     m.page.set(None);
     m.seq.set(-1);
@@ -1168,6 +1175,7 @@ fn reading(b: Bridge, m: Mail) -> impl IntoElement {
         .child(dynamic(move || match m.page.get() {
             Some(page) => view()
                 .app_class(Some("flex-1".into()))
+                .child(invite::card(files.clone(), m))
                 .child(pictures::bar(files.clone(), m))
                 .child(reader::view(
                     move || reader::seal(&page, dark()),
@@ -1625,6 +1633,7 @@ pub fn build(bridge: Bridge) -> Root {
             loading: signal(true),
             seq: signal(-1),
             help: signal(false),
+            invite: signal(invite::Cards::new()),
         };
         keys(b.clone(), m);
         b.spawn(load_list(b.clone(), m, 0));

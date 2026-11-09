@@ -34,6 +34,9 @@ pub const CALENDAR_API: &str = "https://www.googleapis.com/calendar/v3";
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// A page of events, attendees and all.
 const PAGE_MAX: u64 = 32 * 1024 * 1024;
+/// What a write that may have landed says: Calendar may hold it already,
+/// so a second try could make it twice.
+pub const UNANSWERED_WRITE: &str = "Calendar didn't answer; check Calendar before trying again.";
 /// The most events one page asks for, which is the most Google gives.
 const PAGE: &str = "2500";
 /// What the first read of a calendar covers.
@@ -47,6 +50,8 @@ const SEARCH_MAX: i64 = 25;
 const NEXT_LOOK: i64 = 50;
 /// How many deletes can still be undone.
 const DELETES_MAX: usize = 20;
+/// The most pages an event's UID is looked for on.
+const UID_PAGES: usize = 20;
 const SEQ: &str = "cal_seq";
 const STATUS: &str = "cal_status";
 
@@ -112,24 +117,50 @@ impl CalendarApi {
     fn answer(
         res: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     ) -> Result<Answer, Failure> {
+        Self::answer_as(res, false)
+    }
+
+    /// A write's answer: a 200 is written whatever its body says, so one
+    /// that won't read or parse is done, with nothing of the event. Every
+    /// failure that leaves open whether it landed (no answer, a 5xx, or a
+    /// 5xx whose body was lost) is `Offline`, worded as [`UNANSWERED_WRITE`];
+    /// anything else is a refusal, which wrote nothing. Nothing here or above
+    /// tries a write again: one that landed would be made twice.
+    fn written(
+        res: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<Answer, Failure> {
+        Self::answer_as(res, true)
+    }
+
+    fn answer_as(
+        res: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+        write: bool,
+    ) -> Result<Answer, Failure> {
         let mut res = res.map_err(|e| {
-            Failure::Offline(format!(
-                "could not reach Calendar: {}",
-                js::slice_utf16(&e.to_string(), 200)
-            ))
+            Failure::Offline(if write {
+                UNANSWERED_WRITE.to_owned()
+            } else {
+                format!(
+                    "could not reach Calendar: {}",
+                    js::slice_utf16(&e.to_string(), 200)
+                )
+            })
         })?;
         let status = res.status().as_u16();
-        let body = res
-            .body_mut()
-            .with_config()
-            .limit(PAGE_MAX)
-            .read_to_vec()
-            .map_err(|e| {
-                Failure::Plain(format!(
+        let body = res.body_mut().with_config().limit(PAGE_MAX).read_to_vec();
+        let body = match body {
+            Ok(body) => body,
+            Err(_) if write && status == 200 => return Ok(Answer::Done(Value::Null)),
+            Err(_) if write && status >= 500 => {
+                return Err(Failure::Offline(UNANSWERED_WRITE.to_owned()));
+            }
+            Err(e) => {
+                return Err(Failure::Plain(format!(
                     "Calendar's answer could not be read: {}",
                     js::slice_utf16(&e.to_string(), 200)
-                ))
-            })?;
+                )));
+            }
+        };
         let why = || {
             let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             v.pointer("/error/message")
@@ -140,9 +171,11 @@ impl CalendarApi {
         match status {
             // a delete answers with nothing
             200 | 204 if body.is_empty() => Ok(Answer::Done(Value::Null)),
-            200 => serde_json::from_slice(&body)
-                .map(Answer::Done)
-                .map_err(|_| Failure::Plain("Calendar's answer is not JSON".to_owned())),
+            200 => match serde_json::from_slice(&body) {
+                Ok(v) => Ok(Answer::Done(v)),
+                Err(_) if write => Ok(Answer::Done(Value::Null)),
+                Err(_) => Err(Failure::Plain("Calendar's answer is not JSON".to_owned())),
+            },
             400 => Ok(Answer::Invalid(js::slice_utf16(&why(), 300))),
             401 => Err(Failure::AccountRequired),
             404 => Ok(Answer::NotFound),
@@ -152,6 +185,7 @@ impl CalendarApi {
             429 => Err(Failure::Plain(
                 "Calendar is busy right now. Try again in a moment.".to_owned(),
             )),
+            500.. if write => Err(Failure::Offline(UNANSWERED_WRITE.to_owned())),
             500.. => Err(Failure::Plain(
                 "Calendar had a problem just now. Try again.".to_owned(),
             )),
@@ -265,6 +299,52 @@ impl CalendarApi {
         }
     }
 
+    /// The event an invite's `.ics` names, by its UID: the series itself,
+    /// never one of its instances, and a cancelled one only when there's no
+    /// live one, as an invite to a cancelled event has to say so. `None` when the calendar holds no such
+    /// event, or only instances of one; an error when the list didn't come
+    /// whole, as a page missed may be the one with the series on it.
+    pub fn by_ical_uid(
+        &self,
+        auth: &Bearer,
+        calendar: &str,
+        uid: &str,
+    ) -> Result<Option<Value>, Failure> {
+        let path = format!("calendars/{}/events", segment(calendar));
+        let unread =
+            || Failure::Plain("Calendar didn't list this event just now. Try again.".to_owned());
+        let mut page = None::<String>;
+        // a copy deleted beside a live one is the one not to answer
+        let mut cancelled = None::<Value>;
+        for _ in 0..UID_PAGES {
+            let mut query = vec![
+                ("iCalUID", uid.to_owned()),
+                ("maxResults", PAGE.to_owned()),
+                ("showDeleted", "true".to_owned()),
+            ];
+            query.extend(page.take().map(|p| ("pageToken", p)));
+            let Answer::Done(v) = self.get(auth, &path, &query)? else {
+                return Err(unread());
+            };
+            let items = v.get("items").and_then(Value::as_array);
+            let masters = items
+                .into_iter()
+                .flatten()
+                .filter(|e| text(e, "recurringEventId").is_empty());
+            for master in masters {
+                if text(master, "status") != "cancelled" {
+                    return Ok(Some(master.clone()));
+                }
+                cancelled.get_or_insert_with(|| master.clone());
+            }
+            match v.get("nextPageToken").and_then(Value::as_str) {
+                Some(next) => page = Some(next.to_owned()),
+                None => return Ok(cancelled),
+            }
+        }
+        Err(unread())
+    }
+
     pub fn insert(
         &self,
         auth: &Bearer,
@@ -286,7 +366,7 @@ impl CalendarApi {
         if body.get("conferenceData").is_some() {
             req = req.query("conferenceDataVersion", "1");
         }
-        Self::answer(req.send(body.to_string().as_bytes()))
+        Self::written(req.send(body.to_string().as_bytes()))
     }
 
     pub fn patch(
@@ -316,7 +396,7 @@ impl CalendarApi {
         if !write.if_match.is_empty() {
             req = req.header("if-match", write.if_match);
         }
-        Self::answer(req.send(body.to_string().as_bytes()))
+        Self::written(req.send(body.to_string().as_bytes()))
     }
 
     pub fn delete(
@@ -337,11 +417,11 @@ impl CalendarApi {
             .delete(url)
             .query("sendUpdates", send_updates(notify))
             .header("authorization", auth.header());
-        Self::answer(req.call())
+        Self::written(req.call())
     }
 }
 
-fn text(v: &Value, key: &str) -> String {
+pub(crate) fn text(v: &Value, key: &str) -> String {
     v.get(key)
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -380,7 +460,7 @@ fn attendees(event: &Value) -> &[Value] {
         .map_or(&[], Vec::as_slice)
 }
 
-fn is_self(attendee: &Value, account: &str) -> bool {
+pub(crate) fn is_self(attendee: &Value, account: &str) -> bool {
     attendee.get("self") == Some(&Value::Bool(true))
         || text(attendee, "email").eq_ignore_ascii_case(account)
 }
@@ -1191,7 +1271,11 @@ fn recurrence(form: &Form, event: &Value) -> Value {
 }
 
 /// The primary calendar, for a save that doesn't name one.
-fn calendar_or_primary(core: &Core, account: &str, named: &str) -> Result<String, Failure> {
+pub(crate) fn calendar_or_primary(
+    core: &Core,
+    account: &str,
+    named: &str,
+) -> Result<String, Failure> {
     if !named.is_empty() {
         return Ok(named.to_owned());
     }
@@ -1504,7 +1588,30 @@ fn restore(core: &Core, args: &Value) -> Result<Value, Failure> {
     finish(core, &auth, &account, &calendar, &id, &written)
 }
 
+/// A guest's answer: everyone else on the event hears of it.
 fn rsvp(core: &Core, args: &Value) -> Result<Value, Failure> {
+    rsvp_with(core, args, None, Answering::default())
+}
+
+/// How an answer goes, for one answered from Mail ([`crate::invite`]).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Answering {
+    /// `sendUpdates=all` whoever else the person's copy lists: an invite
+    /// answered from Mail is for its organiser.
+    pub notify_all: bool,
+    /// Said as sent once Google has the write, before any sync: the sync
+    /// comes after, from the sync thread, so a slow one can't outlast the
+    /// screen's wait and have a second press send the answer again.
+    pub stands_after_write: bool,
+}
+
+/// [`rsvp`], from `known` when the caller has just read the event.
+pub(crate) fn rsvp_with(
+    core: &Core,
+    args: &Value,
+    known: Option<Value>,
+    how: Answering,
+) -> Result<Value, Failure> {
     let (auth, account) = signed_in(core)?;
     let Some((calendar, id)) = ids(args) else {
         return Ok(bad_args("That isn't an event."));
@@ -1513,11 +1620,11 @@ fn rsvp(core: &Core, args: &Value) -> Result<Value, Failure> {
     if !["accepted", "declined", "tentative"].contains(&response.as_str()) {
         return Ok(bad_args("A reply is accepted, declined or tentative."));
     }
-    let Some(live) = core
-        .calendar
-        .event(&auth, &calendar, &id)?
-        .filter(|v| text(v, "status") != "cancelled")
-    else {
+    let live = match known {
+        Some(event) => Some(event),
+        None => core.calendar.event(&auth, &calendar, &id)?,
+    };
+    let Some(live) = live.filter(|v| text(v, "status") != "cancelled") else {
         return Ok(gone());
     };
     // a reply to one instance is the plain reading: `all` has to be said
@@ -1551,12 +1658,23 @@ fn rsvp(core: &Core, args: &Value) -> Result<Value, Failure> {
     }
     let etag = text(&event, "etag");
     let write = Write {
-        notify: !guests_of(&event, &account).is_empty(),
+        notify: how.notify_all || !guests_of(&event, &account).is_empty(),
         if_match: &etag,
     };
-    let answer = core
+    let answer = match core
         .calendar
-        .patch(&auth, &calendar, &write_id, &body, &write)?;
+        .patch(&auth, &calendar, &write_id, &body, &write)
+    {
+        Ok(answer) => answer,
+        // the PATCH went out and may have landed: never a plain failure,
+        // or a second press would send the answer again
+        Err(Failure::Offline(_)) if how.stands_after_write => return Ok(unconfirmed()),
+        // Calendar refused it, so nothing went: the buttons come back
+        Err(e @ (Failure::Plain(_) | Failure::NeedsAccess)) if how.stands_after_write => {
+            return Ok(not_sent(e));
+        }
+        Err(e) => return Err(e),
+    };
     if let Some(no) = refused(&answer) {
         core.sync.wake();
         return Ok(no);
@@ -1564,7 +1682,52 @@ fn rsvp(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Answer::Done(written) = answer else {
         return Ok(gone());
     };
+    if how.stands_after_write {
+        return Ok(answered(core, &account, &calendar, &written));
+    }
     finish(core, &auth, &account, &calendar, &id, &written)
+}
+
+/// The code of a PATCH that failed on its way, and so may have landed.
+const UNCONFIRMED: &str = "unconfirmed";
+
+fn unconfirmed() -> Value {
+    fail(
+        UNCONFIRMED,
+        "Calendar didn't say whether your reply went. It may have.",
+    )
+}
+
+/// A PATCH Calendar refused: it wrote nothing, so this says so plainly.
+fn not_sent(e: Failure) -> Value {
+    let failure = failed(e);
+    let why = failure
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("Calendar didn't accept it.");
+    ok(json!({"refused": "not_sent", "message": format!("Your reply wasn't sent. {why}")}))
+}
+
+/// An answer Google has: what it sent back goes in, and the sync thread
+/// brings the rest. The answer is written, so a store that won't take it is
+/// logged and said as `stored: false`, never a failure.
+fn answered(core: &Core, account: &str, calendar: &str, written: &Value) -> Value {
+    let mut event = event_of(calendar, account, written);
+    let stored = match event.as_mut() {
+        // a series' rows are its instances, which only the sync brings
+        Some(event) if written.get("recurrence").is_some() => {
+            event.series = event.id.clone();
+            Ok(())
+        }
+        Some(event) => with_own_store(core, account, |store| store.put_event(account, event)),
+        None => Ok(()),
+    }
+    .and_then(|()| bump(core, account));
+    if stored.is_err() {
+        eprintln!("buwiz-gws: an answer was sent but couldn't be stored");
+    }
+    core.sync.wake();
+    ok(json!({"event": event.as_ref().map(row_json), "stored": stored.is_ok()}))
 }
 
 /// `gws_event_draft`: a ticket and nothing else. No Google, no store: the
@@ -1653,6 +1816,25 @@ mod tests {
     use super::*;
 
     const ME: &str = "owner@example.com";
+
+    #[test]
+    fn an_answer_the_store_wont_take_is_still_sent_and_says_so() {
+        let core = Core::new(
+            &crate::apis::Apis::at("http://127.0.0.1:9"),
+            Err(gws_store::Error {
+                code: "none",
+                message: "no store".to_owned(),
+            }),
+        );
+        let written = json!({"id": "e1", "status": "confirmed", "summary": "Roof", "start": {"dateTime": "2026-11-10T02:00:00Z"}, "end": {"dateTime": "2026-11-10T03:00:00Z"}, "attendees": [{"email": ME, "self": true, "responseStatus": "accepted"}]});
+        let v = answered(&core, ME, ME, &written);
+        assert_ne!(v["isError"], true, "{v}");
+        assert_eq!(v["structuredContent"]["stored"], false, "{v}");
+        assert_eq!(
+            v["structuredContent"]["event"]["response"], "accepted",
+            "{v}"
+        );
+    }
 
     #[test]
     fn a_segment_never_leaves_its_place_in_the_path() {

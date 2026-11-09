@@ -61,6 +61,8 @@ pub const APPS: [App; 3] = [
             tools::UPLOAD_CHUNK,
             tools::UPLOAD_DROP,
             tools::MAIL_ATTACHMENT_OPEN,
+            tools::MAIL_INVITE,
+            tools::MAIL_INVITE_REPLY,
             tools::MAIL_ATTACHMENT_PREVIEW,
             tools::MAIL_ATTACHMENT_SAVE,
             tools::MAIL_PICTURES,

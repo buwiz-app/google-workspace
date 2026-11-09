@@ -596,6 +596,8 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
             "gws_mail_picture_sender_add",
             "gws_mail_picture_sender_remove",
             "gws_mail_attachment_preview",
+            "gws_mail_invite",
+            "gws_mail_invite_reply",
             "gws_resolve"
         ]
     );
@@ -756,6 +758,7 @@ fn the_model_is_refused_every_calendar_write_and_never_sees_one_on_its_list() {
         "gws_event_restore",
         "gws_event_rsvp",
         "gws_cal_show",
+        "gws_mail_invite_reply",
     ];
     let mut lines = vec![
         json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}),
@@ -1238,6 +1241,11 @@ fn a_press_gets_its_document_through_the_real_server_and_the_model_gets_nothing(
         (
             "gws_mail_attachment_open",
             json!({"message": "m1", "part": "1"}),
+        ),
+        ("gws_mail_invite", json!({"message": "m1"})),
+        (
+            "gws_mail_invite_reply",
+            json!({"message": "m1", "response": "accepted"}),
         ),
         (
             "gws_mail_attachment_preview",

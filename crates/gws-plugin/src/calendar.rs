@@ -265,6 +265,29 @@ impl CalendarApi {
         }
     }
 
+    /// The event an invite's `.ics` names, by its UID: a series comes as its
+    /// master. `None` when the calendar has no such event, or only a cancelled one.
+    pub fn by_ical_uid(
+        &self,
+        auth: &Bearer,
+        calendar: &str,
+        uid: &str,
+    ) -> Result<Option<Value>, Failure> {
+        let path = format!("calendars/{}/events", segment(calendar));
+        let query = [("iCalUID", uid.to_owned()), ("maxResults", "10".to_owned())];
+        let Answer::Done(v) = self.get(auth, &path, &query)? else {
+            return Ok(None);
+        };
+        let items = v.get("items").and_then(Value::as_array);
+        let live: Vec<&Value> = items
+            .into_iter()
+            .flatten()
+            .filter(|e| text(e, "status") != "cancelled")
+            .collect();
+        let master = live.iter().find(|e| text(e, "recurringEventId").is_empty());
+        Ok(master.or(live.first()).map(|e| (*e).clone()))
+    }
+
     pub fn insert(
         &self,
         auth: &Bearer,
@@ -1191,7 +1214,11 @@ fn recurrence(form: &Form, event: &Value) -> Value {
 }
 
 /// The primary calendar, for a save that doesn't name one.
-fn calendar_or_primary(core: &Core, account: &str, named: &str) -> Result<String, Failure> {
+pub(crate) fn calendar_or_primary(
+    core: &Core,
+    account: &str,
+    named: &str,
+) -> Result<String, Failure> {
     if !named.is_empty() {
         return Ok(named.to_owned());
     }
@@ -1504,7 +1531,9 @@ fn restore(core: &Core, args: &Value) -> Result<Value, Failure> {
     finish(core, &auth, &account, &calendar, &id, &written)
 }
 
-fn rsvp(core: &Core, args: &Value) -> Result<Value, Failure> {
+/// A guest's answer, which the organiser hears of. An invite in Mail is
+/// answered here too ([`crate::invite`]).
+pub(crate) fn rsvp(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (auth, account) = signed_in(core)?;
     let Some((calendar, id)) = ids(args) else {
         return Ok(bad_args("That isn't an event."));

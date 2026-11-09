@@ -117,6 +117,8 @@ pub const FILE_EDITS: &str = "gws_file_edits";
 pub const FILE_UPLOAD: &str = "gws_file_upload";
 pub const FILE_DISCARD: &str = "gws_file_discard";
 pub const MAIL_ATTACHMENT_OPEN: &str = "gws_mail_attachment_open";
+pub const MAIL_INVITE: &str = "gws_mail_invite";
+pub const MAIL_INVITE_REPLY: &str = "gws_mail_invite_reply";
 
 /// A write: the person's, on a screen, and never the model's.
 fn write(name: &'static str, description: &'static str, input_schema: Value) -> Def {
@@ -568,6 +570,19 @@ pub fn defs() -> Vec<Def> {
             MAIL_ATTACHMENT_OPEN,
             "Download a mail's attachment to this Mac for the Bot's viewer. A person's press alone. An edit can only be saved to Drive as a new file.",
             json!({"type": "object", "properties": {"message": {"type": "string"}, "part": {"type": "string"}}, "required": ["message", "part"]}),
+        ),
+        Def {
+            name: MAIL_INVITE,
+            description: "The invite in a mail, read from its .ics, and whether Calendar has its event and what the person answered.",
+            input_schema: json!({"type": "object", "properties": {"thread": {"type": "string"}, "message": {"type": "string"}}}),
+            read_only: true,
+            audience: APP_ONLY,
+            open_world: true,
+        },
+        write(
+            MAIL_INVITE_REPLY,
+            "Answer a mail's invite in Calendar: yes, no or maybe, and the organiser hears. A person's press alone.",
+            json!({"type": "object", "properties": {"message": {"type": "string"}, "response": {"type": "string", "enum": ["accepted", "declined", "tentative"]}}, "required": ["message", "response"]}),
         ),
         Def {
             name: RESOLVE,

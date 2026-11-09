@@ -6,6 +6,8 @@
 //! them out: it drops values, and a row with several texts goes out unnamed.
 //! The Bot's `agent_hub::filter` tests hold that on the bytes it sends.
 
+mod invite;
+
 use std::collections::HashSet;
 
 use buwiz_app::{Bridge, Placement};
@@ -1233,6 +1235,7 @@ fn reading(b: Bridge, m: Mail) -> impl IntoElement {
         .child(dynamic(move || match m.page.get() {
             Some(page) => view()
                 .app_class(Some("flex-1".into()))
+                .child(invite::card(files.clone(), m))
                 .child(dynamic(move || {
                     let n = m.images.get();
                     if n > 0 {

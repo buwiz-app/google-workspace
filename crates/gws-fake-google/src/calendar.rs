@@ -442,6 +442,14 @@ fn text(v: &Value, key: &str) -> String {
     v[key].as_str().unwrap_or_default().to_owned()
 }
 
+/// An event's `iCalUID`: its own, else what Google makes of its id.
+fn ical_uid(event: &Value) -> String {
+    match event["iCalUID"].as_str() {
+        Some(uid) => uid.to_owned(),
+        None => format!("{}@google.com", text(event, "id")),
+    }
+}
+
 /// What Google adds to an attendee list: a response, and who `self` is.
 fn tidy_attendees(event: &mut Value) {
     for a in event["attendees"].as_array_mut().into_iter().flatten() {
@@ -619,6 +627,17 @@ impl Calendars {
         let Some(at) = self.at(calendar) else {
             return not_found();
         };
+        // how an invite finds its event: by the UID its .ics carries, a series
+        // as its master
+        if let Some(uid) = r.param("iCalUID") {
+            let held = &self.list[at].about;
+            let items: Vec<&Value> = held
+                .events
+                .iter()
+                .filter(|e| !is_cancelled(e) && ical_uid(e) == uid)
+                .collect();
+            return Reply::json(200, json!({"items": items, "timeZone": held.time_zone}));
+        }
         if r.param("singleEvents").as_deref() != Some("true") {
             return error(400, "The stub lists events with singleEvents=true only.");
         }

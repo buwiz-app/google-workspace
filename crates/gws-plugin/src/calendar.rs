@@ -267,8 +267,10 @@ impl CalendarApi {
         }
     }
 
-    /// The event an invite's `.ics` names, by its UID: a series comes as its
-    /// master. `None` when the calendar has no such event, or only a cancelled one.
+    /// The event an invite's `.ics` names, by its UID: the series itself,
+    /// never one of its instances. `None` when the calendar holds no such
+    /// event, or only instances of one; an error when the list didn't come
+    /// whole, as a page missed may be the one with the series on it.
     pub fn by_ical_uid(
         &self,
         auth: &Bearer,
@@ -276,31 +278,28 @@ impl CalendarApi {
         uid: &str,
     ) -> Result<Option<Value>, Failure> {
         let path = format!("calendars/{}/events", segment(calendar));
-        // a series with many changed instances can run to pages, and the
-        // series itself may be on any of them
-        let (mut first, mut page) = (None, None::<String>);
+        let unread =
+            || Failure::Plain("Calendar didn't list this event just now. Try again.".to_owned());
+        let mut page = None::<String>;
         for _ in 0..UID_PAGES {
             let mut query = vec![("iCalUID", uid.to_owned()), ("maxResults", PAGE.to_owned())];
             query.extend(page.take().map(|p| ("pageToken", p)));
             let Answer::Done(v) = self.get(auth, &path, &query)? else {
-                return Ok(first);
+                return Err(unread());
             };
             let items = v.get("items").and_then(Value::as_array);
-            for e in items.into_iter().flatten() {
-                if text(e, "status") == "cancelled" {
-                    continue;
-                }
-                if text(e, "recurringEventId").is_empty() {
-                    return Ok(Some(e.clone()));
-                }
-                first = first.or_else(|| Some(e.clone()));
+            let master = items.into_iter().flatten().find(|e| {
+                text(e, "status") != "cancelled" && text(e, "recurringEventId").is_empty()
+            });
+            if let Some(master) = master {
+                return Ok(Some(master.clone()));
             }
             match v.get("nextPageToken").and_then(Value::as_str) {
                 Some(next) => page = Some(next.to_owned()),
-                None => break,
+                None => return Ok(None),
             }
         }
-        Ok(first)
+        Err(unread())
     }
 
     pub fn insert(

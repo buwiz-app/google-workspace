@@ -121,6 +121,31 @@ fn line(words: String, class: &str) -> Text {
     text(words).app_class(Some(format!("text-[12px] {class}").into()))
 }
 
+/// Whether a reply's answer says it went: a tool's failure (`isError`, as
+/// compose reads one) or a refusal is why it didn't, and only an answer
+/// that holds the event it wrote is a reply sent.
+fn sent(v: &Value) -> Result<(), String> {
+    let why = |v: &Value| {
+        let said = v
+            .get("message")
+            .or_else(|| v.pointer("/structuredContent/message"))
+            .or_else(|| v.pointer("/content/0/text"));
+        said.and_then(Value::as_str)
+            .unwrap_or("That didn't work.")
+            .to_owned()
+    };
+    if v.get("isError") == Some(&Value::Bool(true)) || v.get("refused").is_some() {
+        return Err(why(v));
+    }
+    let event = v
+        .get("event")
+        .or_else(|| v.pointer("/structuredContent/event"));
+    match event {
+        Some(e) if e.is_object() => Ok(()),
+        _ => Err(why(v)),
+    }
+}
+
 /// The person's answer, called in this press.
 fn answer_now(b: &Bridge, m: Mail, state: Signal<Option<Card>>, response: &'static str) {
     // the press is on the card, so the card is there
@@ -141,16 +166,12 @@ fn answer_now(b: &Bridge, m: Mail, state: Signal<Option<Card>>, response: &'stat
     // busy. It runs beside Mail's jobs, as an attachment's open does
     let job = Box::pin(async move {
         card.busy = false;
-        card.said = Some(match call.await {
-            Ok(v) if v.get("refused").is_some() => v
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("That didn't work.")
-                .to_owned(),
-            Ok(_) => {
+        card.said = Some(match call.await.map(|v| sent(&v)) {
+            Ok(Ok(())) => {
                 card.calendar = Calendar::Guest(response.to_owned());
                 "Your reply was sent.".to_owned()
             }
+            Ok(Err(why)) => why,
             Err(e) => e.message,
         });
         state.try_set(Some(card));
@@ -334,6 +355,30 @@ mod tests {
             ),
             Calendar::Differs
         );
+    }
+
+    #[test]
+    fn only_an_answer_holding_its_event_is_a_reply_sent() {
+        assert_eq!(sent(&json!({"event": {"response": "accepted"}})), Ok(()));
+        assert_eq!(
+            sent(&json!({"structuredContent": {"event": {"response": "accepted"}}})),
+            Ok(())
+        );
+        assert_eq!(
+            sent(
+                &json!({"isError": true, "content": [{"type": "text", "text": "Calendar had a problem just now. Try again."}]})
+            ),
+            Err("Calendar had a problem just now. Try again.".to_owned())
+        );
+        assert_eq!(
+            sent(&json!({"code": "busy", "message": "Gmail didn't send this invite just now."})),
+            Err("Gmail didn't send this invite just now.".to_owned())
+        );
+        assert_eq!(
+            sent(&json!({"refused": "changed", "message": "No."})),
+            Err("No.".to_owned())
+        );
+        assert!(sent(&json!({"event": null})).is_err());
     }
 
     #[test]

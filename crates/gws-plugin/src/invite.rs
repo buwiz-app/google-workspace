@@ -19,7 +19,7 @@ use crate::accounts::Bearer;
 use crate::calendar;
 use crate::gmail::{self, Failure, HEADER_MAX, cap_bytes};
 use crate::mail::{now_ms, signed_in, with_store};
-use crate::tools::{MAIL_INVITE, MAIL_INVITE_REPLY, failed, ok};
+use crate::tools::{MAIL_INVITE, MAIL_INVITE_REPLY, fail, failed, ok};
 use crate::{Core, js};
 
 /// The most of an `.ics` read: Google's run to a few KiB.
@@ -361,6 +361,10 @@ fn on_clock<Z: TimeZone>(zone: &Z, wall: NaiveDateTime) -> Option<DateTime<Utc>>
 /// that's none of those can't be read, so it's no invite.
 fn in_zone(wall: NaiveDateTime, tzid: &str, defined: &[Defined]) -> Option<DateTime<Utc>> {
     let name = tzid.trim();
+    // or it would find a VTIMEZONE that names no zone
+    if name.is_empty() {
+        return None;
+    }
     let iana = name
         .parse::<Tz>()
         .ok()
@@ -599,9 +603,9 @@ fn mime(part: &Value) -> String {
         .to_ascii_lowercase()
 }
 
-/// Where a message's invite part is, as a JSON pointer: its text/calendar
-/// part, else an application/ics file.
-fn invite_part(message: &Value) -> Option<String> {
+/// Where a message's invite parts are, as JSON pointers: its text/calendar
+/// part first, then an application/ics file, each the first of its kind.
+fn invite_parts(message: &Value) -> Vec<String> {
     fn walk(part: &Value, at: String, depth: usize, found: &mut [Option<String>; 2]) {
         match mime(part).as_str() {
             "text/calendar" if found[0].is_none() => found[0] = Some(at.clone()),
@@ -617,14 +621,18 @@ fn invite_part(message: &Value) -> Option<String> {
         }
     }
     let mut found = [None, None];
-    walk(
-        message.get("payload")?,
-        "/payload".to_owned(),
-        0,
-        &mut found,
-    );
-    let [calendar, file] = found;
-    calendar.or(file)
+    if let Some(payload) = message.get("payload") {
+        walk(payload, "/payload".to_owned(), 0, &mut found);
+    }
+    found.into_iter().flatten().collect()
+}
+
+/// The event in the part at `at`, if it reads as one.
+fn event_at(message: &Value, at: &str) -> Option<Event> {
+    message
+        .pointer(at)
+        .and_then(text_of)
+        .and_then(|ics| read(&ics))
 }
 
 /// A part's charset, from its Content-Type; UTF-8 when it names none.
@@ -691,37 +699,41 @@ fn text_of(part: &Value) -> Option<String> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(clean)
         .ok()?;
-    decoded(&bytes, &charset_of(part))
+    // a byte-order mark before decoding, or a single-byte charset makes it words
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    decoded(bytes, &charset_of(part))
 }
 
-/// The newest message in `messages` with an invite part, and where that is.
-fn newest(messages: &[Value]) -> Option<(usize, String)> {
-    messages
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(i, m)| invite_part(m).map(|at| (i, at)))
+/// The newest message in `messages` with an invite part.
+fn newest(messages: &[Value]) -> Option<usize> {
+    messages.iter().rposition(|m| !invite_parts(m).is_empty())
 }
 
 /// Brings the bytes of the newest invite in `thread` (a `format=full` thread)
-/// into its part, as Gmail sends a named part by attachment id. False when
-/// they were wanted and didn't come: then the view is no answer to keep, as
-/// it would say "no invite" for good.
+/// into its parts, as Gmail sends a named part by attachment id. False when
+/// they were wanted and didn't come: then there's no answer yet, and the view
+/// is none to keep, as it would say "no invite" for good.
 pub fn fill(core: &Core, auth: &Bearer, thread: &mut Value) -> bool {
     let Some(messages) = thread.get_mut("messages").and_then(Value::as_array_mut) else {
         return true;
     };
     match newest(messages) {
-        Some((i, at)) => fill_at(core, auth, &mut messages[i], &at),
+        Some(i) => fill_message(core, auth, &mut messages[i]),
         None => true,
     }
 }
 
+/// The letter's part first; the file only when the letter's gives no event.
 fn fill_message(core: &Core, auth: &Bearer, message: &mut Value) -> bool {
-    match invite_part(message) {
-        Some(at) => fill_at(core, auth, message, &at),
-        None => true,
+    for at in invite_parts(message) {
+        if !fill_at(core, auth, message, &at) {
+            return false;
+        }
+        if event_at(message, &at).is_some() {
+            return true;
+        }
     }
+    true
 }
 
 fn fill_at(core: &Core, auth: &Bearer, message: &mut Value, at: &str) -> bool {
@@ -742,18 +754,20 @@ fn fill_at(core: &Core, auth: &Bearer, message: &mut Value, at: &str) -> bool {
                 json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes));
             true
         }
-        Ok(Some(_)) => true,
-        _ => false,
+        // too big, or gone from Gmail: that lasts
+        Ok(_) => true,
+        Err(_) => false,
     }
 }
 
 /// The thread view's `invite`: the newest message's that has one, or null.
+/// The letter's own part, else the file.
 pub fn of(messages: &[Value]) -> Value {
-    let Some((i, at)) = newest(messages) else {
+    let Some(i) = newest(messages) else {
         return Value::Null;
     };
     let m = &messages[i];
-    let event = m.pointer(&at).and_then(text_of).and_then(|ics| read(&ics));
+    let event = invite_parts(m).iter().find_map(|at| event_at(m, at));
     let id = js::string_or_empty(m.get("id"));
     event.and_then(|e| e.json(&id)).unwrap_or(Value::Null)
 }
@@ -766,29 +780,46 @@ fn refusal(code: &str, why: &str) -> Value {
 
 /// The invite in thread `id`: from its saved view, else from Gmail. A view
 /// saved before invites were read has no `invite` at all, which is "not read
-/// yet", not "none".
-fn of_thread(core: &Core, auth: &Bearer, account: &str, id: &str) -> Result<Value, Failure> {
+/// yet", not "none". `None` when its bytes didn't come: ask again.
+fn of_thread(
+    core: &Core,
+    auth: &Bearer,
+    account: &str,
+    id: &str,
+) -> Result<Option<Value>, Failure> {
     let saved = with_store(core, |store| store.view(account, id, now_ms()))?;
     if let Some(invite) = saved
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|mut v| v.get_mut("invite").map(Value::take))
     {
-        return Ok(invite);
+        return Ok(Some(invite));
     }
     let Some(mut full) = core.gmail.thread_full(auth, id)? else {
-        return Ok(Value::Null);
+        return Ok(Some(Value::Null));
     };
-    fill(core, auth, &mut full);
+    if !fill(core, auth, &mut full) {
+        return Ok(None);
+    }
     let messages = full.get("messages").and_then(Value::as_array);
-    Ok(of(messages.map_or(&[], Vec::as_slice)))
+    Ok(Some(of(messages.map_or(&[], Vec::as_slice))))
 }
 
-fn of_message(core: &Core, auth: &Bearer, id: &str) -> Result<Value, Failure> {
+fn of_message(core: &Core, auth: &Bearer, id: &str) -> Result<Option<Value>, Failure> {
     let Some(mut message) = core.gmail.full(auth, id)? else {
-        return Ok(Value::Null);
+        return Ok(Some(Value::Null));
     };
-    fill_message(core, auth, &mut message);
-    Ok(of(std::slice::from_ref(&message)))
+    if !fill_message(core, auth, &mut message) {
+        return Ok(None);
+    }
+    Ok(Some(of(std::slice::from_ref(&message))))
+}
+
+/// An invite whose bytes didn't come: a try again, never "no invite".
+fn again() -> Value {
+    fail(
+        "busy",
+        "Gmail didn't send this invite just now. Try again in a moment.",
+    )
 }
 
 /// The person's primary calendar and the event in it with `uid`.
@@ -857,6 +888,9 @@ fn look(core: &Core, args: &Value) -> Result<Value, Failure> {
         (true, false) if gmail::id_ok(&thread) => of_thread(core, &auth, &account, &thread)?,
         _ => return Ok(refusal("invalid_args", "That isn't a mail.")),
     };
+    let Some(invite) = invite else {
+        return Ok(again());
+    };
     if invite.get("method").and_then(Value::as_str) != Some("request") {
         return Ok(ok(json!({"invite": invite, "calendar": null})));
     }
@@ -886,7 +920,9 @@ fn reply(core: &Core, args: &Value) -> Result<Value, Failure> {
             "A reply is accepted, declined or tentative.",
         ));
     }
-    let invite = of_message(core, &auth, &message)?;
+    let Some(invite) = of_message(core, &auth, &message)? else {
+        return Ok(again());
+    };
     match invite.get("method").and_then(Value::as_str) {
         Some("request") => {}
         Some(_) => {
@@ -1193,6 +1229,30 @@ mod tests {
         assert_eq!(title(part_in("ISO-8859-1", &ics(b"Caf\xe9"))), "Caf\u{e9}");
         assert_eq!(title(part_in("utf-8", &ics("Café".as_bytes()))), "Café");
         assert_eq!(title(part_in("x-klingon", &ics(b"Cafe"))), Value::Null);
+    }
+
+    #[test]
+    fn a_byte_order_mark_in_a_single_byte_charset_is_still_no_part_of_it() {
+        let mut bytes = b"\xef\xbb\xbf".to_vec();
+        bytes.extend_from_slice(GOOGLE.as_bytes());
+        let v = of(&[message("m1", json!([part_in("windows-1252", &bytes)]))]);
+        assert_eq!(v["title"], "Roof inspection");
+    }
+
+    #[test]
+    fn an_empty_tzid_is_no_zone_even_beside_a_zone_with_no_name() {
+        let ics = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VTIMEZONE\r\nBEGIN:STANDARD\r\nTZOFFSETTO:+0800\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART;TZID=:20261110T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(read(ics), None);
+        assert_eq!(read(&ics.replace("TZID=:", "TZID=\" \":")), None);
+    }
+
+    #[test]
+    fn a_letter_part_with_no_event_falls_back_to_the_file() {
+        let m = message(
+            "m1",
+            json!([{"mimeType": "multipart/alternative", "parts": [part("text/calendar", "BEGIN:VCALENDAR\r\n")]}, part("application/ics", OUTLOOK)]),
+        );
+        assert_eq!(of(&[m])["title"], "Budget review; Q4");
     }
 
     #[test]

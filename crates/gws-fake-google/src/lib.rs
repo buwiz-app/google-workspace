@@ -528,6 +528,7 @@ struct Account {
     reads_fail_after_write: bool,
     draft_reads_fail: bool,
     attachments_fail: bool,
+    attachments_gone: bool,
     /// Reads so far, once attachment ids change with each.
     reads: Option<AtomicU64>,
     /// `(draft id, message id, raw message, thread)`.
@@ -1007,6 +1008,7 @@ impl Account {
                 Some(m) => Reply::json(200, self.resource(m, &format, &wanted)),
                 None => not_found(),
             },
+            ("GET", ["messages", _, "attachments", _]) if self.attachments_gone => not_found(),
             ("GET", ["messages", _, "attachments", _]) if self.attachments_fail => Reply::json(
                 500,
                 json!({"error": {"code": 500, "message": "Backend error"}}),
@@ -1592,6 +1594,11 @@ impl FakeGoogle {
     /// Attachment reads fail, as Gmail's backend sometimes does.
     pub fn attachments_fail(&self, fail: bool) {
         self.account.lock().unwrap().attachments_fail = fail;
+    }
+
+    /// Attachment reads find nothing, as for one Gmail no longer holds.
+    pub fn attachments_gone(&self, gone: bool) {
+        self.account.lock().unwrap().attachments_gone = gone;
     }
 
     /// From now on a token covers `scope` alone, and writes need more.

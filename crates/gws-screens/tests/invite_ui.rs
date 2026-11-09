@@ -191,6 +191,23 @@ fn a_refused_answer_says_why_and_keeps_what_was_answered() {
 }
 
 #[test]
+fn a_failed_answer_is_never_said_to_be_sent() {
+    let (mut app, _, fake) = opened(in_calendar("needsAction"));
+    *fake.reply.lock().unwrap() = Some(
+        json!({"isError": true, "content": [{"type": "text", "text": "Calendar had a problem just now. Try again."}]}),
+    );
+    app.press("label:Answer yes").expect("Yes presses");
+    app.wait_for_within("text:Calendar had a problem just now. Try again.", WAIT)
+        .expect("it says why");
+    assert!(!app.screen().shows("Your reply was sent."));
+    assert!(!app.screen().selected("label:Answer yes").unwrap());
+    assert!(
+        app.screen().enabled("label:Answer yes").unwrap(),
+        "it can be pressed again"
+    );
+}
+
+#[test]
 fn an_invite_not_in_calendar_shows_with_its_buttons_off() {
     let (mut app, _, fake) = opened(
         json!({"invite": invite("request"), "calendar": {"found": false, "guest": false, "response": null}}),

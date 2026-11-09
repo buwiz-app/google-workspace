@@ -313,24 +313,7 @@ fn the_organiser_hears_even_when_the_persons_copy_lists_no_one_else() {
 
 #[test]
 fn a_series_past_a_page_of_changed_instances_is_answered_on_the_series() {
-    let mut seed = rich();
-    let master = seed
-        .calendars
-        .iter_mut()
-        .find(|c| c.primary)
-        .unwrap()
-        .events
-        .pop()
-        .unwrap();
-    let primary = seed.calendars.iter_mut().find(|c| c.primary).unwrap();
-    for n in 0..7 {
-        let mut instance = master.clone();
-        instance["id"] = json!(format!("roofinspection_{n}"));
-        instance["recurringEventId"] = json!("roofinspection");
-        primary.events.push(instance);
-    }
-    primary.events.push(master);
-    let google = FakeGoogle::start(seed);
+    let google = FakeGoogle::start(instances_first(7, true));
     google.calendar_page(3);
     let core = signed_in(&google, "pages");
     data(core.run(
@@ -340,4 +323,76 @@ fn a_series_past_a_page_of_changed_instances_is_answered_on_the_series() {
     let writes = google.calendar_writes();
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].event, "roofinspection");
+}
+
+#[test]
+fn an_invite_whose_bytes_didnt_come_asks_for_a_try_again_not_no_invite() {
+    let google = FakeGoogle::start(rich());
+    let core = signed_in(&google, "busy");
+    google.attachments_fail(true);
+    let look = core.run("gws_mail_invite", &json!({"thread": INVITE}));
+    assert_eq!(look["isError"], true, "{look}");
+    assert_eq!(look["structuredContent"]["code"], "busy");
+    let reply = core.run(
+        "gws_mail_invite_reply",
+        &json!({"message": INVITE, "response": "accepted"}),
+    );
+    assert_eq!(reply["structuredContent"]["code"], "busy", "{reply}");
+    assert!(google.calendar_writes().is_empty());
+    google.attachments_fail(false);
+    let look = data(core.run("gws_mail_invite", &json!({"thread": INVITE})));
+    assert_eq!(look["invite"]["title"], "Roof inspection");
+}
+
+#[test]
+fn an_attachment_gmail_no_longer_holds_is_no_invite_for_good() {
+    let google = FakeGoogle::start(rich());
+    let core = signed_in(&google, "gone");
+    google.attachments_gone(true);
+    let view = data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
+    assert_eq!(view["invite"], Value::Null);
+    google.attachments_gone(false);
+    let view = data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
+    assert_eq!(view["invite"], Value::Null, "the view was kept");
+}
+
+/// The rich seed with `n` changed instances of the invite's series ahead of
+/// it, and the series itself only if `master`.
+fn instances_first(n: usize, master: bool) -> Seed {
+    let mut seed = rich();
+    let primary = seed.calendars.iter_mut().find(|c| c.primary).unwrap();
+    let series = primary.events.pop().unwrap();
+    for i in 0..n {
+        let mut instance = series.clone();
+        instance["id"] = json!(format!("roofinspection_{i}"));
+        instance["recurringEventId"] = json!("roofinspection");
+        primary.events.push(instance);
+    }
+    if master {
+        primary.events.push(series);
+    }
+    seed
+}
+
+#[test]
+fn an_instance_is_never_answered_in_place_of_its_series() {
+    // only instances: the series isn't there to answer
+    let google = FakeGoogle::start(instances_first(3, false));
+    let core = signed_in(&google, "instances");
+    let refused = data(core.run(
+        "gws_mail_invite_reply",
+        &json!({"message": INVITE, "response": "accepted"}),
+    ));
+    assert_eq!(refused["refused"], "not_found");
+    assert!(google.calendar_writes().is_empty());
+    // past every page it looks at: no answer, rather than an instance's
+    let google = FakeGoogle::start(instances_first(25, true));
+    google.calendar_page(1);
+    let core = signed_in(&google, "past-pages");
+    let answer = core.run(
+        "gws_mail_invite_reply",
+        &json!({"message": INVITE, "response": "accepted"}),
+    );
+    assert_eq!(answer["isError"], true, "{answer}");
+    assert!(google.calendar_writes().is_empty());
 }

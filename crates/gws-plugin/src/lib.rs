@@ -16,6 +16,7 @@ pub mod clean;
 pub mod compose;
 pub mod drive;
 pub mod files;
+pub mod fold;
 pub mod gmail;
 pub mod js;
 pub mod mail;

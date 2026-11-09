@@ -78,12 +78,13 @@ const MIGRATIONS: &[(i64, &str)] = &[
         9,
         "CREATE TABLE sign_ins(label TEXT NOT NULL PRIMARY KEY, subject TEXT NOT NULL) WITHOUT ROWID;",
     ),
-    // the senders whose web pictures always show; a stored view has neither
-    // the pictures inside its mail nor the sender they'd be trusted by
+    // a stored mail view shows every message open: fetched again, it folds
+    (10, "DELETE FROM bodies;"),
+    // the senders whose web pictures always show. Views stored before it are
+    // gone with 10, so each comes again with its pictures and its sender
     (
         11,
-        "CREATE TABLE picture_senders(account TEXT NOT NULL, address TEXT NOT NULL, added INTEGER NOT NULL, PRIMARY KEY(account, address)) WITHOUT ROWID;
-         DELETE FROM bodies;",
+        "CREATE TABLE picture_senders(account TEXT NOT NULL, address TEXT NOT NULL, added INTEGER NOT NULL, PRIMARY KEY(account, address)) WITHOUT ROWID;",
     ),
 ];
 
@@ -636,6 +637,25 @@ mod tests {
                  DROP TABLE picture_senders;
                  ALTER TABLE drive_files DROP COLUMN can;
                  PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&paths, &key()).unwrap();
+        assert_eq!(store.view("a", "t", 2).unwrap(), None);
+    }
+
+    /// One kept from before folds shows every message open.
+    #[test]
+    fn a_stored_mail_view_from_before_folds_goes() {
+        let dir = Dir::new("folds");
+        let paths = Paths::in_dir(&dir.0);
+        let store = Store::open(&paths, &key()).unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "INSERT INTO bodies(account, thread, view, size, used) VALUES('a', 't', '{}', 2, 1);
+                 DROP TABLE picture_senders;
+                 PRAGMA user_version = 9;",
             )
             .unwrap();
         drop(store);

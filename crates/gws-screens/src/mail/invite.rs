@@ -2,6 +2,11 @@
 //! by the plugin from its `.ics`, with Yes, No and Maybe answered through
 //! Calendar so the organiser hears.
 //!
+//! Once Calendar has the event, the card shows Calendar's own title, time,
+//! place and organiser, never the `.ics`'s: what a press answers is what the
+//! person sees. The card's state lives in [`Mail`], by conversation, so a
+//! page shown again (pictures let in) keeps an answer on its way.
+//!
 //! The label rule holds: the card's words are texts, read as values, and the
 //! answers carry fixed labels with other words than they show, so the Bot's
 //! filter names none of them and the AI can't press one. A press is the
@@ -62,15 +67,33 @@ fn invite_of(v: &Value) -> Option<Invite> {
     })
 }
 
+/// The invite with Calendar's own words for its event in place of the
+/// `.ics`'s, when Calendar sent them.
+fn as_calendar_has_it(mut invite: Invite, event: Option<&Value>) -> Invite {
+    if let Some(e) = event.filter(|e| e.is_object()) {
+        invite.title = text_in(e, "title");
+        invite.when = When::of(
+            &text_in(e, "start"),
+            &text_in(e, "end"),
+            e.get("all_day") == Some(&Value::Bool(true)),
+        );
+        invite.place = text_in(e, "place");
+        invite.organizer = text_in(e, "organizer");
+    }
+    invite
+}
+
 /// What Calendar says of an invitation's event.
 #[derive(Clone, PartialEq, Debug)]
 enum Calendar {
     /// Not there yet: the buttons wait for Calendar's sync.
     Missing,
+    /// There, and cancelled.
+    Cancelled,
     /// There, but the person isn't on its guest list.
     NotAGuest,
-    /// An event with the invite's UID whose organiser or start isn't the
-    /// invite's: a forged or stale `.ics`, which can't answer it.
+    /// An event with the invite's UID that doesn't read as the invite does:
+    /// a forged or stale `.ics`, which can't answer it.
     Differs,
     /// There, with the person's answer so far.
     Guest(String),
@@ -78,12 +101,30 @@ enum Calendar {
 
 fn calendar_of(v: &Value) -> Calendar {
     let yes = |key: &str| v.get(key) == Some(&Value::Bool(true));
+    if yes("found") && yes("cancelled") {
+        return Calendar::Cancelled;
+    }
     match (yes("found"), yes("matches"), yes("guest")) {
         (false, ..) => Calendar::Missing,
         (true, false, _) => Calendar::Differs,
         (true, true, true) => Calendar::Guest(text_in(v, "response")),
         (true, true, false) => Calendar::NotAGuest,
     }
+}
+
+/// What the card shows for one conversation, kept in [`Mail`].
+#[derive(Clone, PartialEq, Debug)]
+pub(super) struct Held {
+    thread: String,
+    shows: Shows,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+enum Shows {
+    Nothing,
+    /// Why there's no card yet, as the plugin said it.
+    Line(String),
+    Card(Card),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -104,7 +145,10 @@ fn day_of(when: &When) -> NaiveDate {
 }
 
 /// The line under the title that says what this is.
-fn about(invite: &Invite) -> String {
+fn about(invite: &Invite, calendar: &Calendar) -> String {
+    if *calendar == Calendar::Cancelled {
+        return "This event was cancelled.".to_owned();
+    }
     match (invite.method.as_str(), &invite.reply) {
         ("cancel", _) => "This event was cancelled.".to_owned(),
         ("reply", Some((who, response))) => match response.as_str() {
@@ -123,7 +167,8 @@ fn line(words: String, class: &str) -> Text {
 
 /// Whether a reply's answer says it went: a tool's failure (`isError`, as
 /// compose reads one) or a refusal is why it didn't, and only an answer
-/// that holds the event it wrote is a reply sent.
+/// that says it was sent is a reply sent. The event it wrote may not be
+/// there: the answer is written all the same.
 fn sent(v: &Value) -> Result<(), String> {
     let why = |v: &Value| {
         let said = v
@@ -137,19 +182,37 @@ fn sent(v: &Value) -> Result<(), String> {
     if v.get("isError") == Some(&Value::Bool(true)) || v.get("refused").is_some() {
         return Err(why(v));
     }
-    let event = v
-        .get("event")
-        .or_else(|| v.pointer("/structuredContent/event"));
-    match event {
-        Some(e) if e.is_object() => Ok(()),
+    let said = v
+        .get("sent")
+        .or_else(|| v.pointer("/structuredContent/sent"));
+    match said {
+        Some(Value::Bool(true)) => Ok(()),
         _ => Err(why(v)),
     }
 }
 
+/// The card for `thread`, changed by `f`, if it's still the one held.
+fn change(m: Mail, thread: &str, f: impl FnOnce(&mut Card)) {
+    m.invite.update(|held| {
+        if let Some(Held {
+            thread: at,
+            shows: Shows::Card(card),
+        }) = held
+            && at == thread
+        {
+            f(card);
+        }
+    });
+}
+
 /// The person's answer, called in this press.
-fn answer_now(b: &Bridge, m: Mail, state: Signal<Option<Card>>, response: &'static str) {
-    // the press is on the card, so the card is there
-    let Some(mut card) = state.get_untracked() else {
+fn answer_now(b: &Bridge, m: Mail, response: &'static str) {
+    let held = m.invite.get_untracked();
+    let Some(Held {
+        thread,
+        shows: Shows::Card(card),
+    }) = held
+    else {
         return;
     };
     if card.busy {
@@ -159,27 +222,31 @@ fn answer_now(b: &Bridge, m: Mail, state: Signal<Option<Card>>, response: &'stat
         "gws_mail_invite_reply",
         json!({"message": card.invite.message, "response": response}),
     );
-    card.busy = true;
-    card.said = None;
-    state.try_set(Some(card.clone()));
+    change(m, &thread, |card| {
+        card.busy = true;
+        card.said = None;
+    });
     // nothing else changes the card meanwhile: a press is refused while it's
-    // busy. It runs beside Mail's jobs, as an attachment's open does
+    // busy, however often the page is shown again. It runs beside Mail's
+    // jobs, as an attachment's open does
     let job = Box::pin(async move {
-        card.busy = false;
-        card.said = Some(match call.await.map(|v| sent(&v)) {
-            Ok(Ok(())) => {
-                card.calendar = Calendar::Guest(response.to_owned());
-                "Your reply was sent.".to_owned()
-            }
-            Ok(Err(why)) => why,
-            Err(e) => e.message,
+        let answer = call.await.map(|v| sent(&v));
+        change(m, &thread, |card| {
+            card.busy = false;
+            card.said = Some(match answer {
+                Ok(Ok(())) => {
+                    card.calendar = Calendar::Guest(response.to_owned());
+                    "Your reply was sent.".to_owned()
+                }
+                Ok(Err(why)) => why,
+                Err(e) => e.message,
+            });
         });
-        state.try_set(Some(card));
     });
     m.beside.with_untracked(|beside| drop(beside.send(job)));
 }
 
-fn answers(b: &Bridge, m: Mail, state: Signal<Option<Card>>, card: &Card) -> View {
+fn answers(b: &Bridge, m: Mail, card: &Card) -> View {
     let (on, mine) = match &card.calendar {
         Calendar::Guest(said) => (!card.busy, said.as_str()),
         _ => (false, ""),
@@ -201,7 +268,7 @@ fn answers(b: &Bridge, m: Mail, state: Signal<Option<Card>>, card: &Card) -> Vie
                 ..AccessibilityState::default()
             })
             .disabled(!on)
-            .on_press(move || answer_now(&b, m, state, response))
+            .on_press(move || answer_now(&b, m, response))
             .child(text(name).app_class(Some(format!("text-[12px] {INK}").into())))
     };
     view()
@@ -213,7 +280,7 @@ fn answers(b: &Bridge, m: Mail, state: Signal<Option<Card>>, card: &Card) -> Vie
         .child(press("Answer maybe", "Maybe", "tentative"))
 }
 
-fn shown(b: &Bridge, m: Mail, state: Signal<Option<Card>>, card: &Card) -> View {
+fn shown(b: &Bridge, m: Mail, card: &Card) -> View {
     let invite = &card.invite;
     let tile = invite.when.as_ref().map(day_of).map_or_else(view, |day| {
         view()
@@ -247,21 +314,21 @@ fn shown(b: &Bridge, m: Mail, state: Signal<Option<Card>>, card: &Card) -> View 
     if !invite.place.is_empty() {
         words = words.child(line(invite.place.clone(), MUTE).number_of_lines(1));
     }
-    words = words.child(line(about(invite), MUTE));
-    if invite.method == "request" {
+    words = words.child(line(about(invite, &card.calendar), MUTE));
+    if invite.method == "request" && card.calendar != Calendar::Cancelled {
         match card.calendar {
             Calendar::Missing => {
                 words = words.child(line("Not in your Calendar yet.".to_owned(), DIM));
             }
             Calendar::Differs => {
                 words = words.child(line(
-                    "This invite doesn't match the event in your Calendar.".to_owned(),
+                    "This invite doesn't match your Calendar.".to_owned(),
                     DIM,
                 ));
             }
             _ => {}
         }
-        words = words.child(answers(b, m, state, card));
+        words = words.child(answers(b, m, card));
     }
     if let Some(said) = &card.said {
         words = words.child(line(said.clone(), MUTE));
@@ -274,32 +341,90 @@ fn shown(b: &Bridge, m: Mail, state: Signal<Option<Card>>, card: &Card) -> View 
         .child(words)
 }
 
+/// Asks the plugin for `thread`'s invite and holds what it says.
+async fn look(b: Bridge, m: Mail, thread: String) {
+    let answer = read(&b, "gws_mail_invite", json!({"thread": thread})).await;
+    // the person has gone on to another
+    if m.chosen.get_untracked().as_ref() != Some(&thread) {
+        return;
+    }
+    if let Some(shows) = shows_of(answer) {
+        m.invite.set(Some(Held { thread, shows }));
+    }
+}
+
+/// Why there's no card, and a way to ask again.
+fn failed(b: &Bridge, m: Mail, thread: String, why: String) -> View {
+    let b = b.clone();
+    view()
+        .app_class(Some(
+            format!("flex-row flex-wrap items-center gap-2 px-3 py-1.5 border-b {LINE}").into(),
+        ))
+        .child(line(why, MUTE))
+        .child(
+            view()
+                .app_class(Some(format!("px-3 py-1 rounded-md border {LINE}").into()))
+                .label("Read this invite again")
+                .on_press(move || {
+                    let job: crate::shell::Job = Box::pin(look(b.clone(), m, thread.clone()));
+                    m.beside.with_untracked(|beside| drop(beside.send(job)));
+                })
+                .child(text("Try again").app_class(Some(format!("text-[12px] {INK}").into()))),
+        )
+}
+
+/// What the plugin's answer shows.
+fn shows_of(answer: Result<Value, String>) -> Option<Shows> {
+    let v = match answer {
+        Err(e) if e == "sign-in" => return None,
+        Err(e) if e.is_empty() => {
+            return Some(Shows::Line(
+                "Couldn't read this invite. Try again.".to_owned(),
+            ));
+        }
+        Err(e) => return Some(Shows::Line(e)),
+        Ok(v) => v,
+    };
+    if v.get("refused").is_some() {
+        let why = v.get("message").and_then(Value::as_str);
+        return Some(Shows::Line(why.unwrap_or("That didn't work.").to_owned()));
+    }
+    let Some(invite) = v.get("invite").and_then(invite_of) else {
+        return Some(Shows::Nothing);
+    };
+    let calendar = v.get("calendar").unwrap_or(&Value::Null);
+    Some(Shows::Card(Card {
+        invite: as_calendar_has_it(invite, calendar.get("event")),
+        calendar: calendar_of(calendar),
+        busy: false,
+        said: None,
+    }))
+}
+
 /// The open conversation's invite, if it has one: asked of the plugin, which
-/// reads it and looks in Calendar. Nothing shows for a mail with none.
+/// reads it and looks in Calendar, once for each conversation opened. Nothing
+/// shows for a mail with none.
 pub(super) fn card(b: Bridge, m: Mail) -> impl IntoElement {
-    let state: Signal<Option<Card>> = signal(None);
-    if let Some(thread) = m.chosen.get_untracked() {
-        let reader = b.clone();
-        b.spawn(async move {
-            let Ok(v) = read(&reader, "gws_mail_invite", json!({"thread": thread})).await else {
-                return;
-            };
-            let Some(invite) = v.get("invite").and_then(invite_of) else {
-                return;
-            };
-            let calendar = calendar_of(v.get("calendar").unwrap_or(&Value::Null));
-            state.try_set(Some(Card {
-                invite,
-                calendar,
-                busy: false,
-                said: None,
-            }));
-        });
+    let thread = m.chosen.get_untracked();
+    let held = m
+        .invite
+        .with_untracked(|h| h.as_ref().map(|h| h.thread.clone()));
+    if let Some(thread) = thread
+        && held.as_ref() != Some(&thread)
+    {
+        b.spawn(look(b.clone(), m, thread));
     }
     dynamic(move || {
-        state
-            .get()
-            .map_or_else(view, |card| shown(&b, m, state, &card))
+        let held = m.invite.get();
+        let open = m.chosen.get_untracked();
+        match held {
+            Some(Held { thread, shows }) if Some(&thread) == open.as_ref() => match shows {
+                Shows::Card(card) => shown(&b, m, &card),
+                Shows::Line(why) => failed(&b, m, thread, why),
+                Shows::Nothing => view(),
+            },
+            _ => view(),
+        }
     })
 }
 
@@ -314,9 +439,16 @@ mod tests {
     #[test]
     fn each_kind_of_invite_says_what_it_is() {
         let request = invite_of(&invite("request")).unwrap();
-        assert_eq!(about(&request), "Ana Reyes invited you");
+        assert_eq!(about(&request, &Calendar::Missing), "Ana Reyes invited you");
+        assert_eq!(
+            about(&request, &Calendar::Cancelled),
+            "This event was cancelled."
+        );
         let cancel = invite_of(&invite("cancel")).unwrap();
-        assert_eq!(about(&cancel), "This event was cancelled.");
+        assert_eq!(
+            about(&cancel, &Calendar::Missing),
+            "This event was cancelled."
+        );
         let mut reply = invite("reply");
         assert_eq!(invite_of(&reply), None, "a reply names who answered");
         for (response, said) in [
@@ -325,7 +457,7 @@ mod tests {
             ("tentative", "Ben Cruz said maybe."),
         ] {
             reply["reply"] = json!({"who": "Ben Cruz", "response": response});
-            assert_eq!(about(&invite_of(&reply).unwrap()), said);
+            assert_eq!(about(&invite_of(&reply).unwrap(), &Calendar::Missing), said);
         }
         assert_eq!(invite_of(&invite("publish")), None);
         assert_eq!(invite_of(&Value::Null), None);
@@ -358,10 +490,15 @@ mod tests {
     }
 
     #[test]
-    fn only_an_answer_holding_its_event_is_a_reply_sent() {
-        assert_eq!(sent(&json!({"event": {"response": "accepted"}})), Ok(()));
+    fn only_an_answer_that_says_it_was_sent_is_a_reply_sent() {
         assert_eq!(
-            sent(&json!({"structuredContent": {"event": {"response": "accepted"}}})),
+            sent(&json!({"sent": true, "event": {"response": "accepted"}})),
+            Ok(())
+        );
+        // written, though the read after it found nothing
+        assert_eq!(sent(&json!({"sent": true, "event": null})), Ok(()));
+        assert_eq!(
+            sent(&json!({"structuredContent": {"sent": true, "event": null}})),
             Ok(())
         );
         assert_eq!(
@@ -378,7 +515,56 @@ mod tests {
             sent(&json!({"refused": "changed", "message": "No."})),
             Err("No.".to_owned())
         );
-        assert!(sent(&json!({"event": null})).is_err());
+        assert!(sent(&json!({"event": {"response": "accepted"}})).is_err());
+    }
+
+    #[test]
+    fn calendars_own_words_stand_in_for_the_invites() {
+        let ics = invite_of(&invite("request")).unwrap();
+        let ours = as_calendar_has_it(
+            ics.clone(),
+            Some(
+                &json!({"title": "Roof check", "start": "2026-11-12T02:00:00Z", "end": "2026-11-12T03:00:00Z", "all_day": false, "place": "Site office", "organizer": "Ana R."}),
+            ),
+        );
+        assert_eq!(
+            (
+                ours.title.as_str(),
+                ours.place.as_str(),
+                ours.organizer.as_str()
+            ),
+            ("Roof check", "Site office", "Ana R.")
+        );
+        assert_ne!(ours.when, ics.when);
+        assert_eq!(
+            ours.message, ics.message,
+            "the answer goes from the same mail"
+        );
+        assert_eq!(as_calendar_has_it(ics.clone(), None), ics);
+        assert_eq!(
+            calendar_of(&json!({"found": true, "cancelled": true})),
+            Calendar::Cancelled
+        );
+    }
+
+    #[test]
+    fn a_look_that_failed_says_why_in_the_cards_place() {
+        assert_eq!(
+            shows_of(Err(
+                "Gmail didn't send this invite just now. Try again in a moment.".to_owned()
+            )),
+            Some(Shows::Line(
+                "Gmail didn't send this invite just now. Try again in a moment.".to_owned()
+            ))
+        );
+        assert_eq!(
+            shows_of(Ok(
+                json!({"refused": "invalid_args", "message": "That isn't a mail."})
+            )),
+            Some(Shows::Line("That isn't a mail.".to_owned()))
+        );
+        assert_eq!(shows_of(Ok(json!({"invite": null}))), Some(Shows::Nothing));
+        assert_eq!(shows_of(Err("sign-in".to_owned())), None);
     }
 
     #[test]

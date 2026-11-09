@@ -88,6 +88,8 @@ pub(crate) struct Calendars {
     /// A read of a whole calendar fails, as a dropped connection would.
     pub(crate) whole_reads_fail: bool,
     pub(crate) writes: Vec<CalendarWrite>,
+    /// A PATCH is written, and answered with nothing of the event.
+    pub(crate) patch_answers_empty: bool,
 }
 
 fn error(code: u16, message: &str) -> Reply {
@@ -630,11 +632,12 @@ impl Calendars {
         // how an invite finds its event: by the UID its .ics carries, a series
         // as its master
         if let Some(uid) = r.param("iCalUID") {
+            let deleted = r.param("showDeleted").as_deref() == Some("true");
             let held = &self.list[at].about;
             let items: Vec<&Value> = held
                 .events
                 .iter()
-                .filter(|e| !is_cancelled(e) && ical_uid(e) == uid)
+                .filter(|e| (deleted || !is_cancelled(e)) && ical_uid(e) == uid)
                 .collect();
             let start: usize = r
                 .param("pageToken")
@@ -816,6 +819,9 @@ impl Calendars {
         }
         self.apply(at, id, &change);
         self.record(r, calendar, id, sent);
+        if self.patch_answers_empty {
+            return Reply::json(200, json!({}));
+        }
         match self.list[at].event(id) {
             Some(event) => Reply::json(200, event),
             None => not_found(),

@@ -268,7 +268,8 @@ impl CalendarApi {
     }
 
     /// The event an invite's `.ics` names, by its UID: the series itself,
-    /// never one of its instances. `None` when the calendar holds no such
+    /// never one of its instances, and cancelled ones too, as an invite to a
+    /// cancelled event has to say so. `None` when the calendar holds no such
     /// event, or only instances of one; an error when the list didn't come
     /// whole, as a page missed may be the one with the series on it.
     pub fn by_ical_uid(
@@ -282,15 +283,20 @@ impl CalendarApi {
             || Failure::Plain("Calendar didn't list this event just now. Try again.".to_owned());
         let mut page = None::<String>;
         for _ in 0..UID_PAGES {
-            let mut query = vec![("iCalUID", uid.to_owned()), ("maxResults", PAGE.to_owned())];
+            let mut query = vec![
+                ("iCalUID", uid.to_owned()),
+                ("maxResults", PAGE.to_owned()),
+                ("showDeleted", "true".to_owned()),
+            ];
             query.extend(page.take().map(|p| ("pageToken", p)));
             let Answer::Done(v) = self.get(auth, &path, &query)? else {
                 return Err(unread());
             };
             let items = v.get("items").and_then(Value::as_array);
-            let master = items.into_iter().flatten().find(|e| {
-                text(e, "status") != "cancelled" && text(e, "recurringEventId").is_empty()
-            });
+            let master = items
+                .into_iter()
+                .flatten()
+                .find(|e| text(e, "recurringEventId").is_empty());
             if let Some(master) = master {
                 return Ok(Some(master.clone()));
             }
@@ -417,7 +423,7 @@ fn attendees(event: &Value) -> &[Value] {
         .map_or(&[], Vec::as_slice)
 }
 
-fn is_self(attendee: &Value, account: &str) -> bool {
+pub(crate) fn is_self(attendee: &Value, account: &str) -> bool {
     attendee.get("self") == Some(&Value::Bool(true))
         || text(attendee, "email").eq_ignore_ascii_case(account)
 }
@@ -1618,7 +1624,12 @@ pub(crate) fn rsvp_with(
     let Answer::Done(written) = answer else {
         return Ok(gone());
     };
-    finish(core, &auth, &account, &calendar, &id, &written)
+    let done = finish(core, &auth, &account, &calendar, &id, &written);
+    // the answer is written: what the read after it finds can't take that back
+    match done {
+        Err(_) if always => Ok(ok(json!({"event": null}))),
+        done => done,
+    }
 }
 
 /// `gws_event_draft`: a ticket and nothing else. No Google, no store: the

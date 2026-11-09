@@ -35,7 +35,8 @@ const DEPTH_MAX: usize = 16;
 const DAYS_MAX: i64 = 3660;
 
 const NOT_YET: &str = "Not in your Calendar yet.";
-const DIFFERS: &str = "This invite doesn't match the event in your Calendar.";
+const DIFFERS: &str = "This invite doesn't match your Calendar.";
+const CANCELLED: &str = "This event was cancelled.";
 
 /// What an invite asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +115,7 @@ pub struct Event {
 
 impl Event {
     /// The guest who is `address`.
+    #[cfg(test)]
     pub fn me(&self, address: &str) -> Option<&Person> {
         self.attendees
             .iter()
@@ -195,7 +197,23 @@ fn unfold(ics: &str) -> Option<Vec<String>> {
 
 /// RFC 6868's escapes in a parameter: `^n`, `^'` and `^^`.
 fn param_text(v: &str) -> String {
-    v.replace("^n", " ").replace("^'", "\"").replace("^^", "^")
+    // one pass, left to right, so `^^n` is a caret and an n
+    let mut out = String::with_capacity(v.len());
+    let mut chars = v.chars().peekable();
+    while let Some(c) = chars.next() {
+        let said = match (c, chars.peek()) {
+            ('^', Some('n')) => ' ',
+            ('^', Some('\'')) => '"',
+            ('^', Some('^')) => '^',
+            _ => {
+                out.push(c);
+                continue;
+            }
+        };
+        chars.next();
+        out.push(said);
+    }
+    out
 }
 
 fn line(text: &str) -> Option<Line> {
@@ -406,6 +424,10 @@ fn duration_of(v: &str) -> Option<TimeDelta> {
         Some(_) => return None,
         None => (rest, ""),
     };
+    // "P" alone says nothing of how long
+    if date.is_empty() && time.is_empty() {
+        return None;
+    }
     let mut secs: i64 = 0;
     for (part, units) in [
         (date, &[('W', 604_800), ('D', 86_400)][..]),
@@ -582,6 +604,13 @@ fn of_lines(lines: &[Line], method: Method, defined: &[Defined]) -> Option<Event
         .take(ATTENDEES_MAX)
         .map(person)
         .collect();
+    // an invitation that says it's cancelled is a cancel, however it's sent
+    let cancelled =
+        once("STATUS")?.is_some_and(|l| l.value.trim().eq_ignore_ascii_case("CANCELLED"));
+    let method = match method {
+        Method::Request if cancelled => Method::Cancel,
+        other => other,
+    };
     Some(Event {
         uid,
         method,
@@ -635,73 +664,17 @@ fn event_at(message: &Value, at: &str) -> Option<Event> {
         .and_then(|ics| read(&ics))
 }
 
-/// A part's charset, from its Content-Type; UTF-8 when it names none.
-fn charset_of(part: &Value) -> String {
-    let headers = part.get("headers").and_then(Value::as_array);
-    let kind = headers.into_iter().flatten().find(|h| {
-        h.get("name")
-            .and_then(Value::as_str)
-            .is_some_and(|n| n.eq_ignore_ascii_case("content-type"))
-    });
-    let kind = kind
-        .and_then(|h| h.get("value"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    kind.split(';')
-        .find_map(|p| p.trim().strip_prefix("charset="))
-        .map_or_else(
-            || "utf-8".to_owned(),
-            |c| c.trim().trim_matches('"').to_owned(),
-        )
-}
-
-/// What windows-1252 puts at 0x80 to 0x9F, where Latin-1 has controls.
-const CP1252: [char; 32] = [
-    '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž', '\u{8f}',
-    '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
-];
-
-/// `bytes` in `charset`; `None` for a charset this doesn't read.
-fn decoded(bytes: &[u8], charset: &str) -> Option<String> {
-    Some(match charset {
-        "utf-8" | "utf8" | "us-ascii" | "ascii" => String::from_utf8_lossy(bytes).into_owned(),
-        "iso-8859-1" | "latin1" | "latin-1" | "iso8859-1" => {
-            bytes.iter().map(|&b| char::from(b)).collect()
-        }
-        "windows-1252" | "cp1252" => bytes
-            .iter()
-            .map(|&b| match b {
-                0x80..=0x9f => CP1252[usize::from(b - 0x80)],
-                _ => char::from(b),
-            })
-            .collect(),
-        _ => return None,
-    })
-}
-
-/// A part's `body.data` as text in its charset, if it holds no more than
-/// [`ICS_MAX`].
+/// A part's `body.data` as text in its charset, as Gmail's bodies are read,
+/// if it holds no more than [`ICS_MAX`].
 fn text_of(part: &Value) -> Option<String> {
     let data = part.pointer("/body/data")?.as_str()?;
     if data.len() > ICS_MAX / 3 * 4 + 8 {
         return None;
     }
-    let clean: String = data
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '=')
-        .map(|c| match c {
-            '+' => '-',
-            '/' => '_',
-            c => c,
-        })
-        .collect();
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(clean)
-        .ok()?;
+    let bytes = gmail::part_bytes(part);
     // a byte-order mark before decoding, or a single-byte charset makes it words
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
-    decoded(bytes, &charset_of(part))
+    Some(gmail::in_charset(bytes, &gmail::part_charset(part)))
 }
 
 /// The newest message in `messages` with an invite part.
@@ -709,60 +682,87 @@ fn newest(messages: &[Value]) -> Option<usize> {
     messages.iter().rposition(|m| !invite_parts(m).is_empty())
 }
 
-/// Brings the bytes of the newest invite in `thread` (a `format=full` thread)
-/// into its parts, as Gmail sends a named part by attachment id. False when
-/// they were wanted and didn't come: then there's no answer yet, and the view
-/// is none to keep, as it would say "no invite" for good.
-pub fn fill(core: &Core, auth: &Bearer, thread: &mut Value) -> bool {
+/// The thread view's `invite` for `thread` (a `format=full` thread): the
+/// newest message's that has one, or null, read once. Its bytes are brought
+/// into its parts, as Gmail sends a named part by attachment id. `None` when
+/// they were wanted and didn't come: then there's no answer yet, and a view
+/// saved with none would say "no invite" for good.
+/// A sign-in that's gone or doesn't cover Gmail is said as itself.
+pub fn fill(core: &Core, auth: &Bearer, thread: &mut Value) -> Result<Option<Value>, Failure> {
     let Some(messages) = thread.get_mut("messages").and_then(Value::as_array_mut) else {
-        return true;
+        return Ok(Some(Value::Null));
     };
-    match newest(messages) {
-        Some(i) => fill_message(core, auth, &mut messages[i]),
-        None => true,
-    }
+    let Some(i) = newest(messages) else {
+        return Ok(Some(Value::Null));
+    };
+    invite_of(core, auth, &mut messages[i])
+}
+
+/// What a thread view says of an invite whose bytes didn't come.
+pub fn pending() -> Value {
+    json!({"pending": true})
+}
+
+/// One message's invite, as [`fill`] gives it.
+fn invite_of(core: &Core, auth: &Bearer, message: &mut Value) -> Result<Option<Value>, Failure> {
+    let id = js::string_or_empty(message.get("id"));
+    let Some(event) = fill_message(core, auth, message)? else {
+        return Ok(None);
+    };
+    Ok(Some(event.and_then(|e| e.json(&id)).unwrap_or(Value::Null)))
 }
 
 /// The letter's part first; the file only when the letter's gives no event.
-fn fill_message(core: &Core, auth: &Bearer, message: &mut Value) -> bool {
+fn fill_message(
+    core: &Core,
+    auth: &Bearer,
+    message: &mut Value,
+) -> Result<Option<Option<Event>>, Failure> {
     for at in invite_parts(message) {
-        if !fill_at(core, auth, message, &at) {
-            return false;
+        if !fill_at(core, auth, message, &at)? {
+            return Ok(None);
         }
-        if event_at(message, &at).is_some() {
-            return true;
+        if let Some(event) = event_at(message, &at) {
+            return Ok(Some(Some(event)));
         }
     }
-    true
+    Ok(Some(None))
 }
 
-fn fill_at(core: &Core, auth: &Bearer, message: &mut Value, at: &str) -> bool {
+/// How long an `.ics` may take: it's on the way to a thread opening.
+const FETCH_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn fill_at(core: &Core, auth: &Bearer, message: &mut Value, at: &str) -> Result<bool, Failure> {
     let id = js::string_or_empty(message.get("id"));
     let Some(part) = message.pointer_mut(at) else {
-        return true;
+        return Ok(true);
     };
     let size = part.pointer("/body/size").and_then(Value::as_u64);
     let attachment = part.pointer("/body/attachmentId").and_then(Value::as_str);
     // one too big is no invite whenever it's asked, so that answer stands
     let wanted = part.pointer("/body/data").is_none() && size.is_some_and(|s| s <= ICS_MAX as u64);
     let (true, Some(attachment)) = (wanted, attachment) else {
-        return true;
+        return Ok(true);
     };
-    match core.gmail.attachment(auth, &id, attachment) {
+    match core
+        .gmail
+        .attachment_within(auth, &id, attachment, FETCH_WITHIN)
+    {
         Ok(Some(bytes)) if bytes.len() <= ICS_MAX => {
             part["body"]["data"] =
                 json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes));
-            true
+            Ok(true)
         }
         // too big, or gone from Gmail: that lasts
-        Ok(_) => true,
-        Err(_) => false,
+        Ok(_) => Ok(true),
+        Err(e @ (Failure::AccountRequired | Failure::NeedsAccess)) => Err(e),
+        Err(_) => Ok(false),
     }
 }
 
-/// The thread view's `invite`: the newest message's that has one, or null.
-/// The letter's own part, else the file.
-pub fn of(messages: &[Value]) -> Value {
+/// [`fill`]'s answer for messages whose bytes are all in.
+#[cfg(test)]
+fn of(messages: &[Value]) -> Value {
     let Some(i) = newest(messages) else {
         return Value::Null;
     };
@@ -791,27 +791,28 @@ fn of_thread(
     if let Some(invite) = saved
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|mut v| v.get_mut("invite").map(Value::take))
+        .filter(|i| *i != pending())
     {
         return Ok(Some(invite));
     }
     let Some(mut full) = core.gmail.thread_full(auth, id)? else {
         return Ok(Some(Value::Null));
     };
-    if !fill(core, auth, &mut full) {
-        return Ok(None);
-    }
-    let messages = full.get("messages").and_then(Value::as_array);
-    Ok(Some(of(messages.map_or(&[], Vec::as_slice))))
+    fill(core, auth, &mut full)
+}
+
+/// The invite a thread's saved view holds, for a view made again from it.
+pub fn saved(core: &Core, account: &str, id: &str) -> Option<Value> {
+    let saved = with_store(core, |store| store.view(account, id, now_ms())).ok()??;
+    let mut view = serde_json::from_str::<Value>(&saved).ok()?;
+    view.get_mut("invite").map(Value::take)
 }
 
 fn of_message(core: &Core, auth: &Bearer, id: &str) -> Result<Option<Value>, Failure> {
     let Some(mut message) = core.gmail.full(auth, id)? else {
         return Ok(Some(Value::Null));
     };
-    if !fill_message(core, auth, &mut message) {
-        return Ok(None);
-    }
-    Ok(Some(of(std::slice::from_ref(&message))))
+    invite_of(core, auth, &mut message)
 }
 
 /// An invite whose bytes didn't come: a try again, never "no invite".
@@ -822,7 +823,8 @@ fn again() -> Value {
     )
 }
 
-/// The person's primary calendar and the event in it with `uid`.
+/// The person's primary calendar and the event in it with `uid`, cancelled
+/// or not.
 fn in_calendar(
     core: &Core,
     auth: &Bearer,
@@ -834,15 +836,17 @@ fn in_calendar(
     Ok(event.map(|e| (calendar, e)))
 }
 
+fn is_cancelled(event: &Value) -> bool {
+    event.get("status").and_then(Value::as_str) == Some("cancelled")
+}
+
 /// The person among an event's guests.
 fn mine<'a>(event: &'a Value, account: &str) -> Option<&'a Value> {
     let guests = event.get("attendees").and_then(Value::as_array);
-    guests.into_iter().flatten().find(|a| {
-        a.get("self") == Some(&Value::Bool(true))
-            || a.get("email")
-                .and_then(Value::as_str)
-                .is_some_and(|e| e.eq_ignore_ascii_case(account))
-    })
+    guests
+        .into_iter()
+        .flatten()
+        .find(|a| calendar::is_self(a, account))
 }
 
 /// A side of a Calendar event as the invite writes it: a UTC moment, or a date.
@@ -858,27 +862,55 @@ fn side_of(event: &Value, key: &str) -> Option<String> {
     )
 }
 
-/// Whether Calendar's event is the one the invite describes: same organiser,
-/// same start. A UID alone is the sender's to write, so a forged or stale
-/// `.ics` could name an event the person is already a guest of.
+fn text_in(v: &Value, key: &str) -> String {
+    v.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Calendar's event as the card shows it, held to one line each as the
+/// invite's words are: what a press answers is what Calendar holds.
+fn shown(event: &Value) -> Value {
+    let organizer = event.get("organizer").unwrap_or(&Value::Null);
+    let name = match text_in(organizer, "displayName") {
+        name if name.trim().is_empty() => text_in(organizer, "email"),
+        name => name,
+    };
+    json!({
+        "title": one_line(&text_in(event, "summary")),
+        "start": side_of(event, "start"),
+        "end": side_of(event, "end"),
+        "all_day": event.pointer("/start/date").is_some(),
+        "place": one_line(&text_in(event, "location")),
+        "organizer": one_line(&name),
+    })
+}
+
+/// Whether Calendar's event is the one the invite describes: same
+/// organiser, start, title and place. Each of those is the sender's to write
+/// as much as the UID is, so this can't tell a forger from the organiser;
+/// what it holds is that a press answers only an event that reads as the
+/// invite did, and the card shows Calendar's own words.
 fn matches(invite: &Value, event: &Value) -> bool {
     let organizer = event
         .pointer("/organizer/email")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let named = invite
-        .get("organizer_address")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let named = text_in(invite, "organizer_address");
     let start = invite.get("start").and_then(Value::as_str);
+    let ours = shown(event);
     !named.is_empty()
-        && organizer.eq_ignore_ascii_case(named)
+        && organizer.eq_ignore_ascii_case(&named)
         && start.is_some()
         && side_of(event, "start").as_deref() == start
+        && ours["title"] == invite["title"]
+        && ours["place"] == invite["place"]
 }
 
 /// `gws_mail_invite`: the invite, and for an invitation whether Calendar has
-/// its event and what the person answered there.
+/// its event, whether that's the one it describes, what the person answered
+/// there, and Calendar's own words for it.
 fn look(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (auth, account) = signed_in(core)?;
     let thread = js::trim(&js::string_or_empty(args.get("thread"))).to_owned();
@@ -896,10 +928,11 @@ fn look(core: &Core, args: &Value) -> Result<Value, Failure> {
     }
     let uid = js::string_or_empty(invite.get("uid"));
     let calendar = match in_calendar(core, &auth, &account, &uid)? {
-        None => json!({"found": false, "matches": false, "guest": false, "response": null}),
+        None => json!({"found": false}),
+        Some((_, event)) if is_cancelled(&event) => json!({"found": true, "cancelled": true}),
         Some((_, event)) => {
             let me = mine(&event, &account);
-            json!({"found": true, "matches": matches(&invite, &event), "guest": me.is_some(), "response": me.and_then(|a| a.get("responseStatus"))})
+            json!({"found": true, "cancelled": false, "matches": matches(&invite, &event), "guest": me.is_some(), "response": me.and_then(|a| a.get("responseStatus")), "event": shown(&event)})
         }
     };
     Ok(ok(json!({"invite": invite, "calendar": calendar})))
@@ -907,6 +940,7 @@ fn look(core: &Core, args: &Value) -> Result<Value, Failure> {
 
 /// `gws_mail_invite_reply`: the person's Yes, No or Maybe, through Calendar.
 /// It always tells the organiser: that's what answering an invite is for.
+/// Once the answer is written it's sent, whatever the read after it finds.
 fn reply(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (auth, account) = signed_in(core)?;
     let message = js::trim(&js::string_or_empty(args.get("message"))).to_owned();
@@ -937,11 +971,21 @@ fn reply(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some((calendar, event)) = in_calendar(core, &auth, &account, &uid)? else {
         return Ok(refusal("not_found", NOT_YET));
     };
+    if is_cancelled(&event) {
+        return Ok(refusal("not_found", CANCELLED));
+    }
     if !matches(&invite, &event) {
         return Ok(refusal("changed", DIFFERS));
     }
     let args = json!({"calendar": calendar, "id": event.get("id"), "response": response});
-    calendar::rsvp_with(core, &args, Some(event), true)
+    let answer = calendar::rsvp_with(core, &args, Some(event), true)?;
+    let content = &answer["structuredContent"];
+    if answer.get("isError") == Some(&Value::Bool(true)) || content.get("refused").is_some() {
+        return Ok(answer);
+    }
+    Ok(ok(
+        json!({"sent": true, "event": content.get("event").cloned().unwrap_or(Value::Null)}),
+    ))
 }
 
 /// Runs an invite tool; `None` for any other tool.
@@ -1208,6 +1252,14 @@ mod tests {
         assert_eq!(read(ics).unwrap().start, at("2026-11-10T02:00:00Z"));
     }
 
+    fn message(id: &str, parts: Value) -> Value {
+        json!({"id": id, "payload": {"mimeType": "multipart/mixed", "parts": parts}})
+    }
+
+    fn part(mime: &str, ics: &str) -> Value {
+        json!({"mimeType": mime, "filename": "invite.ics", "body": {"data": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ics)}})
+    }
+
     fn part_in(charset: &str, bytes: &[u8]) -> Value {
         json!({"mimeType": "text/calendar", "headers": [{"name": "Content-Type", "value": format!("text/calendar; charset=\"{charset}\"; method=REQUEST")}], "body": {"data": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)}})
     }
@@ -1228,7 +1280,8 @@ mod tests {
         );
         assert_eq!(title(part_in("ISO-8859-1", &ics(b"Caf\xe9"))), "Caf\u{e9}");
         assert_eq!(title(part_in("utf-8", &ics("Café".as_bytes()))), "Café");
-        assert_eq!(title(part_in("x-klingon", &ics(b"Cafe"))), Value::Null);
+        // one it doesn't know is read as UTF-8, as a mail's body is
+        assert_eq!(title(part_in("x-klingon", &ics(b"Cafe"))), "Cafe");
     }
 
     #[test]
@@ -1256,43 +1309,112 @@ mod tests {
     }
 
     #[test]
-    fn calendars_event_matches_only_with_the_invites_organiser_and_start() {
+    fn calendars_event_matches_only_with_the_invites_organiser_start_title_and_place() {
         let e = read(GOOGLE).unwrap().json("m1").unwrap();
-        let event = |organizer: &str, start: Value| json!({"organizer": {"email": organizer}, "start": start});
+        let event = |organizer: &str, start: Value, title: &str, place: &str| json!({"organizer": {"email": organizer}, "start": start, "summary": title, "location": place});
         let at = json!({"dateTime": "2026-11-10T10:00:00+08:00"});
-        assert!(matches(&e, &event("ANA@example.com", at.clone())));
-        assert!(!matches(&e, &event("mallory@evil.example", at)));
+        let (title, place) = ("Roof inspection", "12 Mabini St, Makati");
+        assert!(matches(
+            &e,
+            &event("ANA@example.com", at.clone(), title, place)
+        ));
+        assert!(!matches(
+            &e,
+            &event("mallory@evil.example", at.clone(), title, place)
+        ));
         assert!(!matches(
             &e,
             &event(
                 "ana@example.com",
-                json!({"dateTime": "2026-11-10T11:00:00+08:00"})
+                json!({"dateTime": "2026-11-10T11:00:00+08:00"}),
+                title,
+                place
             )
         ));
         assert!(!matches(
             &e,
-            &event("ana@example.com", json!({"date": "2026-11-10"}))
+            &event(
+                "ana@example.com",
+                json!({"date": "2026-11-10"}),
+                title,
+                place
+            )
+        ));
+        // a co-attendee's forgery: the UID, organiser and start, other words
+        assert!(!matches(
+            &e,
+            &event(
+                "ana@example.com",
+                at.clone(),
+                "Roof inspection, moved",
+                place
+            )
+        ));
+        assert!(!matches(
+            &e,
+            &event("ana@example.com", at.clone(), title, "Another street")
+        ));
+        // Calendar's words are held as the invite's are
+        assert!(matches(
+            &e,
+            &event("ana@example.com", at, "  Roof\ninspection ", place)
         ));
         let all_day = read(APPLE).unwrap().json("m1").unwrap();
         assert!(matches(
             &all_day,
-            &event("cara@example.com", json!({"date": "2026-11-24"}))
+            &event(
+                "cara@example.com",
+                json!({"date": "2026-11-24"}),
+                "Family day \\o/",
+                "Lola's house Bacolod"
+            )
         ));
         // an invite naming no organiser can't be checked, so it answers nothing
         let mut nobody = e.clone();
         nobody["organizer_address"] = json!("");
         assert!(!matches(
             &nobody,
-            &event("", json!({"dateTime": "2026-11-10T02:00:00Z"}))
+            &event(
+                "",
+                json!({"dateTime": "2026-11-10T02:00:00Z"}),
+                title,
+                place
+            )
         ));
     }
 
-    fn message(id: &str, parts: Value) -> Value {
-        json!({"id": id, "payload": {"mimeType": "multipart/mixed", "parts": parts}})
+    #[test]
+    fn a_duration_with_no_length_is_no_invite() {
+        for empty in ["P", "PT", "+P"] {
+            let ics = GOOGLE.replace("DTEND:20261110T030000Z", &format!("DURATION:{empty}"));
+            assert_eq!(read(&ics), None, "{empty}");
+        }
+        let ics = GOOGLE.replace("DTEND:20261110T030000Z", "DURATION:P0D");
+        assert!(read(&ics).is_some(), "zero is a length");
     }
 
-    fn part(mime: &str, ics: &str) -> Value {
-        json!({"mimeType": mime, "filename": "invite.ics", "body": {"data": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ics)}})
+    #[test]
+    fn a_parameters_carets_read_left_to_right() {
+        assert_eq!(param_text("a^^n"), "a^n");
+        assert_eq!(param_text("^'Ana^' ^^ ^n^x"), "\"Ana\" ^  ^x");
+        let ics = GOOGLE.replace("ORGANIZER;CN=Ana Reyes", "ORGANIZER;CN=Ana ^^n Reyes");
+        assert_eq!(read(&ics).unwrap().organizer.name, "Ana ^n Reyes");
+    }
+
+    #[test]
+    fn an_invitation_that_says_it_is_cancelled_is_a_cancel() {
+        let ics = GOOGLE.replace("STATUS:CONFIRMED", "STATUS:CANCELLED");
+        assert_eq!(read(&ics).unwrap().method, Method::Cancel);
+        assert_eq!(read(GOOGLE).unwrap().method, Method::Request);
+    }
+
+    #[test]
+    fn the_shared_view_of_a_thread_has_no_invite_in_it() {
+        // only `thread()` reads one, so pictures' views don't say "none"
+        let view = crate::mail::view_of(
+            &json!({"messages": [message("m1", json!([part("text/calendar", GOOGLE)]))]}),
+        );
+        assert_eq!(view.get("invite"), None);
     }
 
     #[test]

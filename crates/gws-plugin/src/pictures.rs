@@ -835,6 +835,10 @@ fn show(core: &Core, args: &Value) -> Result<Value, Failure> {
     let placer = placer.into_inner().unwrap_or_else(|e| e.into_inner());
     placer.finish(&mut thread);
     let mut view = mail::view_of(&thread);
+    // the invite was read as the thread opened: the view made again keeps it
+    if let Some(invite) = crate::invite::saved(core, &account, &id) {
+        view["invite"] = invite;
+    }
     view["pictures"] = named(&thread, &account);
     view["pictures"]["asked"] = Value::Bool(true);
     Ok(answer(core, &account, view))

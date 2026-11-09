@@ -256,6 +256,9 @@ struct Mail {
     problem: Signal<Option<String>>,
     seq: Signal<i64>,
     help: Signal<bool>,
+    /// The open conversation's invite card, kept out of the page so showing
+    /// the page again leaves it be.
+    invite: Signal<Option<invite::Held>>,
 }
 
 /// A file on a mail in the open conversation.
@@ -1695,6 +1698,7 @@ pub fn build(bridge: Bridge) -> Root {
             loading: signal(true),
             seq: signal(-1),
             help: signal(false),
+            invite: signal(None),
         };
         keys(b.clone(), m);
         b.spawn(load_list(b.clone(), m, 0));

@@ -555,7 +555,7 @@ struct Account {
     wrote: bool,
     reads_fail_after_write: bool,
     draft_reads_fail: bool,
-    attachments_fail: bool,
+    attachments_fail: Option<u16>,
     attachments_gone: bool,
     /// Reads so far, once attachment ids change with each.
     reads: Option<AtomicU64>,
@@ -1045,10 +1045,14 @@ impl Account {
                 None => not_found(),
             },
             ("GET", ["messages", _, "attachments", _]) if self.attachments_gone => not_found(),
-            ("GET", ["messages", _, "attachments", _]) if self.attachments_fail => Reply::json(
-                500,
-                json!({"error": {"code": 500, "message": "Backend error"}}),
-            ),
+            ("GET", ["messages", _, "attachments", _]) if self.attachments_fail.is_some() => {
+                let code = self.attachments_fail.unwrap_or(500);
+                let why = match code {
+                    403 => "Request had insufficient authentication scopes.",
+                    _ => "Backend error",
+                };
+                Reply::json(code, json!({"error": {"code": code, "message": why}}))
+            }
             ("GET", ["messages", id, "attachments", att]) => {
                 let at = att.rsplit('-').next().and_then(|i| i.parse::<usize>().ok());
                 let held = self
@@ -1629,7 +1633,17 @@ impl FakeGoogle {
 
     /// Attachment reads fail, as Gmail's backend sometimes does.
     pub fn attachments_fail(&self, fail: bool) {
-        self.account.lock().unwrap().attachments_fail = fail;
+        self.account.lock().unwrap().attachments_fail = fail.then_some(500);
+    }
+
+    /// Attachment reads answer `status`, as a lapsed sign-in's 401 does.
+    pub fn attachments_answer(&self, status: u16) {
+        self.account.lock().unwrap().attachments_fail = Some(status);
+    }
+
+    /// Calendar writes a PATCH and answers it with nothing of the event.
+    pub fn calendar_patch_answers_empty(&self, empty: bool) {
+        self.account.lock().unwrap().calendars.patch_answers_empty = empty;
     }
 
     /// Attachment reads find nothing, as for one Gmail no longer holds.

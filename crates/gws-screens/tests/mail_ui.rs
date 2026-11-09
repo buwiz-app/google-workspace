@@ -367,6 +367,7 @@ impl Host for Fake {
                         || json!({"opened": true, "name": "Roof quote.docx", "kind": "word"}),
                     ),
             ),
+            "gws_mail_invite" => (String::new(), json!({"invite": null})),
             "gws_mail_thread" => {
                 let id = args["thread"].as_str().unwrap_or_default();
                 (id.to_owned(), thread(id))

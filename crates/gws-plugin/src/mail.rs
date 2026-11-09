@@ -1055,7 +1055,7 @@ pub fn view_of(thread: &Value) -> Value {
         }
         page.push_str(after);
     }
-    json!({"id": thread.get("id"), "page": page, "links": links, "images": images, "attachments": attachments, "invite": crate::invite::of(&list)})
+    json!({"id": thread.get("id"), "page": page, "links": links, "images": images, "attachments": attachments})
 }
 
 /// One message of a thread, as much of it as fits.
@@ -1133,9 +1133,10 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
         return Ok(fail("not_found", "That conversation is gone."));
     };
     // an invite that didn't come must be asked for again, not kept as none
-    let whole = crate::invite::fill(core, &auth, &mut full);
-    let view = pictures::view(core, &auth, &account, &mut full);
-    if whole {
+    let invite = crate::invite::fill(core, &auth, &mut full)?;
+    let mut view = pictures::view(core, &auth, &account, &mut full);
+    view["invite"] = invite.clone().unwrap_or_else(crate::invite::pending);
+    if invite.is_some() {
         with_own_store(core, &account, |store| {
             store.put_view(&account, &id, &view.to_string(), now_ms())
         })?;

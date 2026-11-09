@@ -75,7 +75,7 @@ fn calendar_has_the_invites_event_and_the_person_has_not_answered() {
         assert_eq!(got["invite"]["title"], "Roof inspection", "{args}");
         assert_eq!(
             got["calendar"],
-            json!({"found": true, "matches": true, "guest": true, "response": "needsAction"}),
+            json!({"found": true, "cancelled": false, "matches": true, "guest": true, "response": "needsAction", "event": {"title": "Roof inspection", "start": "2026-11-10T02:00:00Z", "end": "2026-11-10T03:00:00Z", "all_day": false, "place": "12 Mabini St", "organizer": "Ana Reyes"}}),
             "{args}"
         );
     }
@@ -218,7 +218,7 @@ fn a_broken_ics_is_no_invite() {
 
 /// The rich invite's `.ics` with `change` made to it.
 fn rich_ics(change: impl Fn(String) -> String) -> String {
-    change("BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nDTSTART:20261110T020000Z\r\nDTEND:20261110T030000Z\r\nUID:fake-roof-inspection@google.com\r\nORGANIZER;CN=Ana Reyes:mailto:ana@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:owner@example.com\r\nSUMMARY:Roof inspection\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".to_owned())
+    change("BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nDTSTART:20261110T020000Z\r\nDTEND:20261110T030000Z\r\nUID:fake-roof-inspection@google.com\r\nORGANIZER;CN=Ana Reyes:mailto:ana@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:owner@example.com\r\nSUMMARY:Roof inspection\r\nLOCATION:12 Mabini St\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".to_owned())
 }
 
 #[test]
@@ -227,7 +227,11 @@ fn an_invite_that_didnt_come_is_asked_for_again_not_kept_as_none() {
     let core = signed_in(&google, "refetch");
     google.attachments_fail(true);
     let view = data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
-    assert_eq!(view["invite"], Value::Null);
+    assert_eq!(
+        view["invite"],
+        json!({"pending": true}),
+        "not none: not read yet"
+    );
     google.attachments_fail(false);
     let view = data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
     assert_eq!(view["invite"]["title"], "Roof inspection");
@@ -395,4 +399,115 @@ fn an_instance_is_never_answered_in_place_of_its_series() {
     );
     assert_eq!(answer["isError"], true, "{answer}");
     assert!(google.calendar_writes().is_empty());
+}
+
+#[test]
+fn a_forgery_with_the_uid_organiser_and_start_but_other_words_answers_nothing() {
+    for change in [
+        (
+            "SUMMARY:Roof inspection",
+            "SUMMARY:Roof inspection, all welcome",
+        ),
+        ("LOCATION:12 Mabini St", "LOCATION:Elsewhere"),
+    ] {
+        let google = FakeGoogle::start(rich());
+        let ics = rich_ics(|s| s.replace(change.0, change.1));
+        let mail = mail_with(&ics, 30);
+        google.deliver(mail.clone());
+        let core = signed_in(&google, "co-attendee");
+        let got = data(core.run("gws_mail_invite", &json!({"message": mail.id})));
+        assert_eq!(got["calendar"]["matches"], false, "{change:?}");
+        // what the card shows is Calendar's, not the letter's
+        assert_eq!(got["calendar"]["event"]["title"], "Roof inspection");
+        assert_eq!(got["calendar"]["event"]["place"], "12 Mabini St");
+        let refused = data(core.run(
+            "gws_mail_invite_reply",
+            &json!({"message": mail.id, "response": "accepted"}),
+        ));
+        assert_eq!(refused["refused"], "changed", "{change:?}");
+        assert!(google.calendar_writes().is_empty());
+    }
+}
+
+#[test]
+fn a_written_answer_is_sent_whatever_the_read_after_it_finds() {
+    let google = FakeGoogle::start(rich());
+    google.calendar_patch_answers_empty(true);
+    google.whole_reads_fail(true);
+    let core = signed_in(&google, "written");
+    let got = data(core.run(
+        "gws_mail_invite_reply",
+        &json!({"message": INVITE, "response": "accepted"}),
+    ));
+    assert_eq!(got["sent"], true, "{got}");
+    assert_eq!(google.calendar_writes().len(), 1);
+}
+
+#[test]
+fn an_event_cancelled_in_calendar_says_so_and_answers_nothing() {
+    let mut seed = rich();
+    for c in &mut seed.calendars {
+        for e in &mut c.events {
+            e["status"] = json!("cancelled");
+        }
+    }
+    let google = FakeGoogle::start(seed);
+    let core = signed_in(&google, "cancelled");
+    let got = data(core.run("gws_mail_invite", &json!({"thread": INVITE})));
+    assert_eq!(got["calendar"], json!({"found": true, "cancelled": true}));
+    let refused = data(core.run(
+        "gws_mail_invite_reply",
+        &json!({"message": INVITE, "response": "accepted"}),
+    ));
+    assert_eq!(refused["message"], "This event was cancelled.");
+    assert!(google.calendar_writes().is_empty());
+}
+
+#[test]
+fn a_lapsed_sign_in_on_the_ics_is_said_as_itself() {
+    let google = FakeGoogle::start(rich());
+    let core = signed_in(&google, "lapsed");
+    google.attachments_answer(401);
+    let look = core.run("gws_mail_invite", &json!({"thread": INVITE}));
+    assert_eq!(
+        look["structuredContent"]["code"], "account_required",
+        "{look}"
+    );
+    let opened = core.run("gws_mail_thread", &json!({"thread": INVITE}));
+    assert_eq!(
+        opened["structuredContent"]["code"], "account_required",
+        "{opened}"
+    );
+    google.attachments_answer(403);
+    let look = core.run("gws_mail_invite", &json!({"thread": INVITE}));
+    assert_eq!(look["isError"], true, "{look}");
+    assert_eq!(look["structuredContent"]["code"], "needs_access", "{look}");
+}
+
+#[test]
+fn the_pictures_view_keeps_the_invite() {
+    let google = FakeGoogle::start(rich());
+    let core = signed_in(&google, "pictures");
+    data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
+    let view = data(core.run("gws_mail_pictures", &json!({"thread": INVITE})));
+    assert_eq!(view["invite"]["title"], "Roof inspection", "{view}");
+}
+
+/// Waits a half minute for the stub, as the reader of an opening thread can't.
+#[test]
+fn a_slow_ics_gives_up_after_half_a_minute_not_ten() {
+    let google = FakeGoogle::start(rich());
+    let core = signed_in(&google, "slow");
+    google.hold("GET", "/attachments/att-000019f000000014-0-0");
+    let (tell, heard) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let _ = tell.send(core.run("gws_mail_invite", &json!({"thread": INVITE})));
+        });
+        google.wait_for_held();
+        let answer = heard.recv_timeout(std::time::Duration::from_secs(50));
+        google.release();
+        let answer = answer.expect("an answer within the half minute and some");
+        assert_eq!(answer["structuredContent"]["code"], "busy", "{answer}");
+    });
 }

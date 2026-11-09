@@ -153,12 +153,31 @@ fn bodies(core: &Core, account: &str, since: i64, spent: &mut i64) -> Result<(),
             break;
         }
         let auth = still(core, account)?;
-        let Some((full, view)) = read_view(core, &auth, account, &id)? else {
+        // every byte that comes counts, the pictures inside the mail among them,
+        // and none is asked for past the round's share or after a sign-out
+        let (mut over, mut gone) = (false, false);
+        let read = read_view(core, &auth, account, &id, &mut |bytes| {
+            let bytes = bytes as i64;
+            *spent += bytes;
+            if still(core, account).is_err() {
+                gone = true;
+            } else if *spent > ROUND_MAX {
+                over = true;
+            }
+            !(gone || over)
+        })?;
+        if gone {
+            return Err(Failure::AccountRequired);
+        }
+        let Some((full, view)) = read else {
             // gone at Google, as a list sync would find
             with_own_store(core, account, |store| store.remove_thread(account, &id))?;
             continue;
         };
-        *spent += came(&full);
+        // a view short of its pictures isn't what an open makes: next round
+        if over {
+            break;
+        }
         let view = view.to_string();
         // what was read is what the row says, or the next sync has news of it
         let Some(row) = row_of(&full) else {
@@ -186,7 +205,8 @@ fn wanted(core: &Core, account: &str, view: &str) -> Result<Vec<(String, String)
         let size = a.get("size").and_then(Value::as_i64).unwrap_or(-1);
         if gmail::id_ok(message)
             && part_ok(part)
-            && (0..ATTACHMENT_MAX).contains(&size)
+            // no size said is no reason to leave it: the fresh read may say one
+            && size < ATTACHMENT_MAX
             && opens(text("mime"), text("name"))
             && !with_store(core, |store| store.has_attachment(account, message, part))?
         {

@@ -541,6 +541,18 @@ fn strip_ids(part: &mut Value) {
     }
 }
 
+/// Takes the size off every attached part, as a read Google sent short.
+fn strip_sizes(part: &mut Value) {
+    if let Some(body) = part.get_mut("body").and_then(Value::as_object_mut)
+        && body.contains_key("attachmentId")
+    {
+        body.remove("size");
+    }
+    if let Some(parts) = part.get_mut("parts").and_then(Value::as_array_mut) {
+        parts.iter_mut().for_each(strip_sizes);
+    }
+}
+
 /// File `i` of a mail, as [`payload`] numbers them.
 fn file_bytes(m: &Mail, i: usize) -> Option<&Vec<u8>> {
     match m.attachments.get(i) {
@@ -571,6 +583,8 @@ struct Account {
     attachments_gone: bool,
     /// Whole reads name no attachment ids.
     ids_missing: bool,
+    /// Whole reads give no attachment sizes.
+    sizes_missing: bool,
     /// Reads so far, once attachment ids change with each.
     reads: Option<AtomicU64>,
     /// `(draft id, message id, raw message, thread)`.
@@ -898,6 +912,9 @@ impl Account {
                 }
                 if self.ids_missing {
                     strip_ids(&mut v["payload"]);
+                }
+                if self.sizes_missing {
+                    strip_sizes(&mut v["payload"]);
                 }
             }
         }
@@ -1855,6 +1872,11 @@ impl FakeGoogle {
     /// Whether whole reads leave out each part's attachment id.
     pub fn attachment_ids_missing(&self, missing: bool) {
         self.account.lock().unwrap().ids_missing = missing;
+    }
+
+    /// Whether whole reads leave out each attached part's size.
+    pub fn attachment_sizes_missing(&self, missing: bool) {
+        self.account.lock().unwrap().sizes_missing = missing;
     }
 
     /// Whether every attachment read answers 404.

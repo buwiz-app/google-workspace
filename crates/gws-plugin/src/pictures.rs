@@ -209,6 +209,7 @@ fn part_picture(
     part: &Value,
     by: Instant,
     calls: &mut usize,
+    gate: &mut dyn FnMut(u64) -> bool,
 ) -> Option<String> {
     if let Some(data) = part.pointer("/body/data").and_then(Value::as_str) {
         // base64 of more than the cap can't decode to within it
@@ -222,7 +223,7 @@ fn part_picture(
     if size > PICTURE_MAX as u64 || !attachment_ok(id) || !gmail::id_ok(message) {
         return None;
     }
-    if *calls >= CID_CALLS {
+    if *calls >= CID_CALLS || !gate(size) {
         return None;
     }
     let left = left(by)?;
@@ -315,7 +316,14 @@ impl Placer {
 
 /// The pictures inside `thread`'s mail, by Content-ID, offered to `placer` by
 /// `by`, with no more than [`CID_CALLS`] calls to Gmail for them.
-fn inside(core: &Core, auth: &Bearer, thread: &Value, placer: &mut Placer, by: Instant) {
+fn inside(
+    core: &Core,
+    auth: &Bearer,
+    thread: &Value,
+    placer: &mut Placer,
+    by: Instant,
+    gate: &mut dyn FnMut(u64) -> bool,
+) {
     let mut calls = 0;
     for (n, m) in messages(thread).iter().enumerate() {
         let parts = by_content_id(m);
@@ -334,7 +342,7 @@ fn inside(core: &Core, auth: &Bearer, thread: &Value, placer: &mut Placer, by: I
             if !seen.insert(url.clone()) {
                 continue;
             }
-            if let Some(data) = part_picture(core, auth, id, part, by, &mut calls) {
+            if let Some(data) = part_picture(core, auth, id, part, by, &mut calls, gate) {
                 placer.offer(&[n], &url, data);
             }
         }
@@ -465,10 +473,22 @@ fn named(thread: &Value, account: &str) -> Value {
 /// The thread's view, with the pictures inside its mail shown, and who its
 /// pictures are from. For the thread view, which the store keeps.
 pub fn view(core: &Core, auth: &Bearer, account: &str, thread: &mut Value) -> Value {
+    view_within(core, auth, account, thread, &mut |_| true)
+}
+
+/// [`view`], with `gate` asked before each picture is fetched from Gmail, with
+/// its size: a read ahead keeps to its round's bytes and its sign-in by it.
+pub fn view_within(
+    core: &Core,
+    auth: &Bearer,
+    account: &str,
+    thread: &mut Value,
+    gate: &mut dyn FnMut(u64) -> bool,
+) -> Value {
     let by = Instant::now() + ALL_WITHIN;
     unplace(thread);
     let mut placer = Placer::new(thread);
-    inside(core, auth, thread, &mut placer, by);
+    inside(core, auth, thread, &mut placer, by, gate);
     placer.finish(thread);
     let mut view = mail::view_of(thread);
     view["pictures"] = named(thread, account);
@@ -822,7 +842,7 @@ fn show(core: &Core, args: &Value) -> Result<Value, Failure> {
     };
     let mut placer = Placer::new(&thread);
     let asks = on_the_web(&placer.uses, lets);
-    inside(core, &auth, &thread, &mut placer, by);
+    inside(core, &auth, &thread, &mut placer, by, &mut |_| true);
     let placer = Mutex::new(placer);
     let urls: Vec<&str> = asks.iter().map(|(u, _)| u.as_str()).collect();
     if !placer.lock().unwrap_or_else(|e| e.into_inner()).full() {

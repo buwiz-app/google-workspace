@@ -366,7 +366,14 @@ pub enum Woken {
 /// it next has to look whatever else happens.
 #[derive(Default)]
 pub struct Waker {
-    state: Mutex<(Option<Woken>, Option<Instant>, Option<Instant>)>,
+    /// The wake waiting, when a screen last asked, the next time set to look,
+    /// and when the timer last had its turn.
+    state: Mutex<(
+        Option<Woken>,
+        Option<Instant>,
+        Option<Instant>,
+        Option<Instant>,
+    )>,
     bell: Condvar,
     stop: AtomicBool,
 }
@@ -413,8 +420,8 @@ impl Waker {
 
     /// Until a wake or the time to look again, and which it was.
     pub(crate) fn wait(&self) -> Woken {
-        let start = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let start = state.3.unwrap_or_else(Instant::now);
         loop {
             let every = if state.1.is_some_and(|at| at.elapsed() < LINGER) {
                 ACTIVE
@@ -423,15 +430,19 @@ impl Waker {
             };
             let due = state.2.map_or(start + every, |at| at.min(start + every));
             let now = Instant::now();
+            // a condvar can wake for nothing: only a time that's come is the
+            // timer's, and a time that's come is, whatever else woke it
             let woken = match state.0.take() {
-                Some(by) => Some(by),
-                // a condvar can wake for nothing: only a time that's come is the timer's
-                None if now >= due => Some(Woken::Timer),
-                None => None,
+                Some(Woken::Person) => Some(Woken::Person),
+                _ if now >= due => Some(Woken::Timer),
+                other => other,
             };
             if let Some(by) = woken {
                 if state.2.is_some_and(|at| at <= now) {
                     state.2 = None;
+                }
+                if by != Woken::Other {
+                    state.3 = Some(now);
                 }
                 return by;
             }
@@ -915,6 +926,8 @@ fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
     }
     let rows = with_store(core, |store| store.threads(&account, &label, skip, PAGE))?;
     let rows: Vec<Thread> = rows.into_iter().map(|t| addressed(t, &label)).collect();
+    // nothing kept is nothing saved to show
+    let saved = saved && !rows.is_empty();
     let total = with_store(core, |store| store.thread_count(&account, &label))?;
     // no token on record yet is not the end: only an empty one is
     let more =
@@ -1178,16 +1191,24 @@ fn day(at: &str) -> String {
 /// what Google sent: an open and a read ahead both keep what this makes, its
 /// pictures inside the mail and what they need to show among it. `None` when
 /// the thread is gone.
+///
+/// `gate` hears of every byte that comes for it, as Gmail sends it: the thread
+/// once it's here, and each picture inside it before it's asked for, which a
+/// false answer stops.
 pub(crate) fn read_view(
     core: &Core,
     auth: &Bearer,
     account: &str,
     id: &str,
+    gate: &mut dyn FnMut(u64) -> bool,
 ) -> Result<Option<(Value, Value)>, Failure> {
     let Some(mut full) = core.gmail.thread_full(auth, id)? else {
         return Ok(None);
     };
-    let view = pictures::view(core, auth, account, &mut full);
+    gate(full.to_string().len() as u64);
+    // a picture comes as base64 inside JSON
+    let mut asks = |size: u64| gate(size.saturating_mul(4).div_ceil(3));
+    let view = pictures::view_within(core, auth, account, &mut full, &mut asks);
     Ok(Some((full, view)))
 }
 
@@ -1214,7 +1235,7 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     }
     // the sign-in is there, and the Bot can't refresh its token just now
     let auth = auth.ok_or_else(unreached)?;
-    let Some((_, view)) = read_view(core, &auth, &account, &id)? else {
+    let Some((_, view)) = read_view(core, &auth, &account, &id, &mut |_| true)? else {
         return Ok(fail("not_found", "That conversation is gone."));
     };
     with_own_store(core, &account, |store| {
@@ -1292,6 +1313,15 @@ mod tests {
         waker.wake();
         assert_eq!(waker.wait(), Woken::Person);
         waker.wake_after(Duration::from_millis(10));
+        assert_eq!(waker.wait(), Woken::Timer);
+    }
+
+    #[test]
+    fn a_wake_after_the_time_to_look_still_counts_as_the_timer() {
+        let waker = Waker::default();
+        waker.wake_after(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(40));
+        waker.wake();
         assert_eq!(waker.wait(), Woken::Timer);
     }
 

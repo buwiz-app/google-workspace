@@ -1894,6 +1894,31 @@ fn start_ok() -> (Headless, Arc<Fake>) {
 }
 
 #[test]
+fn offline_an_empty_list_claims_no_saved_mail() {
+    let (mut app, fake) = start();
+    *fake.status.lock().unwrap() = "offline".to_owned();
+    *fake.changed.lock().unwrap() = true;
+    app.wait(Duration::from_secs(16)).expect("the watch looks");
+    assert!(
+        app.screen()
+            .shows("Can't reach Google. Showing saved mail."),
+        "{:?}",
+        app.screen().texts()
+    );
+    pick_label(&mut app, "Trash");
+    assert!(
+        app.screen().shows("Can't reach Google."),
+        "{:?}",
+        app.screen().texts()
+    );
+    assert!(
+        !app.screen()
+            .shows("Can't reach Google. Showing saved mail."),
+        "nothing listed is nothing saved"
+    );
+}
+
+#[test]
 fn every_empty_list_says_which_it_is_and_the_reader_asks_for_nothing() {
     let (mut app, _) = start_ok();
     assert!(app.screen().shows("Pick a conversation to read it"));

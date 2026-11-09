@@ -735,6 +735,10 @@ fn lapsed_with_nothing_kept_the_tools_say_google_cant_be_reached() {
     )
     .unwrap();
     assert!(file.to_string().contains("Can't reach Google"), "{file}");
+    // a list with nothing kept claims no saved mail
+    let sent = data(core.run("gws_mail_list", &json!({"label": "SENT"})));
+    assert_eq!(sent["threads"], json!([]));
+    assert_eq!(sent["saved"], false, "{sent}");
 }
 
 #[test]
@@ -865,4 +869,71 @@ fn a_view_read_ahead_has_the_pictures_inside_its_mail() {
         reads,
         "opened from what was kept"
     );
+}
+
+#[test]
+fn a_part_google_named_no_size_for_is_tried_again() {
+    let google = seeded(vec![with_file(1, 2, "receipt.docx", b"PK sized".to_vec())]);
+    google.attachment_sizes_missing(true);
+    let core = synced(&google, "no-size");
+    gws::prefetch::run(&core).unwrap();
+    assert!(has_view(&core, &id(1)));
+    assert!(!has_file(&core, &id(1), "1"));
+    assert!(!fetched(&core, &id(1)), "not done with it");
+    google.attachment_sizes_missing(false);
+    gws::prefetch::run(&core).unwrap();
+    assert!(has_file(&core, &id(1), "1"));
+}
+
+/// A mail with `n` pictures inside it of `size` bytes each, by Content-ID.
+fn with_pictures(n: u64, days_ago: i64, count: usize, size: usize) -> Mail {
+    let mut m = mail(n, days_ago);
+    m.html = Some(
+        (0..count)
+            .map(|i| format!("<img src=\"cid:p{i}\">"))
+            .collect::<String>(),
+    );
+    m.inline = (0..count)
+        .map(|i| {
+            let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+            png.resize(size, i as u8);
+            (format!("p{i}"), format!("p{i}.png"), PNG.to_owned(), png)
+        })
+        .collect();
+    m
+}
+
+#[test]
+fn the_pictures_inside_a_mail_count_against_the_round() {
+    let mib = 1024 * 1024;
+    let google = seeded(vec![
+        with_pictures(1, 1, 20, 3 * mib / 2),
+        with_pictures(2, 2, 20, 3 * mib / 2),
+    ]);
+    let core = synced(&google, "pictures-share");
+    gws::prefetch::run(&core).unwrap();
+    // each comes as 2 MiB of base64: the first mail's twenty make 40, and the
+    // second's stop when the next would pass the round's 50
+    let asked = attachment_reads(&google);
+    assert!(asked < 30, "{asked} asked");
+    assert!(has_view(&core, &id(1)));
+    assert!(!has_view(&core, &id(2)), "short of its pictures, it waits");
+}
+
+#[test]
+fn a_sign_out_stops_the_pictures_inside_a_mail_too() {
+    let google = seeded(vec![with_pictures(1, 1, 3, 1024)]);
+    let core = synced(&google, "pictures-gone");
+    google.hold("GET", &format!("/attachments/att-{}-0-0", id(1)));
+    std::thread::scope(|s| {
+        let round = s.spawn(|| gws::prefetch::run(&core));
+        google.wait_for_held();
+        core.account(
+            "buwiz.account.clear",
+            &json!({"account": "google", "label": "default"}),
+        );
+        google.release();
+        assert!(round.join().unwrap().is_err());
+    });
+    assert_eq!(attachment_reads(&google), 1, "no picture asked after it");
 }

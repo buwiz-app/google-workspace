@@ -15,14 +15,15 @@ use gws_store::mail::{Label, Thread};
 use serde_json::{Value, json};
 
 use crate::accounts::Bearer;
-use crate::gmail::{self, Failure};
+use crate::gmail::{self, Failure, Limit, Whole};
+use crate::pictures::{self, Made};
 use crate::tools::{
     MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_DRAFT_DELETE, MAIL_DRAFT_OF, MAIL_DRAFT_READ,
     MAIL_DRAFT_SAVE, MAIL_JOB, MAIL_JOB_START, MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK,
     MAIL_REPLY_START, MAIL_SEND, MAIL_SEND_ARM, MAIL_SEND_DISARM, MAIL_THREAD, MAIL_TRASH,
     MAIL_UNDO, PEOPLE_SUGGEST, SEARCH_MAIL, UPLOAD_CHUNK, UPLOAD_DROP, fail, failed, ok,
 };
-use crate::{Core, clean, compose, fold, js, pictures};
+use crate::{Core, clean, compose, fold, js};
 
 /// Rows a list page holds.
 pub const PAGE: i64 = 50;
@@ -217,7 +218,7 @@ fn act(core: &Core, tool: &str, args: &Value) -> Result<Value, Failure> {
         // a failed read here is only a stale row: the sync below mends it
         let _ = fetch_rows(core, &auth, &account, &changed);
     }
-    core.sync.wake();
+    core.sync.wake_by_person();
     match failure {
         Some(e) if undo.is_none() => Err(e),
         Some(_) => Ok(ok(
@@ -286,7 +287,7 @@ fn undo(core: &Core, args: &Value) -> Result<Value, Failure> {
         undo.threads.remove(0);
     }
     let _ = fetch_rows(core, &auth, &account, &ids);
-    core.sync.wake();
+    core.sync.wake_by_person();
     Ok(ok(json!({"done": ids.len()})))
 }
 
@@ -318,7 +319,7 @@ impl Tickets {
 
 /// A card's rows, each with a ticket to open it by.
 fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (auth, account) = signed_in(core)?;
+    let (auth, account) = reader(core)?;
     let held = core
         .tickets
         .lock()
@@ -328,7 +329,11 @@ fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some(Subject::Search(query)) = held else {
         return Ok(fail("not_found", "This card is out of date."));
     };
-    let (rows, saved) = match search(core, &auth, &account, &query) {
+    let found = match &auth {
+        Some(auth) => search(core, auth, &account, &query),
+        None => Err(unreached()),
+    };
+    let (rows, saved) = match found {
         Ok(rows) => (rows, false),
         Err(Failure::Offline(_)) => (
             with_store(core, |store| {
@@ -348,11 +353,30 @@ fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
     Ok(ok(json!({"rows": rows, "more": more, "saved": saved})))
 }
 
+/// What a sync woke for. Mail is kept ahead only after the timer's or a
+/// person's: a wake from anything else, a write the model or a routine made
+/// among them, must not start a round of downloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Woken {
+    Timer,
+    Person,
+    Other,
+}
+
+/// The wake waiting, when a screen last asked, the next time set to look, and
+/// when the timer last had its turn.
+type Wakes = (
+    Option<Woken>,
+    Option<Instant>,
+    Option<Instant>,
+    Option<Instant>,
+);
+
 /// Wakes the sync, remembers when a screen last asked for something, and when
 /// it next has to look whatever else happens.
 #[derive(Default)]
 pub struct Waker {
-    state: Mutex<(bool, Option<Instant>, Option<Instant>)>,
+    state: Mutex<Wakes>,
     bell: Condvar,
     stop: AtomicBool,
 }
@@ -364,12 +388,26 @@ impl Waker {
         self.wake();
     }
 
-    fn stopping(&self) -> bool {
+    pub(crate) fn stopping(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
 
     pub fn wake(&self) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).0 = true;
+        self.woken(Woken::Other);
+    }
+
+    /// [`Self::wake`] for what the person did on a screen.
+    pub fn wake_by_person(&self) {
+        self.woken(Woken::Person);
+    }
+
+    fn woken(&self, by: Woken) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // a person's wake still waiting isn't lost to another
+        if state.0 != Some(Woken::Person) {
+            state.0 = Some(by);
+        }
+        drop(state);
         self.bell.notify_all();
     }
 
@@ -383,26 +421,39 @@ impl Waker {
         self.bell.notify_all();
     }
 
-    fn wait(&self) {
+    /// Until a wake or the time to look again, and which it was.
+    pub(crate) fn wait(&self) -> Woken {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let every = if state.1.is_some_and(|at| at.elapsed() < LINGER) {
-            ACTIVE
-        } else {
-            IDLE
-        };
-        let every = state.2.map_or(every, |at| {
-            every.min(at.saturating_duration_since(Instant::now()))
-        });
-        if !state.0 {
+        let start = state.3.unwrap_or_else(Instant::now);
+        loop {
+            let every = if state.1.is_some_and(|at| at.elapsed() < LINGER) {
+                ACTIVE
+            } else {
+                IDLE
+            };
+            let due = state.2.map_or(start + every, |at| at.min(start + every));
+            let now = Instant::now();
+            // a condvar can wake for nothing: only a time that's come is the
+            // timer's, and a time that's come is, whatever else woke it
+            let woken = match state.0.take() {
+                Some(Woken::Person) => Some(Woken::Person),
+                _ if now >= due => Some(Woken::Timer),
+                other => other,
+            };
+            if let Some(by) = woken {
+                if state.2.is_some_and(|at| at <= now) {
+                    state.2 = None;
+                }
+                if by != Woken::Other {
+                    state.3 = Some(now);
+                }
+                return by;
+            }
             state = self
                 .bell
-                .wait_timeout(state, every)
+                .wait_timeout(state, due - now)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
-        }
-        state.0 = false;
-        if state.2.is_some_and(|at| at <= Instant::now()) {
-            state.2 = None;
         }
     }
 }
@@ -454,12 +505,14 @@ impl Settle {
 pub fn start(core: Arc<Core>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         loop {
-            core.sync.wait();
+            let woken = core.sync.wait();
             if core.sync.stopping() {
                 return;
             }
             if core.provisioned() {
-                let _ = sync(&core);
+                if sync(&core).is_ok() && woken != Woken::Other {
+                    crate::prefetch::kick(&core);
+                }
                 crate::files::sweep(&core);
             }
         }
@@ -593,6 +646,23 @@ pub(crate) fn with_store<T>(
 
 pub(crate) fn signed_in(core: &Core) -> Result<(Bearer, String), Failure> {
     core.accounts.session().ok_or(Failure::AccountRequired)
+}
+
+/// Whose saved mail a screen reads, with their token while it's live. A lapsed
+/// one is still their sign-in: with no connection the Bot can't refresh it, and
+/// what's saved is still theirs to read. No token means Google can't be asked.
+/// Only the active sign-in's mail: with no active one, nobody's.
+pub(crate) fn reader(core: &Core) -> Result<(Option<Bearer>, String), Failure> {
+    if let Some((auth, account)) = core.accounts.session() {
+        return Ok((Some(auth), account));
+    }
+    let (account, _) = core.accounts.signed_in().ok_or(Failure::AccountRequired)?;
+    Ok((None, account))
+}
+
+/// What a call to Google comes to with no live token.
+pub(crate) fn unreached() -> Failure {
+    Failure::Offline(crate::tools::GOOGLE_UNREACHED.to_owned())
 }
 
 /// `Ana Reyes <ana@example.com>` as (name, address); a bare address is both.
@@ -800,14 +870,14 @@ fn row_json(t: &Thread) -> Value {
 }
 
 fn labels(core: &Core) -> Result<Value, Failure> {
-    let (_, account) = signed_in(core)?;
+    let (_, account) = reader(core)?;
     let list = with_store(core, |store| store.labels(&account))?;
     let rows: Vec<Value> = list.iter().map(|l| json!({"id": l.id, "name": l.name, "kind": l.kind, "unread": l.unread, "total": l.total})).collect();
     Ok(ok(json!({"labels": rows})))
 }
 
 fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (auth, account) = signed_in(core)?;
+    let (auth, account) = reader(core)?;
     let mut query = js::trim(&js::string_or_empty(args.get("query"))).to_owned();
     // a card's search, carried to the full screen by its ticket
     if let Some(Subject::Search(q)) = core
@@ -819,7 +889,11 @@ fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
         query = q.clone();
     }
     if !query.is_empty() {
-        return Ok(match search(core, &auth, &account, &query) {
+        let found = match &auth {
+            Some(auth) => search(core, auth, &account, &query),
+            None => Err(unreached()),
+        };
+        return Ok(match found {
             Ok(rows) => ok(
                 json!({"threads": rows.iter().map(row_json).collect::<Vec<_>>(), "more": false, "saved": false}),
             ),
@@ -840,21 +914,29 @@ fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
     }
     let skip = args.get("skip").and_then(Value::as_i64).unwrap_or(0).max(0);
     let stored = with_store(core, |store| store.threads(&account, &label, skip, PAGE))?;
+    let mut saved = false;
     if (stored.len() as i64) < PAGE {
         // the store has less than a page here: ask Google for the next one
-        match fill(core, &auth, &account, &label) {
-            Ok(_) | Err(Failure::Offline(_)) => {}
+        let filled = match &auth {
+            Some(auth) => fill(core, auth, &account, &label),
+            None => Err(unreached()),
+        };
+        match filled {
+            Ok(_) => {}
+            Err(Failure::Offline(_)) => saved = true,
             Err(e) => return Err(e),
         }
     }
     let rows = with_store(core, |store| store.threads(&account, &label, skip, PAGE))?;
     let rows: Vec<Thread> = rows.into_iter().map(|t| addressed(t, &label)).collect();
+    // nothing kept is nothing saved to show
+    let saved = saved && !rows.is_empty();
     let total = with_store(core, |store| store.thread_count(&account, &label))?;
     // no token on record yet is not the end: only an empty one is
     let more =
         with_store(core, |store| store.state(&account, &page_key(&label)))?.as_deref() != Some("");
     Ok(ok(
-        json!({"threads": rows.iter().map(row_json).collect::<Vec<_>>(), "more": more || skip + PAGE < total, "saved": false}),
+        json!({"threads": rows.iter().map(row_json).collect::<Vec<_>>(), "more": more || skip + PAGE < total, "saved": saved}),
     ))
 }
 
@@ -952,6 +1034,8 @@ pub fn view_of(thread: &Value) -> Value {
     let hidden = fold::hidden(&open);
     // each message, its history folded, and what its row says: the words
     // before the fold
+    // and the Content-IDs of the pictures that went in, whose cards go
+    let mut shown: Vec<HashSet<String>> = Vec::with_capacity(list.len());
     let (mut parts, snippets): (Vec<Part>, Vec<String>) = list
         .iter()
         .map(|m| {
@@ -960,17 +1044,35 @@ pub fn view_of(thread: &Value) -> Value {
                 Some(h) => {
                     // the pictures picked for it go in first, so what folds
                     // folds with them
-                    let mut c = clean::clean_with(&h, &|url| pictures::inline(m, url));
-                    let (folded, cut) = fold::quotes(&c.html);
-                    let fresh = cut.map(|cut| clean::visible_text(&c.html[..cut]));
-                    c.html = folded;
-                    let snippet = gmail::snippet_of(fresh.as_deref().unwrap_or(&text));
-                    (Part::Html(c, text), snippet)
+                    let put = std::cell::RefCell::new(HashSet::new());
+                    let c = clean::clean_with(&h, &|url| {
+                        let data = pictures::inline(m, url);
+                        if data.is_some() {
+                            put.borrow_mut().insert(url.to_owned());
+                        }
+                        data
+                    });
+                    // what the cleaner turned down stays out
+                    let put = put.into_inner();
+                    shown.push(
+                        put.iter()
+                            .filter(|url| !c.images.contains(url))
+                            .filter_map(|url| gmail::cid_of(url))
+                            .collect(),
+                    );
+                    let quoted = fold::quotes(&c.html).unwrap_or_default();
+                    let snippet = gmail::snippet_of(if quoted.regions.is_empty() {
+                        &text
+                    } else {
+                        &quoted.fresh
+                    });
+                    (Part::Html(c, quoted.regions, text), snippet)
                 }
                 None => {
-                    let cut = fold::plain_cut(&text).unwrap_or(text.len());
-                    let snippet = gmail::snippet_of(&text[..cut]);
-                    (Part::Text(text), snippet)
+                    shown.push(HashSet::new());
+                    let cut = fold::plain_cut(&text);
+                    let snippet = gmail::snippet_of(&text[..cut.unwrap_or(text.len())]);
+                    (Part::Text(text, cut), snippet)
                 }
             }
         })
@@ -1006,15 +1108,18 @@ pub fn view_of(thread: &Value) -> Value {
         escape(&gmail::cap_bytes(&subject, gmail::HEADER_MAX))
     );
     // an attachment is fetched from its own message, so it says which that is
-    let attachments: Vec<Value> = list
-        .iter()
-        .flat_map(|m| {
-            gmail::attachments(m).into_iter().map(|mut a| {
-                a["message"] = m.get("id").cloned().unwrap_or(Value::Null);
-                a
+    let files = |shown: &[HashSet<String>]| -> Vec<Value> {
+        list.iter()
+            .zip(shown)
+            .flat_map(|(m, shown)| {
+                gmail::attachments(m, shown).into_iter().map(|mut a| {
+                    a["message"] = m.get("id").cloned().unwrap_or(Value::Null);
+                    a
+                })
             })
-        })
-        .collect();
+            .collect()
+    };
+    let mut attachments = files(&shown);
     // what's counted is what's sent: the markup, as JSON
     let mut size = sent(&title)
         + meta.iter().map(|(b, a)| sent(b) + sent(a)).sum::<usize>()
@@ -1034,13 +1139,25 @@ pub fn view_of(thread: &Value) -> Value {
             }
         }
     }
+    // a message given way to text shows no pictures, so its cards come back
+    let mut lost = false;
+    for (part, shown) in parts.iter().zip(&mut shown) {
+        if !matches!(part, Part::Html(..)) && !shown.is_empty() {
+            shown.clear();
+            lost = true;
+        }
+    }
+    if lost {
+        attachments = files(&shown);
+    }
     let (mut page, mut links, mut images) = (title, Vec::new(), 0);
     for ((before, after), part) in meta.iter().zip(parts) {
         page.push_str(before);
         match part {
-            Part::Html(c, _) => {
+            Part::Html(c, regions, _) => {
                 let (base, count) = (links.len(), c.links.len());
-                page.push_str(&clean::rewrite(&c.html, "gws-link:", |n, out| {
+                let html = fold::wrap(&c.html, &regions);
+                page.push_str(&clean::rewrite(&html, "gws-link:", |n, out| {
                     let known = n < count;
                     if known {
                         out.push_str(&format!("\"gws-link:{}\"", n + base));
@@ -1050,7 +1167,7 @@ pub fn view_of(thread: &Value) -> Value {
                 images += c.images.len();
                 links.extend(c.links);
             }
-            Part::Text(t) => page.push_str(&fold::plain(&t)),
+            Part::Text(t, cut) => page.push_str(&fold::split(&t, cut)),
             Part::TooLong => page.push_str(TOO_LONG),
         }
         page.push_str(after);
@@ -1059,32 +1176,59 @@ pub fn view_of(thread: &Value) -> Value {
 }
 
 /// One message of a thread, as much of it as fits.
+/// A text keeps where its fold starts, so its row and its fold agree.
 enum Part {
-    Html(clean::Cleaned, String),
-    Text(String),
+    /// The cleaned HTML, what of it folds, and the message's plain text.
+    Html(clean::Cleaned, Vec<fold::Region>, String),
+    Text(String, Option<usize>),
     TooLong,
 }
 
 impl Part {
     fn size(&self) -> usize {
         match self {
-            Part::Html(c, _) => sent(&c.html) + json!(c.links).to_string().len(),
-            Part::Text(t) => sent(&fold::plain(t)),
+            // the fold's markup measured where it goes, nothing built
+            Part::Html(c, regions, _) => {
+                let mut html = 2;
+                fold::pieces(&c.html, regions, |p| html += sent(p) - 2);
+                let links = c.links.iter().map(|l| sent(l) + 1).sum::<usize>();
+                html + links.max(1) + 1
+            }
+            Part::Text(t, cut) => sent(&fold::split(t, *cut)),
             Part::TooLong => TOO_LONG.len(),
         }
     }
 
     fn shrink(&mut self) {
         *self = match std::mem::replace(self, Part::TooLong) {
-            Part::Html(_, text) => Part::Text(text),
+            // as plain text it keeps the fold where the HTML had it, worked
+            // out only now that it's needed
+            Part::Html(c, regions, text) => {
+                match regions.first().and_then(|r| fold::shrunk(&c.html, r.start)) {
+                    Some((shown, cut)) => Part::Text(shown, Some(cut)),
+                    None => {
+                        let cut = fold::plain_cut(&text);
+                        Part::Text(text, cut)
+                    }
+                }
+            }
             _ => Part::TooLong,
         };
     }
 }
 
-/// `text`'s size in a JSON result.
+/// `text`'s size in a JSON result, as serde_json writes it, counted without
+/// writing it.
 fn sent(text: &str) -> usize {
-    Value::from(text).to_string().len()
+    let escapes: usize = text
+        .bytes()
+        .map(|b| match b {
+            b'"' | b'\\' | b'\x08' | b'\x0c' | b'\n' | b'\r' | b'\t' => 1,
+            0..=0x1f => 5,
+            _ => 0,
+        })
+        .sum();
+    text.len() + escapes + 2
 }
 
 /// Whether Gmail marks this one message unread.
@@ -1108,8 +1252,73 @@ fn day(at: &str) -> String {
     }
 }
 
+/// What a saved view was made by. A view of an older shape is made again: a
+/// migration that clears them all (as 6, 7 and 10 did) runs once, and this
+/// holds for each change after. Raise it whenever `view_of` or what it lists
+/// changes.
+pub const VIEW_VERSION: i64 = 3;
+
+/// What [`read_view`] came to.
+pub(crate) enum Viewed {
+    /// Gone at Google.
+    Gone,
+    /// Past the read's cap, which another read comes to as well.
+    TooBig(Failure),
+    /// Begun, and outlasting the read's time.
+    TooSlow(Failure),
+    /// Refused by Gmail's answer, as [`Whole::Failed`].
+    Failed(Failure),
+    /// What Google sent, the page made of it, and what its pictures and its
+    /// invite's twin check came to: a view kept is only a whole one.
+    Read {
+        full: Value,
+        view: Value,
+        made: Made,
+    },
+}
+
+/// A thread read whole from Google, within `limit`, and made into the page
+/// an open shows, with what Google sent: an open and a read ahead both keep
+/// what this makes, its pictures inside the mail and what they need to show
+/// among it.
+///
+/// `gate` hears of every byte that comes for it, as Gmail sends it: the thread
+/// once it's here, and each picture inside it before it's asked for, which a
+/// false answer stops.
+pub(crate) fn read_view(
+    core: &Core,
+    auth: &Bearer,
+    account: &str,
+    id: &str,
+    limit: Limit,
+    gate: &mut dyn FnMut(u64) -> bool,
+) -> Result<Viewed, Failure> {
+    let mut full = match core.gmail.thread_whole(auth, id, limit)? {
+        Whole::Read(full) => full,
+        Whole::Gone => return Ok(Viewed::Gone),
+        Whole::TooBig(why) => return Ok(Viewed::TooBig(why)),
+        Whole::TooSlow(why) => return Ok(Viewed::TooSlow(why)),
+        Whole::Failed(why) => return Ok(Viewed::Failed(why)),
+    };
+    // past the round's share or after a sign-out, the twin check asks nothing
+    let go_on = gate(full.to_string().len() as u64);
+    let told = go_on && core.gmail.mark_twins(auth, &mut full);
+    // a picture comes as base64 inside JSON
+    let mut asks = |size: u64| gate(size.saturating_mul(4).div_ceil(3));
+    let (mut view, made) = pictures::view_within(core, auth, account, &mut full, &mut asks);
+    view["view_version"] = VIEW_VERSION.into();
+    // an `.ics` Gmail sends apart is the invite card's to fetch, so a slow or
+    // refused one never holds up the thread: until then it's pending, never
+    // none. A read ahead keeps the same
+    let invite = crate::invite::fill(None, &mut full)?;
+    view["invite"] = invite.unwrap_or_else(crate::invite::pending);
+    // a twin check cut short is a picture missed: the next read may finish it
+    let made = if told { made } else { Made::Missed };
+    Ok(Viewed::Read { full, view, made })
+}
+
 fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (auth, account) = signed_in(core)?;
+    let (auth, account) = reader(core)?;
     let id = js::trim(&js::string_or_empty(args.get("thread"))).to_owned();
     // a card's row opens by ticket
     let id = match core
@@ -1126,26 +1335,29 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     }
     if let Some(saved) = with_store(core, |store| store.view(&account, &id, now_ms()))?
         && let Ok(view) = serde_json::from_str::<Value>(&saved)
+        && view.get("view_version").and_then(Value::as_i64) == Some(VIEW_VERSION)
     {
         return Ok(pictures::answer(core, &account, view));
     }
-    let Some(mut full) = core.gmail.thread_full(&auth, &id)? else {
-        return Ok(fail("not_found", "That conversation is gone."));
+    // the sign-in is there, and the Bot can't refresh its token just now
+    let auth = auth.ok_or_else(unreached)?;
+    let (view, made) = match read_view(core, &auth, &account, &id, Limit::FULL, &mut |_| true)? {
+        Viewed::Read { view, made, .. } => (view, made),
+        Viewed::Gone => return Ok(fail("not_found", "That conversation is gone.")),
+        Viewed::TooBig(why) | Viewed::TooSlow(why) | Viewed::Failed(why) => return Err(why),
     };
-    // an `.ics` Gmail sends apart is the invite card's to fetch, so a slow
-    // or refused one never holds up the thread; until then it's pending,
-    // never none
-    let invite = crate::invite::fill(None, &mut full)?;
-    let mut view = pictures::view(core, &auth, &account, &mut full);
-    view["invite"] = invite.unwrap_or_else(crate::invite::pending);
-    with_own_store(core, &account, |store| {
-        store.put_view(&account, &id, &view.to_string(), now_ms())
-    })?;
+    // a twin check or a picture cut short isn't kept, so the next open can
+    // finish it
+    if made == Made::Whole {
+        with_own_store(core, &account, |store| {
+            store.put_view(&account, &id, &view.to_string(), now_ms())
+        })?;
+    }
     Ok(pictures::answer(core, &account, view))
 }
 
 fn changes(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (_, account) = signed_in(core)?;
+    let (auth, account) = reader(core)?;
     let since = args.get("since").and_then(Value::as_i64).unwrap_or(-1);
     let (seq, status) = with_store(core, |store| {
         Ok((
@@ -1156,8 +1368,13 @@ fn changes(core: &Core, args: &Value) -> Result<Value, Failure> {
             store.state(&account, STATUS)?,
         ))
     })?;
+    // with no live token the sync can't run, and what it last said is old news
+    let status = match auth {
+        Some(_) => status.unwrap_or_else(|| "syncing".to_owned()),
+        None => "offline".to_owned(),
+    };
     Ok(ok(
-        json!({"seq": seq, "changed": seq != since, "status": status.unwrap_or_else(|| "syncing".to_owned())}),
+        json!({"seq": seq, "changed": seq != since, "status": status}),
     ))
 }
 
@@ -1198,6 +1415,46 @@ pub fn run(core: &Core, tool: &str, args: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wake_says_what_caused_it_and_a_persons_isnt_lost() {
+        let waker = Waker::default();
+        waker.wake();
+        assert_eq!(waker.wait(), Woken::Other);
+        waker.wake_by_person();
+        waker.wake();
+        assert_eq!(waker.wait(), Woken::Person);
+        waker.wake_after(Duration::from_millis(10));
+        assert_eq!(waker.wait(), Woken::Timer);
+    }
+
+    #[test]
+    fn a_wake_after_the_time_to_look_still_counts_as_the_timer() {
+        let waker = Waker::default();
+        waker.wake_after(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(40));
+        waker.wake();
+        assert_eq!(waker.wait(), Woken::Timer);
+    }
+
+    #[test]
+    fn a_wake_for_nothing_isnt_the_timer() {
+        let waker = Waker::default();
+        waker.wake_after(Duration::from_millis(400));
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                waker.bell.notify_all();
+            });
+            assert_eq!(waker.wait(), Woken::Timer);
+        });
+        assert!(
+            start.elapsed() >= Duration::from_millis(400),
+            "woke at {:?}",
+            start.elapsed()
+        );
+    }
 
     #[test]
     fn a_row_names_who_the_persons_last_message_went_to() {
@@ -1805,6 +2062,44 @@ mod tests {
         ]}})
     }
 
+    /// [`message`] with a picture by Content-ID that the view put in.
+    fn with_picture(id: &str, html: &str) -> Value {
+        let mut m = message(id, &format!("<img src=\"cid:dot\">{html}"));
+        let alternative = m["payload"].take();
+        m["payload"] = json!({"mimeType": "multipart/related", "headers": alternative["headers"].clone(), "parts": [
+            alternative,
+            {"partId": "1", "mimeType": "image/png", "filename": "dot.png", "headers": [{"name": "Content-ID", "value": "<dot>"}], "body": {"attachmentId": "x", "size": 70}},
+        ]});
+        m["gwsPictures"] = json!({"cid:dot": "data:image/png;base64,iVBORw0KGgo="});
+        m
+    }
+
+    #[test]
+    fn a_message_given_way_to_text_gets_its_pictures_cards_back() {
+        let small = view_of(&json!({"id": "t", "messages": [with_picture("one", "<p>Hi</p>")]}));
+        assert!(small["page"].as_str().unwrap().contains("data:image/png"));
+        assert_eq!(small["attachments"], json!([]), "shown, it's the letter's");
+        // markup enough to give way, and words few enough to fit then
+        let big = "<b>.</b>".repeat(120_000);
+        let view = view_of(&json!({"id": "t", "messages": [
+            with_picture("old", &big),
+            with_picture("new", "<p>Hi</p>"),
+        ]}));
+        let page = view["page"].as_str().unwrap();
+        assert_eq!(
+            page.matches("data:image/png").count(),
+            1,
+            "the newest shows it"
+        );
+        let cards: Vec<&Value> = view["attachments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| &a["message"])
+            .collect();
+        assert_eq!(cards, [&json!("old")], "the oldest went to text");
+    }
+
     #[test]
     fn an_oversized_thread_gives_up_the_oldest_first() {
         let big = format!("<p>{}</p>", "x".repeat(500 * 1024));
@@ -2005,6 +2300,104 @@ mod tests {
         );
         assert!(
             page[fold..].contains("On Nov 6, 2026, Ana &lt;ana@example.com&gt; wrote:"),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn a_message_shrunk_to_text_keeps_its_fold() {
+        let heavy = format!(
+            r#"<p>Fresh words</p><div class="gmail_quote">{}</div>"#,
+            "<b>x</b>".repeat(120_000)
+        );
+        let view = view_of(&json!({"id": "t", "messages": [
+            labelled("a", &heavy, &["INBOX"]),
+            labelled("b", "<p>last</p>", &["INBOX"]),
+        ]}));
+        let page = view["page"].as_str().unwrap();
+        assert!(!page.contains("<b>x</b>"), "the oldest gave way to text");
+        let fold = page
+            .find(r#"<details class="gws-quote"><summary>•••</summary><pre"#)
+            .expect("the fold stays");
+        assert!(page[..fold].contains(r#"<span class="gws-snip">Fresh words</span>"#));
+        assert!(page[..fold].contains(">Fresh words</pre>"));
+        assert!(page[fold..].starts_with(
+            r#"<details class="gws-quote"><summary>•••</summary><pre style="white-space:pre-wrap;font:inherit;margin:0">xxx"#
+        ));
+    }
+
+    /// The page of a thread whose first message is too big for HTML.
+    fn shrunk_page(html: &str) -> String {
+        let heavy = format!("<p>Fresh words</p>{}{html}", "<b>x</b>".repeat(120_000));
+        let view = view_of(&json!({"id": "t", "messages": [
+            labelled("a", &heavy, &["INBOX"]),
+            labelled("b", "<p>last</p>", &["INBOX"]),
+        ]}));
+        let page = view["page"].as_str().unwrap().to_owned();
+        assert!(!page.contains("<b>x</b>"), "the oldest gave way to text");
+        page
+    }
+
+    #[test]
+    fn a_shrunk_message_with_a_plain_reply_still_folds_it() {
+        let page = shrunk_page("<p>On Nov 6, 2026, Ana wrote:</p><p>&gt; Can we?</p>");
+        let fold = page
+            .find(r#"<details class="gws-quote"><summary>•••</summary><pre"#)
+            .expect("the fold stays");
+        assert!(
+            page[fold..].contains(">On Nov 6, 2026, Ana wrote:"),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn a_shrunk_message_whose_first_quote_is_hidden_still_folds_the_rest() {
+        let page = shrunk_page(
+            r#"<div style="display:none"><blockquote type="cite">INJECT</blockquote></div><blockquote type="cite">Old words</blockquote>"#,
+        );
+        assert!(!page.contains("INJECT"), "{page}");
+        let fold = page
+            .find(r#"<details class="gws-quote"><summary>•••</summary><pre"#)
+            .expect("the fold stays");
+        assert!(page[fold..].contains(">Old words</pre>"), "{page}");
+    }
+
+    #[test]
+    fn a_parts_size_is_what_it_sends_counted_without_building_it() {
+        let c = clean::clean(
+            r#"<div><a href="https://a.example/?q=&quot;">Sounds</a> "good".<br><i>On Nov 6, 2026, Ana wrote:</i></div><blockquote type="cite">Old	\</blockquote>"#,
+        );
+        let regions = fold::quotes(&c.html).unwrap().regions;
+        assert!(!regions[0].reopen.is_empty(), "the fold reopens an element");
+        let expected = sent(&fold::wrap(&c.html, &regions)) + json!(c.links).to_string().len();
+        let part = Part::Html(c, regions, String::new());
+        let (size, made) = fold::allocations(|| part.size());
+        assert_eq!((size, made), (expected, 0));
+        let empty = Part::Html(clean::clean("<p>x</p>"), Vec::new(), String::new());
+        assert_eq!(empty.size(), sent("<p>x</p>") + 2);
+        for text in ["", "plain", "\"\\\n\r\t\u{8}\u{c}\u{1}\u{1f}\u{7f}é😀</>"] {
+            assert_eq!(sent(text), Value::from(text).to_string().len(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_shrunk_message_shows_none_of_what_its_page_hides() {
+        let page = shrunk_page(
+            r#"<div style="display:none"><blockquote type="cite">INJECT</blockquote></div>"#,
+        );
+        assert!(!page.contains("INJECT"), "{page}");
+    }
+
+    #[test]
+    fn a_bare_attribution_and_a_quote_is_not_a_row_of_its_own() {
+        let view = view_of(&json!({"id": "t", "messages": [
+            labelled("a", r#"<div>On Nov 6, 2026, Ana wrote:</div><blockquote type="cite"><div>Old words</div></blockquote>"#, &["INBOX"]),
+            labelled("b", "<p>last</p>", &["INBOX"]),
+        ]}));
+        let page = view["page"].as_str().unwrap();
+        assert!(!page.contains("gws-quote"), "{page}");
+        assert!(
+            page.contains(r#"<span class="gws-snip">On Nov 6, 2026, Ana wrote: Old words</span>"#),
             "{page}"
         );
     }

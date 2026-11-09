@@ -34,6 +34,9 @@ pub const CALENDAR_API: &str = "https://www.googleapis.com/calendar/v3";
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// A page of events, attendees and all.
 const PAGE_MAX: u64 = 32 * 1024 * 1024;
+/// What a write that may have landed says: Calendar may hold it already,
+/// so a second try could make it twice.
+pub const UNANSWERED_WRITE: &str = "Calendar didn't answer; check Calendar before trying again.";
 /// The most events one page asks for, which is the most Google gives.
 const PAGE: &str = "2500";
 /// What the first read of a calendar covers.
@@ -120,8 +123,9 @@ impl CalendarApi {
     /// A write's answer: a 200 is written whatever its body says, so one
     /// that won't read or parse is done, with nothing of the event. Every
     /// failure that leaves open whether it landed (no answer, a 5xx, or a
-    /// 5xx whose body was lost) is `Offline`; anything else is a refusal,
-    /// which wrote nothing.
+    /// 5xx whose body was lost) is `Offline`, worded as [`UNANSWERED_WRITE`];
+    /// anything else is a refusal, which wrote nothing. Nothing here or above
+    /// tries a write again: one that landed would be made twice.
     fn written(
         res: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     ) -> Result<Answer, Failure> {
@@ -133,10 +137,14 @@ impl CalendarApi {
         write: bool,
     ) -> Result<Answer, Failure> {
         let mut res = res.map_err(|e| {
-            Failure::Offline(format!(
-                "could not reach Calendar: {}",
-                js::slice_utf16(&e.to_string(), 200)
-            ))
+            Failure::Offline(if write {
+                UNANSWERED_WRITE.to_owned()
+            } else {
+                format!(
+                    "could not reach Calendar: {}",
+                    js::slice_utf16(&e.to_string(), 200)
+                )
+            })
         })?;
         let status = res.status().as_u16();
         let body = res.body_mut().with_config().limit(PAGE_MAX).read_to_vec();
@@ -144,9 +152,7 @@ impl CalendarApi {
             Ok(body) => body,
             Err(_) if write && status == 200 => return Ok(Answer::Done(Value::Null)),
             Err(_) if write && status >= 500 => {
-                return Err(Failure::Offline(
-                    "Calendar had a problem just now. Try again.".to_owned(),
-                ));
+                return Err(Failure::Offline(UNANSWERED_WRITE.to_owned()));
             }
             Err(e) => {
                 return Err(Failure::Plain(format!(
@@ -179,9 +185,7 @@ impl CalendarApi {
             429 => Err(Failure::Plain(
                 "Calendar is busy right now. Try again in a moment.".to_owned(),
             )),
-            500.. if write => Err(Failure::Offline(
-                "Calendar had a problem just now. Try again.".to_owned(),
-            )),
+            500.. if write => Err(Failure::Offline(UNANSWERED_WRITE.to_owned())),
             500.. => Err(Failure::Plain(
                 "Calendar had a problem just now. Try again.".to_owned(),
             )),
@@ -362,7 +366,7 @@ impl CalendarApi {
         if body.get("conferenceData").is_some() {
             req = req.query("conferenceDataVersion", "1");
         }
-        Self::answer(req.send(body.to_string().as_bytes()))
+        Self::written(req.send(body.to_string().as_bytes()))
     }
 
     pub fn patch(
@@ -413,7 +417,7 @@ impl CalendarApi {
             .delete(url)
             .query("sendUpdates", send_updates(notify))
             .header("authorization", auth.header());
-        Self::answer(req.call())
+        Self::written(req.call())
     }
 }
 

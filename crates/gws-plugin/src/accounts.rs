@@ -246,12 +246,23 @@ impl Accounts {
 
     /// Who is signed in and what the sign-in covers. A token that has lapsed is
     /// still their sign-in: the Bot ends one with a clear, and until it does
-    /// it's trying to refresh this one.
+    /// it's trying to refresh this one. Lapsed, it's the label the Bot made
+    /// active, or from a Bot with no list the one sign-in held, if there's
+    /// only one. Otherwise nobody: another account must never stand in for it.
     pub fn signed_in(&self) -> Option<(String, Vec<String>)> {
         let held = self.held();
-        let live = held.tokens.get(GOOGLE);
-        let label = |label: &String| held.tokens.labelled(GOOGLE, label);
-        live.or_else(|| held.who.keys().find_map(label))
+        let label = |label: &str| held.tokens.labelled(GOOGLE, label);
+        let lapsed = || match &held.listed {
+            Some(listed) => label(&listed.iter().find(|l| l.active)?.label),
+            None => {
+                let mut all = held.who.keys().filter_map(|l| label(l));
+                let one = all.next()?;
+                all.next().is_none().then_some(one)
+            }
+        };
+        held.tokens
+            .get(GOOGLE)
+            .or_else(lapsed)
             .map(|a| (a.subject.clone(), a.scopes.clone()))
     }
 

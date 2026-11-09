@@ -52,6 +52,9 @@ pub struct Part {
 struct Kept {
     message: String,
     id: String,
+    /// The part it is: what a small file, in the message itself with no id,
+    /// is read by.
+    part: String,
     name: String,
     mime: String,
 }
@@ -262,6 +265,7 @@ fn kept(args: &Value) -> Vec<Kept> {
         .map(|item| Kept {
             message: text(item, "message"),
             id: text(item, "id"),
+            part: text(item, "part"),
             name: file_name(&text(item, "name")),
             mime: mime_type(&text(item, "mime")),
         })
@@ -281,8 +285,8 @@ fn upload_ids(args: &Value) -> Vec<String> {
 #[derive(Default)]
 struct Gathered {
     parts: Vec<Part>,
-    /// `(the attachment's id, the upload that holds it now)`.
-    kept: Vec<(String, String)>,
+    /// `(the attachment's id, its part, the upload that holds it now)`.
+    kept: Vec<(String, String, String)>,
 }
 
 /// Every file a save carries: what was uploaded, then what the draft already
@@ -301,12 +305,31 @@ fn gather(core: &Core, auth: &Bearer, args: &Value) -> Result<Result<Gathered, V
             }
         }
     }
+    // a message read once, for the small files it holds itself
+    let mut read: Vec<(String, Option<Value>)> = Vec::new();
     for keep in kept(args) {
-        if !gmail::id_ok(&keep.message) || keep.id.is_empty() {
+        let by_part = keep.id.is_empty();
+        if !gmail::id_ok(&keep.message) || (by_part && !crate::files::part_ok(&keep.part)) {
             drop_kept(core, &got);
             return Ok(Err(fail("invalid_args", "That isn't an attachment.")));
         }
-        let bytes = core.gmail.attachment(auth, &keep.message, &keep.id);
+        let bytes = if by_part {
+            let at = match read.iter().position(|(m, _)| *m == keep.message) {
+                Some(at) => Ok(at),
+                None => core.gmail.full(auth, &keep.message).map(|mail| {
+                    read.push((keep.message.clone(), mail));
+                    read.len() - 1
+                }),
+            };
+            at.map(|at| {
+                read[at]
+                    .1
+                    .as_ref()
+                    .and_then(|mail| gmail::part_bytes(mail, &keep.part))
+            })
+        } else {
+            core.gmail.attachment(auth, &keep.message, &keep.id)
+        };
         if !matches!(bytes, Ok(Some(_))) {
             drop_kept(core, &got);
         }
@@ -331,7 +354,7 @@ fn gather(core: &Core, auth: &Bearer, args: &Value) -> Result<Result<Gathered, V
         if let Some(file) = held.files.get_mut(&upload) {
             file.part.bytes.clone_from(&part.bytes);
         }
-        got.kept.push((keep.id, upload));
+        got.kept.push((keep.id, keep.part, upload));
         got.parts.push(part);
     }
     if got.parts.iter().map(|p| p.bytes.len()).sum::<usize>() > ATTACHMENTS_MAX {
@@ -346,7 +369,7 @@ fn gather(core: &Core, auth: &Bearer, args: &Value) -> Result<Result<Gathered, V
 
 fn drop_kept(core: &Core, got: &Gathered) {
     let mut held = uploads(core);
-    for (_, upload) in &got.kept {
+    for (_, _, upload) in &got.kept {
         held.files.remove(upload);
     }
 }
@@ -717,7 +740,7 @@ fn write_draft(core: &Core, args: &Value) -> Result<Value, Failure> {
     let text = |path: &str| saved.pointer(path).and_then(Value::as_str);
     let id = text("/id").unwrap_or_default();
     let mut files = uploads(core);
-    let kept_ids = got.kept.iter().map(|(_, upload)| upload.clone());
+    let kept_ids = got.kept.iter().map(|(_, _, upload)| upload.clone());
     for upload in upload_ids(args).into_iter().chain(kept_ids) {
         if let Some(file) = files.files.get_mut(&upload) {
             file.draft = Some(id.to_owned());
@@ -731,7 +754,7 @@ fn write_draft(core: &Core, args: &Value) -> Result<Value, Failure> {
     let kept: Vec<Value> = got
         .kept
         .iter()
-        .map(|(attachment, upload)| json!({"id": attachment, "upload": upload}))
+        .map(|(attachment, part, upload)| json!({"id": attachment, "part": part, "upload": upload}))
         .collect();
     Ok(ok(json!({
         "draft": saved.pointer("/id"),
@@ -833,7 +856,7 @@ pub fn read(core: &Core, args: &Value) -> Result<Value, Failure> {
         "subject": gmail::header(&message, "Subject"),
         "body": gmail::body(&message),
         "thread": message.get("threadId"),
-        "attachments": gmail::attachments(&message),
+        "attachments": gmail::carried(&message),
     })))
 }
 
@@ -1155,7 +1178,7 @@ pub fn reply_start(core: &Core, args: &Value) -> Result<Value, Failure> {
         "forward" => json!({
             "to": [], "cc": [],
             "source": last.get("id"),
-            "attachments": gmail::attachments(last),
+            "attachments": gmail::carried(last),
             "subject": prefixed("Fwd: ", &subject),
             "body": format!("\n\n---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {subject}\nTo: {}\n\n{}", h("From"), h("Date"), h("To"), gmail::body(last)),
         }),

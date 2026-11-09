@@ -247,6 +247,9 @@ fn an_invite_that_didnt_come_is_asked_for_again_not_kept_as_none() {
     let view = data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
     assert_eq!(view["invite"], json!({"pending": true}), "still not none");
     google.attachments_fail(false);
+    // an open cut short isn't kept, so this one saves the view the look keeps it in
+    let view = data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
+    assert_eq!(view["invite"], json!({"pending": true}));
     let got = data(core.run("gws_mail_invite", &json!({"thread": INVITE})));
     assert_eq!(got["invite"]["title"], "Roof inspection");
     let view = data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
@@ -385,17 +388,15 @@ fn a_damaged_ics_is_a_final_cant_read_not_a_try_again() {
     data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
     let got = data(core.run("gws_mail_invite", &json!({"thread": INVITE})));
     assert_eq!(got["invite"], json!({"damaged": true}), "{got}");
-    let fetched = |google: &FakeGoogle| {
-        google
-            .log()
-            .iter()
-            .filter(|s| s.target.contains("/attachments/"))
-            .count()
-    };
-    let once = fetched(&google);
-    let again = data(core.run("gws_mail_invite", &json!({"thread": INVITE})));
-    assert_eq!(again["invite"], json!({"damaged": true}));
-    assert_eq!(fetched(&google), once, "kept, not fetched again");
+    // the same each time, never a "try again": the twin check that bytes
+    // like these cut short keeps the open's view from being saved, so it's
+    // read again rather than kept
+    let again = core.run("gws_mail_invite", &json!({"thread": INVITE}));
+    assert_ne!(again["structuredContent"]["code"], "busy", "{again}");
+    assert_eq!(
+        again["structuredContent"]["invite"],
+        json!({"damaged": true})
+    );
 }
 
 /// The rich seed with `n` changed instances of the invite's series ahead of

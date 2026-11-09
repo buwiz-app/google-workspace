@@ -320,10 +320,11 @@ fn a_lapsed_token_is_still_the_sign_in_until_the_bot_ends_it() {
     let status = core.run("gws_status", &json!({}));
     assert_eq!(status["structuredContent"]["signed_in"], true);
     assert_eq!(status["structuredContent"]["subject"], "owner@example.com");
-    let list = core.run("gws_mail_list", &json!({"label": "INBOX"}));
-    assert_eq!(list["isError"], true);
-    assert_ne!(list["structuredContent"]["code"], "account_required");
-    assert!(list.to_string().contains("Can't reach Google"), "{list}");
+    // what needs Google says it can't be reached; what's saved still reads
+    let found = core.run("gws_search_mail", &json!({"query": "roof"}));
+    assert_eq!(found["isError"], true);
+    assert_ne!(found["structuredContent"]["code"], "account_required");
+    assert!(found.to_string().contains("Can't reach Google"), "{found}");
 
     // the Bot's clear still ends it
     core.account(

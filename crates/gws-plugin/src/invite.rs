@@ -785,7 +785,7 @@ fn text_of(part: &Value) -> Option<String> {
     if data.len() > ICS_MAX / 3 * 4 + 8 {
         return None;
     }
-    let bytes = gmail::part_bytes(part);
+    let bytes = gmail::data_of(part).unwrap_or_default();
     // a byte-order mark before decoding, or a single-byte charset makes it words
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
     Some(gmail::in_charset(bytes, &gmail::part_charset(part)))

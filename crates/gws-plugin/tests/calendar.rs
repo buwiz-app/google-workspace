@@ -1620,3 +1620,29 @@ mod reads {
         }
     }
 }
+
+/// A 500 after the event went in leaves open whether it landed, so nothing
+/// tries again: one try more would make it twice.
+#[test]
+fn a_new_event_answered_500_after_it_landed_is_made_once_and_said_so() {
+    let google = account();
+    let core = signed_in(&google, "insert-500");
+    google.calendar_insert_answers_500(true);
+    let answer = core.run("gws_event_save", &meeting(1));
+    assert_eq!(answer["isError"], true, "{answer}");
+    assert_eq!(
+        answer["content"][0]["text"],
+        gws::calendar::UNANSWERED_WRITE,
+        "{answer}"
+    );
+    let posts: Vec<_> = google
+        .calendar_writes()
+        .into_iter()
+        .filter(|w| w.method == "POST")
+        .collect();
+    assert_eq!(posts.len(), 1, "no second POST: {posts:?}");
+    assert!(
+        google.log().iter().filter(|s| s.method == "POST").count() == 1,
+        "one POST reached Calendar"
+    );
+}

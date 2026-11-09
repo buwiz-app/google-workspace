@@ -119,6 +119,8 @@ pub const FILE_DISCARD: &str = "gws_file_discard";
 pub const MAIL_ATTACHMENT_OPEN: &str = "gws_mail_attachment_open";
 pub const MAIL_INVITE: &str = "gws_mail_invite";
 pub const MAIL_INVITE_REPLY: &str = "gws_mail_invite_reply";
+pub const MAIL_ATTACHMENT_PREVIEW: &str = "gws_mail_attachment_preview";
+pub const MAIL_ATTACHMENT_SAVE: &str = "gws_mail_attachment_save";
 pub const MAIL_PICTURES: &str = "gws_mail_pictures";
 pub const MAIL_PICTURE_SENDER_ADD: &str = "gws_mail_picture_sender_add";
 pub const MAIL_PICTURE_SENDER_REMOVE: &str = "gws_mail_picture_sender_remove";
@@ -575,6 +577,11 @@ pub fn defs() -> Vec<Def> {
             json!({"type": "object", "properties": {"message": {"type": "string"}, "part": {"type": "string"}}, "required": ["message", "part"]}),
         ),
         write(
+            MAIL_ATTACHMENT_SAVE,
+            "Download a mail's attachment to this Mac for the Bot to copy to Downloads. A person's press alone.",
+            json!({"type": "object", "properties": {"message": {"type": "string"}, "part": {"type": "string"}}, "required": ["message", "part"]}),
+        ),
+        write(
             MAIL_PICTURES,
             "Fetch a conversation's web pictures from this Mac and show them in it. A person's press alone: the sender can see the mail was opened.",
             json!({"type": "object", "properties": {"thread": {"type": "string"}, "trusted": {"type": "boolean"}}, "required": ["thread"]}),
@@ -594,6 +601,14 @@ pub fn defs() -> Vec<Def> {
             read_only: false,
             audience: APP_ONLY,
             open_world: false,
+        },
+        Def {
+            name: MAIL_ATTACHMENT_PREVIEW,
+            description: "A small picture on a mail, as image bytes for its card. Never another kind of file.",
+            input_schema: json!({"type": "object", "properties": {"message": {"type": "string"}, "part": {"type": "string"}}, "required": ["message", "part"]}),
+            read_only: true,
+            audience: APP_ONLY,
+            open_world: true,
         },
         Def {
             name: MAIL_INVITE,

@@ -6,6 +6,7 @@
 //! blocking, on the tool's own thread. It follows no redirects, so the token
 //! only ever goes to the API base.
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -33,7 +34,7 @@ const METADATA_AT_ONCE: usize = 8;
 /// A list or metadata answer.
 const SMALL_MAX: u64 = 1024 * 1024;
 /// A `format=full` message (attachments are not in it, only their ids).
-const FULL_MAX: u64 = 32 * 1024 * 1024;
+pub const FULL_MAX: u64 = 32 * 1024 * 1024;
 
 /// Why a Gmail call gave nothing.
 #[derive(Debug, PartialEq)]
@@ -51,6 +52,74 @@ pub enum Failure {
 /// What an attachment whose bytes won't decode fails with: a try again
 /// brings the same.
 pub const DAMAGED: &str = "That attachment came back damaged.";
+/// What a whole read of a thread came to.
+#[derive(Debug)]
+pub enum Whole {
+    Read(Value),
+    /// Gone at Google.
+    Gone,
+    /// Bigger than the read may take: another read of it comes to the same,
+    /// so it's no failure to wait out. What the read said, as a failure.
+    TooBig(Failure),
+    /// Begun, and longer coming than the read may take: on this link the
+    /// next read of it takes as long.
+    TooSlow(Failure),
+    /// Gmail answered, and refused this one: an error status, or a 200 that
+    /// isn't JSON. Not a 401, a missing scope or a busy answer, which are the
+    /// account's or Gmail's and not the thread's.
+    Failed(Failure),
+}
+
+/// What one whole read may take: its bytes and its time, and a file
+/// download's.
+#[derive(Debug, Clone, Copy)]
+pub struct Limit {
+    pub bytes: u64,
+    pub time: Duration,
+    pub file_bytes: u64,
+    pub file_time: Duration,
+}
+
+impl Limit {
+    /// What an open's read of a thread takes, and a press's download.
+    pub const FULL: Self = Self {
+        bytes: FULL_MAX,
+        time: TIMEOUT,
+        file_bytes: ATTACHMENT_MAX,
+        file_time: UPLOAD_TIMEOUT,
+    };
+}
+
+/// What a download of an attachment came to.
+#[derive(Debug)]
+pub enum File {
+    Bytes(Vec<u8>),
+    /// Gone at Google, or its id gone stale.
+    Gone,
+    /// Begun, and too big or too long coming for the download: the next one
+    /// comes to the same.
+    TooBig(Failure),
+    TooSlow(Failure),
+    /// Gmail answered, and refused this one, as [`Whole::Failed`].
+    Failed(Failure),
+}
+
+/// Why an answer gave nothing: past its cap, out of time once it had begun,
+/// refused by an answer of Gmail's about this one, or anything else.
+enum Refused {
+    TooBig(Failure),
+    TooSlow(Failure),
+    Failed(Failure),
+    Other(Failure),
+}
+
+impl From<Refused> for Failure {
+    fn from(refused: Refused) -> Self {
+        match refused {
+            Refused::TooBig(f) | Refused::TooSlow(f) | Refused::Failed(f) | Refused::Other(f) => f,
+        }
+    }
+}
 
 /// The Gmail API at a base URL.
 #[derive(Clone)]
@@ -167,6 +236,18 @@ impl Gmail {
         cap: u64,
         within: Option<Duration>,
     ) -> Result<Option<Value>, Failure> {
+        Ok(self.get_sized(auth, path, query, cap, within)?)
+    }
+
+    /// [`Self::get_within`], saying apart an answer past `cap`.
+    fn get_sized(
+        &self,
+        auth: &Bearer,
+        path: String,
+        query: Vec<(&'static str, String)>,
+        cap: u64,
+        within: Option<Duration>,
+    ) -> Result<Option<Value>, Refused> {
         let url = format!("{}/{path}", self.base);
         let mut req = self
             .agent
@@ -179,7 +260,7 @@ impl Gmail {
         for (k, v) in &query {
             req = req.query(*k, v);
         }
-        Self::answer(req.call(), cap)
+        Self::answer_sized(req.call(), cap)
     }
 
     /// A POST: a person's press, or a draft the model filled, which sends nothing.
@@ -198,11 +279,19 @@ impl Gmail {
         res: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
         cap: u64,
     ) -> Result<Option<Value>, Failure> {
+        Ok(Self::answer_sized(res, cap)?)
+    }
+
+    /// [`Self::answer`], saying apart a body past `cap`.
+    fn answer_sized(
+        res: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+        cap: u64,
+    ) -> Result<Option<Value>, Refused> {
         let mut res = res.map_err(|e| {
-            Failure::Offline(format!(
+            Refused::Other(Failure::Offline(format!(
                 "could not reach Gmail: {}",
                 js::slice_utf16(&e.to_string(), 200)
-            ))
+            )))
         })?;
         let status = res.status().as_u16();
         let body = res
@@ -211,21 +300,38 @@ impl Gmail {
             .limit(cap)
             .read_to_vec()
             .map_err(|e| {
-                Failure::Plain(format!(
+                let failure = Failure::Plain(format!(
                     "Gmail's answer could not be read: {}",
                     js::slice_utf16(&e.to_string(), 200)
-                ))
+                ));
+                match e {
+                    ureq::Error::BodyExceedsLimit(_) => Refused::TooBig(failure),
+                    // Gmail answered, and its answer outlasted the read
+                    ureq::Error::Timeout(_) => Refused::TooSlow(failure),
+                    _ => Refused::Other(failure),
+                }
             })?;
+        Self::answered(status, &body).map_err(|failure| match (&failure, status) {
+            // the account's, or Gmail asking for a wait: no one thread's
+            (Failure::AccountRequired | Failure::NeedsAccess, _) | (_, 429) => {
+                Refused::Other(failure)
+            }
+            _ => Refused::Failed(failure),
+        })
+    }
+
+    /// What Gmail's answer with `status` and `body` says.
+    fn answered(status: u16, body: &[u8]) -> Result<Option<Value>, Failure> {
         match status {
             // a delete answers with nothing
             200 | 204 if body.is_empty() => Ok(Some(Value::Null)),
-            200 => serde_json::from_slice(&body)
+            200 => serde_json::from_slice(body)
                 .map(Some)
                 .map_err(|_| Failure::Plain("Gmail's answer is not JSON".to_owned())),
             401 => Err(Failure::AccountRequired),
             404 => Ok(None),
             _ => {
-                let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
                 let why = v
                     .pointer("/error/message")
                     .and_then(Value::as_str)
@@ -453,6 +559,28 @@ impl Gmail {
         )
     }
 
+    /// [`Self::thread_full`], within `limit`, saying apart a thread past it.
+    pub fn thread_whole(&self, auth: &Bearer, id: &str, limit: Limit) -> Result<Whole, Failure> {
+        if !id_ok(id) {
+            return Ok(Whole::Gone);
+        }
+        let read = self.get_sized(
+            auth,
+            format!("threads/{id}"),
+            vec![("format", "full".to_owned())],
+            limit.bytes,
+            Some(limit.time),
+        );
+        match read {
+            Ok(Some(v)) => Ok(Whole::Read(v)),
+            Ok(None) => Ok(Whole::Gone),
+            Err(Refused::TooBig(f)) => Ok(Whole::TooBig(f)),
+            Err(Refused::TooSlow(f)) => Ok(Whole::TooSlow(f)),
+            Err(Refused::Failed(f)) => Ok(Whole::Failed(f)),
+            Err(Refused::Other(f)) => Err(f),
+        }
+    }
+
     /// Each message of a thread, with its labels now.
     pub fn thread_labels(&self, auth: &Bearer, id: &str) -> Result<Option<Messages>, Failure> {
         let query = vec![("format", "minimal".to_owned())];
@@ -569,6 +697,40 @@ impl Gmail {
         id: &str,
         within: Duration,
     ) -> Result<Option<Vec<u8>>, Failure> {
+        match self.attachment_sized(auth, message, id, within, ATTACHMENT_MAX) {
+            Ok(bytes) => Ok(bytes),
+            Err(refused) => Err(refused.into()),
+        }
+    }
+
+    /// [`Self::attachment_within`] within `limit`'s file bytes and time,
+    /// saying apart a download that began and was too big or too long coming,
+    /// and one Gmail refused.
+    pub fn attachment_whole(
+        &self,
+        auth: &Bearer,
+        message: &str,
+        id: &str,
+        limit: Limit,
+    ) -> Result<File, Failure> {
+        match self.attachment_sized(auth, message, id, limit.file_time, limit.file_bytes) {
+            Ok(Some(bytes)) => Ok(File::Bytes(bytes)),
+            Ok(None) => Ok(File::Gone),
+            Err(Refused::TooBig(f)) => Ok(File::TooBig(f)),
+            Err(Refused::TooSlow(f)) => Ok(File::TooSlow(f)),
+            Err(Refused::Failed(f)) => Ok(File::Failed(f)),
+            Err(Refused::Other(f)) => Err(f),
+        }
+    }
+
+    fn attachment_sized(
+        &self,
+        auth: &Bearer,
+        message: &str,
+        id: &str,
+        within: Duration,
+        cap: u64,
+    ) -> Result<Option<Vec<u8>>, Refused> {
         let url = format!("{}/messages/{message}/attachments/{id}", self.base);
         let req = self
             .slow
@@ -578,14 +740,89 @@ impl Gmail {
             .build()
             .header("authorization", auth.header())
             .header("accept", "application/json");
-        let Some(v) = Self::answer(req.call(), ATTACHMENT_MAX)? else {
+        let Some(v) = Self::answer_sized(req.call(), cap)? else {
             return Ok(None);
         };
         let data = v.get("data").and_then(Value::as_str).unwrap_or_default();
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(data.trim_end_matches('='))
-            .map_err(|_| Failure::Plain(DAMAGED.to_owned()))?;
+            .map_err(|_| Refused::Other(Failure::Plain(DAMAGED.to_owned())))?;
         Ok(Some(bytes))
+    }
+
+    /// Marks each invite's text/calendar alternative whose file holds the same
+    /// bytes, so [`attachments`] shows that event once. A rescheduled invite
+    /// can carry another `invite.ics` of the same size, so the size alone says
+    /// nothing. What can't be read stays, as two is better than a lost file.
+    ///
+    /// All of it keeps to [`TWINS_WITHIN`], each fetch to [`TIMEOUT`] at most:
+    /// it comes before the thread shows. Out of time, the pairs not yet read
+    /// stay two cards. `false` when a fetch was cut short or failed, so the
+    /// view made from it isn't kept: next time may tell.
+    pub fn mark_twins(&self, auth: &Bearer, thread: &mut Value) -> bool {
+        self.mark_twins_by(auth, thread, std::time::Instant::now() + TWINS_WITHIN)
+    }
+
+    /// [`Self::mark_twins`], done by `by`.
+    pub fn mark_twins_by(&self, auth: &Bearer, thread: &mut Value, by: std::time::Instant) -> bool {
+        let Some(messages) = thread.get_mut("messages").and_then(Value::as_array_mut) else {
+            return true;
+        };
+        let missed = std::cell::Cell::new(false);
+        for message in messages {
+            let Some(id) = message.get("id").and_then(Value::as_str).map(str::to_owned) else {
+                continue;
+            };
+            let bytes = |p: &Value| match data_of(p) {
+                Some(data) => Some(data),
+                None => {
+                    let att = p.pointer("/body/attachmentId").and_then(Value::as_str)?;
+                    let left = by
+                        .checked_duration_since(std::time::Instant::now())
+                        .filter(|d| !d.is_zero());
+                    let Some(left) = left else {
+                        missed.set(true);
+                        return None;
+                    };
+                    match self.attachment_within(auth, &id, att, left.min(TIMEOUT)) {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            missed.set(true);
+                            None
+                        }
+                    }
+                }
+            };
+            // the calendar part's bytes once, against each file that may be it
+            let mut read: Vec<(String, Option<Vec<u8>>)> = Vec::new();
+            let same: Vec<String> = twin_pairs(message)
+                .into_iter()
+                .filter(|(cal, file)| {
+                    let key = cal
+                        .get("partId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let at = match read.iter().position(|(k, _)| k == key) {
+                        Some(at) => at,
+                        None => {
+                            read.push((key.to_owned(), bytes(cal)));
+                            read.len() - 1
+                        }
+                    };
+                    read[at]
+                        .1
+                        .as_ref()
+                        .is_some_and(|a| bytes(file).is_some_and(|b| *a == b))
+                })
+                .filter_map(|(cal, _)| cal.get("partId").and_then(Value::as_str).map(str::to_owned))
+                .collect();
+            for part in same {
+                if let Some(cal) = message.get_mut("payload").and_then(|p| part_mut(p, &part)) {
+                    cal[TWIN] = Value::Bool(true);
+                }
+            }
+        }
+        !missed.get()
     }
 
     /// The id of the draft in conversation `thread`, among the newest there are.
@@ -801,22 +1038,120 @@ pub fn html_body(message: &Value) -> Option<String> {
     leaves.iter().find(is_html).map(|p| decode_part(p))
 }
 
-/// Attachments: `{name, mime, size, id, part}`. `part` is what stays the same
-/// from read to read, as Google calls a part's id immutable and promises nothing
-/// of `attachmentId`. A mail that's one attachment and nothing else has the empty
-/// id, and an empty one can't be told from none, so that's `root`.
-pub fn attachments(message: &Value) -> Vec<Value> {
-    fn walk(part: &Value, out: &mut Vec<Value>) {
-        let name = part
+/// What [`Gmail::mark_twins`] sets on a calendar part whose bytes are a file's
+/// too. Google never sends this key, and a sender writes MIME, not this JSON.
+const TWIN: &str = "buwizTwin";
+/// The largest calendar part compared byte for byte; past it both stay.
+const TWIN_MAX: u64 = 256 * 1024;
+/// The most (calendar part, file) pairs compared in one message. Each is a
+/// fetch, and the calendar part's own one more: an invite has one pair, and a
+/// mail with more than this many files of one name and size isn't one. Past it,
+/// the rest stay as cards.
+const TWINS_MAX: usize = 16;
+/// How long the twin check may take for a whole thread, before it shows.
+pub const TWINS_WITHIN: Duration = Duration::from_secs(5);
+
+/// Every part with a file name, and whether it sits anywhere under a
+/// multipart/alternative.
+fn named_parts(message: &Value) -> Vec<(&Value, bool)> {
+    fn walk<'a>(part: &'a Value, alternative: bool, out: &mut Vec<(&'a Value, bool)>) {
+        let named = part
             .get("filename")
             .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !name.is_empty() {
-            let id = match part.get("partId").and_then(Value::as_str) {
-                Some("") => Some("root"),
-                id => id,
-            };
-            out.push(serde_json::json!({"name": name, "mime": part.get("mimeType"), "size": part.pointer("/body/size"), "id": part.pointer("/body/attachmentId"), "part": id}));
+            .is_some_and(|n| !n.is_empty());
+        if named {
+            out.push((part, alternative));
+        }
+        let inside = alternative
+            || part
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.eq_ignore_ascii_case("multipart/alternative"));
+        for p in part
+            .get("parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            walk(p, inside, out);
+        }
+    }
+    let mut found = Vec::new();
+    if let Some(p) = message.get("payload") {
+        walk(p, false, &mut found);
+    }
+    found
+}
+
+fn file_name(part: &Value) -> &str {
+    part.get("filename")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+fn listed(part: &Value) -> Value {
+    let id = match part.get("partId").and_then(Value::as_str) {
+        Some("") => Some("root"),
+        id => id,
+    };
+    serde_json::json!({"name": file_name(part), "mime": part.get("mimeType"), "size": part.pointer("/body/size"), "id": part.pointer("/body/attachmentId"), "part": id})
+}
+
+/// A Content-ID as one key, the same from a part's header and from a `cid:`
+/// URL: percent escapes undone, then no angle brackets, in lower case. RFC 2392
+/// makes the URL the header's id escaped, and mail clients match either case,
+/// so `<Logo@a>`, `cid:logo%40a` and `CID:%3Clogo@A%3E` are one.
+pub fn cid_key(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+        match (
+            bytes[at],
+            bytes.get(at + 1).copied().and_then(hex),
+            bytes.get(at + 2).copied().and_then(hex),
+        ) {
+            (b'%', Some(h), Some(l)) => {
+                out.push(h * 16 + l);
+                at += 3;
+            }
+            (b, ..) => {
+                out.push(b);
+                at += 1;
+            }
+        }
+    }
+    let id = String::from_utf8(out).ok()?;
+    let id = id
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim();
+    (!id.is_empty()).then(|| id.to_lowercase())
+}
+
+/// `cid:<id>`'s [`cid_key`], or none for any other URL.
+pub fn cid_of(url: &str) -> Option<String> {
+    url.get(..4)
+        .filter(|s| s.eq_ignore_ascii_case("cid:"))
+        .and_then(|_| cid_key(&url[4..]))
+}
+
+/// Every part of `message` the letter may show by Content-ID, by its
+/// [`cid_key`]: the first with each id, and none sent as an attachment, which
+/// stays a file (RFC 2183).
+pub fn by_content_id(message: &Value) -> HashMap<String, &Value> {
+    fn walk<'a>(part: &'a Value, out: &mut HashMap<String, &'a Value>) {
+        let attached = part_header(part, "content-disposition").is_some_and(|d| {
+            d.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("attachment")
+        });
+        if let Some(id) = part_header(part, "content-id").and_then(cid_key)
+            && !attached
+        {
+            out.entry(id).or_insert(part);
         }
         for p in part
             .get("parts")
@@ -827,11 +1162,125 @@ pub fn attachments(message: &Value) -> Vec<Value> {
             walk(p, out);
         }
     }
-    let mut out = Vec::new();
+    let mut out = HashMap::new();
     if let Some(p) = message.get("payload") {
         walk(p, &mut out);
     }
     out
+}
+
+/// Attachments as the reader shows them: `{name, mime, size, id, part}`.
+/// `part` is what stays the same from read to read, as Google calls a part's
+/// id immutable and promises nothing of `attachmentId`. A mail that's one
+/// attachment and nothing else has the empty id, and an empty one can't be told
+/// from none, so that's `root`.
+///
+/// `shown` is the [`cid_key`]s of the pictures the view put in the letter, and
+/// each of those is the letter's, not a file. A picture referenced but not
+/// shown, too big, of a kind not taken or out of time, stays a card. An invite's
+/// event comes twice, as Google sends it: the text/calendar alternative of the
+/// letter and an application/ics file. The alternative goes once
+/// [`Gmail::mark_twins`] has found the file holds the same bytes. Two files are
+/// never made one, whatever their names.
+pub fn attachments(message: &Value, shown: &HashSet<String>) -> Vec<Value> {
+    let inline = by_content_id(message);
+    let in_letter = |p: &Value| {
+        part_header(p, "content-id")
+            .and_then(cid_key)
+            .filter(|id| shown.contains(id))
+            .and_then(|id| inline.get(&id))
+            .is_some_and(|q| std::ptr::eq(*q, p))
+    };
+    named_parts(message)
+        .into_iter()
+        .filter(|(p, _)| !in_letter(p) && p.get(TWIN) != Some(&Value::Bool(true)))
+        .map(|(p, _)| listed(p))
+        .collect()
+}
+
+/// Every part a draft or a forward carries on: each with a file name, the
+/// pictures the letter shows by Content-ID too, and nothing made one, so a
+/// draft saved again loses none of what it held.
+pub fn carried(message: &Value) -> Vec<Value> {
+    named_parts(message)
+        .into_iter()
+        .map(|(p, _)| listed(p))
+        .collect()
+}
+
+/// The pairs that may be one event twice: a text/calendar part under an
+/// alternative, and each application/ics file outside one with its name and
+/// its size. Their bytes decide. `(the calendar part, the file)`.
+fn twin_pairs(message: &Value) -> Vec<(&Value, &Value)> {
+    let parts = named_parts(message);
+    let typed = |p: &Value, kind: &str| {
+        p.get("mimeType")
+            .and_then(Value::as_str)
+            .is_some_and(|m| m.eq_ignore_ascii_case(kind))
+    };
+    let size = |p: &Value| p.pointer("/body/size").and_then(Value::as_u64);
+    let mut pairs = Vec::new();
+    for (cal, _) in parts
+        .iter()
+        .filter(|(p, alt)| *alt && typed(p, "text/calendar"))
+    {
+        let Some(n) = size(cal).filter(|n| *n <= TWIN_MAX) else {
+            continue;
+        };
+        for (file, _) in parts.iter().filter(|(p, alt)| {
+            !*alt
+                && typed(p, "application/ics")
+                && file_name(p) == file_name(cal)
+                && size(p) == Some(n)
+        }) {
+            if pairs.len() == TWINS_MAX {
+                return pairs;
+            }
+            pairs.push((*cal, *file));
+        }
+    }
+    pairs
+}
+
+/// A part's own `body.data` as bytes: how Gmail can send a small file, with
+/// no attachment id to fetch it by.
+pub fn data_of(part: &Value) -> Option<Vec<u8>> {
+    let data = part.pointer("/body/data").and_then(Value::as_str)?;
+    let clean: String = data
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '=')
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            c => c,
+        })
+        .collect();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(clean)
+        .ok()
+}
+
+/// The bytes a part holds in the message itself, by the id
+/// [`attachments`] and [`carried`] give it (`root` for the whole message).
+pub fn part_bytes(message: &Value, part: &str) -> Option<Vec<u8>> {
+    let id = if part == "root" { "" } else { part };
+    fn find<'a>(p: &'a Value, id: &str) -> Option<&'a Value> {
+        if p.get("partId").and_then(Value::as_str) == Some(id) {
+            return Some(p);
+        }
+        p.get("parts")?.as_array()?.iter().find_map(|q| find(q, id))
+    }
+    data_of(find(message.get("payload")?, id)?)
+}
+
+fn part_mut<'a>(part: &'a mut Value, id: &str) -> Option<&'a mut Value> {
+    if part.get("partId").and_then(Value::as_str) == Some(id) {
+        return Some(part);
+    }
+    part.get_mut("parts")?
+        .as_array_mut()?
+        .iter_mut()
+        .find_map(|p| part_mut(p, id))
 }
 
 fn collect_leaves<'a>(part: &'a Value, out: &mut Vec<&'a Value>) {
@@ -865,27 +1314,6 @@ fn part_header<'a>(part: &'a Value, name: &str) -> Option<&'a str> {
         })
         .and_then(|h| h.get("value"))
         .and_then(Value::as_str)
-}
-
-/// A part's `body.data` (base64url, padded or not, or standard base64) as
-/// bytes; none when it isn't base64.
-pub(crate) fn part_bytes(part: &Value) -> Vec<u8> {
-    let data = part
-        .pointer("/body/data")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let clean: String = data
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '=')
-        .map(|c| match c {
-            '+' => '-',
-            '/' => '_',
-            c => c,
-        })
-        .collect();
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(clean)
-        .unwrap_or_default()
 }
 
 /// A part's charset, from its Content-Type, lower case; empty when it names none.
@@ -926,7 +1354,7 @@ pub(crate) fn in_charset(bytes: &[u8], charset: &str) -> String {
 
 /// A part's `body.data` as text in its charset.
 fn decode_part(part: &Value) -> String {
-    in_charset(&part_bytes(part), &part_charset(part))
+    in_charset(&data_of(part).unwrap_or_default(), &part_charset(part))
 }
 
 /// `&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&nbsp;` and numeric
@@ -1097,16 +1525,213 @@ mod tests {
                 {"partId": "2.0", "mimeType": "text/csv", "filename": "b.csv", "body": {"attachmentId": "y"}},
             ]},
         ]}});
-        let parts: Vec<Value> = attachments(&mixed)
+        let parts: Vec<Value> = attachments(&mixed, &none())
             .iter()
             .map(|a| a["part"].clone())
             .collect();
         assert_eq!(parts, [json!("1"), json!("2.0")]);
         let alone = json!({"payload": {"partId": "", "mimeType": "text/csv", "filename": "a.csv", "body": {"attachmentId": "x"}}});
-        assert_eq!(attachments(&alone)[0]["part"], "root");
+        assert_eq!(attachments(&alone, &none())[0]["part"], "root");
         // one that doesn't say can't pass for another: it opens nothing
         let silent = json!({"payload": {"mimeType": "text/csv", "filename": "a.csv"}});
-        assert_eq!(attachments(&silent)[0]["part"], Value::Null);
+        assert_eq!(attachments(&silent, &none())[0]["part"], Value::Null);
+    }
+
+    fn none() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    fn names(message: &Value) -> Vec<(String, String)> {
+        shown_names(message, &none())
+    }
+
+    fn shown_names(message: &Value, shown: &HashSet<String>) -> Vec<(String, String)> {
+        attachments(message, shown)
+            .iter()
+            .map(|a| {
+                (
+                    a["name"].as_str().unwrap().to_owned(),
+                    a["part"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn pair(name: &str, part: &str) -> (String, String) {
+        (name.to_owned(), part.to_owned())
+    }
+
+    fn twins(message: &Value) -> Vec<(String, String)> {
+        twin_pairs(message)
+            .into_iter()
+            .map(|(c, f)| pair(c["partId"].as_str().unwrap(), f["partId"].as_str().unwrap()))
+            .collect()
+    }
+
+    fn invite(calendar_size: u64, deeper: bool) -> Value {
+        let calendar = json!({"partId": "0.1", "mimeType": "text/calendar", "filename": "invite.ics", "body": {"attachmentId": "x", "size": calendar_size}});
+        let calendar = if deeper {
+            json!({"partId": "0.1", "mimeType": "multipart/related", "parts": [
+                {"partId": "0.1.0", "mimeType": "text/calendar", "filename": "invite.ics", "body": {"attachmentId": "x", "size": calendar_size}},
+            ]})
+        } else {
+            calendar
+        };
+        json!({"payload": {"partId": "", "mimeType": "multipart/mixed", "parts": [
+            {"partId": "0", "mimeType": "multipart/alternative", "parts": [
+                {"partId": "0.0", "mimeType": "text/plain", "body": {"data": b64("Hi")}},
+                calendar,
+            ]},
+            {"partId": "1", "mimeType": "application/ics", "filename": "invite.ics", "headers": [{"name": "Content-Disposition", "value": "attachment; filename=\"invite.ics\""}], "body": {"attachmentId": "y", "size": 640}},
+        ]}})
+    }
+
+    #[test]
+    fn an_invites_calendar_part_and_its_file_of_one_size_may_be_one_event() {
+        assert_eq!(twins(&invite(640, false)), [pair("0.1", "1")]);
+        // a rescheduled invite of another size is another event
+        assert_eq!(twins(&invite(651, false)), []);
+    }
+
+    #[test]
+    fn only_an_ics_file_can_be_the_twin_and_every_one_is_compared() {
+        let mut two = invite(640, false);
+        let second = json!({"partId": "2", "mimeType": "application/ics", "filename": "invite.ics", "body": {"attachmentId": "z", "size": 640}});
+        two["payload"]["parts"].as_array_mut().unwrap().push(second);
+        assert_eq!(twins(&two), [pair("0.1", "1"), pair("0.1", "2")]);
+        // a file of the same name and size that isn't an event is no twin
+        let mut other = invite(640, false);
+        other["payload"]["parts"][1]["mimeType"] = json!("application/octet-stream");
+        assert_eq!(twins(&other), []);
+    }
+
+    #[test]
+    fn a_small_file_is_read_from_its_own_part() {
+        let mail = json!({"payload": {"partId": "", "mimeType": "multipart/mixed", "parts": [
+            {"partId": "0", "mimeType": "text/plain", "body": {"data": b64("Hi")}},
+            {"partId": "1", "mimeType": "text/csv", "filename": "a.csv", "body": {"data": b64("a,b"), "size": 3}},
+        ]}});
+        assert_eq!(part_bytes(&mail, "1"), Some(b"a,b".to_vec()));
+        assert_eq!(part_bytes(&mail, "2"), None);
+        let alone = json!({"payload": {"partId": "", "mimeType": "text/csv", "filename": "a.csv", "body": {"data": b64("x")}}});
+        assert_eq!(part_bytes(&alone, "root"), Some(b"x".to_vec()));
+    }
+
+    #[test]
+    fn a_calendar_part_deep_inside_the_alternative_is_still_its_part() {
+        assert_eq!(twins(&invite(640, true)), [pair("0.1.0", "1")]);
+    }
+
+    #[test]
+    fn only_a_marked_twin_leaves_the_list_and_a_draft_keeps_both() {
+        let mut both = invite(640, false);
+        assert_eq!(
+            names(&both),
+            [pair("invite.ics", "0.1"), pair("invite.ics", "1")],
+            "unread, the bytes haven't said they're one"
+        );
+        let cal = part_mut(both.get_mut("payload").unwrap(), "0.1").unwrap();
+        cal[TWIN] = json!(true);
+        assert_eq!(names(&both), [pair("invite.ics", "1")]);
+        assert_eq!(carried(&both).len(), 2);
+    }
+
+    #[test]
+    fn two_files_with_one_name_and_size_stay_two() {
+        let twice = json!({"payload": {"partId": "", "mimeType": "multipart/mixed", "parts": [
+            {"partId": "0", "mimeType": "text/plain", "body": {"data": b64("Hi")}},
+            {"partId": "1", "mimeType": "image/png", "filename": "scan.png", "headers": [{"name": "Content-Disposition", "value": "attachment"}], "body": {"attachmentId": "x", "size": 90}},
+            {"partId": "2", "mimeType": "image/png", "filename": "scan.png", "body": {"attachmentId": "y", "size": 90}},
+            {"partId": "3", "mimeType": "image/png", "filename": "scan.png", "body": {"attachmentId": "z"}},
+        ]}});
+        assert_eq!(
+            names(&twice),
+            [
+                pair("scan.png", "1"),
+                pair("scan.png", "2"),
+                pair("scan.png", "3")
+            ]
+        );
+        assert_eq!(twins(&twice), []);
+    }
+
+    #[test]
+    fn a_picture_the_view_put_in_is_not_a_file_but_is_carried() {
+        let shown = |disposition: Option<&str>| {
+            let mut headers = vec![json!({"name": "Content-ID", "value": "<logo>"})];
+            if let Some(d) = disposition {
+                headers.push(json!({"name": "Content-Disposition", "value": d}));
+            }
+            json!({"payload": {"partId": "", "mimeType": "multipart/related", "parts": [
+                {"partId": "0", "mimeType": "text/html", "body": {"data": b64("<img src=cid:logo>")}},
+                {"partId": "1", "mimeType": "image/png", "filename": "logo.png", "headers": headers, "body": {"attachmentId": "x", "size": 90}},
+            ]}})
+        };
+        let logo = HashSet::from(["logo".to_owned()]);
+        for disposition in [Some("inline; filename=\"logo.png\""), None] {
+            let mail = shown(disposition);
+            assert!(attachments(&mail, &logo).is_empty(), "{disposition:?}");
+            // a draft or a forward carries it on
+            let carried: Vec<Value> = carried(&mail).iter().map(|a| a["part"].clone()).collect();
+            assert_eq!(carried, [json!("1")], "{disposition:?}");
+            // named in the letter but not put in, it stays a card
+            assert_eq!(names(&mail), [pair("logo.png", "1")], "{disposition:?}");
+        }
+    }
+
+    #[test]
+    fn a_picture_sent_as_a_file_stays_one_and_is_not_put_in_the_letter() {
+        let mail = json!({"payload": {"partId": "", "mimeType": "multipart/related", "parts": [
+            {"partId": "0", "mimeType": "text/html", "body": {"data": b64("<img src=cid:logo>")}},
+            {"partId": "1", "mimeType": "image/png", "filename": "logo.png", "headers": [{"name": "Content-ID", "value": "<logo>"}, {"name": "Content-Disposition", "value": "Attachment; filename=\"logo.png\""}], "body": {"attachmentId": "x", "size": 90}},
+        ]}});
+        assert!(by_content_id(&mail).is_empty(), "nothing to put in");
+        let logo = HashSet::from(["logo".to_owned()]);
+        assert_eq!(shown_names(&mail, &logo), [pair("logo.png", "1")]);
+    }
+
+    #[test]
+    fn only_the_part_put_in_leaves_the_cards() {
+        let mail = json!({"payload": {"partId": "", "mimeType": "multipart/related", "parts": [
+            {"partId": "0", "mimeType": "text/html", "body": {"data": b64("<img src=\"CID:%3CR1%3E\">")}},
+            {"partId": "1", "mimeType": "image/png", "filename": "a.png", "headers": [{"name": "Content-ID", "value": "<r1>"}], "body": {"attachmentId": "x", "size": 90}},
+            {"partId": "2", "mimeType": "image/png", "filename": "b.png", "headers": [{"name": "Content-ID", "value": "<R1>"}], "body": {"attachmentId": "y", "size": 90}},
+            {"partId": "3", "mimeType": "image/png", "filename": "c.png", "headers": [{"name": "Content-ID", "value": "<r10>"}], "body": {"attachmentId": "z", "size": 90}},
+        ]}});
+        let shown: HashSet<String> = cid_of("CID:%3CR1%3E").into_iter().collect();
+        // the second with the same id was never put in, nor one with a longer id
+        assert_eq!(
+            shown_names(&mail, &shown),
+            [pair("b.png", "2"), pair("c.png", "3")]
+        );
+    }
+
+    #[test]
+    fn a_content_id_is_one_key_from_its_header_or_a_cid_url() {
+        assert_eq!(cid_of("cid:logo@digest").as_deref(), Some("logo@digest"));
+        assert_eq!(
+            cid_of("CID:%3CLogo%40digest%3E").as_deref(),
+            Some("logo@digest")
+        );
+        assert_eq!(cid_key(" <Logo@Digest> ").as_deref(), Some("logo@digest"));
+        assert_eq!(cid_of("cid:"), None);
+        assert_eq!(cid_of("cid:%3C%3E"), None);
+        assert_eq!(cid_of("https://a.example/cid:x"), None);
+        assert_eq!(
+            cid_of("cid:100%"),
+            Some("100%".to_owned()),
+            "a lone % stays"
+        );
+    }
+
+    #[test]
+    fn up_to_sixteen_files_are_compared_with_a_calendar_part() {
+        let mut many = invite(640, false);
+        for n in 2..30 {
+            let file = json!({"partId": n.to_string(), "mimeType": "application/ics", "filename": "invite.ics", "body": {"attachmentId": format!("z{n}"), "size": 640}});
+            many["payload"]["parts"].as_array_mut().unwrap().push(file);
+        }
+        assert_eq!(twins(&many).len(), 16);
     }
 
     #[test]

@@ -95,6 +95,8 @@ pub(crate) struct Calendars {
     /// A PATCH is written, and answered 500, as a backend that fell over
     /// after the write would.
     pub(crate) patch_answers_500: bool,
+    /// An insert is written, and answered 500.
+    pub(crate) insert_answers_500: bool,
     /// A PATCH is refused with this status, and nothing is written.
     pub(crate) patch_refuses: Option<u16>,
 }
@@ -790,6 +792,9 @@ impl Calendars {
         event["id"] = json!(id);
         self.add(at, event);
         self.record(r, calendar, &id, sent);
+        if self.insert_answers_500 {
+            return error(500, "Backend Error");
+        }
         match self.list[at].event(&id) {
             Some(event) => Reply::json(200, event),
             None => not_found(),

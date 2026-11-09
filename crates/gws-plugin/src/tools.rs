@@ -117,6 +117,7 @@ pub const FILE_EDITS: &str = "gws_file_edits";
 pub const FILE_UPLOAD: &str = "gws_file_upload";
 pub const FILE_DISCARD: &str = "gws_file_discard";
 pub const MAIL_ATTACHMENT_OPEN: &str = "gws_mail_attachment_open";
+pub const MAIL_ATTACHMENT_SAVE: &str = "gws_mail_attachment_save";
 pub const MAIL_PICTURES: &str = "gws_mail_pictures";
 pub const MAIL_PICTURE_SENDER_ADD: &str = "gws_mail_picture_sender_add";
 pub const MAIL_PICTURE_SENDER_REMOVE: &str = "gws_mail_picture_sender_remove";
@@ -570,6 +571,11 @@ pub fn defs() -> Vec<Def> {
         write(
             MAIL_ATTACHMENT_OPEN,
             "Download a mail's attachment to this Mac for the Bot's viewer. A person's press alone. An edit can only be saved to Drive as a new file.",
+            json!({"type": "object", "properties": {"message": {"type": "string"}, "part": {"type": "string"}}, "required": ["message", "part"]}),
+        ),
+        write(
+            MAIL_ATTACHMENT_SAVE,
+            "Download a mail's attachment to this Mac for the Bot to copy to Downloads. A person's press alone.",
             json!({"type": "object", "properties": {"message": {"type": "string"}, "part": {"type": "string"}}, "required": ["message", "part"]}),
         ),
         write(

@@ -114,8 +114,8 @@ fn save_hands_the_bot_the_files_bytes() {
         .unwrap_or_else(|e| panic!("the card: {e}: {:?}", app.screen().texts()));
     app.press("label:Save this attachment")
         .expect("Save presses");
-    app.wait_for_within("text:Saved to Downloads.", WAIT)
-        .unwrap_or_else(|e| panic!("saved: {e}: {:?}", app.screen().texts()));
+    app.wait_for_within("text:Saving to Downloads…", WAIT)
+        .unwrap_or_else(|e| panic!("saving: {e}: {:?}", app.screen().texts()));
     settle(&mut app);
     let answers = real.answers.lock().unwrap();
     let (_, saved) = answers

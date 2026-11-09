@@ -1983,7 +1983,7 @@ fn a_small_file_with_no_attachment_id_still_opens_saves_and_shows_its_picture() 
 }
 
 #[test]
-fn save_calls_the_tool_with_the_files_ids_and_says_it_saved() {
+fn save_calls_the_tool_with_the_files_ids_and_leaves_saved_to_the_bot() {
     let (mut app, fake) = with_attachments();
     *fake.save_answer.lock().unwrap() = Some(json!({"saved": true}));
     app.press("label:Save this attachment").expect("it presses");
@@ -1992,7 +1992,9 @@ fn save_calls_the_tool_with_the_files_ids_and_says_it_saved() {
         fake.called("gws_mail_attachment_save"),
         [json!({"message": "m7", "part": "1"})]
     );
-    assert!(app.screen().shows("Saved to Downloads."));
+    // the Bot hasn't copied it yet: its own toast says when it has
+    assert!(app.screen().shows("Saving to Downloads…"));
+    assert!(!app.screen().shows("Saved to Downloads."));
     assert!(fake.called("gws_mail_attachment_open").is_empty());
 }
 
@@ -2004,7 +2006,7 @@ fn a_refused_save_says_why() {
     app.press("label:Save this attachment").expect("it presses");
     settle(&mut app);
     assert!(app.screen().shows("Update Buwiz Bot to open this here."));
-    assert!(!app.screen().shows("Saved to Downloads."));
+    assert!(!app.screen().shows("Saving to Downloads…"));
 }
 
 #[test]

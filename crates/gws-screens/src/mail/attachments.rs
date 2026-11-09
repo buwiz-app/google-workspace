@@ -299,7 +299,8 @@ fn card(b: Bridge, m: Mail, c: Cards, at: usize, a: Attachment) -> View {
                             &saved,
                             "gws_mail_attachment_save",
                             "Saving…",
-                            Some("Saved to Downloads."),
+                            // the Bot copies it after this answer, and says how that went
+                            Some("Saving to Downloads…"),
                         );
                     })
                     .child(text("Save").app_class(Some(format!("text-[12px] {INK}").into()))),

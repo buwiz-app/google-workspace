@@ -958,3 +958,30 @@ fn a_picture_google_said_too_little_of_leaves_its_thread_to_the_open() {
     let page = opened["page"].as_str().unwrap();
     assert_eq!(page.matches("data:image/png;base64,").count(), 1, "{page}");
 }
+
+#[test]
+fn a_picture_that_failed_to_come_keeps_no_view_and_a_later_round_keeps_it() {
+    let google = seeded(vec![with_pictures(1, 1, 1, 1024), mail(2, 2)]);
+    let core = synced(&google, "pictures-failed");
+    google.attachment_reads_fail(true);
+    gws::prefetch::run(&core).unwrap();
+    assert!(
+        !has_view(&core, &id(1)),
+        "a view short of a picture isn't kept"
+    );
+    assert!(has_view(&core, &id(2)), "older mail goes on");
+    google.attachment_reads_fail(false);
+    gws::prefetch::run(&core).unwrap();
+    let kept: Value = {
+        let held = core.store().unwrap();
+        let view = held
+            .as_ref()
+            .unwrap()
+            .view(FAKE_EMAIL, &id(1), 0)
+            .unwrap()
+            .expect("kept once the picture comes");
+        serde_json::from_str(&view).unwrap()
+    };
+    let page = kept["page"].as_str().unwrap();
+    assert_eq!(page.matches("data:image/png;base64,").count(), 1, "{page}");
+}

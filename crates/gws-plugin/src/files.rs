@@ -94,8 +94,8 @@ pub(crate) const NO_TYPE: [&str; 2] = ["", "application/octet-stream"];
 /// How an attachment was handed over, in its row's `version`: an attachment
 /// has no Drive version, and the store keeps no other place for it. Empty is
 /// the Bot's own view.
-const BY_APP: &str = "open_with";
-const SAVED: &str = "save";
+const BY_APP: &str = handoff::OPEN_WITH;
+const SAVED: &str = handoff::SAVE;
 const OPEN_FIELDS: &str = "id,name,mimeType,size,version,md5Checksum,capabilities(canDownload)";
 const CHECK_FIELDS: &str = "version,md5Checksum,parents";
 
@@ -695,6 +695,14 @@ fn read_only(row: &Opened) -> bool {
             || !handoff::by_mime(&row.mime).is_some_and(|kind| kind.editable))
 }
 
+/// Whether the Mac's own app changed a file it was handed: read-only here, so
+/// [`is_edited`] never says, and only a hash against what came can.
+fn changed_in_app(core: &Core, path: &Path, row: &Opened) -> bool {
+    row.version == BY_APP
+        && file_here(path)
+        && core.hashes.run(path).map_or(true, |hash| hash != row.hash)
+}
+
 /// The way an attachment's row says it was handed over.
 fn handed_way(row: &Opened) -> Way {
     if row.version == BY_APP {
@@ -1060,7 +1068,22 @@ fn write_part(dir: &Path, bytes: &[u8]) -> Result<(), Failure> {
         part.write_all(bytes)?;
         quarantine(&part)
     };
-    write().map_err(|_| cant_save())
+    write().map_err(|e| write_failed(&e))
+}
+
+/// A write that failed. A disk that can't hold the download mark is said so:
+/// nothing lands here unmarked, and the person can move the Bot's data to one
+/// that can.
+fn write_failed(e: &std::io::Error) -> Failure {
+    #[cfg(target_os = "macos")]
+    if matches!(e.raw_os_error(), Some(libc::ENOTSUP | libc::EOPNOTSUPP)) {
+        return Failure::Plain(
+            "This disk can't hold the mark macOS puts on a download, so the file wasn't saved here."
+                .to_owned(),
+        );
+    }
+    let _ = e;
+    cant_save()
 }
 
 /// Marks a stranger's file as come from outside, as a browser's download is:
@@ -1119,12 +1142,21 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
         if row.account == account && now == Some(handed_way(row)) {
             return reopen(core, row);
         }
+        let path = path_of(core, row)?;
         // this Bot would hand an edit elsewhere, where it'd be lost
-        if row.account == account && is_edited(core, &path_of(core, row)?, row) {
+        if row.account == account && is_edited(core, &path, row) {
             return Ok(needs_update("open"));
         }
+        // what the Mac's own app changed is never the Bot's to upload, but a
+        // download mustn't land on it either
+        if row.account == account && changed_in_app(core, &path, row) {
+            return Ok(refusal(
+                "in_use",
+                "This attachment has changes in another app on this Mac. Save them there first.",
+            ));
+        }
         // a download would land on another account's work
-        if is_edited(core, &path_of(core, row)?, row) {
+        if is_edited(core, &path, row) || changed_in_app(core, &path, row) {
             return Ok(refusal(
                 "in_use",
                 "Another of your Google accounts has edits to this attachment here.",
@@ -1627,6 +1659,22 @@ mod tests {
             browser_link("a1", "video/mp4"),
             "https://drive.google.com/file/d/a1/view"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_disk_that_cant_hold_the_download_mark_says_so() {
+        for code in [libc::ENOTSUP, libc::EOPNOTSUPP] {
+            let Failure::Plain(why) = write_failed(&std::io::Error::from_raw_os_error(code)) else {
+                panic!("a plain failure");
+            };
+            assert!(why.contains("can't hold the mark"), "{why}");
+        }
+        let Failure::Plain(why) = write_failed(&std::io::Error::from_raw_os_error(libc::ENOSPC))
+        else {
+            panic!("a plain failure");
+        };
+        assert_eq!(why, "That file couldn't be saved on this Mac.");
     }
 
     #[test]

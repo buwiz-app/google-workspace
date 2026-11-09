@@ -1256,11 +1256,11 @@ fn open_attachment(home: &Home, n: usize) -> Value {
 #[test]
 fn an_attachment_opens_the_same_way_in_a_folder_of_its_own() {
     let google = FakeGoogle::start(Seed::default());
-    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK report")]));
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK\x03\x04report")]));
     let home = Home::new(&google.base(), "att");
     let answer = open_attachment(&home, 0);
     let path = path_in(&answer);
-    assert_eq!(fs::read(&path).unwrap(), b"PK report");
+    assert_eq!(fs::read(&path).unwrap(), b"PK\x03\x04report");
     assert_eq!(answer["_meta"]["buwiz/document"]["name"], "report.docx");
     assert_eq!(answer["_meta"]["buwiz/document"]["mime"], DOCX);
     assert_eq!(answer["structuredContent"]["opened"], true);
@@ -1286,7 +1286,7 @@ fn an_attachment_opens_the_same_way_in_a_folder_of_its_own() {
 #[test]
 fn a_thread_says_which_message_each_attachment_is_on() {
     let google = FakeGoogle::start(Seed::default());
-    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK report")]));
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK\x03\x04report")]));
     let home = Home::new(&google.base(), "attthread");
     let thread = data(
         home.core
@@ -1298,16 +1298,20 @@ fn a_thread_says_which_message_each_attachment_is_on() {
         "gws_mail_attachment_open",
         &json!({"message": listed["message"], "part": listed["part"]}),
     );
-    assert_eq!(fs::read(path_in(&answer)).unwrap(), b"PK report");
+    assert_eq!(fs::read(path_in(&answer)).unwrap(), b"PK\x03\x04report");
 }
 
 #[test]
 fn an_attachments_hostile_name_stays_in_its_folder() {
     let google = FakeGoogle::start(Seed::default());
     google.deliver(mail_with(vec![
-        ("../../../evil.docx", DOCX, b"PK"),
-        ("/etc/passwd.docx", DOCX, b"PK fake"),
-        (".hidden.docx", "application/octet-stream", b"PK fake"),
+        ("../../../evil.docx", DOCX, b"PK\x03\x04"),
+        ("/etc/passwd.docx", DOCX, b"PK\x03\x04fake"),
+        (
+            ".hidden.docx",
+            "application/octet-stream",
+            b"PK\x03\x04fake",
+        ),
     ]));
     let home = Home::new(&google.base(), "atthostile");
     for n in 0..3 {
@@ -1329,7 +1333,7 @@ fn read_again(home: &Home) -> Value {
 #[test]
 fn an_id_that_changes_between_reads_is_still_the_same_attachment() {
     let google = FakeGoogle::start(Seed::default());
-    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK report")]));
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK\x03\x04report")]));
     google.attachment_ids_change();
     let home = Home::new(&google.base(), "attid");
     let first = read_again(&home);
@@ -1360,7 +1364,7 @@ fn second_account_in_use(home: &Home) {
 #[test]
 fn another_accounts_edited_attachment_isnt_opened_over() {
     let google = FakeGoogle::start(Seed::default());
-    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK report")]));
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK\x03\x04report")]));
     let home = Home::new(&google.base(), "attaccounts");
     let path = path_in(&open_attachment(&home, 0));
     fs::write(&path, b"PK mine").unwrap();
@@ -1374,7 +1378,7 @@ fn another_accounts_edited_attachment_isnt_opened_over() {
 #[test]
 fn another_accounts_clean_attachment_is_fetched_for_this_one() {
     let google = FakeGoogle::start(Seed::default());
-    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK report")]));
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK\x03\x04report")]));
     let home = Home::new(&google.base(), "attclean");
     let path = path_in(&open_attachment(&home, 0));
     second_account_in_use(&home);
@@ -1402,7 +1406,7 @@ fn edited_attachment(home: &Home) -> (PathBuf, String) {
 #[test]
 fn an_edited_attachment_is_listed_and_saves_as_a_new_file_in_my_drive() {
     let google = FakeGoogle::start(Seed::default());
-    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK report")]));
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK\x03\x04report")]));
     let home = Home::new(&google.base(), "attedit");
     let (path, id) = edited_attachment(&home);
     let edits = home.edits();
@@ -1435,7 +1439,7 @@ fn an_edited_attachment_is_listed_and_saves_as_a_new_file_in_my_drive() {
 #[test]
 fn an_edited_attachment_goes_only_when_it_is_discarded() {
     let google = FakeGoogle::start(Seed::default());
-    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK report")]));
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK\x03\x04report")]));
     let home = Home::new(&google.base(), "attdiscard");
     let (path, id) = edited_attachment(&home);
     data(home.core.run("gws_file_discard", &json!({"id": id})));
@@ -1446,7 +1450,7 @@ fn an_edited_attachment_goes_only_when_it_is_discarded() {
 #[test]
 fn an_edited_attachment_outlasts_its_24_hours_and_a_sign_out() {
     let google = FakeGoogle::start(Seed::default());
-    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK report")]));
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK\x03\x04report")]));
     let home = Home::new(&google.base(), "attstays");
     let (path, _) = edited_attachment(&home);
     home.later(LIFE_MS * 3);
@@ -1484,8 +1488,8 @@ fn a_file_that_cant_be_read_is_kept_and_not_taken_for_unedited() {
 fn an_attachment_with_no_edit_goes_at_24_hours_and_at_sign_out() {
     let google = FakeGoogle::start(Seed::default());
     google.deliver(mail_with(vec![
-        ("a.docx", DOCX, b"PK a"),
-        ("b.docx", DOCX, b"PK b"),
+        ("a.docx", DOCX, b"PK\x03\x04a"),
+        ("b.docx", DOCX, b"PK\x03\x04b"),
     ]));
     let home = Home::new(&google.base(), "attgone");
     let path = path_in(&open_attachment(&home, 0));
@@ -1581,7 +1585,7 @@ fn each_kind_of_attachment_takes_its_own_way_to_the_bot() {
     google.deliver(mail_with(vec![
         ("IMG_4250.png", "image/png", PNG),
         ("receipt.pdf", "application/pdf", PDF),
-        ("report.docx", DOCX, b"PK report"),
+        ("report.docx", DOCX, b"PK\x03\x04report"),
         ("site-plans.zip", "application/zip", b"PK\x05\x06"),
         ("invite.ics", "application/ics", b"BEGIN:VCALENDAR"),
         ("notes.txt", "text/plain", b"hello"),
@@ -1670,7 +1674,7 @@ fn with_no_viewer_for_it_an_image_goes_to_the_computers_app() {
     let google = FakeGoogle::start(Seed::default());
     google.deliver(mail_with(vec![
         ("IMG_4250.png", "image/png", PNG),
-        ("report.docx", DOCX, b"PK report"),
+        ("report.docx", DOCX, b"PK\x03\x04report"),
     ]));
     let home = Home::new(&google.base(), "openwith");
     bot_can(&home, &["open_with"]);
@@ -1718,7 +1722,7 @@ fn the_name_on_disk_ends_as_its_bytes_are() {
     google.deliver(mail_with(vec![
         ("Scan", "application/pdf", PDF),
         ("IMG_9.PNG", "application/octet-stream", PNG),
-        ("../plans", "application/vnd.apple.pages", b"PK"),
+        ("../plans", "application/vnd.apple.pages", b"PK\x03\x04"),
         ("schedule.ics.exe", "application/ics", b"BEGIN:VCALENDAR"),
     ]));
     let home = Home::new(&google.base(), "diskname");
@@ -1785,8 +1789,8 @@ fn each_press_a_bot_cant_answer_says_to_update_it() {
         ("IMG_4250.png", "image/png", PNG),
         ("receipt.pdf", "application/pdf", PDF),
         ("notes.txt", "text/plain", b"hello"),
-        ("report.docx", DOCX, b"PK report"),
-        ("budget.xlsx", XLSX, b"PK budget"),
+        ("report.docx", DOCX, b"PK\x03\x04report"),
+        ("budget.xlsx", XLSX, b"PK\x03\x04budget"),
     ]));
     let home = Home::new(&google.base(), "update");
     let open = "Update Buwiz Bot to open this here.";
@@ -1916,7 +1920,7 @@ fn every_attachment_written_here_is_quarantined() {
     google.deliver(mail_with(vec![
         ("IMG_4250.png", "image/png", PNG),
         ("invite.ics", "application/ics", b"BEGIN:VCALENDAR"),
-        ("report.docx", DOCX, b"PK report"),
+        ("report.docx", DOCX, b"PK\x03\x04report"),
         ("run.command", "application/octet-stream", b"#!/bin/sh"),
         ("site-plans.zip", "application/zip", b"PK\x05\x06"),
     ]));
@@ -1995,8 +1999,8 @@ fn opened_in_the_macs_app(home: &Home) -> Vec<(PathBuf, String)> {
 fn what_the_macs_own_app_has_never_goes_to_drive_or_outlasts_a_sign_out() {
     let google = FakeGoogle::start(Seed::default());
     google.deliver(mail_with(vec![
-        ("report.docx", DOCX, b"PK report"),
-        ("budget.xlsx", XLSX, b"PK budget"),
+        ("report.docx", DOCX, b"PK\x03\x04report"),
+        ("budget.xlsx", XLSX, b"PK\x03\x04budget"),
     ]));
     let home = Home::new(&google.base(), "byapp");
     let files = opened_in_the_macs_app(&home);
@@ -2021,7 +2025,7 @@ fn what_the_macs_own_app_has_never_goes_to_drive_or_outlasts_a_sign_out() {
 #[test]
 fn an_edit_in_the_bots_view_isnt_handed_to_the_macs_app() {
     let google = FakeGoogle::start(Seed::default());
-    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK report")]));
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK\x03\x04report")]));
     let home = Home::new(&google.base(), "switch");
     let (path, _) = edited_attachment(&home);
     bot_can(&home, &["open_with"]);
@@ -2030,4 +2034,62 @@ fn an_edit_in_the_bots_view_isnt_handed_to_the_macs_app() {
     assert_eq!(answer.get("_meta"), None);
     assert_eq!(fs::read(&path).unwrap(), b"PK mine");
     assert_eq!(home.edits().len(), 1, "still the person's to answer");
+}
+
+#[test]
+fn an_edit_in_the_macs_app_isnt_fetched_over_by_another_way_or_account() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("report.docx", DOCX, b"PK\x03\x04report"),
+        ("budget.xlsx", XLSX, b"PK\x03\x04budget"),
+    ]));
+    let home = Home::new(&google.base(), "appedit");
+    let files = opened_in_the_macs_app(&home);
+    let (path, _) = &files[0];
+    // the Bot has its own view now, which would fetch it again
+    bot_can(&home, &EVERYTHING);
+    let answer = open_attachment(&home, 0);
+    assert_eq!(refusal(&answer), "in_use", "{answer}");
+    assert_eq!(answer.get("_meta"), None);
+    assert_eq!(fs::read(path).unwrap(), b"PK\x03\x04 edited in Pages");
+    // and another account's open would land on it
+    second_account_in_use(&home);
+    bot_can(&home, &["open_with"]);
+    let answer = open_attachment(&home, 0);
+    assert_eq!(refusal(&answer), "in_use", "{answer}");
+    assert_eq!(fs::read(path).unwrap(), b"PK\x03\x04 edited in Pages");
+    // one the app left alone is fetched again, the new way
+    let (other, _) = &files[1];
+    fs::write(other, b"PK\x03\x04budget").unwrap();
+    bot_can(&home, &EVERYTHING);
+    let answer = open_attachment(&home, 1);
+    assert_eq!(handed(&answer).0, "buwiz/document", "{answer}");
+}
+
+#[test]
+fn a_zip_kind_that_isnt_a_zip_is_only_saved() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("report.docx", DOCX, b"<html>not a document"),
+        ("plan.pages", "application/vnd.apple.pages", b"MZ"),
+        ("deck.pptx", "application/octet-stream", b"#!/bin/sh"),
+        (
+            "sheet.numbers",
+            "application/vnd.apple.numbers",
+            b"PK\x03\x04",
+        ),
+    ]));
+    let home = Home::new(&google.base(), "notzip");
+    bot_can(&home, &EVERYTHING);
+    for n in 0..3 {
+        let answer = open_attachment(&home, n);
+        assert_eq!(refusal(&answer), "unsupported", "{n}: {answer}");
+        assert_eq!(
+            says(&answer),
+            "This kind of file can't open here. Save it instead."
+        );
+        assert_eq!(answer.get("_meta"), None);
+    }
+    assert!(!home.open_dir().exists(), "nothing stays");
+    assert_eq!(handed(&open_attachment(&home, 3)).0, "buwiz/open_with");
 }

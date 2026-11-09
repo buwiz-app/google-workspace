@@ -894,7 +894,7 @@ fn search(core: &Core, auth: &Bearer, account: &str, query: &str) -> Result<Vec<
     fetch_rows(core, auth, account, &ids)
 }
 
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -950,6 +950,29 @@ pub fn view_of(thread: &Value) -> Value {
         .map(|(i, m)| i + 1 == list.len() || unread(m))
         .collect();
     let hidden = fold::hidden(&open);
+    // each message, its history folded, and what its row says: the words
+    // before the fold
+    let (mut parts, snippets): (Vec<Part>, Vec<String>) = list
+        .iter()
+        .map(|m| {
+            let text = gmail::body(m);
+            match gmail::html_body(m) {
+                Some(h) => {
+                    let mut c = clean::clean(&h);
+                    let (folded, cut) = fold::quotes(&c.html);
+                    let fresh = cut.map(|cut| clean::visible_text(&c.html[..cut]));
+                    c.html = folded;
+                    let snippet = gmail::snippet_of(fresh.as_deref().unwrap_or(&text));
+                    (Part::Html(c, text), snippet)
+                }
+                None => {
+                    let cut = fold::plain_cut(&text).unwrap_or(text.len());
+                    let snippet = gmail::snippet_of(&text[..cut]);
+                    (Part::Text(text), snippet)
+                }
+            }
+        })
+        .unzip();
     // each message's markup before its body and after it
     let meta: Vec<(String, String)> = list
         .iter()
@@ -958,13 +981,12 @@ pub fn view_of(thread: &Value) -> Value {
             let (name, address) = sender_of(&gmail::header(m, "From"));
             let name = gmail::cap_bytes(&name, gmail::HEADER_MAX);
             let at = when(millis(m));
-            let snippet = gmail::snippet_of(fold::fresh(&gmail::body(m)));
             let run = hidden.iter().find(|r| r.contains(&i));
             let mut before = match run {
                 Some(r) if r.start == i => fold::more(r.len()),
                 _ => String::new(),
             };
-            before.push_str(&fold::message(&name, &snippet, &day(&at), open[i]));
+            before.push_str(&fold::message(&name, &snippets[i], &day(&at), open[i]));
             before.push_str(&format!(
                 "<div class=\"gws-meta\">&lt;{}&gt; · {at}<br>to {}</div>",
                 escape(&gmail::cap_bytes(&address, gmail::HEADER_MAX)),
@@ -989,17 +1011,6 @@ pub fn view_of(thread: &Value) -> Value {
                 a["message"] = m.get("id").cloned().unwrap_or(Value::Null);
                 a
             })
-        })
-        .collect();
-    let mut parts: Vec<Part> = list
-        .iter()
-        .map(|m| match gmail::html_body(m) {
-            Some(h) => {
-                let mut c = clean::clean(&h);
-                c.html = fold::quotes(&c.html);
-                Part::Html(c, gmail::body(m))
-            }
-            None => Part::Text(gmail::body(m)),
         })
         .collect();
     // what's counted is what's sent: the markup, as JSON
@@ -1231,7 +1242,7 @@ mod tests {
             let page = view["page"].as_str().unwrap();
             assert_eq!(folds(page), [false, false, false, false, true], "{page}");
             assert!(
-                page.contains(r#"<details class="gws-more"><summary>3 more messages</summary>"#),
+                page.contains(r#"<details class="gws-more"><summary><span class="gws-n">3 more messages</span><span class="gws-less">Fewer messages</span></summary>"#),
                 "{page}"
             );
             // each reply's history is behind its pill, and its row shows the new words
@@ -1922,7 +1933,7 @@ mod tests {
             [false, false, false, false, false, false, true]
         );
         let more = page
-            .find(r#"<details class="gws-more"><summary>5 more messages</summary>"#)
+            .find(r#"<details class="gws-more"><summary><span class="gws-n">5 more messages</span><span class="gws-less">Fewer messages</span></summary>"#)
             .expect("the middle collapses");
         assert!(page.find("said 0").unwrap() < more, "the first stays a row");
         let close = page
@@ -1987,6 +1998,39 @@ mod tests {
         );
         assert!(
             page[fold..].contains("On Nov 6, 2026, Ana &lt;ana@example.com&gt; wrote:"),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn a_folded_row_shows_none_of_what_the_fold_hides() {
+        // Apple's reply has no "wrote:" line, only the cited quote
+        let view = view_of(&json!({"id": "t", "messages": [
+            labelled("a", r#"<div>Sounds good.</div><blockquote type="cite"><div>Old words</div></blockquote>"#, &["INBOX"]),
+            labelled("b", "<p>last</p>", &["INBOX"]),
+        ]}));
+        let page = view["page"].as_str().unwrap();
+        assert!(
+            page.contains(r#"<span class="gws-snip">Sounds good.</span>"#),
+            "{page}"
+        );
+        assert!(
+            page.contains(
+                r#"<details class="gws-quote"><summary>•••</summary><blockquote type="cite">"#
+            ),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn a_mail_that_is_only_a_quote_is_not_hidden() {
+        let view = view_of(&json!({"id": "t", "messages": [
+            labelled("a", r#"<div class="gmail_quote"><p>Forwarded words</p></div>"#, &["INBOX"]),
+        ]}));
+        let page = view["page"].as_str().unwrap();
+        assert!(!page.contains("gws-quote"), "{page}");
+        assert!(
+            page.contains(r#"<span class="gws-snip">Forwarded words</span>"#),
             "{page}"
         );
     }

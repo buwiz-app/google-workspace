@@ -45,7 +45,8 @@ const FOLDS: &str = "details>summary{list-style:none;cursor:default}\
      details.gws-msg>summary>.gws-from{font-weight:600;margin-right:12px}\
      details.gws-msg[open]>summary>.gws-snip{display:none}\
      details.gws-more>summary{display:block;padding:8px 0;border-top:1px solid;font-size:12px;text-align:center}\
-     details.gws-more[open]>summary{display:none}\
+     details.gws-more>summary>.gws-less,details.gws-more[open]>summary>.gws-n{display:none}\
+     details.gws-more[open]>summary>.gws-less{display:inline}\
      details.gws-quote>summary{display:inline-block;margin:8px 0;padding:0 8px;border-radius:8px;font-size:11px;line-height:14px;letter-spacing:1px}";
 
 /// `html` with [`MAIL_CSP`] ahead of everything else in it, in the Bot's theme.
@@ -126,7 +127,9 @@ mod tests {
                 "no disclosure triangle"
             );
             assert!(page.contains("details.gws-msg[open]>summary>.gws-snip{display:none}"));
-            assert!(page.contains("details.gws-more[open]>summary{display:none}"));
+            // an opened run keeps a row that folds it again
+            assert!(!page.contains("details.gws-more[open]>summary{display:none}"));
+            assert!(page.contains("details.gws-more[open]>summary>.gws-less{display:inline}"));
             let pill = if dark {
                 "details.gws-quote>summary{background-color:#3a3a3a!important"
             } else {

@@ -295,6 +295,12 @@ fn builder(links: Found, images: Found) -> Builder<'static> {
                 Some(format!("gws-image:{}", images.len() - 1).into())
             }
             (_, "style") => Some(safe_style(value).into()),
+            // kept only to say a quote is cited: any other value could be
+            // a marker the rewrite below would swap
+            ("blockquote", "type") => value
+                .trim()
+                .eq_ignore_ascii_case("cite")
+                .then(|| "cite".into()),
             _ => Some(value.into()),
         },
     );
@@ -633,6 +639,17 @@ pub fn clean(html: &str) -> Cleaned {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quotes_type_is_cite_or_nothing() {
+        let page = clean(
+            r#"<blockquote type="gws-image:0">a</blockquote><blockquote type=" CITE ">b</blockquote><img src="https://pics.example/a.png">"#,
+        );
+        assert_eq!(
+            page.html,
+            r#"<blockquote>a</blockquote><blockquote type="cite">b</blockquote><img>"#
+        );
+    }
 
     #[test]
     fn a_character_across_a_cut_is_no_panic() {

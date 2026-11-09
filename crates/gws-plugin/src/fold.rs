@@ -7,6 +7,7 @@
 //! `summary` of a mail's, and what it gives back closes each element it opens,
 //! so a mail can neither write a fold nor close one of these.
 
+use crate::mail::escape;
 use crate::{clean, gmail};
 
 /// What ends a fold of any kind.
@@ -26,8 +27,11 @@ pub fn message(name: &str, snippet: &str, day: &str, open: bool) -> String {
 }
 
 /// The row that stands for `n` folded messages in the middle of a thread.
+/// Opened, it says "Fewer messages", and folds them again.
 pub fn more(n: usize) -> String {
-    format!("<details class=\"gws-more\"><summary>{n} more messages</summary>")
+    format!(
+        "<details class=\"gws-more\"><summary><span class=\"gws-n\">{n} more messages</span><span class=\"gws-less\">Fewer messages</span></summary>"
+    )
 }
 
 /// The runs of folded messages that go behind a "N more messages" row, as
@@ -45,25 +49,16 @@ pub fn hidden(open: &[bool]) -> Vec<std::ops::Range<usize>> {
     runs
 }
 
-/// The words a message adds, without the history it quotes: what its row
-/// shows. All of it when it's nothing but a quote.
-pub fn fresh(text: &str) -> &str {
-    let mut lines = Vec::new();
+/// A text's lines, each with where it starts, trimmed.
+fn lines(text: &str) -> Vec<(usize, &str)> {
     let mut at = 0;
-    for line in text.split('\n') {
-        lines.push((at, line.trim()));
-        at += line.len() + 1;
-    }
-    let cut = lines.iter().enumerate().find_map(|(i, &(start, line))| {
-        if line.starts_with('>') {
-            return Some(start);
-        }
-        attribution(&lines, i).map(|first| lines[first].0)
-    });
-    match cut.map(|c| text[..c].trim_end()) {
-        Some(before) if !before.is_empty() => before,
-        _ => text,
-    }
+    text.split('\n')
+        .map(|line| {
+            let start = at;
+            at += line.len() + 1;
+            (start, line.trim())
+        })
+        .collect()
 }
 
 /// Where the "On … wrote:" line ending at line `i` starts: Gmail can wrap it
@@ -80,36 +75,31 @@ fn attribution(lines: &[(usize, &str)], i: usize) -> Option<usize> {
     }
 }
 
-/// A plain text part, with the trailing "On … wrote:" line and the `>` lines
-/// after it behind a fold.
-pub fn plain(text: &str) -> String {
-    let lines: Vec<(usize, &str)> = {
-        let mut at = 0;
-        text.split('\n')
-            .map(|line| {
-                let start = at;
-                at += line.len() + 1;
-                (start, line.trim())
-            })
-            .collect()
-    };
+/// Where a plain text part's quoted history starts: its trailing "On …
+/// wrote:" line with only `>` lines after it, and the sender's own words
+/// before it. The row's snippet stops there too.
+pub fn plain_cut(text: &str) -> Option<usize> {
+    let lines = lines(text);
     let mut first = lines.len();
     while first > 0 && (lines[first - 1].1.is_empty() || lines[first - 1].1.starts_with('>')) {
         first -= 1;
     }
     let quoted = lines[first..].iter().any(|(_, l)| l.starts_with('>'));
-    match (first > 0 && quoted)
+    let from = (first > 0 && quoted)
         .then(|| attribution(&lines, first - 1))
-        .flatten()
-    {
-        Some(from) => {
-            let cut = lines[from].0;
-            format!(
-                "{}{QUOTE}{}{END}",
-                pre(text[..cut].trim_end_matches(['\n', '\r'])),
-                pre(&text[cut..])
-            )
-        }
+        .flatten()?;
+    let cut = lines[from].0;
+    (!text[..cut].trim().is_empty()).then_some(cut)
+}
+
+/// A plain text part, its quoted history behind a fold.
+pub fn plain(text: &str) -> String {
+    match plain_cut(text) {
+        Some(cut) => format!(
+            "{}{QUOTE}{}{END}",
+            pre(text[..cut].trim_end_matches(['\n', '\r'])),
+            pre(&text[cut..])
+        ),
         None => pre(text),
     }
 }
@@ -124,8 +114,9 @@ pub fn pre(text: &str) -> String {
 /// Cleaned HTML with its trailing quoted history behind folds: Gmail's
 /// `gmail_quote` (its `gmail_attr` line is inside it) and Apple's
 /// `blockquote type=cite`. A quote with the sender's own words after it is an
-/// answer in between, and stays.
-pub fn quotes(cleaned: &str) -> String {
+/// answer in between, and stays; a mail that is nothing but a quote isn't
+/// hidden. Also where the folds start, which is where the row's snippet stops.
+pub fn quotes(cleaned: &str) -> (String, Option<usize>) {
     let spans = spans(cleaned);
     // from the last quote back, while only quotes and blank space follow
     let mut first = spans.len();
@@ -137,6 +128,10 @@ pub fn quotes(cleaned: &str) -> String {
         }
         first -= 1;
     }
+    let cut = spans.get(first).map(|s| s.0);
+    if cut.is_none_or(|c| clean::visible_text(&cleaned[..c]).is_empty()) {
+        return (cleaned.to_owned(), None);
+    }
     let mut out = String::with_capacity(cleaned.len() + 64);
     let mut at = 0;
     for &(start, end) in &spans[first..] {
@@ -147,13 +142,15 @@ pub fn quotes(cleaned: &str) -> String {
         at = end;
     }
     out.push_str(&cleaned[at..]);
-    out
+    (out, cut)
 }
 
 /// Whether a start tag opens quoted history.
 fn quote(tag: &str, name: &str) -> bool {
     let class = clean::attribute(tag, "class").unwrap_or_default();
-    class.split_ascii_whitespace().any(|c| c == "gmail_quote")
+    // only where a block may stand: a fold in a table row is moved out of it
+    let block = name == "div" || name == "blockquote";
+    (block && class.split_ascii_whitespace().any(|c| c == "gmail_quote"))
         || (name == "blockquote"
             && clean::attribute(tag, "type").is_some_and(|t| t.eq_ignore_ascii_case("cite")))
 }
@@ -212,13 +209,6 @@ fn blank(html: &str) -> bool {
     true
 }
 
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,7 +229,7 @@ mod tests {
             r#"<div dir="ltr"><p>Thursday works.</p></div><div class="gmail_quote gmail_quote_container"><div class="gmail_attr">On Nov 6, 2026, Ana wrote:</div><blockquote class="gmail_quote"><p>Can we?</p></blockquote></div>"#,
         )
         .html;
-        let folded = quotes(&page);
+        let folded = quotes(&page).0;
         let fold = folded.find(QUOTE).expect("folded");
         assert!(folded[..fold].contains("Thursday works."));
         assert!(folded[fold..].starts_with(&format!("{QUOTE}<div class=\"gmail_quote")));
@@ -264,7 +254,7 @@ mod tests {
             page.contains(r#"<blockquote type="cite">"#),
             "the cleaner keeps it: {page}"
         );
-        let folded = quotes(&page);
+        let folded = quotes(&page).0;
         assert_eq!(folded.matches(QUOTE).count(), 1, "{folded}");
         assert!(
             folded.ends_with(&format!("Older</blockquote></blockquote>{END}")),
@@ -272,7 +262,7 @@ mod tests {
         );
         // a plain blockquote is the sender quoting something, not history
         let plain = clean::clean("<blockquote>A saying</blockquote>").html;
-        assert_eq!(quotes(&plain), plain);
+        assert_eq!(quotes(&plain).0, plain);
     }
 
     #[test]
@@ -281,7 +271,7 @@ mod tests {
             r#"<blockquote type="cite">Can we?</blockquote><p>Yes.</p><blockquote type="cite">And Friday?</blockquote><p>&nbsp;</p><br>"#,
         )
         .html;
-        let folded = quotes(&page);
+        let folded = quotes(&page).0;
         assert_eq!(folded.matches(QUOTE).count(), 1, "{folded}");
         assert!(folded.find(QUOTE).unwrap() > folded.find("Yes.").unwrap());
     }
@@ -322,17 +312,43 @@ mod tests {
     }
 
     #[test]
-    fn a_row_shows_the_new_words_only() {
-        assert_eq!(
-            fresh("Thursday works.\n\nOn Nov 6, 2026, Ana <ana@example.com> wrote:\nCan we?"),
-            "Thursday works."
-        );
-        assert_eq!(fresh("Yes.\n> Can we?"), "Yes.");
-        assert_eq!(
-            fresh("Yes.\nOn Thu, Ana <\nana@example.com> wrote:\n> x"),
-            "Yes."
-        );
-        assert_eq!(fresh("> only a quote"), "> only a quote");
+    fn a_row_stops_where_the_fold_starts() {
+        let text = "Thursday works.\n\nOn Nov 6, 2026, Ana <ana@example.com> wrote:\n> Can we?";
+        assert_eq!(text[..plain_cut(text).unwrap()].trim(), "Thursday works.");
+        let wrapped = "Yes.\nOn Thu, Ana <\nana@example.com> wrote:\n> x";
+        assert_eq!(&wrapped[..plain_cut(wrapped).unwrap()], "Yes.\n");
+        let html = clean::clean(
+            r#"<div>Sounds good.</div><blockquote type="cite">Old words</blockquote>"#,
+        )
+        .html;
+        let cut = quotes(&html).1.unwrap();
+        assert_eq!(clean::visible_text(&html[..cut]), "Sounds good.");
+    }
+
+    #[test]
+    fn a_mail_that_is_all_quote_stays_in_sight() {
+        for html in [
+            r#"<div class="gmail_quote"><p>Forwarded words</p></div>"#,
+            r#"<br><blockquote type="cite">Old words</blockquote><p>&nbsp;</p>"#,
+            r#"<p style="display:none">hidden</p><blockquote type="cite">Old words</blockquote>"#,
+        ] {
+            let page = clean::clean(html).html;
+            assert_eq!(quotes(&page), (page.clone(), None), "{html}");
+        }
+        let text = "\nOn Nov 6, Ana wrote:\n> Can we?";
+        assert_eq!((plain_cut(text), plain(text)), (None, pre(text)));
+    }
+
+    #[test]
+    fn a_gmail_quote_class_in_a_table_folds_nothing() {
+        for html in [
+            r#"<p>Hi</p><table><tbody><tr class="gmail_quote"><td>Old</td></tr></tbody></table>"#,
+            r#"<p>Hi</p><table><tbody><tr><td class="gmail_quote">Old</td></tr></tbody></table>"#,
+            r#"<p>Hi</p><ul><li class="gmail_quote">Old</li></ul>"#,
+        ] {
+            let page = clean::clean(html).html;
+            assert_eq!(quotes(&page).0, page, "{html}");
+        }
     }
 
     #[test]
@@ -347,7 +363,7 @@ mod tests {
             !page.contains("</details") && !page.contains("</summary"),
             "{page}"
         );
-        let folded = quotes(&page);
+        let folded = quotes(&page).0;
         assert_eq!(folded, page, "no quote, no fold");
         // the row is text, however it's written
         let row = message("</summary></details><b>x", "<details open>", "Nov 6", false);
@@ -355,7 +371,7 @@ mod tests {
         assert_eq!(row.matches("<summary>").count(), 1, "{row}");
         assert!(!row.contains("<b>") && !row.contains(" open>"), "{row}");
         // a quote that never closes in the mail is closed by the cleaner
-        let open = quotes(&clean::clean(r#"<p>Hi</p><div class="gmail_quote"><p>Old"#).html);
+        let open = quotes(&clean::clean(r#"<p>Hi</p><div class="gmail_quote"><p>Old"#).html).0;
         assert!(open.ends_with(&format!("</div>{END}")), "{open}");
     }
 }

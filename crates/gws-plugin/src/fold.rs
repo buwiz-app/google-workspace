@@ -61,40 +61,44 @@ fn lines(text: &str) -> Vec<(usize, &str)> {
         .collect()
 }
 
-/// Whether `first` to `last` is an "On … wrote:" line, which Gmail can wrap
-/// onto a second one. It has a header's shape too, a date or an address, so
-/// "On reflection, here's what Ana wrote:" stays the sender's.
-fn wrote(first: &str, last: &str) -> bool {
-    first.starts_with("On ") && last.ends_with("wrote:") && (dated(first) || dated(last))
+/// The most lines an "On … wrote:" line is wrapped onto.
+const WRAPPED: usize = 3;
+
+/// Whether `lines`, in order, are one "On … wrote:" line, which Gmail can
+/// wrap onto up to [`WRAPPED`]: none blank, and no sentence ending before the
+/// last. It has a header's shape too, a digit (a date or a time) or an
+/// address, so "On Sunday I wrote:" stays the sender's.
+fn wrote(lines: &[&str]) -> bool {
+    let (Some(first), Some(last)) = (lines.first(), lines.last()) else {
+        return false;
+    };
+    lines.len() <= WRAPPED
+        && first.starts_with("On ")
+        && last.ends_with("wrote:")
+        && !lines.iter().any(|l| l.trim().is_empty())
+        && !lines[..lines.len() - 1]
+            .iter()
+            .any(|l| l.ends_with(['.', '!', '?']))
+        && lines.iter().any(|l| dated(l))
 }
 
-/// Whether a line names a day, a time or an address, as a header does.
+/// Whether a line has a digit or an address, as a header's date, time or
+/// sender does.
 fn dated(line: &str) -> bool {
-    const NAMES: &str = "mon tue tues wed thu thur thurs fri sat sun monday tuesday \
-        wednesday thursday friday saturday sunday jan feb mar apr may jun jul aug sep sept oct \
-        nov dec january february march april june july august september october november \
-        december";
     let address = |w: &str| {
         let w = w.trim_matches(|c: char| !c.is_alphanumeric());
         w.find('@').is_some_and(|at| at > 0 && at + 1 < w.len())
     };
-    let name = |w: &str| {
-        w.starts_with(|c: char| c.is_ascii_uppercase())
-            && NAMES.split_whitespace().any(|n| n.eq_ignore_ascii_case(w))
-    };
-    line.bytes().any(|b| b.is_ascii_digit())
-        || line.split_whitespace().any(address)
-        || line.split(|c: char| !c.is_ascii_alphabetic()).any(name)
+    line.bytes().any(|b| b.is_ascii_digit()) || line.split_whitespace().any(address)
 }
 
-/// Where the "On … wrote:" line ending at line `i` starts.
+/// Where the "On … wrote:" line ending at line `i` starts: the fewest lines
+/// back that make one.
 fn attribution(lines: &[(usize, &str)], i: usize) -> Option<usize> {
-    let line = lines[i].1;
-    if wrote(line, line) {
-        Some(i)
-    } else {
-        (i > 0 && wrote(lines[i - 1].1, line)).then(|| i - 1)
-    }
+    (0..WRAPPED.min(i + 1)).map(|back| i - back).find(|&from| {
+        let wrapped: Vec<&str> = lines[from..=i].iter().map(|(_, l)| *l).collect();
+        wrote(&wrapped)
+    })
 }
 
 /// Where a plain text part's quoted history starts: its trailing "On …
@@ -421,14 +425,16 @@ fn quote(tag: &str, name: &str) -> bool {
             && clean::attribute(tag, "type").is_some_and(|t| t.eq_ignore_ascii_case("cite")))
 }
 
-/// The outermost quotes, each as the nodes of its start tag and its end tag.
+/// The outermost quotes a person can see, each as the nodes of its start tag
+/// and its end tag. A hidden one is no quote: a fold of it would be a pill
+/// with nothing behind it.
 fn spans(html: &str, nodes: &[Node]) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut i = 0;
     while i < nodes.len() {
         let n = &nodes[i];
         let tag = &html[n.at..n.end];
-        if n.kind == Kind::Open && quote(tag, name_of(tag)) {
+        if n.kind == Kind::Open && !n.hidden && quote(tag, name_of(tag)) {
             let close = nodes[i + 1..]
                 .iter()
                 .position(|m| m.kind == Kind::Close && m.depth == n.depth)
@@ -446,9 +452,6 @@ fn spans(html: &str, nodes: &[Node]) -> Vec<(usize, usize)> {
 fn breaks(n: &Node) -> bool {
     !n.hidden && n.kind != Kind::Text && crate::gmail::BLOCKS.contains(&n.name.as_str())
 }
-
-/// The most lines an "On … wrote:" line is wrapped onto.
-const WRAPPED: usize = 3;
 
 /// The node a quote really starts at: the "On … wrote:" line just ahead of
 /// it, if the last lines before it are one, and the elements of the sender's
@@ -497,8 +500,7 @@ fn attributed(html: &str, nodes: &[Node], open: usize) -> (usize, Vec<usize>) {
         }
         lines.push((joined, first));
         let text: Vec<&str> = lines.iter().rev().map(|(l, _)| l.as_str()).collect();
-        let text = text.join(" ");
-        if wrote(&text, &text) {
+        if wrote(&text) {
             found = Some(first);
             break;
         }
@@ -718,7 +720,7 @@ mod tests {
         assert!(folded.ends_with(&format!("</blockquote>{END}")), "{folded}");
         // as bare text it folds too
         let bare = clean::clean(
-            r#"<div>Yes.</div>On Thu, Ana wrote:<br><blockquote type="cite">Old</blockquote>"#,
+            r#"<div>Yes.</div>On Thu, Nov 6, Ana wrote:<br><blockquote type="cite">Old</blockquote>"#,
         )
         .html;
         let cut = quotes(&bare).1.unwrap();
@@ -764,7 +766,7 @@ mod tests {
         assert_eq!(quotes(&page), (page.clone(), None));
         // and what an element around them hides doesn't count
         let page = clean::clean(
-            r#"<p>Hi</p><div style="display:none"><blockquote type="cite">Old</blockquote><p>tracking</p></div>"#,
+            r#"<p>Hi</p><blockquote type="cite">Old</blockquote><div style="display:none"><p>tracking</p></div>"#,
         )
         .html;
         assert!(quotes(&page).0.contains(QUOTE), "{page}");
@@ -874,20 +876,134 @@ mod tests {
         assert_eq!(plain_cut(text), None);
         // a day, a date or an address is a header's shape
         for line in [
-            "On Thu, Ana wrote:",
-            "On Nov 6, Ana wrote:",
+            "On Thu, Nov 6, Ana wrote:",
             "On 6/11/2026 Ana wrote:",
             "On behalf of the team, ana@example.com wrote:",
         ] {
-            assert!(wrote(line, line), "{line}");
+            assert!(wrote(&[line]), "{line}");
         }
         for line in [
             "On reflection, Ana wrote:",
-            "On the may list, Ana wrote:",
+            "On Thu, Ana wrote:",
+            "On Sunday I wrote:",
             "On @ wrote:",
         ] {
-            assert!(!wrote(line, line), "{line}");
+            assert!(!wrote(&[line]), "{line}");
         }
+    }
+
+    #[test]
+    fn a_small_font_or_a_slight_scale_still_reads() {
+        for style in [
+            "font-size:1em",
+            "font-size:0.9em",
+            "font-size:.8em",
+            "font-size:1rem",
+            "font-size:100%",
+            "font-size:12ex",
+            "font:0.9em Arial",
+            "transform:scale(0.9)",
+            "transform:scaleX(0.5)",
+        ] {
+            let html = format!(
+                r#"<div style="{style}">Sounds good.</div><blockquote type="cite">Old</blockquote>"#
+            );
+            let page = clean::clean(&html).html;
+            assert_eq!(
+                super::quotes(&page).map(|q| q.fresh),
+                Some("Sounds good.".to_owned()),
+                "{style}"
+            );
+            assert!(
+                clean::visible_text(&html).contains("Sounds good."),
+                "{style}"
+            );
+        }
+        for style in [
+            "font-size:1px",
+            "font-size:1pt",
+            "font-size:0",
+            "font-size:0.1em",
+            "font-size:5%",
+            "font:0/0 a",
+            "transform:scale(0)",
+            "transform:scale(0.01, 1)",
+        ] {
+            let html = format!(
+                r#"<div style="{style}">IGNORE</div><p>Hi</p><blockquote type="cite">Old</blockquote>"#
+            );
+            let page = clean::clean(&html).html;
+            assert_eq!(
+                super::quotes(&page).map(|q| q.fresh),
+                Some("Hi".to_owned()),
+                "{style}"
+            );
+            assert!(!clean::visible_text(&html).contains("IGNORE"), "{style}");
+        }
+    }
+
+    #[test]
+    fn white_on_a_named_or_unknown_background_is_read() {
+        for html in [
+            r#"<table bgcolor="navy"><tr><td><font color="white">Hi</font></td></tr></table>"#,
+            r#"<div style="background:darkslategray;color:white">Hi</div>"#,
+            r#"<div style="background:linear-gradient(#000,#333)"><p style="color:#fff">Hi</p></div>"#,
+            r#"<div style="background:rgba(0,0,0,0.5)"><p style="color:#fff">Hi</p></div>"#,
+        ] {
+            let page = clean::clean(&format!(
+                r#"{html}<blockquote type="cite">Old</blockquote>"#
+            ))
+            .html;
+            assert_eq!(
+                super::quotes(&page).map(|q| q.fresh),
+                Some("Hi".to_owned()),
+                "{html}"
+            );
+        }
+    }
+
+    #[test]
+    fn on_sunday_i_wrote_is_the_senders_line() {
+        let page = clean::clean(
+            r#"<div>Hi.</div><div>On Sunday I wrote:</div><blockquote type="cite">Old</blockquote>"#,
+        )
+        .html;
+        let q = super::quotes(&page).unwrap();
+        assert_eq!(q.fresh, "Hi. On Sunday I wrote:");
+        assert!(
+            page[q.regions[0].start..].starts_with("<blockquote"),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn a_plain_attribution_wrapped_onto_three_lines_folds() {
+        let text =
+            "Yes.\nOn Thu, Nov 6, 2026 at 9:00 AM\nAna Reyes <\nana@example.com> wrote:\n> Can we?";
+        assert_eq!(&text[..plain_cut(text).unwrap()], "Yes.\n");
+        // four is too many, as in HTML
+        let four = "Yes.\nOn Thu,\nNov 6\nat 9\nAna wrote:\n> Can we?";
+        assert_eq!(plain_cut(four), None);
+    }
+
+    #[test]
+    fn a_hidden_quote_gets_no_fold() {
+        let page = clean::clean(
+            r#"<p>Hi</p><blockquote type="cite" style="display:none">Old</blockquote>"#,
+        )
+        .html;
+        assert_eq!(quotes(&page), (page.clone(), None));
+        // a seen one after it still folds, alone
+        let page = clean::clean(
+            r#"<p>Hi</p><div class="gmail_quote" style="opacity:0">Hidden</div><blockquote type="cite">Old</blockquote>"#,
+        )
+        .html;
+        let q = super::quotes(&page).unwrap();
+        assert_eq!(q.regions.len(), 1);
+        assert!(
+            page[q.regions[0].start..].starts_with("<blockquote"),
+            "{page}"
+        );
     }
 
     #[test]
@@ -965,22 +1081,14 @@ mod tests {
         );
         // a fold that starts in what's hidden starts after the words before it
         let page = clean::clean(
-            r#"<p>Hi</p><div style="display:none"><blockquote type="cite">INJECT</blockquote></div><blockquote type="cite">Old words</blockquote>"#,
+            r#"<p>Hi</p><div style="display:none"><p>INJECT</p></div><blockquote type="cite">Old words</blockquote>"#,
         )
         .html;
-        let q = super::quotes(&page).unwrap();
-        assert_eq!(q.regions.len(), 2);
-        assert_eq!(
-            shrunk(&page, q.regions[0].start),
-            Some(("Hi\n\nOld words".to_owned(), 4))
-        );
+        let cut = page.find("INJECT").unwrap();
+        assert_eq!(shrunk(&page, cut), Some(("Hi\n\nOld words".to_owned(), 4)));
         // nothing left to fold
-        let page = clean::clean(
-            r#"<p>Hi</p><blockquote type="cite" style="display:none">INJECT</blockquote>"#,
-        )
-        .html;
-        let q = super::quotes(&page).unwrap();
-        assert_eq!(shrunk(&page, q.regions[0].start), None);
+        let page = clean::clean(r#"<p>Hi</p><div style="display:none">INJECT</div>"#).html;
+        assert_eq!(shrunk(&page, page.find("INJECT").unwrap()), None);
     }
 
     #[test]

@@ -471,7 +471,7 @@ fn unreadable(ink: Rgba, paper: Rgba) -> bool {
 }
 
 /// A `style`, reduced to the declarations a browser would read.
-fn declarations(style: &str) -> Vec<(String, String)> {
+pub(crate) fn declarations(style: &str) -> Vec<(String, String)> {
     let style = no_comments(style).to_ascii_lowercase();
     style
         .split(';')

@@ -28,6 +28,7 @@ use crate::calendar::time::{When, when_line};
 use crate::shell::{CHOSEN, DIM, INK, LINE, MUTE, RETRIES, backoff, read, sleep};
 
 const SENT: &str = "Your reply was sent.";
+const NOT_SHOWN: &str = "Sent. Calendar hasn't shown it yet.";
 const NOT_YET: &str = "Not in your Calendar yet.";
 const DIFFERS: &str = "This invite doesn't match your Calendar.";
 const UNCHECKED: &str = "From the mail, not checked with Calendar.";
@@ -147,6 +148,13 @@ impl Held {
     fn busy(&self) -> bool {
         matches!(&self.shows, Some(Shows::Card(c)) if c.busy)
     }
+
+    /// Something of this card must outlast leaving the conversation.
+    fn kept(&self) -> bool {
+        self.looking
+            || self.busy()
+            || matches!(&self.shows, Some(Shows::Card(c)) if c.unshown.is_some())
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -166,6 +174,10 @@ struct Card {
     /// An answer is on its way, or its look.
     busy: bool,
     said: Option<String>,
+    /// An answer that may have reached Calendar, which Calendar hasn't
+    /// shown yet: the buttons stay off, whatever the time or an error, until
+    /// a look shows an answer there.
+    unshown: Option<String>,
 }
 
 /// Claims a look for `thread`: false while one is on its way or an answer
@@ -183,9 +195,37 @@ fn begin(cards: &mut Cards, thread: &str) -> bool {
 fn landed(cards: &mut Cards, thread: &str, shows: Shows) {
     let held = cards.entry(thread.to_owned()).or_default();
     held.looking = false;
-    if !held.busy() {
-        held.shows = Some(shows);
+    if held.busy() {
+        return;
     }
+    let unshown = match &held.shows {
+        Some(Shows::Card(c)) => c.unshown.clone(),
+        _ => None,
+    };
+    held.shows = Some(match (unshown, shows) {
+        (Some(response), Shows::Card(fresh)) => Shows::Card(Box::new(settle(*fresh, &response))),
+        // a look that failed takes nothing back of an answer that may have gone
+        (Some(_), _) => return,
+        (None, shows) => shows,
+    });
+}
+
+/// Whether Calendar shows an answer from the person: theirs, or one since.
+fn shows_an_answer(card: &Card) -> bool {
+    matches!(&card.calendar, Calendar::Guest(r) if r != "needsAction")
+}
+
+/// A fresh card for an answer that may have gone as `response`.
+fn settle(mut fresh: Card, response: &str) -> Card {
+    if shows_an_answer(&fresh) {
+        fresh.unshown = None;
+        fresh.said =
+            (fresh.calendar == Calendar::Guest(response.to_owned())).then(|| SENT.to_owned());
+    } else {
+        fresh.unshown = Some(response.to_owned());
+        fresh.said = Some(NOT_SHOWN.to_owned());
+    }
+    fresh
 }
 
 /// The card for `thread`, changed by `f`.
@@ -244,7 +284,9 @@ struct Words {
 
 fn words(card: &Card) -> Words {
     let invite = &card.invite;
-    let request = invite.method == "request" && card.calendar != Calendar::Cancelled;
+    let request = invite.method == "request"
+        && card.calendar != Calendar::Cancelled
+        && card.calendar != Calendar::Unverified;
     if request && card.calendar == Calendar::Differs {
         return Words {
             event: None,
@@ -266,14 +308,17 @@ fn words(card: &Card) -> Words {
         invite.place.clone(),
         about(invite, &card.calendar),
     ));
-    let (mut notes, mut why, mut look_again) = (Vec::new(), None, false);
+    let (mut notes, mut why, mut look_again) = (Vec::new(), None, card.unshown.is_some());
+    // a cancel or a reply from a sender Gmail can't vouch for is the mail's word
+    if card.calendar == Calendar::Unverified {
+        notes = vec![UNCHECKED, UNVERIFIED];
+    }
     if request {
         match &card.calendar {
             Calendar::Missing => {
                 notes = vec![UNCHECKED, NOT_YET];
                 look_again = true;
             }
-            Calendar::Unverified => notes = vec![UNCHECKED, UNVERIFIED],
             Calendar::Unanswered(e) => {
                 notes = vec![UNCHECKED];
                 why = Some(e.clone());
@@ -286,7 +331,8 @@ fn words(card: &Card) -> Words {
         event,
         notes,
         why,
-        buttons: request,
+        // an unverified invitation shows its buttons, off
+        buttons: request || (invite.method == "request" && card.calendar == Calendar::Unverified),
         look_again,
     }
 }
@@ -295,7 +341,20 @@ fn words(card: &Card) -> Words {
 /// reads as the invite does, from a sender Gmail vouched for, and never
 /// while an answer or its look is on its way.
 fn lit(card: &Card) -> bool {
-    matches!(card.calendar, Calendar::Guest(_)) && !card.busy
+    matches!(card.calendar, Calendar::Guest(_)) && !card.busy && card.unshown.is_none()
+}
+
+/// Whether a reply's answer leaves it open that the PATCH landed: it said
+/// it went, or the plugin says it may have, or the answer was lost on the way.
+fn may_have_gone(answer: &Result<Value, buwiz_app::BuwizError>) -> bool {
+    match answer {
+        Ok(v) => {
+            sent(v).is_ok()
+                || v.pointer("/structuredContent/code").and_then(Value::as_str)
+                    == Some("unconfirmed")
+        }
+        Err(_) => true,
+    }
 }
 
 fn line(words: String, class: &str) -> Text {
@@ -334,20 +393,19 @@ fn confirms(shows: &Shows, response: &str) -> bool {
 }
 
 /// The card once an answer's look is in. A fresh card is Calendar's word;
-/// a look that failed keeps the card as it was, marked as answered if the
-/// reply said it went.
-fn after_answer(old: &Card, fresh: Shows, response: &str, said: String, went: bool) -> Shows {
+/// a look that failed keeps the card as it was. An answer that may have
+/// gone stays unshown until Calendar shows one: no timer and no error
+/// lights the buttons again.
+fn after_answer(old: &Card, fresh: Shows, response: &str, said: String, maybe: bool) -> Shows {
     let mut card = match fresh {
         Shows::Card(card) => *card,
-        _ => {
-            let mut card = old.clone();
-            if went {
-                card.calendar = Calendar::Guest(response.to_owned());
-            }
-            card
-        }
+        _ => old.clone(),
     };
     card.busy = false;
+    if maybe {
+        return Shows::Card(Box::new(settle(card, response)));
+    }
+    card.unshown = None;
     card.said = Some(said);
     Shows::Card(Box::new(card))
 }
@@ -377,9 +435,9 @@ fn answer_now(b: &Bridge, m: Mail, thread: String, response: &'static str) {
     // jobs, as an attachment's open does
     let b = b.clone();
     let job = Box::pin(async move {
-        let answer = call.await.map(|v| sent(&v));
-        let went = matches!(answer, Ok(Ok(())));
-        let why = match answer {
+        let answer = call.await;
+        let maybe = may_have_gone(&answer);
+        let why = match answer.map(|v| sent(&v)) {
             Ok(Ok(())) => SENT.to_owned(),
             Ok(Err(why)) => why,
             Err(e) => e.message,
@@ -389,7 +447,8 @@ fn answer_now(b: &Bridge, m: Mail, thread: String, response: &'static str) {
         let mut attempt = 0;
         let fresh = loop {
             let fresh = shows_of(read(&b, "gws_mail_invite", json!({"thread": thread})).await);
-            if confirms(&fresh, response) || !went || attempt >= RETRIES {
+            let shown = matches!(&fresh, Shows::Card(c) if shows_an_answer(c));
+            if shown || !maybe || attempt >= RETRIES {
                 break fresh;
             }
             sleep(backoff(attempt)).await;
@@ -404,7 +463,7 @@ fn answer_now(b: &Bridge, m: Mail, thread: String, response: &'static str) {
             if let Some(held) = cards.get_mut(&thread)
                 && let Some(Shows::Card(old)) = &held.shows
             {
-                held.shows = Some(after_answer(old, fresh, response, said, went));
+                held.shows = Some(after_answer(old, fresh, response, said, maybe));
             }
         });
     });
@@ -573,6 +632,7 @@ fn shows_of(answer: Result<Value, String>) -> Shows {
         calendar: calendar_of(calendar),
         busy: false,
         said: None,
+        unshown: None,
     }))
 }
 
@@ -584,7 +644,7 @@ pub(super) fn opened(b: &Bridge, m: Mail, thread: &str) {
         return;
     }
     m.invite
-        .update(|cards| cards.retain(|t, h| t == thread || h.looking || h.busy()));
+        .update(|cards| cards.retain(|t, h| t == thread || h.kept()));
     start(b, m, thread);
 }
 
@@ -766,6 +826,7 @@ mod tests {
             calendar,
             busy: false,
             said: None,
+            unshown: None,
         }
     }
 
@@ -806,6 +867,21 @@ mod tests {
             assert!(!lit(&card(c.clone())), "{c:?}");
         }
         assert!(lit(&card(Calendar::Guest("needsAction".to_owned()))));
+    }
+
+    #[test]
+    fn a_cancel_gmail_cant_vouch_for_is_said_to_be_the_mails() {
+        let cancel = Card {
+            invite: invite_of(&invite("cancel")).unwrap(),
+            ..card(Calendar::Unverified)
+        };
+        let said = words(&cancel);
+        assert_eq!(said.notes, [UNCHECKED, UNVERIFIED]);
+        assert!(!said.buttons);
+        assert_eq!(
+            calendar_of(&json!({"unverified": true})),
+            Calendar::Unverified
+        );
     }
 
     #[test]
@@ -855,7 +931,7 @@ mod tests {
         assert!(confirms(&fresh("accepted"), "accepted"));
         assert!(!confirms(&fresh("needsAction"), "accepted"));
         assert!(!confirms(&Shows::Line("x".to_owned()), "accepted"));
-        // a look that failed after a reply that went keeps it answered
+        // a look that failed after a reply that may have gone: off, unshown
         let Shows::Card(after) = after_answer(
             &asked,
             Shows::Line("x".to_owned()),
@@ -865,9 +941,31 @@ mod tests {
         ) else {
             panic!("a card");
         };
-        assert_eq!(after.calendar, Calendar::Guest("accepted".to_owned()));
         assert!(!after.busy);
-        assert_eq!(after.said.as_deref(), Some(SENT));
+        assert!(!lit(&after), "no timer or error lights it");
+        assert_eq!(after.said.as_deref(), Some(NOT_SHOWN));
+        assert!(words(&after).look_again);
+        // a look that still shows no answer keeps it so; one that shows one lights it
+        let mut cards = Cards::new();
+        cards.insert(
+            "a".to_owned(),
+            Held {
+                shows: Some(Shows::Card(after)),
+                looking: false,
+            },
+        );
+        landed(&mut cards, "a", fresh("needsAction"));
+        landed(&mut cards, "a", Shows::Line("Gmail is busy.".to_owned()));
+        let Some(Shows::Card(c)) = &cards["a"].shows else {
+            panic!("a card");
+        };
+        assert!(!lit(c), "still unshown");
+        landed(&mut cards, "a", fresh("accepted"));
+        let Some(Shows::Card(c)) = &cards["a"].shows else {
+            panic!("a card");
+        };
+        assert!(lit(c));
+        assert_eq!(c.said.as_deref(), Some(SENT));
     }
 
     #[test]

@@ -92,6 +92,9 @@ pub(crate) struct Calendars {
     pub(crate) patch_answers_empty: bool,
     /// A PATCH is written, and answered 200 with a body that isn't JSON.
     pub(crate) patch_answers_junk: bool,
+    /// A PATCH is written, and answered 500, as a backend that fell over
+    /// after the write would.
+    pub(crate) patch_answers_500: bool,
 }
 
 fn error(code: u16, message: &str) -> Reply {
@@ -823,6 +826,9 @@ impl Calendars {
         self.record(r, calendar, id, sent);
         if self.patch_answers_empty {
             return Reply::json(200, json!({}));
+        }
+        if self.patch_answers_500 {
+            return error(500, "Backend Error");
         }
         if self.patch_answers_junk {
             return Reply(

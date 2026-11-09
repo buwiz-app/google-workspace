@@ -1646,9 +1646,16 @@ pub(crate) fn rsvp_with(
         notify: how.notify_all || !guests_of(&event, &account).is_empty(),
         if_match: &etag,
     };
-    let answer = core
+    let answer = match core
         .calendar
-        .patch(&auth, &calendar, &write_id, &body, &write)?;
+        .patch(&auth, &calendar, &write_id, &body, &write)
+    {
+        Ok(answer) => answer,
+        // the PATCH went out and may have landed: never a plain failure,
+        // or a second press would send the answer again
+        Err(e) if how.stands_after_write => return Ok(unconfirmed(e)),
+        Err(e) => return Err(e),
+    };
     if let Some(no) = refused(&answer) {
         core.sync.wake();
         return Ok(no);
@@ -1660,6 +1667,17 @@ pub(crate) fn rsvp_with(
         return Ok(answered(core, &account, &calendar, &written));
     }
     finish(core, &auth, &account, &calendar, &id, &written)
+}
+
+/// The code of a PATCH that failed on its way, and so may have landed.
+const UNCONFIRMED: &str = "unconfirmed";
+
+fn unconfirmed(e: Failure) -> Value {
+    let why = match e {
+        Failure::Offline(_) => "Calendar didn't answer. Your reply may have gone.",
+        _ => "Calendar didn't say whether your reply went.",
+    };
+    fail(UNCONFIRMED, why)
 }
 
 /// An answer Google has: what it sent back goes in, and the sync thread

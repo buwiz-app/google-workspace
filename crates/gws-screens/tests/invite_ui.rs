@@ -39,6 +39,10 @@ struct Fake {
     held_looks: Mutex<Vec<Done>>,
     /// A reply whose answer says it failed still reaches Calendar.
     went_anyway: Mutex<bool>,
+    /// Calendar lags: a reply doesn't show there until [`Fake::answered`].
+    lags: Mutex<bool>,
+    /// A reply's answer is lost on the bridge.
+    reply_lost: Mutex<bool>,
     calls: Mutex<Vec<(String, Value)>>,
 }
 
@@ -128,6 +132,16 @@ impl Host for Fake {
             }
             "gws_mail_invite" if args["thread"] == "t20" => self.invite.lock().unwrap().clone(),
             "gws_mail_invite" => json!({"invite": null}),
+            "gws_mail_invite_reply" if *self.reply_lost.lock().unwrap() => {
+                return done(Err(BuwizError::new(
+                    "timeout",
+                    false,
+                    "The plugin took too long.",
+                )));
+            }
+            "gws_mail_invite_reply" if *self.lags.lock().unwrap() => {
+                json!({"sent": true, "event": null})
+            }
             "gws_mail_invite_reply" => {
                 let said = self.reply.lock().unwrap().clone();
                 if said.is_none() || *self.went_anyway.lock().unwrap() {
@@ -614,4 +628,62 @@ fn a_lapsed_sign_in_shows_the_sign_in_steps_not_a_blank() {
         .expect("the row presses");
     app.wait_for_within("text:Make a Google Cloud project", WAIT)
         .expect("the sign-in steps show");
+}
+
+/// Past the screen's own retries, which end in under eight seconds.
+const PAST_RETRIES: Duration = Duration::from_secs(20);
+
+#[test]
+fn a_reply_calendar_lags_on_never_lights_again_until_it_shows() {
+    let (mut app, _, fake) = opened(in_calendar("needsAction"));
+    *fake.lags.lock().unwrap() = true;
+    app.press("label:Answer yes").expect("Yes presses");
+    app.wait_for_within("text:Sent. Calendar hasn't shown it yet.", PAST_RETRIES)
+        .expect("it says so");
+    app.wait(Duration::from_secs(2)).expect("time passes");
+    assert!(!lit(&app), "no timer lights it");
+    let _ = app.press("label:Answer yes");
+    settle(&mut app);
+    assert_eq!(fake.called("gws_mail_invite_reply").len(), 1, "not twice");
+    // a look that still finds nothing keeps it off
+    app.press("label:Look in Calendar again")
+        .expect("it presses");
+    settle(&mut app);
+    assert!(!lit(&app));
+    fake.answered(&json!("accepted"));
+    app.press("label:Look in Calendar again")
+        .expect("it presses");
+    app.wait_for_within("text:Your reply was sent.", WAIT)
+        .expect("Calendar shows it");
+    assert!(lit(&app));
+    assert!(app.screen().selected("label:Answer yes").unwrap());
+}
+
+#[test]
+fn a_reply_lost_on_its_way_never_lights_the_buttons_at_once() {
+    let (mut app, _, fake) = opened(in_calendar("needsAction"));
+    *fake.reply_lost.lock().unwrap() = true;
+    app.press("label:Answer yes").expect("Yes presses");
+    settle(&mut app);
+    assert!(!lit(&app), "it may have gone");
+    app.wait_for_within("text:Sent. Calendar hasn't shown it yet.", PAST_RETRIES)
+        .expect("it says so");
+    assert!(!lit(&app));
+    let _ = app.press("label:Answer yes");
+    settle(&mut app);
+    assert_eq!(fake.called("gws_mail_invite_reply").len(), 1, "not twice");
+}
+
+#[test]
+fn a_cancel_gmail_cant_vouch_for_is_labelled_the_mails() {
+    let (app, _, _) = opened(json!({"invite": invite("cancel"), "calendar": {"unverified": true}}));
+    assert!(
+        app.screen()
+            .shows("From the mail, not checked with Calendar.")
+    );
+    assert!(
+        app.screen()
+            .shows("Gmail couldn't confirm this invite came from its organiser.")
+    );
+    assert_eq!(app.screen().count("label:Answer yes").unwrap(), 0);
 }

@@ -1651,6 +1651,11 @@ impl FakeGoogle {
         self.account.lock().unwrap().calendars.patch_answers_empty = empty;
     }
 
+    /// Calendar writes a PATCH and answers 500.
+    pub fn calendar_patch_answers_500(&self, fail: bool) {
+        self.account.lock().unwrap().calendars.patch_answers_500 = fail;
+    }
+
     /// Calendar writes a PATCH and answers 200 with a body cut off mid-way.
     pub fn calendar_patch_answers_junk(&self, junk: bool) {
         self.account.lock().unwrap().calendars.patch_answers_junk = junk;

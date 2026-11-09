@@ -794,37 +794,74 @@ fn text_of(part: &Value) -> Option<String> {
 /// Google Calendar's own sender of invites.
 const CALENDAR_SENDER: &str = "calendar-notification@google.com";
 
-/// Mail domains anyone can have an address at: there, the domain says
-/// nothing of who the organiser is.
-const PUBLIC_DOMAINS: &[&str] = &[
+/// Which rule [`sent_by_organizer`] is: a saved invite judged by another
+/// is judged again, as the rule only ever grows stricter.
+const SENDER_RULE: u64 = 2;
+
+/// Mail services anyone can have an address at, where the domain says
+/// nothing of who the organiser is. A name with a dot is that domain; one
+/// without is that service under any public suffix (yahoo.co.uk, gmx.de).
+/// Either covers its subdomains.
+const PUBLIC_MAIL: &[&str] = &[
+    "yahoo",
+    "hotmail",
+    "outlook",
+    "live",
+    "yandex",
+    "gmx",
+    "fastmail",
     "gmail.com",
     "googlemail.com",
-    "outlook.com",
-    "hotmail.com",
-    "live.com",
-    "yahoo.com",
     "icloud.com",
     "me.com",
     "mac.com",
     "proton.me",
     "protonmail.com",
+    "proton.ch",
+    "pm.me",
     "aol.com",
-    "gmx.com",
-    "gmx.net",
+    "ymail.com",
+    "rocketmail.com",
+    "msn.com",
+    "mail.com",
+    "zoho.com",
+    "qq.com",
+    "163.com",
+    "naver.com",
 ];
+
+/// Whether `domain` is one of [`PUBLIC_MAIL`] or below one. With no public
+/// suffix list, a service's name counts before any one or two short labels
+/// (`.com`, `.co.uk`): a company domain that matches only loses alignment.
+fn is_public(domain: &str) -> bool {
+    let labels: Vec<&str> = domain.split('.').collect();
+    PUBLIC_MAIL.iter().any(|entry| {
+        if entry.contains('.') {
+            return domain == *entry || domain.ends_with(&format!(".{entry}"));
+        }
+        labels.iter().enumerate().any(|(i, label)| {
+            let rest = &labels[i + 1..];
+            label == entry && (1..=2).contains(&rest.len()) && rest.iter().all(|l| l.len() <= 3)
+        })
+    })
+}
 
 /// Whether the mail comes from who sends the organiser's invites: Gmail's
 /// own Authentication-Results vouch for its From ([`pictures::vouched`]),
-/// and that From is Google Calendar's own sender, the organiser's address
-/// at a public mail domain, or else the organiser's domain. Any other
-/// google.com sender is a person, who could forward a crafted `.ics`. The
-/// `.ics` is the sender's to write, UID and all, so only this says who sent it.
+/// and that From is Google Calendar's own sender, the organiser's own
+/// address at a public mail service, or else the organiser's domain. Any
+/// other sender at Google is a person, who could forward a crafted `.ics`.
+/// The `.ics` is the sender's to write, UID and all, so only this says who
+/// sent it.
 fn sent_by_organizer(message: &Value, organizer: &str) -> bool {
-    let domain = |a: &str| a.rsplit_once('@').map(|(_, d)| d.to_ascii_lowercase());
-    let (Some(from), Some(theirs)) = (pictures::from_of(message), domain(organizer)) else {
+    let (_, raw) = crate::mail::sender_of(&gmail::short_header(message, "From"));
+    // only ASCII addresses compare: Unicode case folding can make two of them one
+    if !raw.is_ascii() || !organizer.is_ascii() || pictures::from_of(message).is_none() {
         return false;
-    };
-    let Some(from_domain) = domain(&from) else {
+    }
+    let (from, organizer) = (raw.to_ascii_lowercase(), organizer.to_ascii_lowercase());
+    let domain = |a: &str| a.rsplit_once('@').map(|(_, d)| d.to_owned());
+    let (Some(from_domain), Some(theirs)) = (domain(&from), domain(&organizer)) else {
         return false;
     };
     if !pictures::vouched(message) {
@@ -833,11 +870,11 @@ fn sent_by_organizer(message: &Value, organizer: &str) -> bool {
     if from == CALENDAR_SENDER {
         return true;
     }
-    if from_domain == "google.com" {
+    if from_domain == "google.com" || from_domain.ends_with(".google.com") {
         return false;
     }
-    if PUBLIC_DOMAINS.contains(&theirs.as_str()) {
-        return from.eq_ignore_ascii_case(organizer);
+    if is_public(&theirs) || is_public(&from_domain) {
+        return from == organizer;
     }
     pictures::aligned(&from_domain, &theirs) || pictures::aligned(&theirs, &from_domain)
 }
@@ -847,6 +884,7 @@ fn sent_by_organizer(message: &Value, organizer: &str) -> bool {
 fn json_of(message: &Value, event: &Event) -> Option<Value> {
     let mut v = event.json(&js::string_or_empty(message.get("id")))?;
     v["sender_ok"] = json!(sent_by_organizer(message, &event.organizer.address));
+    v["sender_rule"] = json!(SENDER_RULE);
     Some(v)
 }
 
@@ -881,19 +919,24 @@ fn in_messages(
     fetch: Option<(&Core, &Bearer)>,
     messages: &mut [Value],
 ) -> Result<Option<Value>, Failure> {
-    let mut damaged = false;
+    // one Gmail can't vouch for never hides one it can: a stranger's
+    // CANCEL mustn't stand over the organiser's invite
+    let (mut damaged, mut unverified) = (false, None);
     for message in messages.iter_mut().rev() {
         match in_message(fetch, message)? {
-            Found::Reads(v) => return Ok(Some(v)),
+            Found::Reads(v) if v["sender_ok"] == true => return Ok(Some(v)),
+            Found::Reads(v) => {
+                unverified.get_or_insert(v);
+            }
             Found::NotIn => return Ok(None),
             Found::Damaged => damaged = true,
             Found::Nothing => {}
         }
     }
-    Ok(Some(if damaged {
-        json!({"damaged": true})
-    } else {
-        Value::Null
+    Ok(Some(match unverified {
+        Some(v) => v,
+        None if damaged => json!({"damaged": true}),
+        None => Value::Null,
     }))
 }
 
@@ -989,7 +1032,9 @@ fn refusal(code: &str, why: &str) -> Value {
 /// since invites carried who sent them. A view saved before invites were
 /// read has no `invite` at all, which is "not read yet", not "none".
 fn settled(invite: &Value) -> bool {
-    invite.is_null() || invite.get("damaged").is_some() || invite.get("sender_ok").is_some()
+    invite.is_null()
+        || invite.get("damaged").is_some()
+        || invite.get("sender_rule").and_then(Value::as_u64) == Some(SENDER_RULE)
 }
 
 /// The invite in thread `id`: from its saved view, else from Gmail, then
@@ -1151,22 +1196,34 @@ fn words_of(e: Failure) -> String {
 /// What Calendar says of an invitation. Nothing of the event when it doesn't
 /// match: a forger's words must not show under Calendar's name. Calendar not
 /// answering is a line on the card, which keeps what Gmail sent.
-fn calendar_says(core: &Core, auth: &Bearer, account: &str, invite: &Value) -> Value {
-    if invite.get("sender_ok") != Some(&Value::Bool(true)) {
-        return json!({"unverified": true});
-    }
+fn calendar_says(
+    core: &Core,
+    auth: &Bearer,
+    account: &str,
+    invite: &Value,
+) -> Result<Value, Failure> {
     let uid = js::string_or_empty(invite.get("uid"));
-    match in_calendar(core, auth, account, &uid) {
-        Err(e) => json!({"error": words_of(e)}),
+    Ok(match in_calendar(core, auth, account, &uid) {
+        Err(e) => return unanswered(e),
         Ok(None) => json!({"found": false}),
-        Ok(Some((_, event))) if is_cancelled(&event) => json!({"found": true, "cancelled": true}),
+        // a cancelled event is one too: it says so only if it's the invite's
         Ok(Some((_, event))) if !matches(invite, &event) => {
             json!({"found": true, "cancelled": false, "matches": false})
         }
+        Ok(Some((_, event))) if is_cancelled(&event) => json!({"found": true, "cancelled": true}),
         Ok(Some((_, event))) => {
             let me = mine(&event, account);
             json!({"found": true, "cancelled": false, "matches": true, "guest": me.is_some(), "response": me.and_then(|a| a.get("responseStatus")), "event": shown(&event)})
         }
+    })
+}
+
+/// Calendar not answering is a line on the card, which keeps what Gmail
+/// sent; a sign-in that's gone is said as itself, so the sign-in shows.
+fn unanswered(e: Failure) -> Result<Value, Failure> {
+    match e {
+        Failure::AccountRequired => Err(e),
+        e => Ok(json!({"error": words_of(e)})),
     }
 }
 
@@ -1185,10 +1242,15 @@ fn look(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some(invite) = invite else {
         return Ok(again());
     };
-    if invite.get("method").and_then(Value::as_str) != Some("request") {
-        return Ok(ok(json!({"invite": invite, "calendar": null})));
-    }
-    let calendar = calendar_says(core, &auth, &account, &invite);
+    // a cancel or a reply is the sender's word as much as an invitation is
+    let calendar = match invite.get("method").and_then(Value::as_str) {
+        None => Value::Null,
+        Some(_) if invite.get("sender_ok") != Some(&Value::Bool(true)) => {
+            json!({"unverified": true})
+        }
+        Some("request") => calendar_says(core, &auth, &account, &invite)?,
+        Some(_) => Value::Null,
+    };
     Ok(ok(json!({"invite": invite, "calendar": calendar})))
 }
 
@@ -1229,11 +1291,11 @@ fn reply(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some((calendar, event)) = in_calendar(core, &auth, &account, &uid)? else {
         return Ok(refusal("not_found", NOT_YET));
     };
-    if is_cancelled(&event) {
-        return Ok(refusal("not_found", CANCELLED));
-    }
     if !matches(&invite, &event) {
         return Ok(refusal("changed", DIFFERS));
+    }
+    if is_cancelled(&event) {
+        return Ok(refusal("not_found", CANCELLED));
     }
     let args = json!({"calendar": calendar, "id": event.get("id"), "response": response});
     let how = calendar::Answering {
@@ -1870,6 +1932,92 @@ mod tests {
                 "{organizer}"
             );
         }
+    }
+
+    #[test]
+    fn a_public_mail_service_counts_under_any_suffix_and_below_it() {
+        for public in [
+            "gmail.com",
+            "yahoo.co.uk",
+            "yahoo.com",
+            "hotmail.fr",
+            "outlook.com.br",
+            "live.jp",
+            "yandex.ru",
+            "gmx.de",
+            "fastmail.fm",
+            "ymail.com",
+            "pm.me",
+            "proton.ch",
+            "qq.com",
+            "naver.com",
+            "mail.gmail.com",
+            "uk.yahoo.com",
+        ] {
+            assert!(is_public(public), "{public}");
+        }
+        for company in [
+            "example.com",
+            "yahooligans.example",
+            "gmail.com.evil.example",
+            "notgmail.com",
+        ] {
+            assert!(!is_public(company), "{company}");
+        }
+    }
+
+    #[test]
+    fn at_a_public_service_or_google_only_the_exact_sender_counts() {
+        let pass =
+            |d: &str| format!("mx.google.com; dkim=pass header.i=@{d}; dmarc=pass header.from={d}");
+        let cases = [
+            // any suffix of a public service: only the organiser's own address
+            ("stranger@yahoo.co.uk", "ana@yahoo.co.uk", false),
+            ("ana@yahoo.co.uk", "ana@yahoo.co.uk", true),
+            ("stranger@hotmail.fr", "ana@hotmail.fr", false),
+            ("someone@fastmail.fm", "ana@fastmail.fm", false),
+            // no subdomain of one either
+            ("ana@mail.gmail.com", "ana@gmail.com", false),
+            // a person anywhere at Google is not Google Calendar
+            ("someone@mail.google.com", "ana@google.com", false),
+            ("someone@google.com", "ana@google.com", false),
+            // case is ASCII's only
+            ("ANA@GMAIL.COM", "ana@gmail.com", true),
+        ];
+        for (from, organizer, ok) in cases {
+            let domain = from.rsplit_once('@').unwrap().1.to_ascii_lowercase();
+            assert_eq!(
+                sent_by_organizer(&signed(from, &pass(&domain)), organizer),
+                ok,
+                "{from} for {organizer}"
+            );
+        }
+        // a local part Unicode folds onto the organiser's is refused
+        let folded = signed("\u{212a}im@gmail.com", &pass("gmail.com"));
+        assert!(!sent_by_organizer(&folded, "kim@gmail.com"));
+    }
+
+    #[test]
+    fn a_saved_invite_settles_only_under_this_sender_rule() {
+        assert!(settled(&Value::Null));
+        assert!(settled(&json!({"damaged": true})));
+        assert!(!settled(&json!({"sender_ok": true})), "the older rule's");
+        assert!(!settled(&json!({"sender_ok": true, "sender_rule": 1})));
+        assert!(settled(
+            &json!({"sender_ok": false, "sender_rule": SENDER_RULE})
+        ));
+    }
+
+    #[test]
+    fn a_lapsed_sign_in_on_calendar_is_said_as_itself() {
+        assert!(matches!(
+            unanswered(Failure::AccountRequired),
+            Err(Failure::AccountRequired)
+        ));
+        assert_eq!(
+            unanswered(Failure::Plain("Calendar is busy.".to_owned())).unwrap(),
+            json!({"error": "Calendar is busy."})
+        );
     }
 
     #[test]

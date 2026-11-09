@@ -66,7 +66,7 @@ fn the_card_reads_the_ics_and_the_thread_view_keeps_it() {
     let view = data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
     assert_eq!(
         view["invite"],
-        json!({"message": INVITE, "uid": "fake-roof-inspection@google.com", "method": "request", "title": "Roof inspection", "start": "2026-11-10T02:00:00Z", "end": "2026-11-10T03:00:00Z", "all_day": false, "place": "12 Mabini St", "organizer": "Ana Reyes", "organizer_address": "ana@example.com", "sender_ok": true})
+        json!({"message": INVITE, "uid": "fake-roof-inspection@google.com", "method": "request", "title": "Roof inspection", "start": "2026-11-10T02:00:00Z", "end": "2026-11-10T03:00:00Z", "all_day": false, "place": "12 Mabini St", "organizer": "Ana Reyes", "organizer_address": "ana@example.com", "sender_ok": true, "sender_rule": 2})
     );
     // a mail with none says so, so a saved view tells "none" from "not read yet"
     let other = data(core.run("gws_mail_thread", &json!({"thread": "000019f00000001e"})));
@@ -736,4 +736,96 @@ fn at_a_public_mail_domain_only_the_organiser_and_google_calendar_send_an_invite
         }
     }
     assert!(google.calendar_writes().is_empty());
+}
+
+#[test]
+fn a_strangers_cancel_after_the_real_invite_never_hides_it() {
+    let google = FakeGoogle::start(rich());
+    let real = sent_by("Ana Reyes <calendar-notification@google.com>", 70);
+    let cancel = Mail {
+        id: format!("{:016x}", 0x1a00_0000_0000_u64 + 71),
+        at: real.at + 60_000,
+        from: "Mallory <mallory@evil.example>".into(),
+        ..mail_with(
+            &rich_ics(|s| s.replace("METHOD:REQUEST", "METHOD:CANCEL")),
+            70,
+        )
+    };
+    google.deliver(real.clone());
+    google.deliver(cancel.clone());
+    let core = signed_in(&google, "strangers-cancel");
+    data(core.run("gws_mail_thread", &json!({"thread": real.thread})));
+    let got = data(core.run("gws_mail_invite", &json!({"thread": real.thread})));
+    assert_eq!(got["invite"]["message"], real.id.as_str(), "{got}");
+    assert_eq!(got["invite"]["method"], "request");
+    assert_eq!(got["calendar"]["matches"], true, "{got}");
+    // alone, the stranger's cancel is said to be unchecked
+    let alone = data(core.run("gws_mail_invite", &json!({"message": cancel.id})));
+    assert_eq!(alone["invite"]["method"], "cancel");
+    assert_eq!(alone["calendar"], json!({"unverified": true}), "{alone}");
+}
+
+#[test]
+fn a_cancelled_event_is_said_only_for_the_invite_it_matches() {
+    let mut seed = rich();
+    for c in &mut seed.calendars {
+        for e in &mut c.events {
+            e["status"] = json!("cancelled");
+        }
+    }
+    let google = FakeGoogle::start(seed);
+    let other = mail_with(
+        &rich_ics(|s| s.replace("SUMMARY:Roof inspection", "SUMMARY:Party")),
+        72,
+    );
+    google.deliver(other.clone());
+    let core = signed_in(&google, "cancelled-other");
+    let got = data(core.run("gws_mail_invite", &json!({"message": other.id})));
+    assert_eq!(
+        got["calendar"],
+        json!({"found": true, "cancelled": false, "matches": false}),
+        "{got}"
+    );
+    let refused = data(core.run(
+        "gws_mail_invite_reply",
+        &json!({"message": other.id, "response": "accepted"}),
+    ));
+    assert_eq!(refused["refused"], "changed");
+}
+
+#[test]
+fn a_patch_that_failed_on_its_way_is_never_a_plain_failure() {
+    let google = FakeGoogle::start(rich());
+    google.calendar_patch_answers_500(true);
+    let core = signed_in(&google, "patch-500");
+    let answer = core.run(
+        "gws_mail_invite_reply",
+        &json!({"message": INVITE, "response": "accepted"}),
+    );
+    assert_eq!(answer["isError"], true, "{answer}");
+    assert_eq!(
+        answer["structuredContent"]["code"], "unconfirmed",
+        "{answer}"
+    );
+    assert_eq!(google.calendar_writes().len(), 1, "it landed");
+}
+
+#[test]
+fn a_saved_invite_judged_by_an_older_sender_rule_is_judged_again() {
+    let google = FakeGoogle::start(rich());
+    let core = signed_in(&google, "old-rule");
+    data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
+    {
+        let held = core.store().unwrap();
+        let store = held.as_ref().unwrap();
+        let mut view: Value =
+            serde_json::from_str(&store.view(FAKE_EMAIL, INVITE, 1).unwrap().unwrap()).unwrap();
+        // as the any-google.com rule saved it
+        view["invite"] = json!({"message": INVITE, "uid": "fake-roof-inspection@google.com", "method": "request", "title": "Old words", "start": "2026-11-10T02:00:00Z", "end": "2026-11-10T03:00:00Z", "all_day": false, "place": "", "organizer": "", "organizer_address": "ana@example.com", "sender_ok": true});
+        store
+            .put_view(FAKE_EMAIL, INVITE, &view.to_string(), 1)
+            .unwrap();
+    }
+    let got = data(core.run("gws_mail_invite", &json!({"thread": INVITE})));
+    assert_eq!(got["invite"]["title"], "Roof inspection", "{got}");
 }

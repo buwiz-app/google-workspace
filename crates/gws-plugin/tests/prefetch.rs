@@ -314,11 +314,12 @@ fn attachments_under_5_mb_that_open_are_kept_and_the_rest_arent() {
         "5 MB waits for the press"
     );
     assert!(!has_file(&core, &id(2), "1"), "an old mail's waits too");
-    assert_eq!(attachment_reads(&google), 2);
+    // the receipt and the photo, and the logo once, for the page itself
+    assert_eq!(attachment_reads(&google), 3);
 
     // a second round finds nothing left to fetch
     gws::prefetch::run(&core).unwrap();
-    assert_eq!(attachment_reads(&google), 2);
+    assert_eq!(attachment_reads(&google), 3);
 }
 
 #[test]

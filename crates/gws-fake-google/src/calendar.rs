@@ -95,6 +95,8 @@ pub(crate) struct Calendars {
     /// A PATCH is written, and answered 500, as a backend that fell over
     /// after the write would.
     pub(crate) patch_answers_500: bool,
+    /// A PATCH is refused with this status, and nothing is written.
+    pub(crate) patch_refuses: Option<u16>,
 }
 
 fn error(code: u16, message: &str) -> Reply {
@@ -804,6 +806,9 @@ impl Calendars {
         let Some(mut held) = self.list[at].event(id) else {
             return not_found();
         };
+        if let Some(code) = self.patch_refuses {
+            return error(code, "The caller does not have permission");
+        }
         if !r.if_match.is_empty() && r.if_match != text(&held, "etag") {
             return error(412, "Precondition Failed");
         }

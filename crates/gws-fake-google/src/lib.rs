@@ -1651,6 +1651,12 @@ impl FakeGoogle {
         self.account.lock().unwrap().calendars.patch_answers_empty = empty;
     }
 
+    /// Calendar refuses a PATCH with `status`, writing nothing; `None` lets
+    /// them through.
+    pub fn calendar_patch_refuses(&self, status: Option<u16>) {
+        self.account.lock().unwrap().calendars.patch_refuses = status;
+    }
+
     /// Calendar writes a PATCH and answers 500.
     pub fn calendar_patch_answers_500(&self, fail: bool) {
         self.account.lock().unwrap().calendars.patch_answers_500 = fail;

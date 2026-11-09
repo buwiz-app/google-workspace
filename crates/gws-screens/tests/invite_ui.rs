@@ -687,3 +687,19 @@ fn a_cancel_gmail_cant_vouch_for_is_labelled_the_mails() {
     );
     assert_eq!(app.screen().count("label:Answer yes").unwrap(), 0);
 }
+
+#[test]
+fn a_reply_calendar_refused_says_so_and_lights_the_buttons_again() {
+    let (mut app, _, fake) = opened(in_calendar("needsAction"));
+    *fake.reply.lock().unwrap() = Some(
+        json!({"refused": "not_sent", "message": "Your reply wasn't sent. Calendar didn't accept that: Forbidden"}),
+    );
+    app.press("label:Answer yes").expect("Yes presses");
+    app.wait_for_within(
+        "text:Your reply wasn't sent. Calendar didn't accept that: Forbidden",
+        WAIT,
+    )
+    .expect("it says so");
+    assert!(lit(&app), "it can be pressed again");
+    assert!(!app.screen().shows("Sent. Calendar hasn't shown it yet."));
+}

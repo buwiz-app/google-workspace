@@ -118,7 +118,10 @@ impl CalendarApi {
     }
 
     /// A write's answer: a 200 is written whatever its body says, so one
-    /// that won't read or parse is done, with nothing of the event.
+    /// that won't read or parse is done, with nothing of the event. Every
+    /// failure that leaves open whether it landed (no answer, a 5xx, or a
+    /// 5xx whose body was lost) is `Offline`; anything else is a refusal,
+    /// which wrote nothing.
     fn written(
         res: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     ) -> Result<Answer, Failure> {
@@ -140,6 +143,11 @@ impl CalendarApi {
         let body = match body {
             Ok(body) => body,
             Err(_) if write && status == 200 => return Ok(Answer::Done(Value::Null)),
+            Err(_) if write && status >= 500 => {
+                return Err(Failure::Offline(
+                    "Calendar had a problem just now. Try again.".to_owned(),
+                ));
+            }
             Err(e) => {
                 return Err(Failure::Plain(format!(
                     "Calendar's answer could not be read: {}",
@@ -170,6 +178,9 @@ impl CalendarApi {
             403 if why().contains("insufficient") => Err(Failure::NeedsAccess),
             429 => Err(Failure::Plain(
                 "Calendar is busy right now. Try again in a moment.".to_owned(),
+            )),
+            500.. if write => Err(Failure::Offline(
+                "Calendar had a problem just now. Try again.".to_owned(),
             )),
             500.. => Err(Failure::Plain(
                 "Calendar had a problem just now. Try again.".to_owned(),
@@ -1653,7 +1664,11 @@ pub(crate) fn rsvp_with(
         Ok(answer) => answer,
         // the PATCH went out and may have landed: never a plain failure,
         // or a second press would send the answer again
-        Err(e) if how.stands_after_write => return Ok(unconfirmed(e)),
+        Err(Failure::Offline(_)) if how.stands_after_write => return Ok(unconfirmed()),
+        // Calendar refused it, so nothing went: the buttons come back
+        Err(e @ (Failure::Plain(_) | Failure::NeedsAccess)) if how.stands_after_write => {
+            return Ok(not_sent(e));
+        }
         Err(e) => return Err(e),
     };
     if let Some(no) = refused(&answer) {
@@ -1672,12 +1687,21 @@ pub(crate) fn rsvp_with(
 /// The code of a PATCH that failed on its way, and so may have landed.
 const UNCONFIRMED: &str = "unconfirmed";
 
-fn unconfirmed(e: Failure) -> Value {
-    let why = match e {
-        Failure::Offline(_) => "Calendar didn't answer. Your reply may have gone.",
-        _ => "Calendar didn't say whether your reply went.",
-    };
-    fail(UNCONFIRMED, why)
+fn unconfirmed() -> Value {
+    fail(
+        UNCONFIRMED,
+        "Calendar didn't say whether your reply went. It may have.",
+    )
+}
+
+/// A PATCH Calendar refused: it wrote nothing, so this says so plainly.
+fn not_sent(e: Failure) -> Value {
+    let failure = failed(e);
+    let why = failure
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("Calendar didn't accept it.");
+    ok(json!({"refused": "not_sent", "message": format!("Your reply wasn't sent. {why}")}))
 }
 
 /// An answer Google has: what it sent back goes in, and the sync thread

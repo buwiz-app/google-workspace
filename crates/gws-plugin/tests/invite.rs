@@ -829,3 +829,45 @@ fn a_saved_invite_judged_by_an_older_sender_rule_is_judged_again() {
     let got = data(core.run("gws_mail_invite", &json!({"thread": INVITE})));
     assert_eq!(got["invite"]["title"], "Roof inspection", "{got}");
 }
+
+#[test]
+fn a_patch_calendar_refused_is_not_sent_and_a_lapsed_sign_in_is_said() {
+    let google = FakeGoogle::start(rich());
+    let core = signed_in(&google, "patch-refused");
+    for status in [403, 409, 400] {
+        google.calendar_patch_refuses(Some(status));
+        let answer = core.run(
+            "gws_mail_invite_reply",
+            &json!({"message": INVITE, "response": "accepted"}),
+        );
+        assert_ne!(
+            answer["structuredContent"]["code"], "unconfirmed",
+            "{status}: {answer}"
+        );
+        let refused = &answer["structuredContent"]["refused"];
+        assert!(refused.is_string(), "{status}: {answer}");
+    }
+    google.calendar_patch_refuses(Some(403));
+    let got = data(core.run(
+        "gws_mail_invite_reply",
+        &json!({"message": INVITE, "response": "accepted"}),
+    ));
+    assert_eq!(got["refused"], "not_sent", "{got}");
+    assert!(
+        got["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Your reply wasn't sent."),
+        "{got}"
+    );
+    google.calendar_patch_refuses(Some(401));
+    let lapsed = core.run(
+        "gws_mail_invite_reply",
+        &json!({"message": INVITE, "response": "accepted"}),
+    );
+    assert_eq!(
+        lapsed["structuredContent"]["code"], "account_required",
+        "{lapsed}"
+    );
+    assert!(google.calendar_writes().is_empty(), "nothing went");
+}

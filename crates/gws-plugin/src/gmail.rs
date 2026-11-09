@@ -33,7 +33,7 @@ const METADATA_AT_ONCE: usize = 8;
 /// A list or metadata answer.
 const SMALL_MAX: u64 = 1024 * 1024;
 /// A `format=full` message (attachments are not in it, only their ids).
-const FULL_MAX: u64 = 32 * 1024 * 1024;
+pub const FULL_MAX: u64 = 32 * 1024 * 1024;
 
 /// Why a Gmail call gave nothing.
 #[derive(Debug, PartialEq)]
@@ -46,6 +46,31 @@ pub enum Failure {
     Offline(String),
     /// Anything else, as a plain message.
     Plain(String),
+}
+
+/// What a whole read of a thread came to.
+#[derive(Debug)]
+pub enum Whole {
+    Read(Value),
+    /// Gone at Google.
+    Gone,
+    /// Bigger than the read may take: another read of it comes to the same,
+    /// so it's no failure to wait out. What the read said, as a failure.
+    TooBig(Failure),
+}
+
+/// Why an answer gave nothing: past its cap, or anything else.
+enum Refused {
+    TooBig(Failure),
+    Other(Failure),
+}
+
+impl From<Refused> for Failure {
+    fn from(refused: Refused) -> Self {
+        match refused {
+            Refused::TooBig(f) | Refused::Other(f) => f,
+        }
+    }
 }
 
 /// The Gmail API at a base URL.
@@ -163,6 +188,18 @@ impl Gmail {
         cap: u64,
         within: Option<Duration>,
     ) -> Result<Option<Value>, Failure> {
+        Ok(self.get_sized(auth, path, query, cap, within)?)
+    }
+
+    /// [`Self::get_within`], saying apart an answer past `cap`.
+    fn get_sized(
+        &self,
+        auth: &Bearer,
+        path: String,
+        query: Vec<(&'static str, String)>,
+        cap: u64,
+        within: Option<Duration>,
+    ) -> Result<Option<Value>, Refused> {
         let url = format!("{}/{path}", self.base);
         let mut req = self
             .agent
@@ -175,7 +212,7 @@ impl Gmail {
         for (k, v) in &query {
             req = req.query(*k, v);
         }
-        Self::answer(req.call(), cap)
+        Self::answer_sized(req.call(), cap)
     }
 
     /// A POST: a person's press, or a draft the model filled, which sends nothing.
@@ -194,11 +231,19 @@ impl Gmail {
         res: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
         cap: u64,
     ) -> Result<Option<Value>, Failure> {
+        Ok(Self::answer_sized(res, cap)?)
+    }
+
+    /// [`Self::answer`], saying apart a body past `cap`.
+    fn answer_sized(
+        res: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+        cap: u64,
+    ) -> Result<Option<Value>, Refused> {
         let mut res = res.map_err(|e| {
-            Failure::Offline(format!(
+            Refused::Other(Failure::Offline(format!(
                 "could not reach Gmail: {}",
                 js::slice_utf16(&e.to_string(), 200)
-            ))
+            )))
         })?;
         let status = res.status().as_u16();
         let body = res
@@ -207,21 +252,30 @@ impl Gmail {
             .limit(cap)
             .read_to_vec()
             .map_err(|e| {
-                Failure::Plain(format!(
+                let failure = Failure::Plain(format!(
                     "Gmail's answer could not be read: {}",
                     js::slice_utf16(&e.to_string(), 200)
-                ))
+                ));
+                match e {
+                    ureq::Error::BodyExceedsLimit(_) => Refused::TooBig(failure),
+                    _ => Refused::Other(failure),
+                }
             })?;
+        Self::answered(status, &body).map_err(Refused::Other)
+    }
+
+    /// What Gmail's answer with `status` and `body` says.
+    fn answered(status: u16, body: &[u8]) -> Result<Option<Value>, Failure> {
         match status {
             // a delete answers with nothing
             200 | 204 if body.is_empty() => Ok(Some(Value::Null)),
-            200 => serde_json::from_slice(&body)
+            200 => serde_json::from_slice(body)
                 .map(Some)
                 .map_err(|_| Failure::Plain("Gmail's answer is not JSON".to_owned())),
             401 => Err(Failure::AccountRequired),
             404 => Ok(None),
             _ => {
-                let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
                 let why = v
                     .pointer("/error/message")
                     .and_then(Value::as_str)
@@ -447,6 +501,26 @@ impl Gmail {
             FULL_MAX,
             Some(within),
         )
+    }
+
+    /// [`Self::thread_full`], within `cap` bytes, saying apart a thread past it.
+    pub fn thread_whole(&self, auth: &Bearer, id: &str, cap: u64) -> Result<Whole, Failure> {
+        if !id_ok(id) {
+            return Ok(Whole::Gone);
+        }
+        let read = self.get_sized(
+            auth,
+            format!("threads/{id}"),
+            vec![("format", "full".to_owned())],
+            cap,
+            Some(TIMEOUT),
+        );
+        match read {
+            Ok(Some(v)) => Ok(Whole::Read(v)),
+            Ok(None) => Ok(Whole::Gone),
+            Err(Refused::TooBig(f)) => Ok(Whole::TooBig(f)),
+            Err(Refused::Other(f)) => Err(f),
+        }
     }
 
     /// Each message of a thread, with its labels now.

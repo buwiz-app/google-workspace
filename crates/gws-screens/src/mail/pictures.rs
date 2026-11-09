@@ -116,6 +116,9 @@ fn fetch(b: &Bridge, m: Mail, only: Value) {
                 let mut shown = Pictures::of(&v, turn);
                 shown.trusted = m.images.with_untracked(|p| p.trusted);
                 m.images.set(shown);
+                // the cards follow the pictures this page has: one put in
+                // leaves them, one that didn't come back is a card again
+                m.attachments.set(super::attachments_in(&v));
                 m.page.set(Some(
                     v.get("page")
                         .and_then(Value::as_str)

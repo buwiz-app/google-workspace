@@ -127,7 +127,8 @@ fn attachment_ok(id: &str) -> bool {
 
 /// A part's picture: its bytes inline, else from the attachment API within
 /// `by`, and nothing past [`PICTURE_MAX`] fetched at all. `calls` counts the
-/// attachment calls, which stop at [`CID_CALLS`].
+/// attachment calls, which stop at [`CID_CALLS`]. `missed` is set when time ran
+/// out or Gmail failed, which another try may not.
 fn part_picture(
     core: &Core,
     auth: &Bearer,
@@ -135,6 +136,7 @@ fn part_picture(
     part: &Value,
     by: Instant,
     calls: &mut usize,
+    missed: &mut bool,
 ) -> Option<String> {
     if let Some(data) = part.pointer("/body/data").and_then(Value::as_str) {
         // base64 of more than the cap can't decode to within it
@@ -151,13 +153,18 @@ fn part_picture(
     if *calls >= CID_CALLS {
         return None;
     }
-    let left = left(by)?;
+    let Some(left) = left(by) else {
+        *missed = true;
+        return None;
+    };
     *calls += 1;
-    let bytes = core
-        .gmail
-        .attachment_within(auth, message, id, left)
-        .ok()??;
-    data_url(&bytes)
+    match core.gmail.attachment_within(auth, message, id, left) {
+        Ok(bytes) => data_url(&bytes?),
+        Err(_) => {
+            *missed = true;
+            None
+        }
+    }
 }
 
 /// What's left of the time until `by`, if any is.
@@ -240,9 +247,10 @@ impl Placer {
 }
 
 /// The pictures inside `thread`'s mail, by Content-ID, offered to `placer` by
-/// `by`, with no more than [`CID_CALLS`] calls to Gmail for them.
-fn inside(core: &Core, auth: &Bearer, thread: &Value, placer: &mut Placer, by: Instant) {
-    let mut calls = 0;
+/// `by`, with no more than [`CID_CALLS`] calls to Gmail for them. `false` when
+/// one was missed for time or a failure, so the view isn't kept.
+fn inside(core: &Core, auth: &Bearer, thread: &Value, placer: &mut Placer, by: Instant) -> bool {
+    let (mut calls, mut missed) = (0, false);
     for (n, m) in messages(thread).iter().enumerate() {
         let parts = gmail::by_content_id(m);
         if parts.is_empty() {
@@ -252,7 +260,7 @@ fn inside(core: &Core, auth: &Bearer, thread: &Value, placer: &mut Placer, by: I
         let mut seen = HashSet::new();
         for url in placer.uses[n].clone() {
             if placer.full() {
-                return;
+                return !missed;
             }
             let Some(part) = gmail::cid_of(&url).and_then(|cid| parts.get(&cid).copied()) else {
                 continue;
@@ -260,11 +268,12 @@ fn inside(core: &Core, auth: &Bearer, thread: &Value, placer: &mut Placer, by: I
             if !seen.insert(url.clone()) {
                 continue;
             }
-            if let Some(data) = part_picture(core, auth, id, part, by, &mut calls) {
+            if let Some(data) = part_picture(core, auth, id, part, by, &mut calls, &mut missed) {
                 placer.offer(&[n], &url, data);
             }
         }
     }
+    !missed
 }
 
 /// Takes out anything that looks like what [`Placer`] puts in.
@@ -389,16 +398,17 @@ fn named(thread: &Value, account: &str) -> Value {
 }
 
 /// The thread's view, with the pictures inside its mail shown, and who its
-/// pictures are from. For the thread view, which the store keeps.
-pub fn view(core: &Core, auth: &Bearer, account: &str, thread: &mut Value) -> Value {
+/// pictures are from. For the thread view, which the store keeps unless the
+/// second answer is `false`: a picture missed for time or a failure.
+pub fn view(core: &Core, auth: &Bearer, account: &str, thread: &mut Value) -> (Value, bool) {
     let by = Instant::now() + ALL_WITHIN;
     unplace(thread);
     let mut placer = Placer::new(thread);
-    inside(core, auth, thread, &mut placer, by);
+    let whole = inside(core, auth, thread, &mut placer, by);
     placer.finish(thread);
     let mut view = mail::view_of(thread);
     view["pictures"] = named(thread, account);
-    view
+    (view, whole)
 }
 
 /// `view` with whether its sender is trusted now, as a tool's answer: only a
@@ -727,6 +737,9 @@ fn show(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some(mut thread) = core.gmail.thread_full_within(&auth, &id, ALL_WITHIN)? else {
         return Ok(fail("not_found", "That conversation is gone."));
     };
+    // the press shows its own cards, so an invite's twin goes here too
+    let twins_by = (Instant::now() + gmail::TWINS_WITHIN).min(by);
+    core.gmail.mark_twins_by(&auth, &mut thread, twins_by);
     unplace(&mut thread);
     let only_trusted = args.get("trusted") == Some(&Value::Bool(true));
     let only_from = args

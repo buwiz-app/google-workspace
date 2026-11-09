@@ -576,6 +576,7 @@ struct Account {
     /// Files this size and under come in `body.data`, with no attachment id.
     data_in_parts: Option<usize>,
     draft_reads_fail: bool,
+    attachment_reads_fail: bool,
     /// Reads so far, once attachment ids change with each.
     reads: Option<AtomicU64>,
     /// `(draft id, message id, raw message, thread)`.
@@ -995,6 +996,15 @@ impl Account {
             .unwrap_or(100)
             .min(500);
         if self.reads_fail_after_write && self.wrote && r.method == "GET" && format == "metadata" {
+            return Reply::json(
+                500,
+                json!({"error": {"code": 500, "message": "Backend error"}}),
+            );
+        }
+        if self.attachment_reads_fail
+            && r.method == "GET"
+            && matches!(segs.as_slice(), ["messages", _, "attachments", _])
+        {
             return Reply::json(
                 500,
                 json!({"error": {"code": 500, "message": "Backend error"}}),
@@ -1637,6 +1647,11 @@ impl FakeGoogle {
     /// Once something is written, reading a thread's metadata fails.
     pub fn reads_fail_after_a_write(&self) {
         self.account.lock().unwrap().reads_fail_after_write = true;
+    }
+
+    /// Whether reading an attachment fails, as a passing outage does.
+    pub fn attachment_reads_fail(&self, fail: bool) {
+        self.account.lock().unwrap().attachment_reads_fail = fail;
     }
 
     /// Whether reading a draft fails.

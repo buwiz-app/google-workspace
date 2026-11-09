@@ -40,6 +40,14 @@ impl Home {
             .clone()
     }
 
+    /// The view a press of Show pictures answers.
+    fn pressed(&self, thread: &str) -> Value {
+        let answer = self
+            .core
+            .run("gws_mail_pictures", &json!({"thread": thread}));
+        answer["structuredContent"].clone()
+    }
+
     fn preview(&self, message: &str, part: &Value) -> Value {
         self.core.run(
             "gws_mail_attachment_preview",
@@ -464,4 +472,51 @@ fn a_picture_named_in_another_case_or_escaped_shows_and_is_no_card() {
         "{view}"
     );
     assert_eq!(view["attachments"], json!([]));
+}
+
+fn dot_letter() -> Mail {
+    letter_with(
+        "<p><img src=\"cid:dot\"></p>",
+        vec![("dot", "dot.png", "image/png", png_saying(1, 1))],
+    )
+}
+
+fn cards(view: &Value) -> Vec<&str> {
+    names(view["attachments"].as_array().unwrap())
+}
+
+#[test]
+fn a_press_that_loses_a_picture_gives_its_card_back() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(dot_letter());
+    let home = Home::new(&google.base(), "presslost");
+    assert!(
+        home.files("18f1aa").is_empty(),
+        "in the letter as it opened"
+    );
+    google.attachment_reads_fail(true);
+    let view = home.pressed("18f1aa");
+    assert!(!view["page"].as_str().unwrap().contains("data:image/png"));
+    assert_eq!(cards(&view), ["dot.png"]);
+}
+
+#[test]
+fn a_picture_that_failed_as_it_opened_is_not_kept_out() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(dot_letter());
+    let home = Home::new(&google.base(), "openlost");
+    google.attachment_reads_fail(true);
+    assert_eq!(names(&home.files("18f1aa")), ["dot.png"]);
+    google.attachment_reads_fail(false);
+    assert!(home.files("18f1aa").is_empty(), "the next open puts it in");
+    let view = home.pressed("18f1aa");
+    assert!(view["page"].as_str().unwrap().contains("data:image/png"));
+    assert!(cards(&view).is_empty(), "and a press shows it once");
+}
+
+#[test]
+fn a_press_shows_an_invites_event_once() {
+    let google = rich();
+    let home = Home::new(&google.base(), "pressinvite");
+    assert_eq!(cards(&home.pressed(INVITE)), ["invite.ics"]);
 }

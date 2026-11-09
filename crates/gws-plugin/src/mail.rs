@@ -1172,10 +1172,11 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
         return Ok(fail("not_found", "That conversation is gone."));
     };
     let told = core.gmail.mark_twins(&auth, &mut full);
-    let mut view = pictures::view(core, &auth, &account, &mut full);
+    let (mut view, whole) = pictures::view(core, &auth, &account, &mut full);
     view["view_version"] = VIEW_VERSION.into();
-    // a twin check cut short isn't kept, so the next open can finish it
-    if told {
+    // a twin check or a picture cut short isn't kept, so the next open can
+    // finish it
+    if told && whole {
         with_own_store(core, &account, |store| {
             store.put_view(&account, &id, &view.to_string(), now_ms())
         })?;

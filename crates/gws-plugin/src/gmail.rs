@@ -884,7 +884,7 @@ const TWIN_MAX: u64 = 256 * 1024;
 /// the rest stay as cards.
 const TWINS_MAX: usize = 16;
 /// How long the twin check may take for a whole thread, before it shows.
-const TWINS_WITHIN: Duration = Duration::from_secs(5);
+pub const TWINS_WITHIN: Duration = Duration::from_secs(5);
 
 /// Every part with a file name, and whether it sits anywhere under a
 /// multipart/alternative.

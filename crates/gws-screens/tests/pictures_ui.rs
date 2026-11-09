@@ -27,6 +27,8 @@ struct Fake {
     /// A pictures answer waits here until released.
     hold_pictures: Mutex<bool>,
     held: Mutex<Vec<(Value, Done)>>,
+    /// The cards of the view as opened, and as the press answers.
+    cards: Mutex<(Value, Value)>,
 }
 
 impl Fake {
@@ -52,7 +54,14 @@ impl Fake {
         } else {
             "<p>without</p>"
         };
-        json!({"id": id, "page": format!("{page}<p>{id}</p>"), "links": [], "images": if shown { 0 } else { 2 }, "attachments": [], "pictures": {"from": from, "trusted": trusted, "asked": shown}})
+        let cards = self.cards.lock().unwrap();
+        let attachments = if shown { &cards.1 } else { &cards.0 };
+        let attachments = if attachments.is_null() {
+            json!([])
+        } else {
+            attachments.clone()
+        };
+        json!({"id": id, "page": format!("{page}<p>{id}</p>"), "links": [], "images": if shown { 0 } else { 2 }, "attachments": attachments, "pictures": {"from": from, "trusted": trusted, "asked": shown}})
     }
 }
 
@@ -284,4 +293,45 @@ fn the_ai_reaches_no_press_of_the_bar_and_no_label_holds_the_sender() {
         filter.labels().iter().any(|l| l == PRESSES[2]),
         "the audit sees Stop"
     );
+}
+
+fn logo_card() -> Value {
+    json!([{"name": "logo.png", "mime": "image/png", "size": 90, "id": "att-1", "part": "1", "message": "t1"}])
+}
+
+#[test]
+fn a_picture_the_press_put_in_takes_its_card_away() {
+    let fake = Arc::new(Fake::default());
+    *fake.cards.lock().unwrap() = (logo_card(), json!([]));
+    let (mut app, _) = start(&fake);
+    open(&mut app, "Subject 1");
+    assert!(app.screen().shows("logo.png"), "not put in as it opened");
+    app.press(&format!("label:{}", PRESSES[0]))
+        .expect("Show pictures presses");
+    settle(&mut app);
+    assert!(
+        !app.screen().shows("Pictures are hidden."),
+        "the press came back"
+    );
+    assert!(!app.screen().shows("logo.png"), "shown once, in the letter");
+}
+
+#[test]
+fn a_picture_the_press_lost_gets_its_card_back() {
+    let fake = Arc::new(Fake::default());
+    *fake.cards.lock().unwrap() = (json!([]), logo_card());
+    let (mut app, _) = start(&fake);
+    open(&mut app, "Subject 1");
+    assert!(
+        !app.screen().shows("logo.png"),
+        "in the letter as it opened"
+    );
+    app.press(&format!("label:{}", PRESSES[0]))
+        .expect("Show pictures presses");
+    settle(&mut app);
+    assert!(
+        !app.screen().shows("Pictures are hidden."),
+        "the press came back"
+    );
+    assert!(app.screen().shows("logo.png"), "not lost from both");
 }

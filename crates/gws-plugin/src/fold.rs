@@ -62,9 +62,32 @@ fn lines(text: &str) -> Vec<(usize, &str)> {
 }
 
 /// Whether `first` to `last` is an "On … wrote:" line, which Gmail can wrap
-/// onto a second one.
+/// onto a second one. It has a header's shape too, a date or an address, so
+/// "On reflection, here's what Ana wrote:" stays the sender's.
 fn wrote(first: &str, last: &str) -> bool {
-    first.starts_with("On ") && last.ends_with("wrote:")
+    first.starts_with("On ") && last.ends_with("wrote:") && (dated(first) || dated(last))
+}
+
+/// Whether a line names a day, a time or an address, as a header does.
+fn dated(line: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun", "monday",
+        "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "jan", "feb", "mar",
+        "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec", "january",
+        "february", "march", "april", "june", "july", "august", "september", "october",
+        "november", "december",
+    ];
+    let address = |w: &str| {
+        let w = w.trim_matches(|c: char| !c.is_alphanumeric());
+        w.find('@').is_some_and(|at| at > 0 && at + 1 < w.len())
+    };
+    let name = |w: &str| {
+        w.starts_with(|c: char| c.is_ascii_uppercase())
+            && NAMES.iter().any(|n| n.eq_ignore_ascii_case(w))
+    };
+    line.bytes().any(|b| b.is_ascii_digit())
+        || line.split_whitespace().any(address)
+        || line.split(|c: char| !c.is_ascii_alphabetic()).any(name)
 }
 
 /// Where the "On … wrote:" line ending at line `i` starts.
@@ -140,6 +163,10 @@ pub struct Quoted {
 /// nothing but a quote isn't hidden. One walk of the markup, however it's
 /// written: a mail can't make this slow.
 pub fn quotes(cleaned: &str) -> Option<Quoted> {
+    // most mail quotes nothing: no walk for it
+    if !cleaned.contains("gmail_quote") && !cleaned.contains("<blockquote") {
+        return None;
+    }
     let nodes = nodes(cleaned);
     let spans = spans(cleaned, &nodes);
     // from the last quote back, while only quotes and blank space follow
@@ -182,30 +209,57 @@ pub fn quotes(cleaned: &str) -> Option<Quoted> {
 /// Cleaned HTML with each of `regions` behind a ••• fold.
 pub fn wrap(cleaned: &str, regions: &[Region]) -> String {
     let mut out = String::with_capacity(cleaned.len() + regions.len() * 64);
+    pieces(cleaned, regions, |p| out.push_str(p));
+    out
+}
+
+/// What [`wrap`] gives, in order, piece by piece: so it can be measured
+/// without being built.
+pub fn pieces<'a>(cleaned: &'a str, regions: &'a [Region], mut out: impl FnMut(&'a str)) {
     let mut at = 0;
     for r in regions {
-        out.push_str(&cleaned[at..r.start]);
+        out(&cleaned[at..r.start]);
         for &(a, b) in r.reopen.iter().rev() {
-            out.push_str(&format!("</{}>", name_of(&cleaned[a..b])));
+            out("</");
+            out(name_of(&cleaned[a..b]));
+            out(">");
         }
-        out.push_str(QUOTE);
+        out(QUOTE);
         for &(a, b) in &r.reopen {
-            out.push_str(&cleaned[a..b]);
+            out(&cleaned[a..b]);
         }
-        out.push_str(&cleaned[r.start..r.end]);
-        out.push_str(END);
+        out(&cleaned[r.start..r.end]);
+        out(END);
         at = r.end;
     }
-    out.push_str(&cleaned[at..]);
-    out
+    out(&cleaned[at..]);
 }
 
 /// Cleaned HTML as the plain text it gives way to, and where in that text
 /// the fold at `cut` starts. Read from the whole page, so what an element
-/// around the quote hides stays hidden; `None` when the fold is in what's
-/// hidden.
+/// around the quote hides stays hidden. A fold that starts in what's hidden
+/// starts after the words before it; `None` when nothing is left to fold.
 pub fn shrunk(cleaned: &str, cut: usize) -> Option<(String, usize)> {
-    // a character the mail doesn't have marks the cut
+    let marked = mark(cleaned).and_then(|mark| {
+        let text = clean::visible_text(&format!("{}{mark}{}", &cleaned[..cut], &cleaned[cut..]));
+        text.split_once(mark)
+            .map(|(fresh, rest)| (fresh.to_owned(), rest.to_owned()))
+    });
+    let (fresh, rest) = match marked {
+        Some(split) => split,
+        None => {
+            let text = clean::visible_text(cleaned);
+            let fresh = clean::visible_text(&cleaned[..cut]);
+            let rest = text.strip_prefix(fresh.trim_end())?.to_owned();
+            (fresh, rest)
+        }
+    };
+    let (fresh, rest) = (fresh.trim_end(), rest.trim_start());
+    (!rest.is_empty()).then(|| (format!("{fresh}\n\n{rest}"), fresh.len() + 2))
+}
+
+/// A character `cleaned` doesn't have, to mark a place in it.
+fn mark(cleaned: &str) -> Option<char> {
     const FIRST: u32 = 0xe000;
     let mut taken = vec![false; 0x1900];
     for c in cleaned.chars() {
@@ -214,11 +268,7 @@ pub fn shrunk(cleaned: &str, cut: usize) -> Option<(String, usize)> {
         }
     }
     let free = taken.iter().position(|t| !t)?;
-    let mark = char::from_u32(FIRST + free as u32)?;
-    let text = clean::visible_text(&format!("{}{mark}{}", &cleaned[..cut], &cleaned[cut..]));
-    let (fresh, rest) = text.split_once(mark)?;
-    let (fresh, rest) = (fresh.trim_end(), rest.trim_start());
-    Some((format!("{fresh}\n\n{rest}"), fresh.len() + 2))
+    char::from_u32(FIRST + free as u32)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,27 +290,20 @@ struct Node {
     name: String,
     /// The element it's in.
     parent: Option<usize>,
-    /// In an element, itself too, that says `display:none` or
-    /// `visibility:hidden`. Colour isn't hiding here: it depends on what's
-    /// behind, and a word that might be seen counts.
+    /// In an element, itself too, that hides what's in it by
+    /// [`clean::sight`]: what the snippet, the fold and the shrunk text all
+    /// read by.
     hidden: bool,
+    /// The colours what's in it is drawn in and on.
+    paint: clean::Paint,
 }
 
-fn name_of(tag: &str) -> String {
-    tag.trim_start_matches(['<', '/'])
-        .chars()
-        .take_while(char::is_ascii_alphanumeric)
-        .collect()
-}
-
-fn hides(style: &str) -> bool {
-    clean::declarations(style)
-        .iter()
-        .any(|(name, value)| match name.as_str() {
-            "display" => value == "none",
-            "visibility" => value == "hidden" || value == "collapse",
-            _ => false,
-        })
+fn name_of(tag: &str) -> &str {
+    let name = tag.trim_start_matches(['<', '/']);
+    let end = name
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(name.len());
+    &name[..end]
 }
 
 /// The one walk of cleaned markup, which the serializer has made regular.
@@ -273,6 +316,7 @@ fn nodes(html: &str) -> Vec<Node> {
         let lt = html[at..].find('<').map_or(html.len(), |n| at + n);
         let parent = open.last().copied();
         let hidden = parent.is_some_and(|p| out[p].hidden);
+        let paint = parent.map_or_else(clean::Paint::default, |p| out[p].paint);
         if lt > at {
             out.push(Node {
                 at,
@@ -282,6 +326,7 @@ fn nodes(html: &str) -> Vec<Node> {
                 name: String::new(),
                 parent,
                 hidden,
+                paint,
             });
         }
         if lt == html.len() {
@@ -289,7 +334,7 @@ fn nodes(html: &str) -> Vec<Node> {
         }
         let end = lt + clean::tag_end(&html[lt..]);
         let tag = &html[lt..end];
-        let name = name_of(tag);
+        let name = name_of(tag).to_owned();
         if tag.starts_with("</") {
             if let Some(i) = open.iter().rposition(|&o| out[o].name == name) {
                 open.truncate(i);
@@ -302,10 +347,17 @@ fn nodes(html: &str) -> Vec<Node> {
                 name,
                 parent: open.last().copied(),
                 hidden,
+                paint,
             });
         } else {
-            let hidden = hidden || clean::attribute(tag, "style").is_some_and(|s| hides(&s));
             let void = clean::VOID.contains(&name.as_str());
+            // as visible_text reads it: an element with nothing in it hides nothing
+            let (hidden, paint) = if void {
+                (hidden, paint)
+            } else {
+                let (hides, paint) = clean::sight(tag, paint);
+                (hidden || hides, paint)
+            };
             if !void {
                 open.push(out.len());
             }
@@ -317,6 +369,7 @@ fn nodes(html: &str) -> Vec<Node> {
                 name,
                 parent,
                 hidden,
+                paint,
             });
         }
         at = end;
@@ -337,8 +390,25 @@ fn said(html: &str, n: &Node) -> Option<String> {
     (!words.is_empty()).then(|| words.join(" "))
 }
 
+/// Whether a text node has words a person may see, as [`said`] says, without
+/// building them: cleaned text writes only `&amp;`, `&lt;`, `&gt;` and
+/// `&nbsp;`, and only the last is space.
 fn words(html: &str, n: &Node) -> bool {
-    said(html, n).is_some()
+    if n.kind != Kind::Text || n.hidden {
+        return false;
+    }
+    let mut rest = &html[n.at..n.end];
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{a0}');
+        match rest.strip_prefix("&nbsp;") {
+            Some(after) => rest = after,
+            None if ["&amp;", "&lt;", "&gt;"].iter().any(|e| rest.starts_with(e)) => {
+                return true;
+            }
+            None if rest.starts_with('&') => return said(html, n).is_some(),
+            None => return !rest.is_empty(),
+        }
+    }
 }
 
 /// Whether a start tag opens quoted history.
@@ -358,7 +428,7 @@ fn spans(html: &str, nodes: &[Node]) -> Vec<(usize, usize)> {
     while i < nodes.len() {
         let n = &nodes[i];
         let tag = &html[n.at..n.end];
-        if n.kind == Kind::Open && quote(tag, &name_of(tag)) {
+        if n.kind == Kind::Open && quote(tag, name_of(tag)) {
             let close = nodes[i + 1..]
                 .iter()
                 .position(|m| m.kind == Kind::Close && m.depth == n.depth)
@@ -377,31 +447,64 @@ fn breaks(n: &Node) -> bool {
     !n.hidden && n.kind != Kind::Text && crate::gmail::BLOCKS.contains(&n.name.as_str())
 }
 
+/// The most lines an "On … wrote:" line is wrapped onto.
+const WRAPPED: usize = 3;
+
 /// The node a quote really starts at: the "On … wrote:" line just ahead of
-/// it, if the last line before it is one, and the elements of the sender's
-/// that line is in, to open again inside the fold. The walk back reads one
-/// line and ends: never longer than the page.
+/// it, if the last lines before it are one, and the elements of the sender's
+/// that line is in, to open again inside the fold. Gmail wraps a long one
+/// with `<br>`, so the walk back joins up to [`WRAPPED`] lines split that way,
+/// with no blank line and no sentence ending between them. It reads those
+/// lines and ends: never longer than the page.
 fn attributed(html: &str, nodes: &[Node], open: usize) -> (usize, Vec<usize>) {
     let depth = nodes[open].depth;
+    // the lines read so far, the last first, each with the node it starts at
+    let mut lines: Vec<(String, usize)> = Vec::new();
     let mut line: Vec<String> = Vec::new();
-    let mut start = None;
+    let mut first = open;
+    let mut found = None;
     let mut i = open;
-    while i > 0 {
-        i -= 1;
-        let n = &nodes[i];
-        if n.depth < depth {
+    loop {
+        // the node before, or None at the edge of what the quote is in
+        let edge = i.checked_sub(1).map(|p| &nodes[p]).filter(|n| n.depth >= depth);
+        if let Some(n) = edge {
+            i -= 1;
+            if let Some(w) = said(html, n) {
+                line.push(w);
+                first = i;
+                continue;
+            }
+            if !breaks(n) {
+                continue;
+            }
+        }
+        if line.is_empty() {
+            // the breaks between the quote and its line, else a blank line
+            if lines.is_empty() && edge.is_some() {
+                continue;
+            }
             break;
         }
-        if let Some(w) = said(html, n) {
-            line.push(w);
-            start = Some(i);
-        } else if !line.is_empty() && breaks(n) {
+        line.reverse();
+        let joined = line.join(" ");
+        line.clear();
+        // a sentence ends: what's before is the sender's
+        if !lines.is_empty() && joined.ends_with(['.', '!', '?']) {
+            break;
+        }
+        lines.push((joined, first));
+        let text: Vec<&str> = lines.iter().rev().map(|(l, _)| l.as_str()).collect();
+        let text = text.join(" ");
+        if wrote(&text, &text) {
+            found = Some(first);
+            break;
+        }
+        let wrapped = edge.is_some_and(|n| n.name == "br");
+        if !wrapped || lines.len() == WRAPPED || !lines[0].0.ends_with("wrote:") {
             break;
         }
     }
-    line.reverse();
-    let line = line.join(" ");
-    let Some(start) = start.filter(|_| wrote(&line, &line)) else {
+    let Some(start) = found else {
         return (open, Vec::new());
     };
     // the elements beside the quote down to the line, outermost first
@@ -422,6 +525,51 @@ fn attributed(html: &str, nodes: &[Node], open: usize) -> (usize, Vec<usize>) {
         chain.pop();
     }
     (start, chain)
+}
+
+/// How many allocations `f` makes on this thread: for tests that something
+/// is measured or checked without building anything.
+#[cfg(test)]
+pub(crate) fn allocations<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let before = counting::now();
+    let out = f();
+    (out, counting::now() - before)
+}
+
+#[cfg(test)]
+mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static MADE: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn now() -> usize {
+        MADE.with(Cell::get)
+    }
+
+    struct Counting;
+
+    // SAFETY: every call goes straight on to the system allocator
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = MADE.try_with(|m| m.set(m.get() + 1));
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            let _ = MADE.try_with(|m| m.set(m.get() + 1));
+            unsafe { System.realloc(ptr, layout, size) }
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
 }
 
 #[cfg(test)]
@@ -650,13 +798,182 @@ mod tests {
     }
 
     #[test]
-    fn words_before_a_quote_count_whatever_their_colour() {
-        // the dark theme shows white ink, so a person may read it
+    fn words_before_a_quote_count_as_the_model_reads_them() {
+        // white on the white page is hidden, as visible_text has it; white on
+        // black is read
         let page = clean::clean(
-            r#"<p style="color:#ffffff">Hi</p><blockquote type="cite">Old</blockquote>"#,
+            r#"<p style="color:#ffffff">Hidden</p><p>Hi</p><blockquote type="cite">Old</blockquote>"#,
         )
         .html;
         assert_eq!(super::quotes(&page).map(|q| q.fresh), Some("Hi".to_owned()));
+        let page = clean::clean(
+            r#"<div style="background:#000"><p style="color:#fff">Hi</p></div><blockquote type="cite">Old</blockquote>"#,
+        )
+        .html;
+        assert_eq!(super::quotes(&page).map(|q| q.fresh), Some("Hi".to_owned()));
+    }
+
+    #[test]
+    fn an_opacity_0_preheader_is_not_in_the_row() {
+        let page = clean::clean(
+            r#"<p style="opacity:0">Preheader</p><p>Hi</p><blockquote type="cite">Old</blockquote>"#,
+        )
+        .html;
+        assert_eq!(super::quotes(&page).map(|q| q.fresh), Some("Hi".to_owned()));
+    }
+
+    #[test]
+    fn a_font_size_0_preheader_before_a_quote_folds_nothing() {
+        // the person sees only the quote: a mail that is all quote stays in sight
+        let page = clean::clean(
+            r#"<p style="font-size:0">Preheader</p><blockquote type="cite">Old</blockquote>"#,
+        )
+        .html;
+        assert_eq!(quotes(&page), (page.clone(), None));
+    }
+
+    #[test]
+    fn the_row_the_fold_and_the_shrunk_text_hide_the_same_words() {
+        for style in [
+            "display:none",
+            "visibility:hidden",
+            "opacity:0",
+            "font-size:0",
+            "font:0/0 a",
+            "color:#fff",
+            "color:transparent",
+            "max-height:0",
+            "mso-hide:all",
+        ] {
+            let page = clean::clean(&format!(
+                r#"<p style="{style}">IGNORE</p><p>Hi</p><blockquote type="cite">Old</blockquote><p style="{style}">IGNORE</p>"#
+            ))
+            .html;
+            let q = super::quotes(&page).unwrap_or_else(|| panic!("{style}: {page}"));
+            assert_eq!(q.fresh, "Hi", "{style}");
+            assert_eq!(q.regions.len(), 1, "{style}");
+            let (text, cut) = shrunk(&page, q.regions[0].start).unwrap();
+            assert_eq!((&text[..cut], &text[cut..]), ("Hi\n\n", "Old"), "{style}");
+        }
+    }
+
+    #[test]
+    fn on_with_no_date_or_address_is_the_senders_own_line() {
+        let page = clean::clean(
+            r#"<div>Hi.</div><div>On reflection, here is what Ana wrote:</div><blockquote type="cite">Old</blockquote>"#,
+        )
+        .html;
+        let q = super::quotes(&page).unwrap();
+        assert_eq!(q.fresh, "Hi. On reflection, here is what Ana wrote:");
+        assert!(page[q.regions[0].start..].starts_with("<blockquote"));
+        // in plain text it's no attribution, so nothing folds
+        let text = "Hi\nOn reflection, Ana wrote:\n> Old";
+        assert_eq!(plain_cut(text), None);
+        // a day, a date or an address is a header's shape
+        for line in [
+            "On Thu, Ana wrote:",
+            "On Nov 6, Ana wrote:",
+            "On 6/11/2026 Ana wrote:",
+            "On behalf of the team, ana@example.com wrote:",
+        ] {
+            assert!(wrote(line, line), "{line}");
+        }
+        for line in ["On reflection, Ana wrote:", "On the may list, Ana wrote:", "On @ wrote:"] {
+            assert!(!wrote(line, line), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_page_with_no_quote_isnt_walked() {
+        let page = clean::clean(&"<p>Hi <b>there</b></p>".repeat(1000)).html;
+        let (q, made) = allocations(|| super::quotes(&page));
+        assert_eq!((q, made), (None, 0));
+    }
+
+    #[test]
+    fn whether_a_text_has_words_is_read_without_building_them() {
+        for (text, has) in [
+            ("Hi", true),
+            ("  \n\t", false),
+            ("&nbsp; &nbsp;", false),
+            ("&nbsp;x", true),
+            ("&amp;", true),
+            ("&lt;", true),
+            ("\u{a0}", false),
+            (" é", true),
+        ] {
+            let page = format!("<p>{text}</p>");
+            let n = nodes(&page).into_iter().nth(1).unwrap();
+            assert_eq!(n.kind, Kind::Text);
+            let (found, made) = allocations(|| words(&page, &n));
+            assert_eq!((found, made), (has, 0), "{text:?}");
+            assert_eq!(found, said(&page, &n).is_some(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn an_attribution_gmail_wrapped_with_br_folds_with_its_quote() {
+        let wrapped = clean::clean(
+            r#"<div>Yes.</div>On Thu, Ana &lt;<br>ana@example.com&gt; wrote:<br><blockquote type="cite">Old</blockquote>"#,
+        )
+        .html;
+        let cut = quotes(&wrapped).1.unwrap();
+        assert_eq!(clean::visible_text(&wrapped[..cut]), "Yes.");
+        // onto three lines, inside the sender's own element
+        let three = clean::clean(
+            r#"<div>Yes.<br>On Thu, Nov 6, 2026 at 9:00 AM<br>Ana Reyes &lt;<br>ana@example.com&gt; wrote:</div><blockquote type="cite">Old</blockquote>"#,
+        )
+        .html;
+        let q = super::quotes(&three).unwrap();
+        assert_eq!(q.fresh, "Yes.");
+        // a sentence before a "wrote:" line is the sender's, and so is what
+        // comes after a blank line or more than three lines up
+        for html in [
+            r#"<div>On Monday I asked.<br>Here is what Ana wrote:</div><blockquote type="cite">Old</blockquote>"#,
+            r#"<div>On Thu, Nov 6<br><br>Ana wrote:</div><blockquote type="cite">Old</blockquote>"#,
+            r#"<div>Hi.<br>On Thu,<br>Nov 6<br>at 9<br>Ana wrote:</div><blockquote type="cite">Old</blockquote>"#,
+        ] {
+            let page = clean::clean(html).html;
+            let q = super::quotes(&page).unwrap();
+            assert!(
+                page[q.regions[0].start..].starts_with("<blockquote"),
+                "{html}: {page}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shrunk_page_folds_where_the_html_did() {
+        let page = clean::clean(
+            r#"<div>Sounds good.</div><div>On Nov 6, 2026, Ana wrote:</div><blockquote type="cite">Old</blockquote>"#,
+        )
+        .html;
+        let q = super::quotes(&page).unwrap();
+        assert_eq!(
+            shrunk(&page, q.regions[0].start),
+            Some((
+                "Sounds good.\n\nOn Nov 6, 2026, Ana wrote:\n\nOld".to_owned(),
+                14
+            ))
+        );
+        // a fold that starts in what's hidden starts after the words before it
+        let page = clean::clean(
+            r#"<p>Hi</p><div style="display:none"><blockquote type="cite">INJECT</blockquote></div><blockquote type="cite">Old words</blockquote>"#,
+        )
+        .html;
+        let q = super::quotes(&page).unwrap();
+        assert_eq!(q.regions.len(), 2);
+        assert_eq!(
+            shrunk(&page, q.regions[0].start),
+            Some(("Hi\n\nOld words".to_owned(), 4))
+        );
+        // nothing left to fold
+        let page = clean::clean(
+            r#"<p>Hi</p><blockquote type="cite" style="display:none">INJECT</blockquote>"#,
+        )
+        .html;
+        let q = super::quotes(&page).unwrap();
+        assert_eq!(shrunk(&page, q.regions[0].start), None);
     }
 
     #[test]

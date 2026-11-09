@@ -1073,8 +1073,12 @@ enum Part {
 impl Part {
     fn size(&self) -> usize {
         match self {
+            // the fold's markup measured where it goes, nothing built
             Part::Html(c, regions, _) => {
-                sent(&fold::wrap(&c.html, regions)) + json!(c.links).to_string().len()
+                let mut html = 2;
+                fold::pieces(&c.html, regions, |p| html += sent(p) - 2);
+                let links = c.links.iter().map(|l| sent(l) + 1).sum::<usize>();
+                html + links.max(1) + 1
             }
             Part::Text(t, cut) => sent(&fold::split(t, *cut)),
             Part::TooLong => TOO_LONG.len(),
@@ -1099,9 +1103,18 @@ impl Part {
     }
 }
 
-/// `text`'s size in a JSON result.
+/// `text`'s size in a JSON result, as serde_json writes it, counted without
+/// writing it.
 fn sent(text: &str) -> usize {
-    Value::from(text).to_string().len()
+    let escapes: usize = text
+        .bytes()
+        .map(|b| match b {
+            b'"' | b'\\' | b'\x08' | b'\x0c' | b'\n' | b'\r' | b'\t' => 1,
+            0..=0x1f => 5,
+            _ => 0,
+        })
+        .sum();
+    text.len() + escapes + 2
 }
 
 /// Whether Gmail marks this one message unread.
@@ -2065,6 +2078,36 @@ mod tests {
             page[fold..].contains(">On Nov 6, 2026, Ana wrote:"),
             "{page}"
         );
+    }
+
+    #[test]
+    fn a_shrunk_message_whose_first_quote_is_hidden_still_folds_the_rest() {
+        let page = shrunk_page(
+            r#"<div style="display:none"><blockquote type="cite">INJECT</blockquote></div><blockquote type="cite">Old words</blockquote>"#,
+        );
+        assert!(!page.contains("INJECT"), "{page}");
+        let fold = page
+            .find(r#"<details class="gws-quote"><summary>•••</summary><pre"#)
+            .expect("the fold stays");
+        assert!(page[fold..].contains(">Old words</pre>"), "{page}");
+    }
+
+    #[test]
+    fn a_parts_size_is_what_it_sends_counted_without_building_it() {
+        let c = clean::clean(
+            r#"<div><a href="https://a.example/?q=&quot;">Sounds</a> "good".<br><i>On Nov 6, 2026, Ana wrote:</i></div><blockquote type="cite">Old	\</blockquote>"#,
+        );
+        let regions = fold::quotes(&c.html).unwrap().regions;
+        assert!(!regions[0].reopen.is_empty(), "the fold reopens an element");
+        let expected = sent(&fold::wrap(&c.html, &regions)) + json!(c.links).to_string().len();
+        let part = Part::Html(c, regions, String::new());
+        let (size, made) = fold::allocations(|| part.size());
+        assert_eq!((size, made), (expected, 0));
+        let empty = Part::Html(clean::clean("<p>x</p>"), Vec::new(), String::new());
+        assert_eq!(empty.size(), sent("<p>x</p>") + 2);
+        for text in ["", "plain", "\"\\\n\r\t\u{8}\u{c}\u{1}\u{1f}\u{7f}é😀</>"] {
+            assert_eq!(sent(text), Value::from(text).to_string().len(), "{text:?}");
+        }
     }
 
     #[test]

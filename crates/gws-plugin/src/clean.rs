@@ -564,6 +564,30 @@ fn ink(tag: &str) -> Option<Rgba> {
     colour(&value)
 }
 
+/// The colours an element's text is drawn in and on, as what's in it
+/// inherits them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Paint {
+    paper: Option<Rgba>,
+    ink: Option<Rgba>,
+}
+
+/// Whether a start tag, inside `around`, hides what's in it from a person,
+/// by its style or by text the colour of what it's on, and the paint it hands
+/// on. The one rule for what a person sees: [`visible_text`] reads by it, and
+/// so does the fold.
+pub(crate) fn sight(tag: &str, around: Paint) -> (bool, Paint) {
+    let paint = Paint {
+        paper: background(tag).or(around.paper),
+        ink: ink(tag).or(around.ink),
+    };
+    let unseen = paint
+        .ink
+        .is_some_and(|ink| unreadable(ink, paint.paper.unwrap_or(PAGE)));
+    let hides = unseen || attribute(tag, "style").is_some_and(|s| hidden(&s));
+    (hides, paint)
+}
+
 /// `html` as plain text, read from the markup the reader shows, without what
 /// that markup plainly hides. No filter can catch every way to hide text, so
 /// this narrows what a mail can slip to the model and proves nothing: what
@@ -574,8 +598,8 @@ pub fn visible_text(html: &str) -> String {
     let mut text = String::new();
     // inside a hidden element: its name, and how many of that name are open
     let mut hiding: Option<(String, usize)> = None;
-    // the backgrounds and text colours of the elements open now, innermost last
-    let mut open: Vec<(String, Option<Rgba>, Option<Rgba>)> = Vec::new();
+    // the elements open now and their paint, innermost last
+    let mut open: Vec<(String, Paint)> = Vec::new();
     let mut rest = html.as_str();
     while !rest.is_empty() {
         let lt = rest.find('<').unwrap_or(rest.len());
@@ -610,17 +634,14 @@ pub fn visible_text(html: &str) -> String {
                 open.truncate(at);
             }
         } else if !void {
-            let paper = background(tag)
-                .or_else(|| open.iter().rev().find_map(|(_, bg, _)| *bg))
-                .unwrap_or(PAGE);
             // a colour is inherited, and can meet a background further in
-            let text = ink(tag).or_else(|| open.iter().rev().find_map(|(.., ink)| *ink));
-            let unseen = text.is_some_and(|ink| unreadable(ink, paper));
-            if unseen || attribute(tag, "style").is_some_and(|s| hidden(&s)) {
+            let around = open.last().map_or_else(Paint::default, |(_, p)| *p);
+            let (hides, paint) = sight(tag, around);
+            if hides {
                 hiding = Some((name, 1));
                 continue;
             }
-            open.push((name.clone(), background(tag), ink(tag)));
+            open.push((name.clone(), paint));
         }
         if gmail::BLOCKS.contains(&name.as_str()) {
             text.push('\n');

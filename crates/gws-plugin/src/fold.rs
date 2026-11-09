@@ -7,8 +7,8 @@
 //! `summary` of a mail's, and what it gives back closes each element it opens,
 //! so a mail can neither write a fold nor close one of these.
 
+use crate::clean;
 use crate::mail::escape;
-use crate::{clean, gmail};
 
 /// What ends a fold of any kind.
 pub const END: &str = "</details>";
@@ -94,7 +94,12 @@ pub fn plain_cut(text: &str) -> Option<usize> {
 
 /// A plain text part, its quoted history behind a fold.
 pub fn plain(text: &str) -> String {
-    match plain_cut(text) {
+    split(text, plain_cut(text))
+}
+
+/// Text with what follows `cut` behind a fold.
+pub fn split(text: &str, cut: Option<usize>) -> String {
+    match cut {
         Some(cut) => format!(
             "{}{QUOTE}{}{END}",
             pre(text[..cut].trim_end_matches(['\n', '\r'])),
@@ -128,13 +133,18 @@ pub fn quotes(cleaned: &str) -> (String, Option<usize>) {
         }
         first -= 1;
     }
-    let cut = spans.get(first).map(|s| s.0);
-    if cut.is_none_or(|c| clean::visible_text(&cleaned[..c]).is_empty()) {
+    let Some(&(start, end)) = spans.get(first) else {
+        return (cleaned.to_owned(), None);
+    };
+    // Apple writes its "On … wrote:" line just ahead of the quote
+    let cut = attributed(cleaned, start);
+    if clean::visible_text(&cleaned[..cut]).is_empty() {
         return (cleaned.to_owned(), None);
     }
     let mut out = String::with_capacity(cleaned.len() + 64);
     let mut at = 0;
-    for &(start, end) in &spans[first..] {
+    let folds = std::iter::once((cut, end)).chain(spans[first + 1..].iter().copied());
+    for (start, end) in folds {
         out.push_str(&cleaned[at..start]);
         out.push_str(QUOTE);
         out.push_str(&cleaned[start..end]);
@@ -142,7 +152,68 @@ pub fn quotes(cleaned: &str) -> (String, Option<usize>) {
         at = end;
     }
     out.push_str(&cleaned[at..]);
-    (out, cut)
+    (out, Some(cut))
+}
+
+/// Where a quote starting at `start` really starts: before the "On …
+/// wrote:" line that comes just ahead of it, if one does, in the same
+/// element as the quote so the fold wraps whole elements.
+fn attributed(html: &str, start: usize) -> usize {
+    for from in siblings(&html[..start]).into_iter().rev() {
+        let said = clean::visible_text(&html[from..start]);
+        let lines: Vec<&str> = said.lines().filter(|l| !l.trim().is_empty()).collect();
+        match (lines.first(), lines.last()) {
+            (None, _) => continue,
+            (Some(first), Some(last))
+                if lines.len() <= 2 && last.trim_end().ends_with("wrote:") =>
+            {
+                if first.starts_with("On ") {
+                    return from;
+                }
+            }
+            _ => break,
+        }
+    }
+    start
+}
+
+/// Where each node at the end's own level starts: the elements and text
+/// right before a point in cleaned markup, which sit beside what's there.
+fn siblings(html: &str) -> Vec<usize> {
+    let mut levels: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut at = 0;
+    while at < html.len() {
+        let lt = html[at..].find('<').map_or(html.len(), |n| at + n);
+        if lt > at
+            && let Some(level) = levels.last_mut()
+        {
+            level.push(at);
+        }
+        if lt == html.len() {
+            break;
+        }
+        let end = lt + clean::tag_end(&html[lt..]);
+        let tag = &html[lt..end];
+        let name: String = tag
+            .trim_start_matches(['<', '/'])
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect();
+        if tag.starts_with("</") {
+            if levels.len() > 1 {
+                levels.pop();
+            }
+        } else {
+            if let Some(level) = levels.last_mut() {
+                level.push(lt);
+            }
+            if !clean::VOID.contains(&name.as_str()) {
+                levels.push(Vec::new());
+            }
+        }
+        at = end;
+    }
+    levels.pop().unwrap_or_default()
 }
 
 /// Whether a start tag opens quoted history.
@@ -192,21 +263,9 @@ fn spans(html: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-/// Whether markup shows no words.
+/// Whether markup shows no words a person can see.
 fn blank(html: &str) -> bool {
-    let mut rest = html;
-    while !rest.is_empty() {
-        let lt = rest.find('<').unwrap_or(rest.len());
-        if !gmail::decode_entities(&rest[..lt])
-            .chars()
-            .all(|c| c.is_whitespace() || c == '\u{a0}')
-        {
-            return false;
-        }
-        rest = &rest[lt..];
-        rest = &rest[clean::tag_end(rest).min(rest.len())..];
-    }
-    true
+    clean::visible_text(html).is_empty()
 }
 
 #[cfg(test)]
@@ -323,6 +382,50 @@ mod tests {
         .html;
         let cut = quotes(&html).1.unwrap();
         assert_eq!(clean::visible_text(&html[..cut]), "Sounds good.");
+    }
+
+    #[test]
+    fn apples_attribution_line_folds_with_its_quote() {
+        let page = clean::clean(
+            r#"<div>Sounds good.</div><div>On Nov 6, 2026, Ana wrote:</div><br><blockquote type="cite"><div>Old</div></blockquote>"#,
+        )
+        .html;
+        let (folded, cut) = quotes(&page);
+        assert_eq!(clean::visible_text(&page[..cut.unwrap()]), "Sounds good.");
+        assert!(
+            folded.starts_with(&format!("<div>Sounds good.</div>{QUOTE}<div>On Nov 6")),
+            "{folded}"
+        );
+        assert!(folded.ends_with(&format!("</blockquote>{END}")), "{folded}");
+        // wrapped onto two lines, as bare text
+        let wrapped = clean::clean(
+            r#"<div>Yes.</div>On Thu, Ana &lt;<br>ana@example.com&gt; wrote:<br><blockquote type="cite">Old</blockquote>"#,
+        )
+        .html;
+        let cut = quotes(&wrapped).1.unwrap();
+        assert_eq!(clean::visible_text(&wrapped[..cut]), "Yes.");
+        // a line that isn't one stays the sender's
+        let said =
+            clean::clean(r#"<div>I wrote:</div><blockquote type="cite">Old</blockquote>"#).html;
+        assert_eq!(
+            clean::visible_text(&said[..quotes(&said).1.unwrap()]),
+            "I wrote:"
+        );
+        // nothing but the line and the quote: nothing of the sender's to show, so no fold
+        let bare = clean::clean(
+            r#"<div>On Nov 6, 2026, Ana wrote:</div><blockquote type="cite">Old</blockquote>"#,
+        )
+        .html;
+        assert_eq!(quotes(&bare), (bare.clone(), None));
+    }
+
+    #[test]
+    fn hidden_words_after_a_quote_dont_keep_it_open() {
+        let page = clean::clean(
+            r#"<p>Hi</p><blockquote type="cite">Old</blockquote><p style="display:none">tracking</p>"#,
+        )
+        .html;
+        assert!(quotes(&page).0.contains(QUOTE), "{page}");
     }
 
     #[test]

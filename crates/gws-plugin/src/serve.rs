@@ -449,6 +449,7 @@ mod tests {
             tools::FILE_UPLOAD,
             tools::FILE_DISCARD,
             tools::MAIL_ATTACHMENT_OPEN,
+            tools::MAIL_ATTACHMENT_PREVIEW,
             tools::DRIVE_ACCESS,
             tools::DRIVE_UPLOAD,
             tools::DRIVE_FOLDER,

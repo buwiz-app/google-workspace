@@ -922,14 +922,14 @@ fn download(
 }
 
 /// A part of a mail, as [`gmail::attachments`] names it: `1`, `0.2`, `root`.
-fn part_ok(part: &str) -> bool {
+pub(crate) fn part_ok(part: &str) -> bool {
     !part.is_empty()
         && part.len() <= PART_ID_MAX
         && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
 }
 
 /// An attachment id: Gmail's, which can be longer than any file name.
-fn attachment_ok(id: &str) -> bool {
+pub(crate) fn attachment_ok(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= ATTACHMENT_ID_MAX
         && id

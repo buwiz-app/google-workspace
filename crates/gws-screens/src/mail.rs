@@ -16,6 +16,8 @@ use nsh_core::prelude::*;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
+mod attachments;
+
 use crate::compose::{self, Compose};
 use crate::reader;
 use crate::shell::{
@@ -264,6 +266,7 @@ struct Attachment {
     id: String,
     name: String,
     mime: String,
+    size: Option<u64>,
 }
 
 fn attachments_in(v: &Value) -> Vec<Attachment> {
@@ -283,6 +286,7 @@ fn attachments_in(v: &Value) -> Vec<Attachment> {
             id: text(a, "id"),
             name: text(a, "name"),
             mime: text(a, "mime"),
+            size: a.get("size").and_then(Value::as_u64),
         })
         .collect()
 }
@@ -1142,80 +1146,6 @@ fn reader_pane(b: Bridge, m: Mail) -> impl IntoElement {
         }))
 }
 
-/// A press on an attachment: it opens in the Bot's viewer, from the answer's
-/// `_meta`, which never reaches here. The call starts at the press, as who
-/// pressed is judged by that moment.
-fn open_attachment(b: &Bridge, m: Mail, a: &Attachment) {
-    let call = b.call(
-        "gws_mail_attachment_open",
-        json!({"message": a.message, "part": a.part}),
-    );
-    m.attachment_said.set(Some("Opening…".to_owned()));
-    let job = Box::pin(async move {
-        m.attachment_said.set(match call.await {
-            Ok(v) if v.get("refused").is_some() => Some(
-                v.get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("That didn't work.")
-                    .to_owned(),
-            ),
-            Ok(_) => None,
-            Err(e) if e.code == "timeout" => {
-                Some("This attachment is taking a while. Press it again in a moment.".to_owned())
-            }
-            Err(e) => Some(e.message),
-        });
-    });
-    m.beside.with_untracked(|beside| drop(beside.send(job)));
-}
-
-fn attachment_row(b: Bridge, m: Mail, a: Attachment) -> View {
-    let row = view()
-        .app_class(Some(
-            "flex-row flex-wrap items-center gap-2 px-3 py-1".into(),
-        ))
-        .child(text(a.name.clone()).number_of_lines(1).app_class(Some(
-            format!("flex-1 min-w-[80px] text-[12px] {INK}").into(),
-        )));
-    if a.message.is_empty() || a.id.is_empty() {
-        return row;
-    }
-    row.child(
-        view()
-            .app_class(Some("px-3 py-1".into()))
-            .label("Open this attachment")
-            .accessibility_value(Some(AccessibilityValue {
-                text: Some(a.name.clone().into()),
-                ..AccessibilityValue::default()
-            }))
-            .on_press(move || open_attachment(&b, m, &a))
-            .child(text("Open").app_class(Some(format!("text-[12px] {INK}").into()))),
-    )
-}
-
-/// The conversation's files, under the page. Past a few they scroll, so the
-/// page keeps its room.
-fn attachments(b: Bridge, m: Mail) -> impl IntoElement {
-    dynamic(move || {
-        let files = m.attachments.get();
-        if files.is_empty() {
-            return view();
-        }
-        let list = files.into_iter().fold(view(), |list, a| {
-            list.child(attachment_row(b.clone(), m, a))
-        });
-        let said = m.attachment_said.get().map_or_else(view, |line| {
-            view()
-                .app_class(Some("px-3 py-1".into()))
-                .child(text(line).app_class(Some(format!("text-[11px] {MUTE}").into())))
-        });
-        view()
-            .app_class(Some(format!("border-t {LINE}").into()))
-            .child(said)
-            .child(scroll().app_class(Some("max-h-[120px]".into())).child(list))
-    })
-}
-
 fn reading(b: Bridge, m: Mail) -> impl IntoElement {
     let picking = b.clone();
     let files = b.clone();
@@ -1253,7 +1183,7 @@ fn reading(b: Bridge, m: Mail) -> impl IntoElement {
                     move || reader::seal(&page, dark()),
                     move |n| m.link.set(m.links.with_untracked(|l| l.get(n).cloned())),
                 ))
-                .child(attachments(files.clone(), m)),
+                .child(attachments::cards(files.clone(), m)),
             None if m.chosen.get().is_some() => view()
                 .app_class(Some("flex-1 items-center justify-center".into()))
                 .child(text("Opening…").app_class(Some(format!("text-[13px] {MUTE}").into()))),

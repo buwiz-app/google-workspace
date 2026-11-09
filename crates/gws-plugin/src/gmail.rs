@@ -6,6 +6,7 @@
 //! blocking, on the tool's own thread. It follows no redirects, so the token
 //! only ever goes to the API base.
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -757,37 +758,97 @@ pub fn html_body(message: &Value) -> Option<String> {
     leaves.iter().find(is_html).map(|p| decode_part(p))
 }
 
-/// Attachments: `{name, mime, size, id, part}`. `part` is what stays the same
-/// from read to read, as Google calls a part's id immutable and promises nothing
-/// of `attachmentId`. A mail that's one attachment and nothing else has the empty
-/// id, and an empty one can't be told from none, so that's `root`.
+/// Attachments: `{name, mime, size, id, part}`, each file once. `part` is what
+/// stays the same from read to read, as Google calls a part's id immutable and
+/// promises nothing of `attachmentId`. A mail that's one attachment and nothing
+/// else has the empty id, and an empty one can't be told from none, so that's
+/// `root`.
+///
+/// Google sends some files twice: an invite's `invite.ics` is the text/calendar
+/// alternative of the letter and an application/ics file too. That alternative
+/// goes when a file has its name, and of parts with the same name and size the
+/// one marked as an attachment stays. A picture the letter shows by its
+/// Content-ID, marked inline, is the letter's and not a file.
 pub fn attachments(message: &Value) -> Vec<Value> {
-    fn walk(part: &Value, out: &mut Vec<Value>) {
-        let name = part
+    fn walk<'a>(part: &'a Value, alternative: bool, out: &mut Vec<(&'a Value, bool)>) {
+        let named = part
             .get("filename")
             .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !name.is_empty() {
-            let id = match part.get("partId").and_then(Value::as_str) {
-                Some("") => Some("root"),
-                id => id,
-            };
-            out.push(serde_json::json!({"name": name, "mime": part.get("mimeType"), "size": part.pointer("/body/size"), "id": part.pointer("/body/attachmentId"), "part": id}));
+            .is_some_and(|n| !n.is_empty());
+        if named {
+            out.push((part, alternative));
         }
+        let inside = part
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .is_some_and(|m| m.eq_ignore_ascii_case("multipart/alternative"));
         for p in part
             .get("parts")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
         {
-            walk(p, out);
+            walk(p, inside, out);
         }
     }
-    let mut out = Vec::new();
+    let name = |p: &Value| {
+        p.get("filename")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let disposed = |p: &Value, how: &str| {
+        part_header(p, "content-disposition")
+            .is_some_and(|d| d.trim_start().to_ascii_lowercase().starts_with(how))
+    };
+    let mut found = Vec::new();
     if let Some(p) = message.get("payload") {
-        walk(p, &mut out);
+        walk(p, false, &mut found);
     }
-    out
+    found.retain(|(p, _)| !(part_header(p, "content-id").is_some() && disposed(p, "inline")));
+    let calendar = |(p, alternative): &(&Value, bool)| {
+        *alternative
+            && p.get("mimeType")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.eq_ignore_ascii_case("text/calendar"))
+    };
+    let files: HashSet<String> = found
+        .iter()
+        .filter(|f| !calendar(f))
+        .map(|(p, _)| name(p))
+        .collect();
+    found.retain(|f| !(calendar(f) && files.contains(&name(f.0))));
+    // by name and size, the one that stays: an attachment over any other
+    let mut kept: HashMap<(String, String), usize> = HashMap::new();
+    let mut out: Vec<&Value> = Vec::new();
+    for (p, _) in found {
+        let key = (
+            name(p),
+            p.pointer("/body/size")
+                .map(Value::to_string)
+                .unwrap_or_default(),
+        );
+        match kept.get(&key) {
+            Some(&at) => {
+                if disposed(p, "attachment") && !disposed(out[at], "attachment") {
+                    out[at] = p;
+                }
+            }
+            None => {
+                kept.insert(key, out.len());
+                out.push(p);
+            }
+        }
+    }
+    out.into_iter()
+        .map(|part| {
+            let id = match part.get("partId").and_then(Value::as_str) {
+                Some("") => Some("root"),
+                id => id,
+            };
+            serde_json::json!({"name": name(part), "mime": part.get("mimeType"), "size": part.pointer("/body/size"), "id": part.pointer("/body/attachmentId"), "part": id})
+        })
+        .collect()
 }
 
 fn collect_leaves<'a>(part: &'a Value, out: &mut Vec<&'a Value>) {
@@ -1027,6 +1088,78 @@ mod tests {
         // one that doesn't say can't pass for another: it opens nothing
         let silent = json!({"payload": {"mimeType": "text/csv", "filename": "a.csv"}});
         assert_eq!(attachments(&silent)[0]["part"], Value::Null);
+    }
+
+    fn names(message: &Value) -> Vec<(String, String)> {
+        attachments(message)
+            .iter()
+            .map(|a| {
+                (
+                    a["name"].as_str().unwrap().to_owned(),
+                    a["part"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn pair(name: &str, part: &str) -> (String, String) {
+        (name.to_owned(), part.to_owned())
+    }
+
+    #[test]
+    fn a_file_google_sends_twice_shows_once() {
+        let invite = json!({"payload": {"partId": "", "mimeType": "multipart/mixed", "parts": [
+            {"partId": "0", "mimeType": "multipart/alternative", "parts": [
+                {"partId": "0.0", "mimeType": "text/plain", "body": {"data": b64("Hi")}},
+                {"partId": "0.1", "mimeType": "text/calendar", "filename": "invite.ics", "body": {"attachmentId": "x", "size": 640}},
+            ]},
+            {"partId": "1", "mimeType": "application/ics", "filename": "invite.ics", "headers": [{"name": "Content-Disposition", "value": "attachment; filename=\"invite.ics\""}], "body": {"attachmentId": "y", "size": 650}},
+        ]}});
+        assert_eq!(names(&invite), [pair("invite.ics", "1")]);
+        // the event alone, as some calendars send it, is still a file
+        let alone = json!({"payload": {"partId": "", "mimeType": "multipart/alternative", "parts": [
+            {"partId": "0", "mimeType": "text/plain", "body": {"data": b64("Hi")}},
+            {"partId": "1", "mimeType": "text/calendar", "filename": "invite.ics", "body": {"attachmentId": "x", "size": 640}},
+        ]}});
+        assert_eq!(names(&alone), [pair("invite.ics", "1")]);
+    }
+
+    #[test]
+    fn of_two_parts_with_one_name_and_size_the_attachment_stays() {
+        let twice = json!({"payload": {"partId": "", "mimeType": "multipart/mixed", "parts": [
+            {"partId": "0", "mimeType": "multipart/related", "parts": [
+                {"partId": "0.0", "mimeType": "text/html", "body": {"data": b64("<p>Hi</p>")}},
+                {"partId": "0.1", "mimeType": "application/pdf", "filename": "a.pdf", "body": {"attachmentId": "x", "size": 90}},
+            ]},
+            {"partId": "1", "mimeType": "application/pdf", "filename": "a.pdf", "headers": [{"name": "Content-Disposition", "value": "attachment"}], "body": {"attachmentId": "y", "size": 90}},
+        ]}});
+        assert_eq!(names(&twice), [pair("a.pdf", "1")]);
+    }
+
+    #[test]
+    fn the_same_name_with_another_size_is_two_files() {
+        let two = json!({"payload": {"partId": "", "mimeType": "multipart/mixed", "parts": [
+            {"partId": "0", "mimeType": "text/plain", "body": {"data": b64("Hi")}},
+            {"partId": "1", "mimeType": "image/png", "filename": "scan.png", "body": {"attachmentId": "x", "size": 90}},
+            {"partId": "2", "mimeType": "image/png", "filename": "scan.png", "body": {"attachmentId": "y", "size": 91}},
+        ]}});
+        assert_eq!(names(&two), [pair("scan.png", "1"), pair("scan.png", "2")]);
+    }
+
+    #[test]
+    fn a_picture_the_letter_shows_by_content_id_is_not_a_file() {
+        let shown = |disposition: &str| {
+            json!({"payload": {"partId": "", "mimeType": "multipart/related", "parts": [
+                {"partId": "0", "mimeType": "text/html", "body": {"data": b64("<img src=cid:logo>")}},
+                {"partId": "1", "mimeType": "image/png", "filename": "logo.png", "headers": [{"name": "Content-ID", "value": "<logo>"}, {"name": "Content-Disposition", "value": disposition}], "body": {"attachmentId": "x", "size": 90}},
+            ]}})
+        };
+        assert!(attachments(&shown("inline; filename=\"logo.png\"")).is_empty());
+        // sent as a file, it stays one, whatever else it carries
+        assert_eq!(
+            names(&shown("attachment; filename=\"logo.png\"")),
+            [pair("logo.png", "1")]
+        );
     }
 
     #[test]

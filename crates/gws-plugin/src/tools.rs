@@ -117,6 +117,7 @@ pub const FILE_EDITS: &str = "gws_file_edits";
 pub const FILE_UPLOAD: &str = "gws_file_upload";
 pub const FILE_DISCARD: &str = "gws_file_discard";
 pub const MAIL_ATTACHMENT_OPEN: &str = "gws_mail_attachment_open";
+pub const MAIL_ATTACHMENT_PREVIEW: &str = "gws_mail_attachment_preview";
 
 /// A write: the person's, on a screen, and never the model's.
 fn write(name: &'static str, description: &'static str, input_schema: Value) -> Def {
@@ -569,6 +570,14 @@ pub fn defs() -> Vec<Def> {
             "Download a mail's attachment to this Mac for the Bot's viewer. A person's press alone. An edit can only be saved to Drive as a new file.",
             json!({"type": "object", "properties": {"message": {"type": "string"}, "part": {"type": "string"}}, "required": ["message", "part"]}),
         ),
+        Def {
+            name: MAIL_ATTACHMENT_PREVIEW,
+            description: "A small picture on a mail, as image bytes for its card. Never another kind of file.",
+            input_schema: json!({"type": "object", "properties": {"message": {"type": "string"}, "part": {"type": "string"}}, "required": ["message", "part"]}),
+            read_only: true,
+            audience: APP_ONLY,
+            open_world: true,
+        },
         Def {
             name: RESOLVE,
             description: "Resolve the /gws command.",

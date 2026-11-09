@@ -61,6 +61,7 @@ pub const APPS: [App; 3] = [
             tools::UPLOAD_CHUNK,
             tools::UPLOAD_DROP,
             tools::MAIL_ATTACHMENT_OPEN,
+            tools::MAIL_ATTACHMENT_PREVIEW,
         ],
         card: true,
         files: true,
@@ -272,9 +273,15 @@ mod tests {
             .iter()
             .find(|a| a.tools.contains(&tools::MAIL_LIST))
             .unwrap();
-        let screen = include_str!("../../gws-screens/src/mail.rs");
+        let screens = [
+            include_str!("../../gws-screens/src/mail.rs"),
+            include_str!("../../gws-screens/src/mail/attachments.rs"),
+        ];
         for def in tools::defs() {
-            if screen.contains(&format!("\"{}\"", def.name)) {
+            if screens
+                .iter()
+                .any(|s| s.contains(&format!("\"{}\"", def.name)))
+            {
                 assert!(mail.tools.contains(&def.name), "{}", def.name);
             }
         }
@@ -335,8 +342,10 @@ mod tests {
         ] {
             assert!(edits.contains(&format!("\"{name}\"")), "{name}");
         }
-        let mail = include_str!("../../gws-screens/src/mail.rs");
-        assert!(mail.contains(&format!("\"{}\"", tools::MAIL_ATTACHMENT_OPEN)));
+        let cards = include_str!("../../gws-screens/src/mail/attachments.rs");
+        for name in [tools::MAIL_ATTACHMENT_OPEN, tools::MAIL_ATTACHMENT_PREVIEW] {
+            assert!(cards.contains(&format!("\"{name}\"")), "{name}");
+        }
         // and these, or no folder, press or file of the writing slice gets through
         for name in [
             tools::DRIVE_ACCESS,

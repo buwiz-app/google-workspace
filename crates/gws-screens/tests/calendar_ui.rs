@@ -869,6 +869,20 @@ fn alone_on_the_list_the_person_has_no_guests() {
     );
 }
 
+/// It sits under a mail's attachment presses there, and "Open" twice read as one.
+#[test]
+fn the_link_bars_press_says_open_link() {
+    let (mut app, _) = start();
+    open(&mut app, "Team review");
+    press(&mut app, "label:Open the Meet link");
+    assert!(
+        app.screen().shows("Open link"),
+        "{:?}",
+        app.screen().texts()
+    );
+    assert!(!app.screen().shows("Open"));
+}
+
 #[test]
 fn detail_shows_the_event_with_replies_and_opens_meet_through_the_link_check() {
     let (mut app, _) = start();

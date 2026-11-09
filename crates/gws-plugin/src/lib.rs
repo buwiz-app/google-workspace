@@ -10,6 +10,7 @@
 
 pub mod accounts;
 pub mod apis;
+pub mod attachment_preview;
 pub mod calendar;
 pub mod clean;
 pub mod compose;
@@ -155,6 +156,7 @@ impl Core {
             .or_else(|| drive::run(self, tool, args))
             .or_else(|| drive::write::run(self, tool, args))
             .or_else(|| files::run(self, tool, args))
+            .or_else(|| attachment_preview::run(self, tool, args))
             .unwrap_or_else(|| tools::run(&self.gmail, &self.accounts, tool, args));
         // nobody signed out: the Bot can't refresh the token right now, so the
         // sign-in card and the screens' sign-in guide would both be wrong

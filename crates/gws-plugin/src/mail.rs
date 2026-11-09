@@ -22,7 +22,7 @@ use crate::tools::{
     MAIL_REPLY_START, MAIL_SEND, MAIL_SEND_ARM, MAIL_SEND_DISARM, MAIL_THREAD, MAIL_TRASH,
     MAIL_UNDO, PEOPLE_SUGGEST, SEARCH_MAIL, UPLOAD_CHUNK, UPLOAD_DROP, fail, failed, ok,
 };
-use crate::{Core, clean, compose, fold, js};
+use crate::{Core, clean, compose, fold, js, pictures};
 
 /// Rows a list page holds.
 pub const PAGE: i64 = 50;
@@ -958,7 +958,9 @@ pub fn view_of(thread: &Value) -> Value {
             let text = gmail::body(m);
             match gmail::html_body(m) {
                 Some(h) => {
-                    let mut c = clean::clean(&h);
+                    // the pictures picked for it go in first, so what folds
+                    // folds with them
+                    let mut c = clean::clean_with(&h, &|url| pictures::inline(m, url));
                     let (folded, cut) = fold::quotes(&c.html);
                     // as plain text it keeps the fold where the HTML had it
                     let (text, cut) = match cut {
@@ -1135,16 +1137,16 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     if let Some(saved) = with_store(core, |store| store.view(&account, &id, now_ms()))?
         && let Ok(view) = serde_json::from_str::<Value>(&saved)
     {
-        return Ok(ok(view));
+        return Ok(pictures::answer(core, &account, view));
     }
-    let Some(full) = core.gmail.thread_full(&auth, &id)? else {
+    let Some(mut full) = core.gmail.thread_full(&auth, &id)? else {
         return Ok(fail("not_found", "That conversation is gone."));
     };
-    let view = view_of(&full);
+    let view = pictures::view(core, &auth, &account, &mut full);
     with_own_store(core, &account, |store| {
         store.put_view(&account, &id, &view.to_string(), now_ms())
     })?;
-    Ok(ok(view))
+    Ok(pictures::answer(core, &account, view))
 }
 
 fn changes(core: &Core, args: &Value) -> Result<Value, Failure> {

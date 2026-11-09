@@ -105,6 +105,39 @@ fn invite_ics_shows_once_on_the_invite() {
 }
 
 #[test]
+fn a_rescheduled_invite_of_the_same_size_shows_both_events() {
+    let first = b"BEGIN:VCALENDAR\r\nSEQUENCE:0\r\nEND:VCALENDAR\r\n".to_vec();
+    let moved = b"BEGIN:VCALENDAR\r\nSEQUENCE:1\r\nEND:VCALENDAR\r\n".to_vec();
+    assert_eq!(first.len(), moved.len(), "this is the case being tested");
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("invite.ics", "text/calendar", first.clone()),
+        ("invite.ics", "application/ics", moved),
+    ]));
+    let home = Home::new(&google.base(), "moved");
+    assert_eq!(names(&home.files("18f1aa")), ["invite.ics", "invite.ics"]);
+    // and the same bytes are one
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("invite.ics", "text/calendar", first.clone()),
+        ("invite.ics", "application/ics", first),
+    ]));
+    let home = Home::new(&google.base(), "same");
+    assert_eq!(names(&home.files("18f1aa")), ["invite.ics"]);
+}
+
+#[test]
+fn two_files_of_one_name_and_size_are_two_cards() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("scan.png", "image/png", b"\x89PNG one".to_vec()),
+        ("scan.png", "image/png", b"\x89PNG two".to_vec()),
+    ]));
+    let home = Home::new(&google.base(), "scans");
+    assert_eq!(names(&home.files("18f1aa")), ["scan.png", "scan.png"]);
+}
+
+#[test]
 fn the_newsletters_logo_is_the_letters_and_not_a_file() {
     let google = rich();
     let home = Home::new(&google.base(), "news");
@@ -168,11 +201,35 @@ fn a_file_dressed_as_a_picture_has_no_preview() {
     }
 }
 
+/// A PNG's start: its signature and a header that says how big it is.
+fn png_saying(w: u32, h: u32) -> Vec<u8> {
+    let mut b = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    b.extend(w.to_be_bytes());
+    b.extend(h.to_be_bytes());
+    b.extend([8, 6, 0, 0, 0]);
+    b
+}
+
+#[test]
+fn a_small_file_that_says_it_is_a_huge_picture_has_no_preview() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("bomb.png", "image/png", png_saying(30000, 30000)),
+        ("ok.png", "image/png", png_saying(8000, 5000)),
+    ]));
+    let home = Home::new(&google.base(), "bomb");
+    let answer = home.preview("18f1aa", &json!("1"));
+    assert_eq!(answer["refused"], "too_big", "{answer}");
+    assert_eq!(answer.get("preview"), None);
+    let answer = home.preview("18f1aa", &json!("2"));
+    assert!(answer["preview"].is_string(), "{answer}");
+}
+
 #[test]
 fn a_picture_past_the_limit_is_never_fetched_for_a_preview() {
     let mut big = b"\x89PNG\r\n\x1a\n".to_vec();
     big.resize(gws::attachment_preview::PREVIEW_MAX as usize + 1, 0);
-    let mut fits = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut fits = png_saying(1, 1);
     fits.resize(gws::attachment_preview::PREVIEW_MAX as usize, 0);
     let google = FakeGoogle::start(Seed::default());
     google.deliver(mail_with(vec![

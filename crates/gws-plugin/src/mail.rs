@@ -1075,9 +1075,10 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     {
         return Ok(ok(view));
     }
-    let Some(full) = core.gmail.thread_full(&auth, &id)? else {
+    let Some(mut full) = core.gmail.thread_full(&auth, &id)? else {
         return Ok(fail("not_found", "That conversation is gone."));
     };
+    core.gmail.mark_twins(&auth, &mut full);
     let view = view_of(&full);
     with_own_store(core, &account, |store| {
         store.put_view(&account, &id, &view.to_string(), now_ms())

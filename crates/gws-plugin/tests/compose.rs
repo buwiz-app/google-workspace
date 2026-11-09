@@ -727,6 +727,30 @@ fn a_forward_carries_the_files_of_the_mail_it_forwards() {
     assert!(sent[1].attachments[0].2 == bytes);
 }
 
+/// A forward carries every part on, as before the reader's cards: the
+/// pictures the letter shows, and an invite's two parts.
+#[test]
+fn a_forward_keeps_the_letters_pictures_and_every_part() {
+    let google = FakeGoogle::start(Seed::default().with_rich_mail("http://127.0.0.1:1"));
+    let core = signed_in(&google, "forward-rich");
+    let files = |thread: &str| {
+        let start = data(core.run(
+            "gws_mail_reply_start",
+            &json!({"thread": thread, "mode": "forward"}),
+        ));
+        let names: Vec<String> = start["attachments"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{start}"))
+            .iter()
+            .map(|f| f["name"].as_str().unwrap().to_owned())
+            .collect();
+        names
+    };
+    // the newsletter, and the invite
+    assert_eq!(files("000019f000000028"), ["logo.png"]);
+    assert_eq!(files("000019f000000014"), ["invite.ics", "invite.ics"]);
+}
+
 #[test]
 fn sent_and_drafts_name_who_the_mail_is_for() {
     let google = FakeGoogle::start(Seed::demo(3));

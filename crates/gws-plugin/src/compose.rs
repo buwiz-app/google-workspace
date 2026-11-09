@@ -833,7 +833,7 @@ pub fn read(core: &Core, args: &Value) -> Result<Value, Failure> {
         "subject": gmail::header(&message, "Subject"),
         "body": gmail::body(&message),
         "thread": message.get("threadId"),
-        "attachments": gmail::attachments(&message),
+        "attachments": gmail::carried(&message),
     })))
 }
 
@@ -1155,7 +1155,7 @@ pub fn reply_start(core: &Core, args: &Value) -> Result<Value, Failure> {
         "forward" => json!({
             "to": [], "cc": [],
             "source": last.get("id"),
-            "attachments": gmail::attachments(last),
+            "attachments": gmail::carried(last),
             "subject": prefixed("Fwd: ", &subject),
             "body": format!("\n\n---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {subject}\nTo: {}\n\n{}", h("From"), h("Date"), h("To"), gmail::body(last)),
         }),

@@ -317,3 +317,30 @@ fn a_small_picture_in_its_part_has_a_preview() {
     let answer = home.preview("18f1aa", &files[0]["part"]);
     assert!(answer["preview"].is_string(), "{answer}");
 }
+
+#[test]
+fn out_of_time_the_twin_check_leaves_both_cards() {
+    let google = rich();
+    let home = Home::new(&google.base(), "late");
+    let auth = home.core.accounts.google().unwrap();
+    let invite_of = |thread: &Value| thread["messages"][0].clone();
+    let mut thread = home.core.gmail.thread_full(&auth, INVITE).unwrap().unwrap();
+    home.core
+        .gmail
+        .mark_twins_by(&auth, &mut thread, std::time::Instant::now());
+    assert_eq!(
+        names(&gws::gmail::attachments(&invite_of(&thread))),
+        ["invite.ics", "invite.ics"]
+    );
+    assert_eq!(
+        fetches(&google),
+        0,
+        "nothing was asked once the time was up"
+    );
+    let mut thread = home.core.gmail.thread_full(&auth, INVITE).unwrap().unwrap();
+    home.core.gmail.mark_twins(&auth, &mut thread);
+    assert_eq!(
+        names(&gws::gmail::attachments(&invite_of(&thread))),
+        ["invite.ics"]
+    );
+}

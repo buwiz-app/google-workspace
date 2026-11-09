@@ -588,7 +588,16 @@ impl Gmail {
     /// bytes, so [`attachments`] shows that event once. A rescheduled invite
     /// can carry another `invite.ics` of the same size, so the size alone says
     /// nothing. What can't be read stays, as two is better than a lost file.
+    ///
+    /// All of it keeps to [`TWINS_WITHIN`], each fetch to [`TIMEOUT`] at most:
+    /// it comes before the thread shows. Out of time, the pairs not yet read
+    /// stay two cards.
     pub fn mark_twins(&self, auth: &Bearer, thread: &mut Value) {
+        self.mark_twins_by(auth, thread, std::time::Instant::now() + TWINS_WITHIN);
+    }
+
+    /// [`Self::mark_twins`], done by `by`.
+    pub fn mark_twins_by(&self, auth: &Bearer, thread: &mut Value, by: std::time::Instant) {
         let Some(messages) = thread.get_mut("messages").and_then(Value::as_array_mut) else {
             return;
         };
@@ -600,7 +609,12 @@ impl Gmail {
                 Some(data) => Some(data),
                 None => {
                     let att = p.pointer("/body/attachmentId").and_then(Value::as_str)?;
-                    self.attachment(auth, &id, att).ok().flatten()
+                    let left = by
+                        .checked_duration_since(std::time::Instant::now())
+                        .filter(|d| !d.is_zero())?;
+                    self.attachment_within(auth, &id, att, left.min(TIMEOUT))
+                        .ok()
+                        .flatten()
                 }
             };
             // the calendar part's bytes once, against each file that may be it
@@ -852,8 +866,13 @@ pub fn html_body(message: &Value) -> Option<String> {
 const TWIN: &str = "buwizTwin";
 /// The largest calendar part compared byte for byte; past it both stay.
 const TWIN_MAX: u64 = 256 * 1024;
-/// The most twins looked for in one message, each a fetch or two.
-const TWINS_MAX: usize = 4;
+/// The most (calendar part, file) pairs compared in one message. Each is a
+/// fetch, and the calendar part's own one more: an invite has one pair, and a
+/// mail with more than this many files of one name and size isn't one. Past it,
+/// the rest stay as cards.
+const TWINS_MAX: usize = 16;
+/// How long the twin check may take for a whole thread, before it shows.
+const TWINS_WITHIN: Duration = Duration::from_secs(5);
 
 /// Every part with a file name, and whether it sits anywhere under a
 /// multipart/alternative.
@@ -901,10 +920,36 @@ fn listed(part: &Value) -> Value {
     serde_json::json!({"name": file_name(part), "mime": part.get("mimeType"), "size": part.pointer("/body/size"), "id": part.pointer("/body/attachmentId"), "part": id})
 }
 
-/// A part the letter shows by its Content-ID: marked inline, or not marked at
-/// all, which is inline too (RFC 2183).
-fn shown_inline(part: &Value) -> bool {
-    part_header(part, "content-id").is_some()
+/// Whether `html` says `cid:<cid>` whole: `cid:logo` isn't `cid:logo2`.
+fn names_cid(html: &str, cid: &str) -> bool {
+    let wanted = format!("cid:{cid}");
+    html.match_indices(&wanted).any(|(at, _)| {
+        html[at + wanted.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || "\"'>);&".contains(c))
+    })
+}
+
+/// A picture the letter shows: an image whose Content-ID its HTML names as
+/// `cid:`, marked inline or not marked at all (inline too, RFC 2183). Any other
+/// part with a Content-ID, a PDF or a picture the letter never shows, is a file.
+/// `html` is the message's HTML in lower case.
+fn shown_inline(part: &Value, html: &str) -> bool {
+    let image = part
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .is_some_and(|m| m.to_ascii_lowercase().starts_with("image/"));
+    let cid = part_header(part, "content-id")
+        .map(|c| {
+            c.trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .trim()
+        })
+        .filter(|c| !c.is_empty());
+    image
+        && cid.is_some_and(|c| names_cid(html, &c.to_ascii_lowercase()))
         && part_header(part, "content-disposition")
             .is_none_or(|d| d.trim_start().to_ascii_lowercase().starts_with("inline"))
 }
@@ -921,9 +966,10 @@ fn shown_inline(part: &Value) -> bool {
 /// once [`Gmail::mark_twins`] has found the file holds the same bytes. Two files
 /// are never made one, whatever their names.
 pub fn attachments(message: &Value) -> Vec<Value> {
+    let html = html_body(message).unwrap_or_default().to_ascii_lowercase();
     named_parts(message)
         .into_iter()
-        .filter(|(p, _)| !shown_inline(p) && p.get(TWIN) != Some(&Value::Bool(true)))
+        .filter(|(p, _)| !shown_inline(p, &html) && p.get(TWIN) != Some(&Value::Bool(true)))
         .map(|(p, _)| listed(p))
         .collect()
 }
@@ -1386,6 +1432,43 @@ mod tests {
             names(&shown(Some("attachment; filename=\"logo.png\""))),
             [pair("logo.png", "1")]
         );
+    }
+
+    #[test]
+    fn a_part_with_a_content_id_is_a_file_unless_the_letter_shows_it() {
+        let mail = |html: &str, mime: &str| {
+            json!({"payload": {"partId": "", "mimeType": "multipart/related", "parts": [
+                {"partId": "0", "mimeType": "text/html", "body": {"data": b64(html)}},
+                {"partId": "1", "mimeType": mime, "filename": "receipt.pdf", "headers": [{"name": "Content-ID", "value": "<r1>"}, {"name": "Content-Disposition", "value": "inline"}], "body": {"attachmentId": "x", "size": 90}},
+            ]}})
+        };
+        // a PDF the letter can't show, even named there
+        assert_eq!(
+            names(&mail("<a href=\"cid:r1\">", "application/pdf")),
+            [pair("receipt.pdf", "1")]
+        );
+        // a picture the letter never shows
+        assert_eq!(
+            names(&mail("<p>Hi</p>", "image/png")),
+            [pair("receipt.pdf", "1")]
+        );
+        // nor one it shows by another, longer id
+        assert_eq!(
+            names(&mail("<img src=\"cid:r10\">", "image/png")),
+            [pair("receipt.pdf", "1")]
+        );
+        // shown, in any case, it is the letter's
+        assert!(attachments(&mail("<IMG SRC=\"CID:R1\">", "image/png")).is_empty());
+    }
+
+    #[test]
+    fn up_to_sixteen_files_are_compared_with_a_calendar_part() {
+        let mut many = invite(640, false);
+        for n in 2..30 {
+            let file = json!({"partId": n.to_string(), "mimeType": "application/ics", "filename": "invite.ics", "body": {"attachmentId": format!("z{n}"), "size": 640}});
+            many["payload"]["parts"].as_array_mut().unwrap().push(file);
+        }
+        assert_eq!(twins(&many).len(), 16);
     }
 
     #[test]

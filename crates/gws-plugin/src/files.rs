@@ -463,8 +463,11 @@ fn unsupported() -> Value {
     refusal("unsupported", "This kind of file can't be opened here.")
 }
 
-/// An attachment no Bot opens, which can still be saved.
-fn save_instead() -> Value {
+/// An attachment this Bot can't open. Save is advised only when it can save.
+fn save_instead(core: &Core) -> Value {
+    if !core.documents.can(handoff::SAVE) {
+        return unsupported();
+    }
     refusal(
         "unsupported",
         "This kind of file can't open here. Save it instead.",
@@ -612,10 +615,16 @@ fn file_name(name: &str, mime: &str) -> String {
         return name;
     };
     let fits = extension(&name).is_some_and(|e| exts.contains(&e.to_lowercase().as_str()));
+    ending(name, fits, exts[0])
+}
+
+/// A safe name as it is when its end already `fits`, else with `.ext` added and
+/// still short enough.
+fn ending(name: String, fits: bool, ext: &str) -> String {
     if fits {
         name
     } else {
-        capped(&format!("{name}.{}", exts[0]))
+        capped(&format!("{name}.{ext}"))
     }
 }
 
@@ -701,6 +710,12 @@ fn changed_in_app(core: &Core, path: &Path, row: &Opened) -> bool {
     row.version == BY_APP
         && file_here(path)
         && core.hashes.run(path).map_or(true, |hash| hash != row.hash)
+}
+
+/// Whether a file holds the person's work: an edit in the Bot's view, or a
+/// change the Mac's own app made. Either stays until the person answers it.
+fn has_work(core: &Core, path: &Path, row: &Opened) -> bool {
+    is_edited(core, path, row) || changed_in_app(core, path, row)
 }
 
 /// The way an attachment's row says it was handed over.
@@ -992,18 +1007,11 @@ fn attachment_folder(message: &str, part: &str) -> String {
     format!("{ATTACHMENT}{message}-{}", &hash[..32])
 }
 
-/// Where a copy on its way to Downloads waits: beside the open one and never in
-/// its folder, which can hold the person's edit.
-fn save_folder(message: &str, part: &str) -> String {
-    let hash = format!("{:x}", Sha256::digest(format!("save\n{part}").as_bytes()));
-    format!("{ATTACHMENT}{message}-{}", &hash[..32])
-}
-
 /// The answer that hands an attachment over, the way its kind goes to this
 /// Bot. Only `_meta` has the path, as for [`opened`].
 fn handed(core: &Core, path: &Path, row: &Opened) -> Value {
     let Some(kind) = handoff::by_mime(&row.mime) else {
-        return save_instead();
+        return save_instead(core);
     };
     match handoff::way(&core.documents, kind) {
         Way::Viewer => opened(path, &row.name, &row.mime),
@@ -1014,7 +1022,7 @@ fn handed(core: &Core, path: &Path, row: &Opened) -> Value {
             answer
         }
         Way::Update => needs_update("open"),
-        Way::SaveOnly => save_instead(),
+        Way::SaveOnly => save_instead(core),
     }
 }
 
@@ -1057,18 +1065,32 @@ fn attachment_args(args: &Value) -> Option<(String, String)> {
     (gmail::id_ok(&message) && part_ok(&part)).then_some((message, part))
 }
 
-/// The bytes, as `dir/.part`.
+/// The bytes, as `dir/.part`, marked.
 fn write_part(dir: &Path, bytes: &[u8]) -> Result<(), Failure> {
-    let write = || -> std::io::Result<()> {
-        let mut part = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(dir.join(PART))?;
-        part.write_all(bytes)?;
-        quarantine(&part)
-    };
-    write().map_err(|e| write_failed(&e))
+    write_marked(dir, bytes, quarantine)
+}
+
+/// [`write_part`], with what marks it. Whatever fails once the file is made
+/// takes it away again: an unmarked stranger's file mustn't wait here.
+fn write_marked(
+    dir: &Path,
+    bytes: &[u8],
+    mark: impl Fn(&File) -> std::io::Result<()>,
+) -> Result<(), Failure> {
+    let to = dir.join(PART);
+    let mut part = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&to)
+        .map_err(|e| write_failed(&e))?;
+    let written = part.write_all(bytes).and_then(|()| mark(&part));
+    if let Err(e) = written {
+        drop(part);
+        let _ = fs::remove_file(&to);
+        return Err(write_failed(&e));
+    }
+    Ok(())
 }
 
 /// A write that failed. A disk that can't hold the download mark is said so:
@@ -1142,37 +1164,29 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
         if row.account == account && now == Some(handed_way(row)) {
             return reopen(core, row);
         }
-        let path = path_of(core, row)?;
-        // this Bot would hand an edit elsewhere, where it'd be lost
-        if row.account == account && is_edited(core, &path, row) {
-            return Ok(needs_update("open"));
-        }
-        // what the Mac's own app changed is never the Bot's to upload, but a
-        // download mustn't land on it either
-        if row.account == account && changed_in_app(core, &path, row) {
-            return Ok(refusal(
-                "in_use",
-                "This attachment has changes in another app on this Mac. Save them there first.",
-            ));
-        }
-        // a download would land on another account's work
-        if is_edited(core, &path, row) || changed_in_app(core, &path, row) {
-            return Ok(refusal(
-                "in_use",
-                "Another of your Google accounts has edits to this attachment here.",
-            ));
+        // a download would land on the person's work: read once, as only one
+        // of the two can be true of a row
+        if has_work(core, &path_of(core, row)?, row) {
+            let why = if row.account != account {
+                "Another of your Google accounts has edits to this attachment here."
+            } else if row.version == BY_APP {
+                "This attachment has changes in another app on this Mac. Save or discard them first."
+            } else {
+                "This attachment has edits here that aren't saved. Save them to Drive or discard them first."
+            };
+            return Ok(refusal("in_use", why));
         }
     }
     let Some((title, mime, attachment)) = listed_part(core, &auth, &message, &part)? else {
         return Ok(attachment_gone());
     };
     let Some(kind) = handoff::declared(&mime, extension(&title)) else {
-        return Ok(save_instead());
+        return Ok(save_instead(core));
     };
     // nothing comes down that this Bot couldn't show
     match handoff::way(&core.documents, kind) {
         Way::Update => return Ok(needs_update("open")),
-        Way::SaveOnly => return Ok(save_instead()),
+        Way::SaveOnly => return Ok(save_instead(core)),
         Way::Viewer | Way::System => {}
     }
     if !attachment_ok(&attachment) {
@@ -1182,7 +1196,7 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
         return Ok(attachment_gone());
     };
     let Some(kind) = handoff::checked(kind, &bytes) else {
-        return Ok(save_instead());
+        return Ok(save_instead(core));
     };
     let by_app = handoff::way(&core.documents, kind) == Way::System;
     let dir = start_part(core, &id)?;
@@ -1211,16 +1225,33 @@ fn saved_name(title: &str, bytes: &[u8]) -> String {
     let kept = extension(&name)
         .and_then(handoff::by_ext)
         .is_some_and(|kind| kind.fits(bytes));
-    if kept {
-        return name;
-    }
     let ext = handoff::sniffed(bytes).map_or("bin", |kind| kind.exts[0]);
-    capped(&format!("{name}.{ext}"))
+    ending(name, kept, ext)
+}
+
+/// The copy the Mac's own app changed, if this account has one: what Save
+/// hands over in place of Gmail's, since the person's work is in it. Its turn
+/// is held by the caller.
+fn changed_copy(
+    core: &Core,
+    account: &str,
+    id: &str,
+) -> Result<Option<(Opened, Vec<u8>)>, Failure> {
+    let Some(row) = with_store(core, |store| store.opened(id))? else {
+        return Ok(None);
+    };
+    let path = path_of(core, &row)?;
+    if row.account != account || !changed_in_app(core, &path, &row) {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).map_err(|_| cant_save())?;
+    Ok(Some((row, bytes)))
 }
 
 /// `gws_mail_attachment_save`: any attachment, fetched as an open is, for the
 /// Bot to copy to Downloads. Its copy here is only looked at, and goes as an
-/// unedited open does.
+/// unedited open does. One the Mac's own app changed is what's saved, and once
+/// its copy is made it's answered, so it goes.
 fn save_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (auth, account) = signed_in(core)?;
     let Some((message, part)) = attachment_args(args) else {
@@ -1229,18 +1260,30 @@ fn save_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
     if !core.documents.can(handoff::SAVE) {
         return Ok(needs_update("save"));
     }
-    let id = save_folder(&message, &part);
+    // beside the open one and never in its folder, which can hold an edit
+    let id = attachment_folder(&message, &format!("save\n{part}"));
     let Some(_turn) = turn(core, &id) else {
         return Ok(busy());
     };
-    let Some((title, _, attachment)) = listed_part(core, &auth, &message, &part)? else {
-        return Ok(attachment_gone());
+    let opened_id = attachment_folder(&message, &part);
+    let Some(_opened_turn) = turn(core, &opened_id) else {
+        return Ok(busy());
     };
-    if !attachment_ok(&attachment) {
-        return Ok(attachment_gone());
-    }
-    let Some(bytes) = core.gmail.attachment(&auth, &message, &attachment)? else {
-        return Ok(attachment_gone());
+    let changed = changed_copy(core, &account, &opened_id)?;
+    let (title, bytes) = match &changed {
+        Some((row, bytes)) => (row.name.clone(), bytes.clone()),
+        None => {
+            let Some((title, _, attachment)) = listed_part(core, &auth, &message, &part)? else {
+                return Ok(attachment_gone());
+            };
+            if !attachment_ok(&attachment) {
+                return Ok(attachment_gone());
+            }
+            let Some(bytes) = core.gmail.attachment(&auth, &message, &attachment)? else {
+                return Ok(attachment_gone());
+            };
+            (title, bytes)
+        }
     };
     let dir = start_part(core, &id)?;
     write_part(&dir, &bytes)?;
@@ -1258,6 +1301,10 @@ fn save_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
         opened_ms: core.clock.now_ms(),
     };
     let path = keep(core, &dir, &row)?;
+    // the person's work is in the saved copy now
+    if changed.is_some() {
+        let _ = remove(core, &opened_id);
+    }
     let mut answer = ok(json!({"saved": true, "name": row.name}));
     answer["_meta"] = json!({"buwiz/save": {"path": path, "name": row.name}});
     Ok(answer)
@@ -1438,7 +1485,7 @@ pub fn sweep(core: &Core) {
         let over = now - row.opened_ms >= LIFE_MS;
         // the stamps can keep a file and never take one: what would go is read
         let done = !file_here(&path)
-            || (over && !seems_edited(core, &path, row) && !is_edited(core, &path, row));
+            || (over && !seems_edited(core, &path, row) && !has_work(core, &path, row));
         if done && let Some(_turn) = turn(core, &row.id) {
             let _ = remove(core, &row.id);
         }
@@ -1468,15 +1515,15 @@ pub fn sweep(core: &Core) {
 }
 
 /// `account` is no longer signed in: what can be fetched again goes with it. A
-/// file edited here and unanswered stays, with its row, for that account to
-/// come back to.
+/// file edited here and unanswered, or changed in the Mac's own app, stays,
+/// with its row, for that account to come back to.
 pub fn forget_account(core: &Core, store: &Store, account: &str) -> gws_store::Result<()> {
     for row in store
         .all_opened()?
         .iter()
         .filter(|row| row.account == account)
     {
-        if path_of(core, row).is_ok_and(|path| is_edited(core, &path, row)) {
+        if path_of(core, row).is_ok_and(|path| has_work(core, &path, row)) {
             continue;
         }
         if let Ok(dir) = folder_of(core, &row.id) {
@@ -1675,6 +1722,21 @@ mod tests {
             panic!("a plain failure");
         };
         assert_eq!(why, "That file couldn't be saved on this Mac.");
+    }
+
+    #[test]
+    fn a_part_that_cant_be_marked_doesnt_stay() {
+        let dir = std::env::temp_dir().join(format!("gws-unmarked-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let refused = write_marked(&dir, b"MZ stranger", |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        });
+        assert!(refused.is_err());
+        assert!(!dir.join(PART).exists(), "no unmarked file waits here");
+        write_marked(&dir, b"MZ stranger", |_| Ok(())).unwrap();
+        assert_eq!(fs::read(dir.join(PART)).unwrap(), b"MZ stranger");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

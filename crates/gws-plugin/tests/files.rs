@@ -1996,7 +1996,7 @@ fn opened_in_the_macs_app(home: &Home) -> Vec<(PathBuf, String)> {
 }
 
 #[test]
-fn what_the_macs_own_app_has_never_goes_to_drive_or_outlasts_a_sign_out() {
+fn a_change_in_the_macs_app_stays_until_saved_or_discarded_and_never_goes_to_drive() {
     let google = FakeGoogle::start(Seed::default());
     google.deliver(mail_with(vec![
         ("report.docx", DOCX, b"PK\x03\x04report"),
@@ -2004,22 +2004,76 @@ fn what_the_macs_own_app_has_never_goes_to_drive_or_outlasts_a_sign_out() {
     ]));
     let home = Home::new(&google.base(), "byapp");
     let files = opened_in_the_macs_app(&home);
+    let (changed, changed_id) = &files[0];
+    // the person left the budget as it came
+    let (unchanged, _) = &files[1];
+    fs::write(unchanged, b"PK\x03\x04budget").unwrap();
     assert_eq!(home.edits(), Vec::<Value>::new(), "not the Bot's edit");
     for (_, id) in &files {
         assert_eq!(refusal(&home.upload(id, "copy")), "not_edited", "{id}");
     }
     assert_eq!(drive_writes(&google), Vec::<String>::new());
-    home.sign_out();
-    for (path, _) in &files {
-        assert!(!path.exists(), "{path:?}");
-    }
-    home.core.account("buwiz.account.set", &push(FAKE_EMAIL));
-    let files = opened_in_the_macs_app(&home);
     home.later(LIFE_MS);
     gws::files::sweep(&home.core);
-    for (path, _) in &files {
-        assert!(!path.exists(), "{path:?}");
-    }
+    assert!(!unchanged.exists(), "an unchanged one goes at 24 hours");
+    assert_eq!(fs::read(changed).unwrap(), b"PK\x03\x04 edited in Pages");
+    home.sign_out();
+    assert_eq!(
+        fs::read(changed).unwrap(),
+        b"PK\x03\x04 edited in Pages",
+        "and stays through a sign-out"
+    );
+    home.core.account("buwiz.account.set", &push(FAKE_EMAIL));
+    let path = handed(&open_attachment(&home, 1)).1;
+    home.sign_out();
+    assert!(!path.exists(), "an unchanged one goes at sign-out");
+    home.core.account("buwiz.account.set", &push(FAKE_EMAIL));
+    // Save hands over the person's work, not Gmail's copy
+    bot_can(&home, &["open_with", "save"]);
+    let fetched = fetches(&google);
+    let answer = save_attachment(&home, 0);
+    let (key, saved) = handed(&answer);
+    assert_eq!(key, "buwiz/save", "{answer}");
+    assert_eq!(fs::read(&saved).unwrap(), b"PK\x03\x04 edited in Pages");
+    assert_eq!(name_on_disk(&saved), "report.docx");
+    assert_eq!(fetches(&google), fetched, "nothing fetched from Gmail");
+    assert!(!changed.exists(), "saved, so answered");
+    assert!(!home.folder(changed_id).exists());
+    assert_eq!(drive_writes(&google), Vec::<String>::new());
+}
+
+#[test]
+fn a_change_in_the_macs_app_goes_when_discarded() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("report.docx", DOCX, b"PK\x03\x04report"),
+        ("budget.xlsx", XLSX, b"PK\x03\x04budget"),
+    ]));
+    let home = Home::new(&google.base(), "byappdiscard");
+    let files = opened_in_the_macs_app(&home);
+    let (path, id) = &files[0];
+    data(home.core.run("gws_file_discard", &json!({"id": id})));
+    assert!(!path.exists());
+}
+
+#[test]
+fn without_save_a_bot_isnt_told_to_save() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![(
+        "tool.exe",
+        "application/x-msdownload",
+        b"MZ",
+    )]));
+    let home = Home::new(&google.base(), "nosave");
+    bot_can(&home, &["word", "sheet", "image", "pdf", "open_with"]);
+    let answer = open_attachment(&home, 0);
+    assert_eq!(refusal(&answer), "unsupported", "{answer}");
+    assert_eq!(says(&answer), "This kind of file can't be opened here.");
+    bot_can(&home, &EVERYTHING);
+    assert_eq!(
+        says(&open_attachment(&home, 0)),
+        "This kind of file can't open here. Save it instead."
+    );
 }
 
 #[test]
@@ -2030,7 +2084,11 @@ fn an_edit_in_the_bots_view_isnt_handed_to_the_macs_app() {
     let (path, _) = edited_attachment(&home);
     bot_can(&home, &["open_with"]);
     let answer = open_attachment(&home, 0);
-    assert_eq!(says(&answer), "Update Buwiz Bot to open this here.");
+    assert_eq!(refusal(&answer), "in_use", "{answer}");
+    assert_eq!(
+        says(&answer),
+        "This attachment has edits here that aren't saved. Save them to Drive or discard them first."
+    );
     assert_eq!(answer.get("_meta"), None);
     assert_eq!(fs::read(&path).unwrap(), b"PK mine");
     assert_eq!(home.edits().len(), 1, "still the person's to answer");

@@ -23,6 +23,8 @@ use crate::shell::{
     read, sleep,
 };
 
+mod pictures;
+
 const ROW_HEIGHT: f32 = 52.0;
 
 #[derive(Clone, PartialEq, Default, Debug)]
@@ -234,7 +236,8 @@ struct Mail {
     undoing: Signal<Option<String>>,
     page: Signal<Option<String>>,
     links: Signal<Vec<String>>,
-    images: Signal<i64>,
+    /// What the page leaves out of its pictures, and who they're from.
+    images: Signal<pictures::Pictures>,
     /// The open conversation's attachments.
     attachments: Signal<Vec<Attachment>>,
     /// Why an attachment didn't open.
@@ -625,8 +628,7 @@ async fn show(b: Bridge, m: Mail, thread: String) {
                     .filter_map(|l| l.as_str().map(str::to_owned))
                     .collect(),
             );
-            m.images
-                .set(v.get("images").and_then(Value::as_i64).unwrap_or(0));
+            pictures::opened(&b, m, &v, turn);
             m.attachments.set(attachments_in(&v));
             m.page.set(Some(
                 v.get("page")
@@ -1233,22 +1235,7 @@ fn reading(b: Bridge, m: Mail) -> impl IntoElement {
         .child(dynamic(move || match m.page.get() {
             Some(page) => view()
                 .app_class(Some("flex-1".into()))
-                .child(dynamic(move || {
-                    let n = m.images.get();
-                    if n > 0 {
-                        view()
-                            .app_class(Some(format!("px-3 py-1.5 border-b {LINE}").into()))
-                            .child(
-                                text(format!(
-                                    "{n} image{} blocked",
-                                    if n == 1 { "" } else { "s" }
-                                ))
-                                .app_class(Some(format!("text-[12px] {MUTE}").into())),
-                            )
-                    } else {
-                        view()
-                    }
-                }))
+                .child(pictures::bar(files.clone(), m))
                 .child(reader::view(
                     move || reader::seal(&page, dark()),
                     move |n| m.link.set(m.links.with_untracked(|l| l.get(n).cloned())),
@@ -1695,7 +1682,7 @@ pub fn build(bridge: Bridge) -> Root {
             beside: signal_with(beside, SignalEquals::Never),
             page: signal(None),
             links: signal(Vec::new()),
-            images: signal(0),
+            images: signal(pictures::Pictures::default()),
             attachments: signal(Vec::new()),
             attachment_said: signal(None),
             status: signal(String::new()),

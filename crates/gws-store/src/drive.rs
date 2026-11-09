@@ -511,7 +511,7 @@ mod tests {
         s.put_page(ME, "my", &[file("a", "apple")], "").unwrap();
         s.set_state(ME, CHANGES_TOKEN, "t1").unwrap();
         s.conn()
-            .execute_batch("DROP TABLE sign_ins; ALTER TABLE drive_files DROP COLUMN can; PRAGMA user_version = 7;")
+            .execute_batch("DROP TABLE sign_ins; DROP TABLE picture_senders; ALTER TABLE drive_files DROP COLUMN can; PRAGMA user_version = 7;")
             .unwrap();
         drop(s);
         let s = Store::open(&paths, &key_from_seed("seed")).unwrap();

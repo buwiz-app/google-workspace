@@ -592,6 +592,9 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
             "gws_file_discard",
             "gws_mail_attachment_open",
             "gws_mail_attachment_save",
+            "gws_mail_pictures",
+            "gws_mail_picture_sender_add",
+            "gws_mail_picture_sender_remove",
             "gws_resolve"
         ]
     );
@@ -1632,4 +1635,101 @@ fn the_manifest_command_prints_this_version_for_protocol_1_0() {
         Some(env!("CARGO_PKG_VERSION")),
         "Cargo.toml and the manifest agree"
     );
+}
+
+/// Through the real server: the model, in a chat or a routine, is refused every
+/// pictures tool, and reading the newsletter fetches none of its pictures.
+#[cfg(feature = "stub")]
+#[test]
+fn the_model_can_never_fetch_a_mails_pictures() {
+    use gws_fake_google::{FakeGoogle, Seed};
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let seed = Seed::default().with_rich_mail(&format!("http://127.0.0.1:{port}"));
+    let news = seed
+        .mails
+        .iter()
+        .find(|m| m.subject.starts_with("Five roofs"))
+        .unwrap()
+        .thread
+        .clone();
+    let google = FakeGoogle::start_on(port, seed);
+    let manifest = manifest_file("pictures-model");
+    let data = std::env::temp_dir().join(format!("gws-stdio-pictures-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data);
+    let mut child = plugin()
+        .arg("mcp")
+        .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
+        .env("GWS_STUB_BASE", google.base())
+        .env("GWS_DATA_DIR", &data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut id = 1;
+    let mut ask = |name: &str, args: Value, caller: Value| -> Value {
+        id += 1;
+        writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args, "_meta": {"buwiz/caller": caller}}})).unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["id"], id, "{line}");
+        v["result"].clone()
+    };
+    let provision = provision();
+    ask(
+        "buwiz.provision",
+        provision["params"]["arguments"].clone(),
+        json!({}),
+    );
+    ask(
+        "buwiz.account.set",
+        json!({"account": "google", "label": "default", "subject": FAKE_SUBJECT, "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}),
+        json!({}),
+    );
+    for caller in [
+        json!({"origin": "agent"}),
+        json!({"origin": "routine", "routine": "r1"}),
+    ] {
+        for (tool, args) in [
+            ("gws_mail_pictures", json!({"thread": news})),
+            (
+                "gws_mail_pictures",
+                json!({"thread": news, "trusted": true}),
+            ),
+            (
+                "gws_mail_picture_sender_add",
+                json!({"address": "news@digest.example"}),
+            ),
+            (
+                "gws_mail_picture_sender_remove",
+                json!({"address": "news@digest.example"}),
+            ),
+        ] {
+            let answer = ask(tool, args, caller.clone());
+            assert_eq!(
+                answer["structuredContent"]["code"], "permission_denied",
+                "{tool}: {answer}"
+            );
+        }
+        let read = ask("gws_read_mail", json!({"id": news}), caller.clone());
+        assert_ne!(read["isError"], true, "{read}");
+    }
+    drop(ask);
+    drop(stdin);
+    child.wait().unwrap();
+    let fetched = google
+        .log()
+        .iter()
+        .filter(|s| s.target.starts_with("/pictures/"))
+        .count();
+    assert_eq!(fetched, 0);
+    let _ = std::fs::remove_dir_all(&data);
 }

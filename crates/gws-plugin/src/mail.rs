@@ -1065,7 +1065,7 @@ pub fn view_of(thread: &Value) -> Value {
 /// A text keeps where its fold starts, so its row and its fold agree.
 enum Part {
     /// The cleaned HTML, what of it folds, and the message's plain text.
-    Html(clean::Cleaned, Vec<(usize, usize)>, String),
+    Html(clean::Cleaned, Vec<fold::Region>, String),
     Text(String, Option<usize>),
     TooLong,
 }
@@ -1086,7 +1086,7 @@ impl Part {
             // as plain text it keeps the fold where the HTML had it, worked
             // out only now that it's needed
             Part::Html(c, regions, text) => {
-                match regions.first().and_then(|r| fold::shrunk(&c.html, r.0)) {
+                match regions.first().and_then(|r| fold::shrunk(&c.html, r.start)) {
                     Some((shown, cut)) => Part::Text(shown, Some(cut)),
                     None => {
                         let cut = fold::plain_cut(&text);

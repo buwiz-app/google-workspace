@@ -62,6 +62,9 @@ pub const APPS: [App; 3] = [
             tools::UPLOAD_DROP,
             tools::MAIL_ATTACHMENT_OPEN,
             tools::MAIL_ATTACHMENT_PREVIEW,
+            tools::MAIL_PICTURES,
+            tools::MAIL_PICTURE_SENDER_ADD,
+            tools::MAIL_PICTURE_SENDER_REMOVE,
         ],
         card: true,
         files: true,
@@ -276,6 +279,7 @@ mod tests {
         let screens = [
             include_str!("../../gws-screens/src/mail.rs"),
             include_str!("../../gws-screens/src/mail/attachments.rs"),
+            include_str!("../../gws-screens/src/mail/pictures.rs"),
         ];
         for def in tools::defs() {
             if screens
@@ -284,6 +288,14 @@ mod tests {
             {
                 assert!(mail.tools.contains(&def.name), "{}", def.name);
             }
+        }
+        // the tie only means something while the screen makes these calls
+        for name in [
+            tools::MAIL_PICTURES,
+            tools::MAIL_PICTURE_SENDER_ADD,
+            tools::MAIL_PICTURE_SENDER_REMOVE,
+        ] {
+            assert!(screens[1].contains(&format!("\"{name}\"")), "{name}");
         }
     }
 

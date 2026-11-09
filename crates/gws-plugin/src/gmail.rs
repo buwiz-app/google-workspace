@@ -151,10 +151,25 @@ impl Gmail {
         query: Vec<(&'static str, String)>,
         cap: u64,
     ) -> Result<Option<Value>, Failure> {
+        self.get_within(auth, path, query, cap, None)
+    }
+
+    /// [`Self::get`], given up on after `within` when that's set.
+    fn get_within(
+        &self,
+        auth: &Bearer,
+        path: String,
+        query: Vec<(&'static str, String)>,
+        cap: u64,
+        within: Option<Duration>,
+    ) -> Result<Option<Value>, Failure> {
         let url = format!("{}/{path}", self.base);
         let mut req = self
             .agent
             .get(&url)
+            .config()
+            .timeout_global(within.or(Some(TIMEOUT)))
+            .build()
             .header("authorization", auth.header())
             .header("accept", "application/json");
         for (k, v) in &query {
@@ -412,14 +427,25 @@ impl Gmail {
 
     /// A whole thread, `format=full`.
     pub fn thread_full(&self, auth: &Bearer, id: &str) -> Result<Option<Value>, Failure> {
+        self.thread_full_within(auth, id, TIMEOUT)
+    }
+
+    /// [`Self::thread_full`], given up on after `within`.
+    pub fn thread_full_within(
+        &self,
+        auth: &Bearer,
+        id: &str,
+        within: Duration,
+    ) -> Result<Option<Value>, Failure> {
         if !id_ok(id) {
             return Ok(None);
         }
-        self.get(
+        self.get_within(
             auth,
             format!("threads/{id}"),
             vec![("format", "full".to_owned())],
             FULL_MAX,
+            Some(within),
         )
     }
 
@@ -528,10 +554,24 @@ impl Gmail {
         message: &str,
         id: &str,
     ) -> Result<Option<Vec<u8>>, Failure> {
+        self.attachment_within(auth, message, id, UPLOAD_TIMEOUT)
+    }
+
+    /// [`Self::attachment`], given up on after `within`.
+    pub fn attachment_within(
+        &self,
+        auth: &Bearer,
+        message: &str,
+        id: &str,
+        within: Duration,
+    ) -> Result<Option<Vec<u8>>, Failure> {
         let url = format!("{}/messages/{message}/attachments/{id}", self.base);
         let req = self
             .slow
             .get(&url)
+            .config()
+            .timeout_global(Some(within))
+            .build()
             .header("authorization", auth.header())
             .header("accept", "application/json");
         let Some(v) = Self::answer(req.call(), ATTACHMENT_MAX)? else {

@@ -22,7 +22,7 @@ use crate::tools::{
     MAIL_REPLY_START, MAIL_SEND, MAIL_SEND_ARM, MAIL_SEND_DISARM, MAIL_THREAD, MAIL_TRASH,
     MAIL_UNDO, PEOPLE_SUGGEST, SEARCH_MAIL, UPLOAD_CHUNK, UPLOAD_DROP, fail, failed, ok,
 };
-use crate::{Core, clean, compose, fold, js};
+use crate::{Core, clean, compose, fold, js, pictures};
 
 /// Rows a list page holds.
 pub const PAGE: i64 = 50;
@@ -958,7 +958,9 @@ pub fn view_of(thread: &Value) -> Value {
             let text = gmail::body(m);
             match gmail::html_body(m) {
                 Some(h) => {
-                    let mut c = clean::clean(&h);
+                    // the pictures picked for it go in first, so what folds
+                    // folds with them
+                    let mut c = clean::clean_with(&h, &|url| pictures::inline(m, url));
                     let (folded, cut) = fold::quotes(&c.html);
                     let fresh = cut.map(|cut| clean::visible_text(&c.html[..cut]));
                     c.html = folded;
@@ -1107,7 +1109,7 @@ fn day(at: &str) -> String {
 }
 
 /// What a saved view was made by. A view of an older shape is made again: a
-/// migration that clears them all (as 7, 8 and 10 did) runs once, and this
+/// migration that clears them all (as 6, 7 and 10 did) runs once, and this
 /// holds for each change after. Raise it whenever `view_of` or what it lists
 /// changes.
 pub const VIEW_VERSION: i64 = 2;
@@ -1132,18 +1134,18 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
         && let Ok(view) = serde_json::from_str::<Value>(&saved)
         && view.get("view_version").and_then(Value::as_i64) == Some(VIEW_VERSION)
     {
-        return Ok(ok(view));
+        return Ok(pictures::answer(core, &account, view));
     }
     let Some(mut full) = core.gmail.thread_full(&auth, &id)? else {
         return Ok(fail("not_found", "That conversation is gone."));
     };
     core.gmail.mark_twins(&auth, &mut full);
-    let mut view = view_of(&full);
+    let mut view = pictures::view(core, &auth, &account, &mut full);
     view["view_version"] = VIEW_VERSION.into();
     with_own_store(core, &account, |store| {
         store.put_view(&account, &id, &view.to_string(), now_ms())
     })?;
-    Ok(ok(view))
+    Ok(pictures::answer(core, &account, view))
 }
 
 fn changes(core: &Core, args: &Value) -> Result<Value, Failure> {

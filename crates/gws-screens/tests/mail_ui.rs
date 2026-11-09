@@ -51,7 +51,7 @@ fn list(args: &Value) -> Value {
     json!({"threads": rows, "more": skip + PAGE < all.len(), "saved": false})
 }
 
-/// A thread's answer: `t1` alone says it has blocked images, which is how a
+/// A thread's answer: `t1` alone says it has hidden pictures, which is how a
 /// test sees whose answer the reader took.
 fn thread(id: &str) -> Value {
     let attachments = if id == "t2" {
@@ -559,7 +559,7 @@ fn a_late_thread_answer_does_not_replace_the_open_one() {
     fake.release("t1");
     settle(&mut app);
     assert!(
-        !app.screen().shows("1 image blocked"),
+        !app.screen().shows("Pictures are hidden."),
         "t1's answer landed after t2"
     );
 }

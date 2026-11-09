@@ -435,6 +435,31 @@ fn headers(m: &Mail) -> Value {
     json!([{"name": "From", "value": m.from}, {"name": "To", "value": m.to}, {"name": "Subject", "value": m.subject}, {"name": "Date", "value": rfc2822(m.at)}, {"name": "Message-ID", "value": id}])
 }
 
+/// What Gmail says it found of the sender: DKIM and DMARC for the From
+/// domain, passed or failed.
+fn authentication_results(m: &Mail, signed: bool) -> String {
+    let address = m
+        .from
+        .rsplit('<')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('>');
+    let domain = address
+        .rsplit('@')
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    if signed {
+        format!(
+            "mx.google.com; dkim=pass header.i=@{domain} header.s=stub header.b=AbCd; spf=pass (google.com: domain of {address} designates 192.0.2.1 as permitted sender) smtp.mailfrom={address}; dmarc=pass (p=NONE sp=NONE dis=NONE) header.from={domain}"
+        )
+    } else {
+        format!(
+            "mx.google.com; spf=softfail (google.com: domain of transitioning {address} does not designate 192.0.2.9 as permitted sender) smtp.mailfrom={address}; dmarc=fail (p=NONE sp=NONE dis=NONE) header.from={domain}"
+        )
+    }
+}
+
 fn snippet(m: &Mail) -> String {
     m.text.replace('\n', " ").chars().take(120).collect()
 }
@@ -530,6 +555,9 @@ fn file_bytes(m: &Mail, i: usize) -> Option<&Vec<u8>> {
 #[derive(Default)]
 struct Account {
     mails: Vec<Mail>,
+    /// Mails whose From Gmail couldn't vouch for: their Authentication-Results
+    /// say DKIM and DMARC failed.
+    forged: Vec<String>,
     /// What `/pictures/<name>` serves.
     pictures: Vec<(String, Vec<u8>)>,
     /// How many more writes go through; `None` is no limit.
@@ -860,6 +888,14 @@ impl Account {
                 let read = self.reads.as_ref();
                 let read = read.map_or(0, |n| n.fetch_add(1, Ordering::Relaxed));
                 v["payload"] = payload(m, true, read);
+                // Gmail's own verdict on the sender goes on top, as it does
+                let results = authentication_results(m, !self.forged.contains(&m.id));
+                if let Some(h) = v["payload"]["headers"].as_array_mut() {
+                    h.insert(
+                        0,
+                        json!({"name": "Authentication-Results", "value": results}),
+                    );
+                }
                 if self.ids_missing {
                     strip_ids(&mut v["payload"]);
                 }
@@ -1628,6 +1664,11 @@ impl FakeGoogle {
     }
 
     /// A new mail arrives, as Gmail's history shows it.
+    /// From now on, mail `id` reads as Gmail reads a forged sender's.
+    pub fn forge_sender(&self, id: &str) {
+        self.account.lock().unwrap().forged.push(id.to_owned());
+    }
+
     pub fn deliver(&self, mail: Mail) {
         let mut a = self.account.lock().unwrap();
         a.history += 1;

@@ -821,3 +821,47 @@ fn another_account_has_no_wait_from_the_last_ones_failure() {
     gws::prefetch::run(&core).unwrap();
     assert_eq!(thread_reads(&google).len(), before + 1);
 }
+
+/// What a round keeps is what an open makes: the newsletter's logo, sent
+/// inside the mail, is in the page, with what its pictures need beside it.
+#[test]
+fn a_view_read_ahead_has_the_pictures_inside_its_mail() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let seed = Seed::default().with_rich_mail(&format!("http://127.0.0.1:{port}"));
+    let news = seed
+        .mails
+        .iter()
+        .find(|m| m.subject.starts_with("Five roofs"))
+        .unwrap()
+        .clone();
+    let google = FakeGoogle::start_on(port, seed);
+    let core = synced(&google, "rich");
+    core.clock.set(news.at + DAY);
+    gws::prefetch::run(&core).unwrap();
+    let kept: Value = {
+        let held = core.store().unwrap();
+        let view = held
+            .as_ref()
+            .unwrap()
+            .view(FAKE_EMAIL, &news.thread, 0)
+            .unwrap()
+            .expect("kept ahead");
+        serde_json::from_str(&view).unwrap()
+    };
+    let page = kept["page"].as_str().unwrap();
+    assert_eq!(page.matches("data:image/png;base64,").count(), 1, "{page}");
+    assert!(!page.contains("cid:"), "{page}");
+    assert_eq!(kept["pictures"]["from"], "news@digest.example");
+    let reads = thread_reads(&google).len();
+    let opened = data(core.run("gws_mail_thread", &json!({"thread": news.thread})));
+    assert_eq!(opened["page"], kept["page"]);
+    assert_eq!(
+        thread_reads(&google).len(),
+        reads,
+        "opened from what was kept"
+    );
+}

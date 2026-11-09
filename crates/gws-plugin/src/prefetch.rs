@@ -153,7 +153,7 @@ fn bodies(core: &Core, account: &str, since: i64, spent: &mut i64) -> Result<(),
             break;
         }
         let auth = still(core, account)?;
-        let Some((full, view)) = read_view(core, &auth, &id)? else {
+        let Some((full, view)) = read_view(core, &auth, account, &id)? else {
             // gone at Google, as a list sync would find
             with_own_store(core, account, |store| store.remove_thread(account, &id))?;
             continue;

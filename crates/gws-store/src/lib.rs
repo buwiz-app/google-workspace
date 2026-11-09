@@ -21,6 +21,7 @@ pub mod calendar;
 pub mod drive;
 pub mod mail;
 pub mod open;
+pub mod pictures;
 pub mod prefetch;
 
 pub const DATA_DIR_ENV: &str = "GWS_DATA_DIR";
@@ -80,6 +81,12 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     // a stored mail view shows every message open: fetched again, it folds
     (10, "DELETE FROM bodies;"),
+    // the senders whose web pictures always show. Views stored before it are
+    // gone with 10, so each comes again with its pictures and its sender
+    (
+        11,
+        "CREATE TABLE picture_senders(account TEXT NOT NULL, address TEXT NOT NULL, added INTEGER NOT NULL, PRIMARY KEY(account, address)) WITHOUT ROWID;",
+    ),
     // recent mail ahead of time: small attachments by their mail's date, the
     // bytes last so a sum of sizes needn't read them; which views have had
     // theirs looked at, and how often; threads there was nothing to keep of
@@ -656,6 +663,7 @@ mod tests {
             .execute_batch(
                 "INSERT INTO bodies(account, thread, view, size, used) VALUES('a', 't', '{}', 2, 1);
                  DROP TABLE sign_ins;
+                 DROP TABLE picture_senders;
                  DROP TABLE attachment_bytes;
                  DROP TABLE ahead_passed;
                  ALTER TABLE bodies DROP COLUMN fetched;
@@ -679,6 +687,7 @@ mod tests {
             .conn()
             .execute_batch(
                 "INSERT INTO bodies(account, thread, view, size, used) VALUES('a', 't', '{}', 2, 1);
+                 DROP TABLE picture_senders;
                  DROP TABLE attachment_bytes;
                  DROP TABLE ahead_passed;
                  ALTER TABLE bodies DROP COLUMN fetched;

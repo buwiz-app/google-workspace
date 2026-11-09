@@ -20,6 +20,7 @@ pub mod gmail;
 pub mod js;
 pub mod mail;
 pub mod manifest;
+pub mod pictures;
 pub mod prefetch;
 pub mod serve;
 pub mod tools;
@@ -90,6 +91,8 @@ pub struct Core {
     pub hashes: files::Hashes,
     /// What an open file's 24 hours are counted by.
     pub clock: files::Clock,
+    /// What fetches a mail's web pictures, at a person's press.
+    pub pictures: pictures::Fetcher,
     /// Whether recent mail is being fetched ahead.
     pub prefetch: prefetch::Running,
 }
@@ -121,6 +124,7 @@ impl Core {
             working: files::Working::default(),
             hashes: files::Hashes::default(),
             clock: files::Clock::default(),
+            pictures: pictures::Fetcher::new(apis),
             prefetch: prefetch::Running::default(),
             pushed: std::sync::atomic::AtomicBool::new(false),
             settle: mail::Settle::default(),
@@ -160,6 +164,7 @@ impl Core {
             .or_else(|| drive::run(self, tool, args))
             .or_else(|| drive::write::run(self, tool, args))
             .or_else(|| files::run(self, tool, args))
+            .or_else(|| pictures::run(self, tool, args))
             .unwrap_or_else(|| tools::run(&self.gmail, &self.accounts, tool, args));
         // nobody signed out: the Bot can't refresh the token right now, so the
         // sign-in card and the screens' sign-in guide would both be wrong
@@ -173,6 +178,10 @@ impl Core {
     pub fn run_for_model(&self, tool: &str, args: &Value) -> Value {
         if tool == tools::MAIL_DRAFT_SAVE {
             return compose::save_for_model(self, args);
+        }
+        // the loop refuses these already: a fetch is a person's, whatever asks
+        if pictures::is_tool(tool) {
+            return tools::fail("permission_denied", "Only a person can do this.");
         }
         self.run(tool, args)
     }

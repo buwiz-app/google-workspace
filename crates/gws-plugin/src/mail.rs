@@ -22,7 +22,7 @@ use crate::tools::{
     MAIL_REPLY_START, MAIL_SEND, MAIL_SEND_ARM, MAIL_SEND_DISARM, MAIL_THREAD, MAIL_TRASH,
     MAIL_UNDO, PEOPLE_SUGGEST, SEARCH_MAIL, UPLOAD_CHUNK, UPLOAD_DROP, fail, failed, ok,
 };
-use crate::{Core, clean, compose, fold, js};
+use crate::{Core, clean, compose, fold, js, pictures};
 
 /// Rows a list page holds.
 pub const PAGE: i64 = 50;
@@ -1024,7 +1024,9 @@ pub fn view_of(thread: &Value) -> Value {
             let text = gmail::body(m);
             match gmail::html_body(m) {
                 Some(h) => {
-                    let mut c = clean::clean(&h);
+                    // the pictures picked for it go in first, so what folds
+                    // folds with them
+                    let mut c = clean::clean_with(&h, &|url| pictures::inline(m, url));
                     let (folded, cut) = fold::quotes(&c.html);
                     let fresh = cut.map(|cut| clean::visible_text(&c.html[..cut]));
                     c.html = folded;
@@ -1173,17 +1175,19 @@ fn day(at: &str) -> String {
 }
 
 /// A thread read whole from Google and made into the page an open shows, with
-/// what Google sent: an open and a read ahead both keep what this makes.
-/// `None` when the thread is gone.
+/// what Google sent: an open and a read ahead both keep what this makes, its
+/// pictures inside the mail and what they need to show among it. `None` when
+/// the thread is gone.
 pub(crate) fn read_view(
     core: &Core,
     auth: &Bearer,
+    account: &str,
     id: &str,
 ) -> Result<Option<(Value, Value)>, Failure> {
-    let Some(full) = core.gmail.thread_full(auth, id)? else {
+    let Some(mut full) = core.gmail.thread_full(auth, id)? else {
         return Ok(None);
     };
-    let view = view_of(&full);
+    let view = pictures::view(core, auth, account, &mut full);
     Ok(Some((full, view)))
 }
 
@@ -1206,17 +1210,17 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     if let Some(saved) = with_store(core, |store| store.view(&account, &id, now_ms()))?
         && let Ok(view) = serde_json::from_str::<Value>(&saved)
     {
-        return Ok(ok(view));
+        return Ok(pictures::answer(core, &account, view));
     }
     // the sign-in is there, and the Bot can't refresh its token just now
     let auth = auth.ok_or_else(unreached)?;
-    let Some((_, view)) = read_view(core, &auth, &id)? else {
+    let Some((_, view)) = read_view(core, &auth, &account, &id)? else {
         return Ok(fail("not_found", "That conversation is gone."));
     };
     with_own_store(core, &account, |store| {
         store.put_view(&account, &id, &view.to_string(), now_ms())
     })?;
-    Ok(ok(view))
+    Ok(pictures::answer(core, &account, view))
 }
 
 fn changes(core: &Core, args: &Value) -> Result<Value, Failure> {

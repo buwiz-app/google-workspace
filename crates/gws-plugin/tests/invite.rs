@@ -699,3 +699,41 @@ fn an_unreadable_newer_invite_never_hides_an_older_one() {
     let got = data(core.run("gws_mail_invite", &json!({"thread": older.thread})));
     assert_eq!(got["invite"]["message"], older.id.as_str(), "{got}");
 }
+
+#[test]
+fn at_a_public_mail_domain_only_the_organiser_and_google_calendar_send_an_invite() {
+    let google = FakeGoogle::start(rich());
+    let ics = rich_ics(|s| s.replace("mailto:ana@example.com", "mailto:ana@gmail.com"));
+    let from = |who: &str, n: u64| Mail {
+        from: who.into(),
+        ..mail_with(&ics, n)
+    };
+    let cases = [
+        (from("Stranger <stranger@gmail.com>", 60), false),
+        (from("Someone <someone@google.com>", 61), false),
+        (from("Ana <ana@gmail.com>", 62), true),
+        (from("Ana <calendar-notification@google.com>", 63), true),
+    ];
+    for (mail, _) in &cases {
+        google.deliver(mail.clone());
+    }
+    let core = signed_in(&google, "public-domains");
+    for (mail, lights) in &cases {
+        let got = data(core.run("gws_mail_invite", &json!({"message": mail.id})));
+        assert_eq!(got["invite"]["sender_ok"], *lights, "{}", mail.from);
+        if !lights {
+            assert_eq!(
+                got["calendar"],
+                json!({"unverified": true}),
+                "{}",
+                mail.from
+            );
+            let refused = data(core.run(
+                "gws_mail_invite_reply",
+                &json!({"message": mail.id, "response": "accepted"}),
+            ));
+            assert_eq!(refused["refused"], "unverified", "{}", mail.from);
+        }
+    }
+    assert!(google.calendar_writes().is_empty());
+}

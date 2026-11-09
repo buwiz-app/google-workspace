@@ -323,6 +323,8 @@ fn windows_zone(name: &str) -> Option<&'static str> {
         "UTC-08" => "Etc/GMT+8",
         "Pacific Standard Time" => "America/Los_Angeles",
         "US Mountain Standard Time" => "America/Phoenix",
+        "British Columbia Standard Time" => "America/Vancouver",
+        "Alberta Standard Time" => "America/Edmonton",
         "Mountain Standard Time (Mexico)" | "Mexico Standard Time 2" => "America/Mazatlan",
         "Mountain Standard Time" => "America/Denver",
         "Yukon Standard Time" => "America/Whitehorse",
@@ -331,6 +333,7 @@ fn windows_zone(name: &str) -> Option<&'static str> {
         "Easter Island Standard Time" => "Pacific/Easter",
         "Central Standard Time (Mexico)" | "Mexico Standard Time" => "America/Mexico_City",
         "Canada Central Standard Time" => "America/Regina",
+        "Manitoba Standard Time" => "America/Winnipeg",
         "SA Pacific Standard Time" => "America/Bogota",
         "Eastern Standard Time (Mexico)" => "America/Cancun",
         "Eastern Standard Time" => "America/New_York",
@@ -788,22 +791,55 @@ fn text_of(part: &Value) -> Option<String> {
     Some(gmail::in_charset(bytes, &gmail::part_charset(part)))
 }
 
+/// Google Calendar's own sender of invites.
+const CALENDAR_SENDER: &str = "calendar-notification@google.com";
+
+/// Mail domains anyone can have an address at: there, the domain says
+/// nothing of who the organiser is.
+const PUBLIC_DOMAINS: &[&str] = &[
+    "gmail.com",
+    "googlemail.com",
+    "outlook.com",
+    "hotmail.com",
+    "live.com",
+    "yahoo.com",
+    "icloud.com",
+    "me.com",
+    "mac.com",
+    "proton.me",
+    "protonmail.com",
+    "aol.com",
+    "gmx.com",
+    "gmx.net",
+];
+
 /// Whether the mail comes from who sends the organiser's invites: Gmail's
 /// own Authentication-Results vouch for its From ([`pictures::vouched`]),
-/// and that From is the organiser's domain, or Google Calendar's own. The
+/// and that From is Google Calendar's own sender, the organiser's address
+/// at a public mail domain, or else the organiser's domain. Any other
+/// google.com sender is a person, who could forward a crafted `.ics`. The
 /// `.ics` is the sender's to write, UID and all, so only this says who sent it.
 fn sent_by_organizer(message: &Value, organizer: &str) -> bool {
     let domain = |a: &str| a.rsplit_once('@').map(|(_, d)| d.to_ascii_lowercase());
     let (Some(from), Some(theirs)) = (pictures::from_of(message), domain(organizer)) else {
         return false;
     };
-    let Some(from) = domain(&from) else {
+    let Some(from_domain) = domain(&from) else {
         return false;
     };
-    pictures::vouched(message)
-        && (from == "google.com"
-            || pictures::aligned(&from, &theirs)
-            || pictures::aligned(&theirs, &from))
+    if !pictures::vouched(message) {
+        return false;
+    }
+    if from == CALENDAR_SENDER {
+        return true;
+    }
+    if from_domain == "google.com" {
+        return false;
+    }
+    if PUBLIC_DOMAINS.contains(&theirs.as_str()) {
+        return from.eq_ignore_ascii_case(organizer);
+    }
+    pictures::aligned(&from_domain, &theirs) || pictures::aligned(&theirs, &from_domain)
 }
 
 /// The thread view's `invite` for a message, `None` for a reply that says
@@ -1624,6 +1660,50 @@ mod tests {
         assert!(read(&ics).is_some());
     }
 
+    /// CLDR's windowsZones.xml, its world ("001") rows: every Windows name
+    /// it knows reads, on the same clock as the zone CLDR gives, whichever of
+    /// its names (Asia/Calcutta, Asia/Kolkata) either side uses.
+    #[test]
+    fn every_windows_name_cldr_knows_keeps_cldrs_clock() {
+        use chrono::Offset as _;
+        let xml = include_str!("../tests/data/windowsZones.xml");
+        let attr = |line: &str, key: &str| -> String {
+            let at = line.find(&format!("{key}=\"")).unwrap() + key.len() + 2;
+            line[at..].split('"').next().unwrap().to_owned()
+        };
+        let rows: Vec<(String, String)> = xml
+            .lines()
+            .filter(|l| l.contains("<mapZone") && l.contains("territory=\"001\""))
+            .map(|l| (attr(l, "other"), attr(l, "type")))
+            .collect();
+        assert!(rows.len() > 130, "{}", rows.len());
+        // the first of each month, either side of every change in recent years
+        let instants: Vec<NaiveDateTime> = (2018..=2027)
+            .flat_map(|y| (1..=12).map(move |m| (y, m)))
+            .map(|(y, m)| {
+                NaiveDate::from_ymd_opt(y, m, 1)
+                    .unwrap()
+                    .and_hms_opt(12, 0, 0)
+                    .unwrap()
+            })
+            .collect();
+        let mut wrong = Vec::new();
+        for (name, cldr) in &rows {
+            let Some(ours) = windows_zone(name) else {
+                wrong.push(format!("{name}: missing"));
+                continue;
+            };
+            let (ours, theirs) = (ours.parse::<Tz>().unwrap(), cldr.parse::<Tz>().unwrap());
+            let differs = instants.iter().find(|at| {
+                ours.offset_from_utc_datetime(at).fix() != theirs.offset_from_utc_datetime(at).fix()
+            });
+            if let Some(at) = differs {
+                wrong.push(format!("{name}: {ours} is not {theirs} at {at}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     #[test]
     fn every_windows_zone_names_a_zone_and_the_rarer_ones_read() {
         let names = include_str!("invite.rs")
@@ -1752,6 +1832,8 @@ mod tests {
             ),
             ("Mallory <m@evil.example>", pass("evil.example"), false),
             ("Mallory <m@notexample.com>", pass("notexample.com"), false),
+            // a person at Google is not Google Calendar
+            ("Someone <someone@google.com>", pass("google.com"), false),
         ];
         for (from, results, ok) in cases {
             assert_eq!(
@@ -1768,6 +1850,26 @@ mod tests {
             &signed("ana@example.com", &pass("example.com")),
             ""
         ));
+        // at a public mail domain, only the organiser's own address
+        let gmail = pass("gmail.com");
+        assert!(!sent_by_organizer(
+            &signed("Stranger <stranger@gmail.com>", &gmail),
+            "ana@gmail.com"
+        ));
+        assert!(sent_by_organizer(
+            &signed("Ana <Ana@Gmail.com>", &gmail),
+            "ana@gmail.com"
+        ));
+        // Google Calendar's sender, whoever organises
+        for organizer in ["ana@gmail.com", "ana@example.com", "boss@outlook.com"] {
+            assert!(
+                sent_by_organizer(
+                    &signed("calendar-notification@google.com", &pass("google.com")),
+                    organizer
+                ),
+                "{organizer}"
+            );
+        }
     }
 
     #[test]

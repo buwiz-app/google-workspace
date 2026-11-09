@@ -295,7 +295,7 @@ mod tests {
             tools::MAIL_PICTURE_SENDER_ADD,
             tools::MAIL_PICTURE_SENDER_REMOVE,
         ] {
-            assert!(screens[1].contains(&format!("\"{name}\"")), "{name}");
+            assert!(screens[2].contains(&format!("\"{name}\"")), "{name}");
         }
     }
 

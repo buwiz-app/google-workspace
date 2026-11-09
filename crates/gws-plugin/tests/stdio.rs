@@ -591,10 +591,10 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
             "gws_file_upload",
             "gws_file_discard",
             "gws_mail_attachment_open",
-            "gws_mail_attachment_preview",
             "gws_mail_pictures",
             "gws_mail_picture_sender_add",
             "gws_mail_picture_sender_remove",
+            "gws_mail_attachment_preview",
             "gws_resolve"
         ]
     );

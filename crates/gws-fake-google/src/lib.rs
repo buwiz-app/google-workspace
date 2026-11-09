@@ -10,6 +10,7 @@
 
 mod calendar;
 mod drive;
+mod rich;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -247,6 +248,9 @@ pub struct Mail {
     pub attachments: Vec<(String, String, Vec<u8>)>,
     /// Its `Message-ID`, for a search by it.
     pub message_id: String,
+    /// Pictures the HTML shows by `cid:`: `(content id, file name, mime,
+    /// bytes)`, in a `multipart/related` beside the body, as Gmail sends them.
+    pub inline: Vec<(String, String, String, Vec<u8>)>,
 }
 
 /// What a fake account starts with.
@@ -310,6 +314,7 @@ impl Seed {
                     html: (i % 2 == 0).then(|| format!("<html><body><p>Hello,</p><p>This is <b>fake</b> mail number {i} from {name}.</p></body></html>")),
                     attachments: Vec::new(),
                     message_id: String::new(),
+                    inline: Vec::new(),
                 }
             })
             .collect();
@@ -372,6 +377,7 @@ impl Seed {
                 html: Some(HOSTILE_HTML.replace("{stub}", stub)),
                 attachments: Vec::new(),
                 message_id: String::new(),
+                inline: Vec::new(),
             },
         );
         self
@@ -429,24 +435,68 @@ fn snippet(m: &Mail) -> String {
 
 /// `read` goes into each attachment's id, which Gmail doesn't promise to keep:
 /// a read counts up once [`FakeGoogle::attachment_ids_change`] says so.
+///
+/// The shape is Gmail's: a `text/calendar` attachment goes inside the
+/// `multipart/alternative` beside the text and HTML, as a Google invite's does,
+/// and [`Mail::inline`] pictures go in a `multipart/related` around it. File
+/// `i` is `attachments[i]`, then `inline[i - attachments.len()]`.
 fn payload(m: &Mail, full: bool, read: u64) -> Value {
     if !full {
         return json!({"mimeType": "multipart/alternative", "headers": headers(m)});
     }
-    let text = json!({"mimeType": "text/plain", "headers": [{"name": "Content-Type", "value": "text/plain; charset=utf-8"}], "body": {"data": b64(m.text.as_bytes()), "size": m.text.len()}});
-    let mut parts = vec![text];
+    let file = |i: usize, part: String, name: &str, mime: &str, size: usize, headers: Value| json!({"partId": part, "mimeType": mime, "filename": name, "headers": headers, "body": {"attachmentId": format!("att-{}-{read}-{i}", m.id), "size": size}});
+    let text = json!({"partId": "0.0", "mimeType": "text/plain", "headers": [{"name": "Content-Type", "value": "text/plain; charset=utf-8"}], "body": {"data": b64(m.text.as_bytes()), "size": m.text.len()}});
+    let mut alternative = vec![text];
     if let Some(html) = &m.html {
-        parts.push(json!({"mimeType": "text/html", "headers": [{"name": "Content-Type", "value": "text/html; charset=utf-8"}], "body": {"data": b64(html.as_bytes()), "size": html.len()}}));
+        alternative.push(json!({"partId": "0.1", "mimeType": "text/html", "headers": [{"name": "Content-Type", "value": "text/html; charset=utf-8"}], "body": {"data": b64(html.as_bytes()), "size": html.len()}}));
     }
-    let body = json!({"partId": "0", "mimeType": "multipart/alternative", "parts": parts});
-    if m.attachments.is_empty() {
-        return json!({"mimeType": "multipart/alternative", "headers": headers(m), "parts": body["parts"]});
-    }
-    let mut mixed = vec![body];
+    let mut mixed = Vec::new();
     for (i, (name, mime, bytes)) in m.attachments.iter().enumerate() {
-        mixed.push(json!({"partId": (i + 1).to_string(), "mimeType": mime, "filename": name, "headers": [{"name": "Content-Disposition", "value": format!("attachment; filename=\"{name}\"")}], "body": {"attachmentId": format!("att-{}-{read}-{i}", m.id), "size": bytes.len()}}));
+        if mime == "text/calendar" {
+            let part = format!("0.{}", alternative.len());
+            alternative.push(file(i, part, name, mime, bytes.len(), json!([{"name": "Content-Type", "value": "text/calendar; charset=\"UTF-8\"; method=REQUEST"}])));
+        } else {
+            let part = (mixed.len() + 1).to_string();
+            mixed.push(file(i, part, name, mime, bytes.len(), json!([{"name": "Content-Disposition", "value": format!("attachment; filename=\"{name}\"")}])));
+        }
     }
+    let body = json!({"partId": "0", "mimeType": "multipart/alternative", "parts": alternative});
+    let body = if m.inline.is_empty() {
+        body
+    } else {
+        let mut related = vec![body];
+        for (n, (cid, name, mime, bytes)) in m.inline.iter().enumerate() {
+            let headers = json!([{"name": "Content-ID", "value": format!("<{cid}>")}, {"name": "Content-Disposition", "value": format!("inline; filename=\"{name}\"")}]);
+            related.push(file(
+                m.attachments.len() + n,
+                format!("0.{}", n + 1),
+                name,
+                mime,
+                bytes.len(),
+                headers,
+            ));
+        }
+        json!({"partId": "0", "mimeType": "multipart/related", "parts": related})
+    };
+    if mixed.is_empty() {
+        let mut only = body;
+        only["partId"] = json!("");
+        only["headers"] = headers(m);
+        return only;
+    }
+    mixed.insert(0, body);
     json!({"partId": "", "mimeType": "multipart/mixed", "headers": headers(m), "parts": mixed})
+}
+
+/// File `i` of a mail, as [`payload`] numbers them.
+fn file_bytes(m: &Mail, i: usize) -> Option<&Vec<u8>> {
+    match m.attachments.get(i) {
+        Some((_, _, bytes)) => Some(bytes),
+        None => m
+            .inline
+            .get(i - m.attachments.len())
+            .map(|(_, _, _, bytes)| bytes),
+    }
 }
 
 #[derive(Default)]
@@ -740,6 +790,7 @@ impl Account {
                     html: None,
                     attachments: sent.attachments,
                     message_id: sent.message_id,
+                    inline: Vec::new(),
                 }
             })
             .collect()
@@ -943,15 +994,17 @@ impl Account {
                     .find(|d| d.1 == *id)
                     .map(|d| Sent::of(&d.2));
                 let found = match &held {
-                    Some(draft) => at.and_then(|i| draft.attachments.get(i)),
+                    Some(draft) => at
+                        .and_then(|i| draft.attachments.get(i))
+                        .map(|(_, _, bytes)| bytes),
                     None => self
                         .mails
                         .iter()
                         .find(|m| m.id == *id)
-                        .and_then(|m| at.and_then(|i| m.attachments.get(i))),
+                        .and_then(|m| at.and_then(|i| file_bytes(m, i))),
                 };
                 match found {
-                    Some((_, _, bytes)) => {
+                    Some(bytes) => {
                         Reply::json(200, json!({"size": bytes.len(), "data": b64(bytes)}))
                     }
                     None => not_found(),
@@ -1083,6 +1136,7 @@ impl Account {
                         html: None,
                         attachments: sent.attachments.clone(),
                         message_id: sent.message_id.clone(),
+                        inline: Vec::new(),
                     },
                 );
                 self.sent.push(sent);
@@ -1296,6 +1350,15 @@ impl Account {
                     .edit(&id, |f| f.content.extend_from_slice(b" changed elsewhere"));
             }
             return Reply::json(200, json!({}));
+        }
+        // a newsletter's pictures on the web: `/pictures/<name>.png`, with no
+        // token, as any web server serves them
+        if let Some(name) = path.strip_prefix("/pictures/") {
+            return if name.ends_with(".png") && !name.contains('/') {
+                Reply(200, "image/png", rich::PHOTO.to_vec(), Vec::new())
+            } else {
+                Reply::json(404, json!({}))
+            };
         }
         if path == "/o/oauth2/v2/auth" {
             return self.authorize(&r);

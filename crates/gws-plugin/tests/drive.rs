@@ -818,6 +818,7 @@ fn a_changes_failure_leaves_mail_and_calendar_syncing() {
             html: None,
             attachments: Vec::new(),
             message_id: String::new(),
+            inline: Vec::new(),
         });
         google.add_event(
             FAKE_EMAIL,

@@ -1242,6 +1242,7 @@ fn mail_with(attachments: Vec<(&str, &str, &[u8])>) -> Mail {
             .map(|(n, m, b)| (n.to_owned(), m.to_owned(), b.to_vec()))
             .collect(),
         message_id: "<a@example.com>".to_owned(),
+        inline: Vec::new(),
     }
 }
 

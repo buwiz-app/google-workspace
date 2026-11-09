@@ -15,6 +15,7 @@
 #      GWS_MAILS      how many fake mails (default 200)
 #      GWS_FILES      add a Drive folder of this many files
 #      GWS_HOSTILE=1  add the stub's hostile mail
+#      GWS_RICH=1     add a long thread, an invite, a photo, a PDF and a newsletter
 #      GWS_GRANT      the one scope the stub grants, as for an older sign-in
 #      GWS_NO_SIGN_IN=1  stop before sign-in, to see the setup guide
 #      GWS_MODEL_PORT  run tools/bot/standin-model.py there instead of the mock:
@@ -85,6 +86,7 @@ up() {
   local hostile=(); [ -z "${GWS_HOSTILE:-}" ] || hostile=(--hostile)
   [ -z "${GWS_GRANT:-}" ] || hostile+=(--grant "$GWS_GRANT")
   [ -z "${GWS_FILES:-}" ] || hostile+=(--files "$GWS_FILES")
+  [ -z "${GWS_RICH:-}" ] || hostile+=(--rich)
   nohup "$stub" --port "$STUB_PORT" --mails "${GWS_MAILS:-200}" ${hostile[@]+"${hostile[@]}"} > "$INST/stub.log" 2>&1 & echo $! > "$INST/stub.pid"
   local model=(MOCK=1 ANTHROPIC_BASE_URL=http://127.0.0.1:1)
   if [ -n "${GWS_MODEL_PORT:-}" ]; then

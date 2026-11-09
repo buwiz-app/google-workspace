@@ -314,7 +314,10 @@ fn small_file_home(name: &str, mime: &str, bytes: Vec<u8>, tag: &str) -> (FakeGo
 #[test]
 fn a_small_file_in_its_part_opens_from_the_message() {
     const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-    let (google, home) = small_file_home("note.docx", DOCX, b"PK small".to_vec(), "smallopen");
+    let (google, home) =
+        small_file_home("note.docx", DOCX, b"PK\x03\x04 small".to_vec(), "smallopen");
+    // a Bot that can show a Word file
+    home.core.documents.heard(&json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {"experimental": {"buwiz/documents": ["word", "save"]}}}}));
     let files = home.files("18f1aa");
     assert_eq!(files[0]["id"], Value::Null, "this is the case being tested");
     let answer = home.core.run(
@@ -324,7 +327,16 @@ fn a_small_file_in_its_part_opens_from_the_message() {
     let path = answer["_meta"]["buwiz/document"]["path"]
         .as_str()
         .unwrap_or_else(|| panic!("{answer}"));
-    assert_eq!(fs::read(path).unwrap(), b"PK small");
+    assert_eq!(fs::read(path).unwrap(), b"PK\x03\x04 small");
+    // and saves from it too
+    let answer = home.core.run(
+        "gws_mail_attachment_save",
+        &json!({"message": "18f1aa", "part": files[0]["part"]}),
+    );
+    let path = answer["_meta"]["buwiz/save"]["path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{answer}"));
+    assert_eq!(fs::read(path).unwrap(), b"PK\x03\x04 small");
     assert_eq!(fetches(&google), 0);
 }
 

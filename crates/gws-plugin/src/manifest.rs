@@ -62,6 +62,7 @@ pub const APPS: [App; 3] = [
             tools::UPLOAD_DROP,
             tools::MAIL_ATTACHMENT_OPEN,
             tools::MAIL_ATTACHMENT_PREVIEW,
+            tools::MAIL_ATTACHMENT_SAVE,
             tools::MAIL_PICTURES,
             tools::MAIL_PICTURE_SENDER_ADD,
             tools::MAIL_PICTURE_SENDER_REMOVE,
@@ -355,7 +356,11 @@ mod tests {
             assert!(edits.contains(&format!("\"{name}\"")), "{name}");
         }
         let cards = include_str!("../../gws-screens/src/mail/attachments.rs");
-        for name in [tools::MAIL_ATTACHMENT_OPEN, tools::MAIL_ATTACHMENT_PREVIEW] {
+        for name in [
+            tools::MAIL_ATTACHMENT_OPEN,
+            tools::MAIL_ATTACHMENT_PREVIEW,
+            tools::MAIL_ATTACHMENT_SAVE,
+        ] {
             assert!(cards.contains(&format!("\"{name}\"")), "{name}");
         }
         // and these, or no folder, press or file of the writing slice gets through
@@ -422,6 +427,7 @@ mod tests {
             tools::FILE_UPLOAD,
             tools::FILE_DISCARD,
             tools::MAIL_ATTACHMENT_OPEN,
+            tools::MAIL_ATTACHMENT_SAVE,
         ] {
             let def = tools::defs().into_iter().find(|d| d.name == name).unwrap();
             assert_eq!(def.audience, tools::APP_ONLY, "{name}");

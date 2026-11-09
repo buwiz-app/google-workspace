@@ -127,8 +127,11 @@ fn attachment_ok(id: &str) -> bool {
 
 /// A part's picture: its bytes inline, else from the attachment API within
 /// `by`, and nothing past [`PICTURE_MAX`] fetched at all. `calls` counts the
-/// attachment calls, which stop at [`CID_CALLS`]. `missed` is set when time ran
-/// out or Gmail failed, which another try may not.
+/// attachment calls, which stop at [`CID_CALLS`]. Nothing is fetched that
+/// `fits` says can't be kept, and `gate` hears only of what's asked for.
+/// `missed` is set when time ran out or Gmail failed, which another try may
+/// not; `short` when Google said too little of a part to fetch it by.
+#[allow(clippy::too_many_arguments)]
 fn part_picture(
     core: &Core,
     auth: &Bearer,
@@ -136,7 +139,10 @@ fn part_picture(
     part: &Value,
     by: Instant,
     calls: &mut usize,
+    fits: &dyn Fn(u64) -> bool,
+    gate: &mut dyn FnMut(u64) -> bool,
     missed: &mut bool,
+    short: &mut bool,
 ) -> Option<String> {
     if let Some(data) = part.pointer("/body/data").and_then(Value::as_str) {
         // base64 of more than the cap can't decode to within it
@@ -145,18 +151,31 @@ fn part_picture(
         }
         return data_url(&unbase64(data)?);
     }
-    let size = part.pointer("/body/size").and_then(Value::as_u64)?;
-    let id = part.pointer("/body/attachmentId").and_then(Value::as_str)?;
+    let size = part.pointer("/body/size").and_then(Value::as_u64);
+    let id = part.pointer("/body/attachmentId").and_then(Value::as_str);
+    let (size, id) = match (size, id) {
+        (Some(size), Some(id)) => (size, id),
+        // an empty part is no picture
+        (Some(0), None) => return None,
+        _ => {
+            *short = true;
+            return None;
+        }
+    };
     if size > PICTURE_MAX as u64 || !attachment_ok(id) || !gmail::id_ok(message) {
         return None;
     }
-    if *calls >= CID_CALLS {
+    if *calls >= CID_CALLS || !fits(size) {
         return None;
     }
+    // a press out of time asks for nothing, and so charges nothing
     let Some(left) = left(by) else {
         *missed = true;
         return None;
     };
+    if !gate(size) {
+        return None;
+    }
     *calls += 1;
     match core.gmail.attachment_within(auth, message, id, left) {
         Ok(bytes) => data_url(&bytes?),
@@ -212,13 +231,25 @@ impl Placer {
         }
     }
 
-    /// Takes `data` for `url` in each of `messages`, if it all fits.
-    fn offer(&mut self, messages: &[usize], url: &str, data: String) -> bool {
-        let times: usize = messages
+    /// How many times `url` shows in `messages`.
+    fn times(&self, messages: &[usize], url: &str) -> usize {
+        messages
             .iter()
             .map(|&m| self.uses[m].iter().filter(|u| *u == url).count().max(1))
-            .sum();
-        let cost = (data.len() + 2) * times;
+            .sum()
+    }
+
+    /// Whether a picture of `size` bytes for `url` in `messages` could be
+    /// taken: asked before it's fetched, so none is fetched only to stay out.
+    fn fits(&self, messages: &[usize], url: &str, size: u64) -> bool {
+        // the longest kind's `data:` prefix, and the base64 of `size`
+        let data = "data:image/jpeg;base64,".len() as u64 + size.div_ceil(3) * 4;
+        (data + 2).saturating_mul(self.times(messages, url) as u64) <= self.room as u64
+    }
+
+    /// Takes `data` for `url` in each of `messages`, if it all fits.
+    fn offer(&mut self, messages: &[usize], url: &str, data: String) -> bool {
+        let cost = (data.len() + 2) * self.times(messages, url);
         if cost > self.room {
             return false;
         }
@@ -247,10 +278,22 @@ impl Placer {
 }
 
 /// The pictures inside `thread`'s mail, by Content-ID, offered to `placer` by
-/// `by`, with no more than [`CID_CALLS`] calls to Gmail for them. `false` when
-/// one was missed for time or a failure, so the view isn't kept.
-fn inside(core: &Core, auth: &Bearer, thread: &Value, placer: &mut Placer, by: Instant) -> bool {
-    let (mut calls, mut missed) = (0, false);
+/// `by`, with no more than [`CID_CALLS`] calls to Gmail for them, and what
+/// that came to.
+fn inside(
+    core: &Core,
+    auth: &Bearer,
+    thread: &Value,
+    placer: &mut Placer,
+    by: Instant,
+    gate: &mut dyn FnMut(u64) -> bool,
+) -> Made {
+    let (mut calls, mut missed, mut short) = (0, false, false);
+    let made = |missed: bool, short: bool| match (missed, short) {
+        (true, _) => Made::Missed,
+        (_, true) => Made::Short,
+        _ => Made::Whole,
+    };
     for (n, m) in messages(thread).iter().enumerate() {
         let parts = gmail::by_content_id(m);
         if parts.is_empty() {
@@ -260,7 +303,7 @@ fn inside(core: &Core, auth: &Bearer, thread: &Value, placer: &mut Placer, by: I
         let mut seen = HashSet::new();
         for url in placer.uses[n].clone() {
             if placer.full() {
-                return !missed;
+                return made(missed, short);
             }
             let Some(part) = gmail::cid_of(&url).and_then(|cid| parts.get(&cid).copied()) else {
                 continue;
@@ -268,12 +311,38 @@ fn inside(core: &Core, auth: &Bearer, thread: &Value, placer: &mut Placer, by: I
             if !seen.insert(url.clone()) {
                 continue;
             }
-            if let Some(data) = part_picture(core, auth, id, part, by, &mut calls, &mut missed) {
+            let room = |size| placer.fits(&[n], &url, size);
+            let picture = part_picture(
+                core,
+                auth,
+                id,
+                part,
+                by,
+                &mut calls,
+                &room,
+                gate,
+                &mut missed,
+                &mut short,
+            );
+            if let Some(data) = picture {
                 placer.offer(&[n], &url, data);
             }
         }
     }
-    !missed
+    made(missed, short)
+}
+
+/// What the pictures inside a thread's mail came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Made {
+    /// Each that could be fetched was.
+    Whole,
+    /// One was missed for time or a failure, which another try may not be:
+    /// the view isn't kept.
+    Missed,
+    /// Google said too little of one to fetch it by: the view isn't kept as
+    /// if whole.
+    Short,
 }
 
 /// Takes out anything that looks like what [`Placer`] puts in.
@@ -398,17 +467,24 @@ fn named(thread: &Value, account: &str) -> Value {
 }
 
 /// The thread's view, with the pictures inside its mail shown, and who its
-/// pictures are from. For the thread view, which the store keeps unless the
-/// second answer is `false`: a picture missed for time or a failure.
-pub fn view(core: &Core, auth: &Bearer, account: &str, thread: &mut Value) -> (Value, bool) {
+/// pictures are from, and what its pictures came to. `gate` is asked before
+/// each picture is fetched from Gmail, with its size: a read ahead keeps to
+/// its round's bytes and its sign-in by it.
+pub fn view_within(
+    core: &Core,
+    auth: &Bearer,
+    account: &str,
+    thread: &mut Value,
+    gate: &mut dyn FnMut(u64) -> bool,
+) -> (Value, Made) {
     let by = Instant::now() + ALL_WITHIN;
     unplace(thread);
     let mut placer = Placer::new(thread);
-    let whole = inside(core, auth, thread, &mut placer, by);
+    let made = inside(core, auth, thread, &mut placer, by, gate);
     placer.finish(thread);
     let mut view = mail::view_of(thread);
     view["pictures"] = named(thread, account);
-    (view, whole)
+    (view, made)
 }
 
 /// `view` with whether its sender is trusted now, as a tool's answer: only a
@@ -761,7 +837,7 @@ fn show(core: &Core, args: &Value) -> Result<Value, Failure> {
     };
     let mut placer = Placer::new(&thread);
     let asks = on_the_web(&placer.uses, lets);
-    inside(core, &auth, &thread, &mut placer, by);
+    inside(core, &auth, &thread, &mut placer, by, &mut |_| true);
     let placer = Mutex::new(placer);
     let urls: Vec<&str> = asks.iter().map(|(u, _)| u.as_str()).collect();
     if !placer.lock().unwrap_or_else(|e| e.into_inner()).full() {
@@ -834,6 +910,42 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+
+    #[test]
+    fn a_picture_out_of_time_is_neither_asked_for_nor_charged() {
+        let dir = std::env::temp_dir().join(format!("gws-late-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let core = Core::new(
+            &Apis::at("http://127.0.0.1:9"),
+            Ok(gws_store::Paths::in_dir(&dir)),
+        );
+        core.unlock("seed");
+        let set = core.account("buwiz.account.set", &json!({"account": "google", "label": "default", "provider": "google", "subject": "owner@example.com", "scopes": [], "access_token": "fake-access-1", "token_type": "Bearer", "expires_at": 4_000_000_000u64}));
+        assert_ne!(set["isError"], true, "{set}");
+        let (auth, _) = core.accounts.session().expect("signed in");
+        let part = json!({"partId": "1", "mimeType": "image/png", "body": {"attachmentId": "att-1", "size": 1024}});
+        let (mut calls, mut charged, mut missed, mut short) = (0, 0u64, false, false);
+        let picture = part_picture(
+            &core,
+            &auth,
+            "1a0000000000001",
+            &part,
+            Instant::now(),
+            &mut calls,
+            &|_| true,
+            &mut |size| {
+                charged += size;
+                true
+            },
+            &mut missed,
+            &mut short,
+        );
+        assert_eq!(picture, None);
+        assert_eq!(charged, 0, "nothing asked for is nothing spent");
+        assert_eq!(calls, 0);
+        assert!(missed, "out of time, the view isn't whole");
+        assert!(!short);
+    }
 
     #[test]
     fn a_picture_is_judged_by_its_bytes() {

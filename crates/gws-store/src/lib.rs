@@ -22,6 +22,7 @@ pub mod drive;
 pub mod mail;
 pub mod open;
 pub mod pictures;
+pub mod prefetch;
 
 pub const DATA_DIR_ENV: &str = "GWS_DATA_DIR";
 /// How long a locked store is waited for.
@@ -86,7 +87,29 @@ const MIGRATIONS: &[(i64, &str)] = &[
         11,
         "CREATE TABLE picture_senders(account TEXT NOT NULL, address TEXT NOT NULL, added INTEGER NOT NULL, PRIMARY KEY(account, address)) WITHOUT ROWID;",
     ),
+    // recent mail ahead of time: small attachments by their mail's date, the
+    // bytes last so a sum of sizes needn't read them; which views have had
+    // theirs looked at, and how often; threads there was nothing to keep of
+    (
+        12,
+        "CREATE TABLE attachment_bytes(account TEXT NOT NULL, message TEXT NOT NULL, part TEXT NOT NULL, thread TEXT NOT NULL, at INTEGER NOT NULL, name TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL, used INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(account, message, part));
+         CREATE INDEX attachment_bytes_of_thread ON attachment_bytes(account, thread);
+         CREATE INDEX attachment_bytes_by_date ON attachment_bytes(account, at);
+         CREATE TABLE ahead_passed(account TEXT NOT NULL, thread TEXT NOT NULL, at INTEGER NOT NULL, messages INTEGER NOT NULL, misses INTEGER NOT NULL, PRIMARY KEY(account, thread)) WITHOUT ROWID;
+         ALTER TABLE bodies ADD COLUMN fetched INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE bodies ADD COLUMN tries INTEGER NOT NULL DEFAULT 0;",
+    ),
 ];
+
+/// Whether `migrations` are numbered 1, 2, 3 … with none missing. The runner
+/// takes each one past the store's version, so one numbered past a gap would
+/// leave whatever fills the gap later never run.
+fn contiguous(migrations: &[(i64, &str)]) -> bool {
+    migrations
+        .iter()
+        .enumerate()
+        .all(|(at, (version, _))| *version == at as i64 + 1)
+}
 
 /// Why the store didn't open or answer: a stable `code` and a message for people.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,6 +337,12 @@ impl Store {
         let current: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if !contiguous(MIGRATIONS) {
+            return Err(error(
+                "schema_gap",
+                "This plugin's store changes skip a number, so it won't open the store.",
+            ));
+        }
         let latest = MIGRATIONS.last().map_or(0, |m| m.0);
         if current > latest {
             return Err(error(
@@ -635,6 +664,10 @@ mod tests {
                 "INSERT INTO bodies(account, thread, view, size, used) VALUES('a', 't', '{}', 2, 1);
                  DROP TABLE sign_ins;
                  DROP TABLE picture_senders;
+                 DROP TABLE attachment_bytes;
+                 DROP TABLE ahead_passed;
+                 ALTER TABLE bodies DROP COLUMN fetched;
+                 ALTER TABLE bodies DROP COLUMN tries;
                  ALTER TABLE drive_files DROP COLUMN can;
                  PRAGMA user_version = 6;",
             )
@@ -655,12 +688,25 @@ mod tests {
             .execute_batch(
                 "INSERT INTO bodies(account, thread, view, size, used) VALUES('a', 't', '{}', 2, 1);
                  DROP TABLE picture_senders;
+                 DROP TABLE attachment_bytes;
+                 DROP TABLE ahead_passed;
+                 ALTER TABLE bodies DROP COLUMN fetched;
+                 ALTER TABLE bodies DROP COLUMN tries;
                  PRAGMA user_version = 9;",
             )
             .unwrap();
         drop(store);
         let store = Store::open(&paths, &key()).unwrap();
         assert_eq!(store.view("a", "t", 2).unwrap(), None);
+    }
+
+    #[test]
+    fn migrations_with_a_number_missing_are_refused() {
+        assert!(contiguous(MIGRATIONS), "the plugin's own have none missing");
+        assert!(contiguous(&[(1, ""), (2, "")]));
+        assert!(!contiguous(&[(1, ""), (3, "")]), "a gap");
+        assert!(!contiguous(&[(2, ""), (3, "")]), "not from 1");
+        assert!(!contiguous(&[(1, ""), (2, ""), (2, "")]), "twice");
     }
 
     #[test]

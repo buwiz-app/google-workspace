@@ -165,8 +165,16 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
     })
 }
 
+/// The header that has [`write_reply`] send a body a KiB at a time, this many
+/// milliseconds apart, as over a slow link.
+const TRICKLE: &str = "x-stub-trickle-ms";
+
 fn write_reply(mut stream: TcpStream, r: Reply) {
     let Reply(status, kind, body, headers) = r;
+    let trickle = headers
+        .iter()
+        .find(|(k, _)| k == TRICKLE)
+        .and_then(|(_, v)| v.parse::<u64>().ok());
     let extra: String = headers
         .iter()
         .map(|(k, v)| format!("{k}: {v}\r\n"))
@@ -176,7 +184,20 @@ fn write_reply(mut stream: TcpStream, r: Reply) {
         body.len()
     );
     let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(&body);
+    match trickle {
+        Some(ms) => {
+            for chunk in body.chunks(1024) {
+                let _ = stream.flush();
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                if stream.write_all(chunk).is_err() {
+                    return;
+                }
+            }
+        }
+        None => {
+            let _ = stream.write_all(&body);
+        }
+    }
 }
 
 fn listen(port: u16, handle: impl Fn(Request) -> Reply + Send + Sync + 'static) -> u16 {
@@ -531,6 +552,28 @@ fn number(part: &mut Value, id: &str) {
     }
 }
 
+/// Takes the attachment id off every part, as a read Google sent short.
+fn strip_ids(part: &mut Value) {
+    if let Some(body) = part.get_mut("body").and_then(Value::as_object_mut) {
+        body.remove("attachmentId");
+    }
+    if let Some(parts) = part.get_mut("parts").and_then(Value::as_array_mut) {
+        parts.iter_mut().for_each(strip_ids);
+    }
+}
+
+/// Takes the size off every attached part, as a read Google sent short.
+fn strip_sizes(part: &mut Value) {
+    if let Some(body) = part.get_mut("body").and_then(Value::as_object_mut)
+        && body.contains_key("attachmentId")
+    {
+        body.remove("size");
+    }
+    if let Some(parts) = part.get_mut("parts").and_then(Value::as_array_mut) {
+        parts.iter_mut().for_each(strip_sizes);
+    }
+}
+
 /// Puts each small file's bytes in its part, in place of its attachment id.
 fn carry_data(m: &Mail, part: &mut Value, max: usize) {
     let at = part
@@ -576,6 +619,19 @@ struct Account {
     /// Files this size and under come in `body.data`, with no attachment id.
     data_in_parts: Option<usize>,
     draft_reads_fail: bool,
+    /// How many more whole-thread reads go through, and what each after gets.
+    thread_reads: Option<(usize, u16)>,
+    /// Every attachment read answers 404, as for an id gone stale.
+    attachments_gone: bool,
+    /// Whole reads name no attachment ids.
+    ids_missing: bool,
+    /// Whole reads give no attachment sizes.
+    sizes_missing: bool,
+    /// Answers to paths ending in this come a KiB at a time, this many
+    /// milliseconds apart.
+    trickle: Option<(String, u64)>,
+    /// Requests for paths ending in this get this status, every time.
+    refuse: Option<(String, u16)>,
     attachment_reads_fail: bool,
     /// Reads so far, once attachment ids change with each.
     reads: Option<AtomicU64>,
@@ -905,6 +961,12 @@ impl Account {
                         json!({"name": "Authentication-Results", "value": results}),
                     );
                 }
+                if self.ids_missing {
+                    strip_ids(&mut v["payload"]);
+                }
+                if self.sizes_missing {
+                    strip_sizes(&mut v["payload"]);
+                }
             }
         }
         v
@@ -1076,6 +1138,7 @@ impl Account {
                 Some(m) => Reply::json(200, self.resource(m, &format, &wanted)),
                 None => not_found(),
             },
+            ("GET", ["messages", _, "attachments", _]) if self.attachments_gone => not_found(),
             ("GET", ["messages", id, "attachments", att]) => {
                 let at = att.rsplit('-').next().and_then(|i| i.parse::<usize>().ok());
                 let held = self
@@ -1115,7 +1178,25 @@ impl Account {
                 }
                 Reply::json(200, Self::page(found, "threads", start, max))
             }
+            ("GET", ["threads", _])
+                if format == "full" && matches!(self.thread_reads, Some((0, _))) =>
+            {
+                let status = self.thread_reads.map_or(500, |(_, s)| s);
+                let message = match status {
+                    429 => "Too many concurrent requests for user",
+                    _ => "Backend error",
+                };
+                Reply::json(
+                    status,
+                    json!({"error": {"code": status, "message": message}}),
+                )
+            }
             ("GET", ["threads", id]) => {
+                if format == "full"
+                    && let Some((left, _)) = &mut self.thread_reads
+                {
+                    *left -= 1;
+                }
                 let drafts = self.draft_mails();
                 let mut mails: Vec<&Mail> = self
                     .mails
@@ -1553,7 +1634,35 @@ impl FakeGoogle {
         let waits = door.clone();
         let port = listen(port, move |r| {
             waits.pass(&r);
-            shared.lock().unwrap().handle(r)
+            let path = r.path().to_owned();
+            let mut account = shared.lock().unwrap();
+            let slow = account
+                .trickle
+                .clone()
+                .filter(|(end, _)| path.ends_with(end.as_str()));
+            let refused = account
+                .refuse
+                .clone()
+                .filter(|(end, _)| path.ends_with(end.as_str()));
+            let mut reply = match refused {
+                Some((_, status)) => {
+                    account.log.push(Seen {
+                        method: r.method.clone(),
+                        target: r.target.clone(),
+                        authorization: r.authorization.clone(),
+                        body: String::new(),
+                    });
+                    Reply::json(
+                        status,
+                        json!({"error": {"code": status, "message": "Backend error"}}),
+                    )
+                }
+                None => account.handle(r),
+            };
+            if let Some((_, ms)) = slow {
+                reply.3.push((TRICKLE.to_owned(), ms.to_string()));
+            }
+            reply
         });
         account.lock().unwrap().drive.base = format!("http://127.0.0.1:{port}");
         Self {
@@ -1851,6 +1960,44 @@ impl FakeGoogle {
     /// Lists answer `n` to a page, whatever was asked for.
     pub fn calendar_page(&self, n: usize) {
         self.account.lock().unwrap().calendars.page = Some(n);
+    }
+
+    /// `left` more whole-thread reads go through, and then each gets `status`:
+    /// a 429 is Gmail saying it's busy.
+    pub fn thread_reads_fail_after(&self, left: usize, status: u16) {
+        self.account.lock().unwrap().thread_reads = Some((left, status));
+    }
+
+    /// Answers to paths ending in `end` come a KiB at a time, `ms` apart, as
+    /// over a slow link: their head at once, then their body. `None` ends it.
+    pub fn trickle(&self, slow: Option<(&str, u64)>) {
+        self.account.lock().unwrap().trickle = slow.map(|(end, ms)| (end.to_owned(), ms));
+    }
+
+    /// Requests for paths ending in `end` answer `status`, every time, as for
+    /// one thread or file Gmail keeps failing on. `None` ends it.
+    pub fn refuse(&self, failing: Option<(&str, u16)>) {
+        self.account.lock().unwrap().refuse = failing.map(|(end, status)| (end.to_owned(), status));
+    }
+
+    /// Whether whole reads leave out each part's attachment id.
+    pub fn attachment_ids_missing(&self, missing: bool) {
+        self.account.lock().unwrap().ids_missing = missing;
+    }
+
+    /// Whether whole reads leave out each attached part's size.
+    pub fn attachment_sizes_missing(&self, missing: bool) {
+        self.account.lock().unwrap().sizes_missing = missing;
+    }
+
+    /// Whether every attachment read answers 404.
+    pub fn attachments_gone(&self, gone: bool) {
+        self.account.lock().unwrap().attachments_gone = gone;
+    }
+
+    /// Ends the failures above.
+    pub fn thread_reads_work(&self) {
+        self.account.lock().unwrap().thread_reads = None;
     }
 
     /// Forgets history before now, as Google does after a while.

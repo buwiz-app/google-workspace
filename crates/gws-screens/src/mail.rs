@@ -163,13 +163,16 @@ fn now_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
-/// The line under the search box, when there is something to say.
-pub fn notice(status: &str, saved: bool) -> Option<&'static str> {
+/// The line under the search box, when there is something to say. With
+/// nothing listed there's no saved mail to claim.
+pub fn notice(status: &str, saved: bool, empty: bool) -> Option<&'static str> {
     match (status, saved) {
-        (_, true) | ("offline", _) => Some("Showing saved mail"),
+        (_, true) | ("offline", _) if empty => Some("Can't reach Google."),
+        (_, true) | ("offline", _) => Some("Can't reach Google. Showing saved mail."),
         ("needs_access", _) => {
             Some("Your Google sign-in needs more access. Sign in again on this app's page.")
         }
+        ("failed", _) if empty => Some("Couldn't update your mail."),
         ("failed", _) => Some("Couldn't update your mail. Showing what's saved."),
         _ => None,
     }
@@ -935,10 +938,10 @@ fn list_pane(b: Bridge, m: Mail) -> impl IntoElement {
             None => view(),
         }))
         .child(dynamic(move || {
-            let line = m
-                .problem
-                .get()
-                .or_else(|| notice(&m.status.get(), m.saved.get()).map(str::to_owned));
+            let line = m.problem.get().or_else(|| {
+                notice(&m.status.get(), m.saved.get(), m.rows.with(Vec::is_empty))
+                    .map(str::to_owned)
+            });
             match line {
                 Some(line) => view()
                     .app_class(Some(format!("px-3 py-1 border-b {LINE}").into()))
@@ -1747,12 +1750,32 @@ mod tests {
 
     #[test]
     fn the_notice_says_what_a_person_can_use() {
-        assert_eq!(notice("ok", false), None);
-        assert_eq!(notice("syncing", false), None);
-        assert_eq!(notice("ok", true), Some("Showing saved mail"));
-        assert_eq!(notice("offline", false), Some("Showing saved mail"));
+        assert_eq!(notice("ok", false, false), None);
+        assert_eq!(notice("syncing", false, false), None);
+        assert_eq!(
+            notice("ok", true, false),
+            Some("Can't reach Google. Showing saved mail.")
+        );
+        assert_eq!(
+            notice("offline", false, false),
+            Some("Can't reach Google. Showing saved mail.")
+        );
+        assert_eq!(
+            notice("offline", false, true),
+            Some("Can't reach Google."),
+            "no saved mail claimed over none"
+        );
+        assert_eq!(
+            notice("failed", false, false),
+            Some("Couldn't update your mail. Showing what's saved.")
+        );
+        assert_eq!(
+            notice("failed", false, true),
+            Some("Couldn't update your mail."),
+            "no saved mail claimed over none"
+        );
         assert!(
-            notice("needs_access", false)
+            notice("needs_access", false, false)
                 .unwrap()
                 .contains("Sign in again")
         );

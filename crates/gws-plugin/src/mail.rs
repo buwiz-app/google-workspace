@@ -15,14 +15,15 @@ use gws_store::mail::{Label, Thread};
 use serde_json::{Value, json};
 
 use crate::accounts::Bearer;
-use crate::gmail::{self, Failure};
+use crate::gmail::{self, Failure, Limit, Whole};
+use crate::pictures::{self, Made};
 use crate::tools::{
     MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_DRAFT_DELETE, MAIL_DRAFT_OF, MAIL_DRAFT_READ,
     MAIL_DRAFT_SAVE, MAIL_JOB, MAIL_JOB_START, MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK,
     MAIL_REPLY_START, MAIL_SEND, MAIL_SEND_ARM, MAIL_SEND_DISARM, MAIL_THREAD, MAIL_TRASH,
     MAIL_UNDO, PEOPLE_SUGGEST, SEARCH_MAIL, UPLOAD_CHUNK, UPLOAD_DROP, fail, failed, ok,
 };
-use crate::{Core, clean, compose, fold, js, pictures};
+use crate::{Core, clean, compose, fold, js};
 
 /// Rows a list page holds.
 pub const PAGE: i64 = 50;
@@ -217,7 +218,7 @@ fn act(core: &Core, tool: &str, args: &Value) -> Result<Value, Failure> {
         // a failed read here is only a stale row: the sync below mends it
         let _ = fetch_rows(core, &auth, &account, &changed);
     }
-    core.sync.wake();
+    core.sync.wake_by_person();
     match failure {
         Some(e) if undo.is_none() => Err(e),
         Some(_) => Ok(ok(
@@ -286,7 +287,7 @@ fn undo(core: &Core, args: &Value) -> Result<Value, Failure> {
         undo.threads.remove(0);
     }
     let _ = fetch_rows(core, &auth, &account, &ids);
-    core.sync.wake();
+    core.sync.wake_by_person();
     Ok(ok(json!({"done": ids.len()})))
 }
 
@@ -318,7 +319,7 @@ impl Tickets {
 
 /// A card's rows, each with a ticket to open it by.
 fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (auth, account) = signed_in(core)?;
+    let (auth, account) = reader(core)?;
     let held = core
         .tickets
         .lock()
@@ -328,7 +329,11 @@ fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some(Subject::Search(query)) = held else {
         return Ok(fail("not_found", "This card is out of date."));
     };
-    let (rows, saved) = match search(core, &auth, &account, &query) {
+    let found = match &auth {
+        Some(auth) => search(core, auth, &account, &query),
+        None => Err(unreached()),
+    };
+    let (rows, saved) = match found {
         Ok(rows) => (rows, false),
         Err(Failure::Offline(_)) => (
             with_store(core, |store| {
@@ -348,11 +353,30 @@ fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
     Ok(ok(json!({"rows": rows, "more": more, "saved": saved})))
 }
 
+/// What a sync woke for. Mail is kept ahead only after the timer's or a
+/// person's: a wake from anything else, a write the model or a routine made
+/// among them, must not start a round of downloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Woken {
+    Timer,
+    Person,
+    Other,
+}
+
+/// The wake waiting, when a screen last asked, the next time set to look, and
+/// when the timer last had its turn.
+type Wakes = (
+    Option<Woken>,
+    Option<Instant>,
+    Option<Instant>,
+    Option<Instant>,
+);
+
 /// Wakes the sync, remembers when a screen last asked for something, and when
 /// it next has to look whatever else happens.
 #[derive(Default)]
 pub struct Waker {
-    state: Mutex<(bool, Option<Instant>, Option<Instant>)>,
+    state: Mutex<Wakes>,
     bell: Condvar,
     stop: AtomicBool,
 }
@@ -364,12 +388,26 @@ impl Waker {
         self.wake();
     }
 
-    fn stopping(&self) -> bool {
+    pub(crate) fn stopping(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
 
     pub fn wake(&self) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).0 = true;
+        self.woken(Woken::Other);
+    }
+
+    /// [`Self::wake`] for what the person did on a screen.
+    pub fn wake_by_person(&self) {
+        self.woken(Woken::Person);
+    }
+
+    fn woken(&self, by: Woken) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // a person's wake still waiting isn't lost to another
+        if state.0 != Some(Woken::Person) {
+            state.0 = Some(by);
+        }
+        drop(state);
         self.bell.notify_all();
     }
 
@@ -383,26 +421,39 @@ impl Waker {
         self.bell.notify_all();
     }
 
-    fn wait(&self) {
+    /// Until a wake or the time to look again, and which it was.
+    pub(crate) fn wait(&self) -> Woken {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let every = if state.1.is_some_and(|at| at.elapsed() < LINGER) {
-            ACTIVE
-        } else {
-            IDLE
-        };
-        let every = state.2.map_or(every, |at| {
-            every.min(at.saturating_duration_since(Instant::now()))
-        });
-        if !state.0 {
+        let start = state.3.unwrap_or_else(Instant::now);
+        loop {
+            let every = if state.1.is_some_and(|at| at.elapsed() < LINGER) {
+                ACTIVE
+            } else {
+                IDLE
+            };
+            let due = state.2.map_or(start + every, |at| at.min(start + every));
+            let now = Instant::now();
+            // a condvar can wake for nothing: only a time that's come is the
+            // timer's, and a time that's come is, whatever else woke it
+            let woken = match state.0.take() {
+                Some(Woken::Person) => Some(Woken::Person),
+                _ if now >= due => Some(Woken::Timer),
+                other => other,
+            };
+            if let Some(by) = woken {
+                if state.2.is_some_and(|at| at <= now) {
+                    state.2 = None;
+                }
+                if by != Woken::Other {
+                    state.3 = Some(now);
+                }
+                return by;
+            }
             state = self
                 .bell
-                .wait_timeout(state, every)
+                .wait_timeout(state, due - now)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
-        }
-        state.0 = false;
-        if state.2.is_some_and(|at| at <= Instant::now()) {
-            state.2 = None;
         }
     }
 }
@@ -454,12 +505,14 @@ impl Settle {
 pub fn start(core: Arc<Core>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         loop {
-            core.sync.wait();
+            let woken = core.sync.wait();
             if core.sync.stopping() {
                 return;
             }
             if core.provisioned() {
-                let _ = sync(&core);
+                if sync(&core).is_ok() && woken != Woken::Other {
+                    crate::prefetch::kick(&core);
+                }
                 crate::files::sweep(&core);
             }
         }
@@ -593,6 +646,23 @@ pub(crate) fn with_store<T>(
 
 pub(crate) fn signed_in(core: &Core) -> Result<(Bearer, String), Failure> {
     core.accounts.session().ok_or(Failure::AccountRequired)
+}
+
+/// Whose saved mail a screen reads, with their token while it's live. A lapsed
+/// one is still their sign-in: with no connection the Bot can't refresh it, and
+/// what's saved is still theirs to read. No token means Google can't be asked.
+/// Only the active sign-in's mail: with no active one, nobody's.
+pub(crate) fn reader(core: &Core) -> Result<(Option<Bearer>, String), Failure> {
+    if let Some((auth, account)) = core.accounts.session() {
+        return Ok((Some(auth), account));
+    }
+    let (account, _) = core.accounts.signed_in().ok_or(Failure::AccountRequired)?;
+    Ok((None, account))
+}
+
+/// What a call to Google comes to with no live token.
+pub(crate) fn unreached() -> Failure {
+    Failure::Offline(crate::tools::GOOGLE_UNREACHED.to_owned())
 }
 
 /// `Ana Reyes <ana@example.com>` as (name, address); a bare address is both.
@@ -800,14 +870,14 @@ fn row_json(t: &Thread) -> Value {
 }
 
 fn labels(core: &Core) -> Result<Value, Failure> {
-    let (_, account) = signed_in(core)?;
+    let (_, account) = reader(core)?;
     let list = with_store(core, |store| store.labels(&account))?;
     let rows: Vec<Value> = list.iter().map(|l| json!({"id": l.id, "name": l.name, "kind": l.kind, "unread": l.unread, "total": l.total})).collect();
     Ok(ok(json!({"labels": rows})))
 }
 
 fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (auth, account) = signed_in(core)?;
+    let (auth, account) = reader(core)?;
     let mut query = js::trim(&js::string_or_empty(args.get("query"))).to_owned();
     // a card's search, carried to the full screen by its ticket
     if let Some(Subject::Search(q)) = core
@@ -819,7 +889,11 @@ fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
         query = q.clone();
     }
     if !query.is_empty() {
-        return Ok(match search(core, &auth, &account, &query) {
+        let found = match &auth {
+            Some(auth) => search(core, auth, &account, &query),
+            None => Err(unreached()),
+        };
+        return Ok(match found {
             Ok(rows) => ok(
                 json!({"threads": rows.iter().map(row_json).collect::<Vec<_>>(), "more": false, "saved": false}),
             ),
@@ -840,21 +914,29 @@ fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
     }
     let skip = args.get("skip").and_then(Value::as_i64).unwrap_or(0).max(0);
     let stored = with_store(core, |store| store.threads(&account, &label, skip, PAGE))?;
+    let mut saved = false;
     if (stored.len() as i64) < PAGE {
         // the store has less than a page here: ask Google for the next one
-        match fill(core, &auth, &account, &label) {
-            Ok(_) | Err(Failure::Offline(_)) => {}
+        let filled = match &auth {
+            Some(auth) => fill(core, auth, &account, &label),
+            None => Err(unreached()),
+        };
+        match filled {
+            Ok(_) => {}
+            Err(Failure::Offline(_)) => saved = true,
             Err(e) => return Err(e),
         }
     }
     let rows = with_store(core, |store| store.threads(&account, &label, skip, PAGE))?;
     let rows: Vec<Thread> = rows.into_iter().map(|t| addressed(t, &label)).collect();
+    // nothing kept is nothing saved to show
+    let saved = saved && !rows.is_empty();
     let total = with_store(core, |store| store.thread_count(&account, &label))?;
     // no token on record yet is not the end: only an empty one is
     let more =
         with_store(core, |store| store.state(&account, &page_key(&label)))?.as_deref() != Some("");
     Ok(ok(
-        json!({"threads": rows.iter().map(row_json).collect::<Vec<_>>(), "more": more || skip + PAGE < total, "saved": false}),
+        json!({"threads": rows.iter().map(row_json).collect::<Vec<_>>(), "more": more || skip + PAGE < total, "saved": saved}),
     ))
 }
 
@@ -1176,8 +1258,62 @@ fn day(at: &str) -> String {
 /// changes.
 pub const VIEW_VERSION: i64 = 3;
 
+/// What [`read_view`] came to.
+pub(crate) enum Viewed {
+    /// Gone at Google.
+    Gone,
+    /// Past the read's cap, which another read comes to as well.
+    TooBig(Failure),
+    /// Begun, and outlasting the read's time.
+    TooSlow(Failure),
+    /// Refused by Gmail's answer, as [`Whole::Failed`].
+    Failed(Failure),
+    /// What Google sent, the page made of it, and what its pictures and its
+    /// invite's twin check came to: a view kept is only a whole one.
+    Read {
+        full: Value,
+        view: Value,
+        made: Made,
+    },
+}
+
+/// A thread read whole from Google, within `limit`, and made into the page
+/// an open shows, with what Google sent: an open and a read ahead both keep
+/// what this makes, its pictures inside the mail and what they need to show
+/// among it.
+///
+/// `gate` hears of every byte that comes for it, as Gmail sends it: the thread
+/// once it's here, and each picture inside it before it's asked for, which a
+/// false answer stops.
+pub(crate) fn read_view(
+    core: &Core,
+    auth: &Bearer,
+    account: &str,
+    id: &str,
+    limit: Limit,
+    gate: &mut dyn FnMut(u64) -> bool,
+) -> Result<Viewed, Failure> {
+    let mut full = match core.gmail.thread_whole(auth, id, limit)? {
+        Whole::Read(full) => full,
+        Whole::Gone => return Ok(Viewed::Gone),
+        Whole::TooBig(why) => return Ok(Viewed::TooBig(why)),
+        Whole::TooSlow(why) => return Ok(Viewed::TooSlow(why)),
+        Whole::Failed(why) => return Ok(Viewed::Failed(why)),
+    };
+    // past the round's share or after a sign-out, the twin check asks nothing
+    let go_on = gate(full.to_string().len() as u64);
+    let told = go_on && core.gmail.mark_twins(auth, &mut full);
+    // a picture comes as base64 inside JSON
+    let mut asks = |size: u64| gate(size.saturating_mul(4).div_ceil(3));
+    let (mut view, made) = pictures::view_within(core, auth, account, &mut full, &mut asks);
+    view["view_version"] = VIEW_VERSION.into();
+    // a twin check cut short is a picture missed: the next read may finish it
+    let made = if told { made } else { Made::Missed };
+    Ok(Viewed::Read { full, view, made })
+}
+
 fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (auth, account) = signed_in(core)?;
+    let (auth, account) = reader(core)?;
     let id = js::trim(&js::string_or_empty(args.get("thread"))).to_owned();
     // a card's row opens by ticket
     let id = match core
@@ -1198,15 +1334,16 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     {
         return Ok(pictures::answer(core, &account, view));
     }
-    let Some(mut full) = core.gmail.thread_full(&auth, &id)? else {
-        return Ok(fail("not_found", "That conversation is gone."));
+    // the sign-in is there, and the Bot can't refresh its token just now
+    let auth = auth.ok_or_else(unreached)?;
+    let (view, made) = match read_view(core, &auth, &account, &id, Limit::FULL, &mut |_| true)? {
+        Viewed::Read { view, made, .. } => (view, made),
+        Viewed::Gone => return Ok(fail("not_found", "That conversation is gone.")),
+        Viewed::TooBig(why) | Viewed::TooSlow(why) | Viewed::Failed(why) => return Err(why),
     };
-    let told = core.gmail.mark_twins(&auth, &mut full);
-    let (mut view, whole) = pictures::view(core, &auth, &account, &mut full);
-    view["view_version"] = VIEW_VERSION.into();
     // a twin check or a picture cut short isn't kept, so the next open can
     // finish it
-    if told && whole {
+    if made == Made::Whole {
         with_own_store(core, &account, |store| {
             store.put_view(&account, &id, &view.to_string(), now_ms())
         })?;
@@ -1215,7 +1352,7 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
 }
 
 fn changes(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (_, account) = signed_in(core)?;
+    let (auth, account) = reader(core)?;
     let since = args.get("since").and_then(Value::as_i64).unwrap_or(-1);
     let (seq, status) = with_store(core, |store| {
         Ok((
@@ -1226,8 +1363,13 @@ fn changes(core: &Core, args: &Value) -> Result<Value, Failure> {
             store.state(&account, STATUS)?,
         ))
     })?;
+    // with no live token the sync can't run, and what it last said is old news
+    let status = match auth {
+        Some(_) => status.unwrap_or_else(|| "syncing".to_owned()),
+        None => "offline".to_owned(),
+    };
     Ok(ok(
-        json!({"seq": seq, "changed": seq != since, "status": status.unwrap_or_else(|| "syncing".to_owned())}),
+        json!({"seq": seq, "changed": seq != since, "status": status}),
     ))
 }
 
@@ -1268,6 +1410,46 @@ pub fn run(core: &Core, tool: &str, args: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wake_says_what_caused_it_and_a_persons_isnt_lost() {
+        let waker = Waker::default();
+        waker.wake();
+        assert_eq!(waker.wait(), Woken::Other);
+        waker.wake_by_person();
+        waker.wake();
+        assert_eq!(waker.wait(), Woken::Person);
+        waker.wake_after(Duration::from_millis(10));
+        assert_eq!(waker.wait(), Woken::Timer);
+    }
+
+    #[test]
+    fn a_wake_after_the_time_to_look_still_counts_as_the_timer() {
+        let waker = Waker::default();
+        waker.wake_after(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(40));
+        waker.wake();
+        assert_eq!(waker.wait(), Woken::Timer);
+    }
+
+    #[test]
+    fn a_wake_for_nothing_isnt_the_timer() {
+        let waker = Waker::default();
+        waker.wake_after(Duration::from_millis(400));
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                waker.bell.notify_all();
+            });
+            assert_eq!(waker.wait(), Woken::Timer);
+        });
+        assert!(
+            start.elapsed() >= Duration::from_millis(400),
+            "woke at {:?}",
+            start.elapsed()
+        );
+    }
 
     #[test]
     fn a_row_names_who_the_persons_last_message_went_to() {

@@ -23,6 +23,7 @@ pub mod js;
 pub mod mail;
 pub mod manifest;
 pub mod pictures;
+pub mod prefetch;
 pub mod serve;
 pub mod tools;
 
@@ -96,6 +97,8 @@ pub struct Core {
     pub documents: handoff::Documents,
     /// What fetches a mail's web pictures, at a person's press.
     pub pictures: pictures::Fetcher,
+    /// Whether recent mail is being fetched ahead.
+    pub prefetch: prefetch::Running,
 }
 
 impl Core {
@@ -127,6 +130,7 @@ impl Core {
             clock: files::Clock::default(),
             documents: handoff::Documents::default(),
             pictures: pictures::Fetcher::new(apis),
+            prefetch: prefetch::Running::default(),
             pushed: std::sync::atomic::AtomicBool::new(false),
             settle: mail::Settle::default(),
         }

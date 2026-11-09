@@ -1260,7 +1260,8 @@ fn quarantine(_: &File) -> std::io::Result<()> {
 /// come from a fresh read of the message, so what lands is that part's. An
 /// image or a PDF is one only if its bytes say so.
 fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (auth, account) = signed_in(core)?;
+    // a kept copy opens with no connection: only Google needs a live token
+    let (auth, account) = crate::mail::reader(core)?;
     let Some((message, part)) = attachment_args(args) else {
         return Ok(bad_args("That isn't an attachment."));
     };
@@ -1293,8 +1294,17 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
             return Ok(refusal("in_use", why));
         }
     }
-    let Some((title, mime, attachment)) = listed_part(core, &auth, &message, &part)? else {
-        return Ok(attachment_gone());
+    // kept ahead: no Google call, and its name, type and bytes are checked the same
+    let kept = crate::prefetch::saved_attachment(core, &account, &message, &part);
+    let (title, mime, attachment) = match &kept {
+        Some(kept) => (kept.name.clone(), kept.mime.clone(), None),
+        None => {
+            let auth = auth.as_ref().ok_or_else(crate::mail::unreached)?;
+            let Some((title, mime, attachment)) = listed_part(core, auth, &message, &part)? else {
+                return Ok(attachment_gone());
+            };
+            (title, mime, Some(attachment))
+        }
     };
     let Some(kind) = handoff::declared(&mime, extension(&title)) else {
         return Ok(save_instead(core));
@@ -1305,8 +1315,16 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
         Way::SaveOnly => return Ok(save_instead(core)),
         Way::Viewer | Way::System => {}
     }
-    let Some(bytes) = bytes_of(core, &auth, &message, attachment)? else {
-        return Ok(attachment_gone());
+    let bytes = match (kept, attachment) {
+        (Some(kept), _) => kept.bytes,
+        (None, Some(attachment)) => {
+            let auth = auth.as_ref().ok_or_else(crate::mail::unreached)?;
+            let Some(bytes) = bytes_of(core, auth, &message, attachment)? else {
+                return Ok(attachment_gone());
+            };
+            bytes
+        }
+        (None, None) => return Ok(attachment_gone()),
     };
     let Some(kind) = handoff::checked(kind, &bytes) else {
         return Ok(save_instead(core));
@@ -1328,6 +1346,17 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
     };
     let path = keep(core, &dir, &row)?;
     Ok(handed(core, &path, &row))
+}
+
+/// Whether an attachment of this type and name opens on this Bot, as an open
+/// asks before it downloads: a read ahead keeps nothing else.
+pub(crate) fn attachment_opens(core: &Core, mime: &str, name: &str) -> bool {
+    handoff::declared(mime, extension(name)).is_some_and(|kind| {
+        matches!(
+            handoff::way(&core.documents, kind),
+            Way::Viewer | Way::System
+        )
+    })
 }
 
 /// The name a saved copy has: the stranger's, made safe. Its extension stays

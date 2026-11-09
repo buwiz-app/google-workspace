@@ -124,7 +124,7 @@ enum Shows {
     Nothing,
     /// Why there's no card yet, as the plugin said it.
     Line(String),
-    Card(Card),
+    Card(Box<Card>),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -393,12 +393,12 @@ fn shows_of(answer: Result<Value, String>) -> Option<Shows> {
         return Some(Shows::Nothing);
     };
     let calendar = v.get("calendar").unwrap_or(&Value::Null);
-    Some(Shows::Card(Card {
+    Some(Shows::Card(Box::new(Card {
         invite: as_calendar_has_it(invite, calendar.get("event")),
         calendar: calendar_of(calendar),
         busy: false,
         said: None,
-    }))
+    })))
 }
 
 /// The open conversation's invite, if it has one: asked of the plugin, which

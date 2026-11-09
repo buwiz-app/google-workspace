@@ -1732,7 +1732,7 @@ fn save_hands_over_every_kind_as_it_came() {
     let all: Vec<(&str, &str, &[u8])> = vec![
         ("IMG_4250.png", "image/png", PNG),
         ("receipt.pdf", "application/pdf", PDF),
-        ("report.docx", DOCX, b"PK report"),
+        ("report.docx", DOCX, b"PK\x03\x04 report"),
         ("site-plans.zip", "application/zip", b"PK\x05\x06"),
         ("tool.exe", "application/x-msdownload", b"MZ"),
         ("IMG_1.png", "image/png", b"<html>"),
@@ -1745,16 +1745,16 @@ fn save_hands_over_every_kind_as_it_came() {
     bot_can(&home, &EVERYTHING);
     // an open edit of the same part stays as it is
     let edited = path_in(&open_attachment(&home, 2));
-    fs::write(&edited, b"PK mine").unwrap();
+    fs::write(&edited, b"PK\x03\x04 mine").unwrap();
     let names = [
         "IMG_4250.png",
         "receipt.pdf",
         "report.docx",
         "site-plans.zip",
-        "tool.exe",
-        "IMG_1.png",
+        "tool.exe.bin",
+        "IMG_1.png.bin",
         "Scan.pdf",
-        "evil",
+        "evil.bin",
     ];
     for (n, (_, _, bytes)) in all.iter().enumerate() {
         let answer = save_attachment(&home, n);
@@ -1768,7 +1768,7 @@ fn save_hands_over_every_kind_as_it_came() {
         assert_eq!(path.ancestors().nth(2).unwrap(), real(&home.open_dir()));
         assert_ne!(path.parent(), edited.parent(), "a folder of its own");
     }
-    assert_eq!(fs::read(&edited).unwrap(), b"PK mine");
+    assert_eq!(fs::read(&edited).unwrap(), b"PK\x03\x04 mine");
     assert_eq!(home.edits().len(), 1, "the edit, and no saved copy");
 }
 
@@ -1888,4 +1888,139 @@ fn images_pdfs_and_saved_copies_go_at_24_hours_and_at_sign_out() {
         assert!(!path.exists(), "{path:?}");
     }
     assert_eq!(every_path(&home.open_dir()), Vec::<PathBuf>::new());
+}
+
+/// The quarantine mark on `path`, as `xattr` reads it back.
+#[cfg(target_os = "macos")]
+fn quarantine_of(path: &Path) -> Option<String> {
+    let out = std::process::Command::new("/usr/bin/xattr")
+        .args(["-p", "com.apple.quarantine"])
+        .arg(path)
+        .output()
+        .unwrap();
+    out.status
+        .success()
+        .then(|| String::from_utf8(out.stdout).unwrap().trim().to_owned())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn every_attachment_written_here_is_quarantined() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("IMG_4250.png", "image/png", PNG),
+        ("site-plans.zip", "application/zip", b"PK\x05\x06"),
+        ("report.docx", DOCX, b"PK report"),
+        ("run.command", "application/octet-stream", b"#!/bin/sh"),
+    ]));
+    let home = Home::new(&google.base(), "quarantine");
+    bot_can(&home, &EVERYTHING);
+    let mut paths = vec![
+        handed(&open_attachment(&home, 0)).1,
+        handed(&open_attachment(&home, 1)).1,
+        handed(&open_attachment(&home, 2)).1,
+    ];
+    for n in 0..4 {
+        paths.push(handed(&save_attachment(&home, n)).1);
+    }
+    for path in &paths {
+        let mark = quarantine_of(path).unwrap_or_else(|| panic!("no mark on {path:?}"));
+        let fields: Vec<&str> = mark.split(';').collect();
+        assert_eq!(fields[0], "0083", "{mark}");
+        let at = u64::from_str_radix(fields[1], 16).unwrap();
+        assert!(at > 1_700_000_000, "the time it came: {mark}");
+        assert_eq!(fields[2], "Buwiz Bot", "{mark}");
+    }
+}
+
+#[test]
+fn legacy_office_files_are_never_handed_to_the_macs_app() {
+    let google = FakeGoogle::start(Seed::default());
+    let ole: &[u8] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1 macros";
+    google.deliver(mail_with(vec![
+        ("old.doc", "application/msword", ole),
+        ("old.xls", "application/vnd.ms-excel", ole),
+        ("deck.ppt", "application/vnd.ms-powerpoint", ole),
+        ("deck.pptx", "application/octet-stream", b"PK\x03\x04"),
+    ]));
+    let home = Home::new(&google.base(), "legacy");
+    bot_can(&home, &["open_with", "save"]);
+    for n in 0..3 {
+        let answer = open_attachment(&home, n);
+        assert_eq!(refusal(&answer), "unsupported", "{n}: {answer}");
+        assert_eq!(
+            says(&answer),
+            "This kind of file can't open here. Save it instead."
+        );
+        assert_eq!(answer.get("_meta"), None);
+        assert_eq!(
+            data(save_attachment(&home, n))["saved"],
+            true,
+            "Save still works"
+        );
+    }
+    assert_eq!(fetches(&google), 3, "only the saves fetched");
+    assert_eq!(handed(&open_attachment(&home, 3)).0, "buwiz/open_with");
+    // the Bot's own view takes the old Word and Excel files, as it always did
+    bot_can(&home, &EVERYTHING);
+    assert_eq!(handed(&open_attachment(&home, 0)).0, "buwiz/document");
+    assert_eq!(handed(&open_attachment(&home, 1)).0, "buwiz/document");
+    assert_eq!(refusal(&open_attachment(&home, 2)), "unsupported");
+}
+
+/// Both editable kinds, with no view for them: the Mac's own app has them.
+fn opened_in_the_macs_app(home: &Home) -> Vec<(PathBuf, String)> {
+    bot_can(home, &["open_with"]);
+    (0..2)
+        .map(|n| {
+            let answer = open_attachment(home, n);
+            let (key, path) = handed(&answer);
+            assert_eq!(key, "buwiz/open_with", "{answer}");
+            fs::write(&path, b"PK\x03\x04 edited in Pages").unwrap();
+            let id = path.parent().unwrap().file_name().unwrap();
+            let id = id.to_str().unwrap().to_owned();
+            (path, id)
+        })
+        .collect()
+}
+
+#[test]
+fn what_the_macs_own_app_has_never_goes_to_drive_or_outlasts_a_sign_out() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("report.docx", DOCX, b"PK report"),
+        ("budget.xlsx", XLSX, b"PK budget"),
+    ]));
+    let home = Home::new(&google.base(), "byapp");
+    let files = opened_in_the_macs_app(&home);
+    assert_eq!(home.edits(), Vec::<Value>::new(), "not the Bot's edit");
+    for (_, id) in &files {
+        assert_eq!(refusal(&home.upload(id, "copy")), "not_edited", "{id}");
+    }
+    assert_eq!(drive_writes(&google), Vec::<String>::new());
+    home.sign_out();
+    for (path, _) in &files {
+        assert!(!path.exists(), "{path:?}");
+    }
+    home.core.account("buwiz.account.set", &push(FAKE_EMAIL));
+    let files = opened_in_the_macs_app(&home);
+    home.later(LIFE_MS);
+    gws::files::sweep(&home.core);
+    for (path, _) in &files {
+        assert!(!path.exists(), "{path:?}");
+    }
+}
+
+#[test]
+fn an_edit_in_the_bots_view_isnt_handed_to_the_macs_app() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK report")]));
+    let home = Home::new(&google.base(), "switch");
+    let (path, _) = edited_attachment(&home);
+    bot_can(&home, &["open_with"]);
+    let answer = open_attachment(&home, 0);
+    assert_eq!(says(&answer), "Update Buwiz Bot to open this here.");
+    assert_eq!(answer.get("_meta"), None);
+    assert_eq!(fs::read(&path).unwrap(), b"PK mine");
+    assert_eq!(home.edits().len(), 1, "still the person's to answer");
 }

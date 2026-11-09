@@ -6,8 +6,12 @@
 //!
 //! The Bot decides the kind from the name on disk, so the name has to end as
 //! the bytes are. An image or a PDF is checked by its first bytes, since a
-//! stranger's word for it is no proof; the other kinds go only to the app their
-//! extension names, which is why that list is short.
+//! stranger's word for it is no proof. The other kinds go only to the app their
+//! extension names, so that list holds only what opens without running
+//! anything: no legacy Office file, which can carry macros, and a zip only
+//! because what lands here is quarantined, so an app inside it meets
+//! Gatekeeper. Whatever the Mac's own app has is only looked at: an edit made
+//! there is never taken to Drive.
 
 use std::sync::Mutex;
 
@@ -61,10 +65,17 @@ pub(crate) struct Kind {
     /// The Bot's view that shows it, if any.
     view: Option<&'static str>,
     /// Whether the computer's own app may have it: what opens it is then
-    /// Pages, Numbers, Preview, Calendar or Archive Utility, and nothing runs.
+    /// Pages, Numbers, Keynote, TextEdit, Calendar or Archive Utility.
     system: bool,
-    /// Its first bytes, for a kind that's checked by them.
+    /// Whether the Bot's view can edit it, and the edit go to Drive: what the
+    /// Word and Spreadsheet views take, as their own check does. Drive opens
+    /// these alone.
+    pub editable: bool,
+    /// Its first bytes, for a kind an open checks by them.
     magic: Option<fn(&[u8]) -> bool>,
+    /// Whether bytes look like this kind at all: what a saved copy's name is
+    /// kept by.
+    fits: fn(&[u8]) -> bool,
 }
 
 const fn kind(
@@ -78,8 +89,70 @@ const fn kind(
         exts,
         view,
         system: true,
+        editable: false,
         magic: None,
+        fits: zip,
     }
+}
+
+/// An editable kind of the Bot's view, which is never the Mac's app's.
+const fn edited(
+    mime: &'static str,
+    exts: &'static [&'static str],
+    view: &'static str,
+    fits: fn(&[u8]) -> bool,
+) -> Kind {
+    Kind {
+        editable: true,
+        fits,
+        ..kind(mime, exts, Some(view))
+    }
+}
+
+/// A kind checked by its first bytes.
+const fn sniffed_kind(
+    mime: &'static str,
+    exts: &'static [&'static str],
+    view: &'static str,
+    magic: fn(&[u8]) -> bool,
+) -> Kind {
+    Kind {
+        magic: Some(magic),
+        fits: magic,
+        ..kind(mime, exts, Some(view))
+    }
+}
+
+/// A zip, which every Office Open XML and iWork file is.
+fn zip(b: &[u8]) -> bool {
+    [b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"]
+        .iter()
+        .any(|m| b.starts_with(*m))
+}
+
+/// The old Office container, of .doc, .xls and .ppt.
+fn ole(b: &[u8]) -> bool {
+    b.starts_with(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+}
+
+/// Text: no NUL, and UTF-8 as far as it's read, a cut character at the end
+/// aside.
+fn text(b: &[u8]) -> bool {
+    let head = &b[..b.len().min(8192)];
+    !head.contains(&0)
+        && std::str::from_utf8(head).map_or_else(|e| e.error_len().is_none(), |_| true)
+}
+
+fn ics(b: &[u8]) -> bool {
+    let b = b.strip_prefix(b"\xef\xbb\xbf").unwrap_or(b);
+    let start = b
+        .iter()
+        .position(|c| !c.is_ascii_whitespace())
+        .unwrap_or(b.len());
+    text(b)
+        && b[start..]
+            .get(..15)
+            .is_some_and(|head| head.eq_ignore_ascii_case(b"BEGIN:VCALENDAR"))
 }
 
 fn png(b: &[u8]) -> bool {
@@ -106,52 +179,61 @@ fn heic(b: &[u8]) -> bool {
     b.len() >= 12 && &b[4..8] == b"ftyp" && BRANDS.contains(&&b[8..12])
 }
 
+/// `%PDF-` and a version, such as `1.7`.
 fn pdf(b: &[u8]) -> bool {
-    b.starts_with(b"%PDF-")
+    b.len() >= 8
+        && b.starts_with(b"%PDF-")
+        && b[5].is_ascii_digit()
+        && b[6] == b'.'
+        && b[7].is_ascii_digit()
 }
 
-/// Every kind an attachment opens as. Anything else is only saved.
+/// Every kind an attachment opens as, and the only kinds Drive opens: the
+/// editable ones. Anything else is only saved.
 pub(crate) const KINDS: [Kind; 19] = [
-    kind(super::files::DOCX, &["docx"], Some(WORD)),
-    kind("application/msword", &["doc"], Some(WORD)),
-    kind(super::files::XLSX, &["xlsx"], Some(SHEET)),
-    kind("application/vnd.ms-excel", &["xls"], Some(SHEET)),
-    kind("text/csv", &["csv"], Some(SHEET)),
+    edited(super::files::DOCX, &["docx"], WORD, zip),
     Kind {
-        magic: Some(png),
-        ..kind("image/png", &["png"], Some(IMAGE))
+        system: false,
+        ..edited("application/msword", &["doc"], WORD, ole)
     },
+    edited(super::files::XLSX, &["xlsx"], SHEET, zip),
+    Kind {
+        system: false,
+        ..edited("application/vnd.ms-excel", &["xls"], SHEET, ole)
+    },
+    edited("text/csv", &["csv"], SHEET, text),
+    sniffed_kind("image/png", &["png"], IMAGE, png),
     Kind {
         aliases: &["image/jpg", "image/pjpeg"],
-        magic: Some(jpeg),
-        ..kind("image/jpeg", &["jpg", "jpeg"], Some(IMAGE))
+        ..sniffed_kind("image/jpeg", &["jpg", "jpeg"], IMAGE, jpeg)
     },
-    Kind {
-        magic: Some(gif),
-        ..kind("image/gif", &["gif"], Some(IMAGE))
-    },
-    Kind {
-        magic: Some(webp),
-        ..kind("image/webp", &["webp"], Some(IMAGE))
-    },
+    sniffed_kind("image/gif", &["gif"], IMAGE, gif),
+    sniffed_kind("image/webp", &["webp"], IMAGE, webp),
     Kind {
         aliases: &["image/heif"],
-        magic: Some(heic),
-        ..kind("image/heic", &["heic", "heif"], Some(IMAGE))
+        ..sniffed_kind("image/heic", &["heic", "heif"], IMAGE, heic)
     },
     Kind {
         aliases: &["application/x-pdf"],
-        magic: Some(pdf),
-        ..kind("application/pdf", &["pdf"], Some(PDF))
+        ..sniffed_kind("application/pdf", &["pdf"], PDF, pdf)
     },
-    kind("text/plain", &["txt"], None),
+    Kind {
+        fits: text,
+        ..kind("text/plain", &["txt"], None)
+    },
     kind(super::files::PPTX, &["pptx"], None),
-    kind("application/vnd.ms-powerpoint", &["ppt"], None),
+    // saved only: it can carry macros
+    Kind {
+        system: false,
+        fits: ole,
+        ..kind("application/vnd.ms-powerpoint", &["ppt"], None)
+    },
     kind("application/vnd.apple.pages", &["pages"], None),
     kind("application/vnd.apple.numbers", &["numbers"], None),
     kind("application/vnd.apple.keynote", &["key"], None),
     Kind {
         aliases: &["application/ics"],
+        fits: ics,
         ..kind("text/calendar", &["ics"], None)
     },
     Kind {
@@ -170,11 +252,24 @@ pub(crate) fn by_mime(mime: &str) -> Option<&'static Kind> {
 
 /// The kind an attachment says it is or, when it says nothing, its name does.
 pub(crate) fn declared(mime: &str, ext: Option<&str>) -> Option<&'static Kind> {
-    if super::files::NO_TYPE.contains(&mime.trim()) {
-        let ext = ext?.to_lowercase();
-        return KINDS.iter().find(|k| k.exts.contains(&ext.as_str()));
+    let mime = mime.trim().to_ascii_lowercase();
+    if super::files::NO_TYPE.contains(&mime.as_str()) {
+        return ext.and_then(by_ext);
     }
-    by_mime(mime)
+    by_mime(&mime)
+}
+
+/// The kind a name's extension says.
+pub(crate) fn by_ext(ext: &str) -> Option<&'static Kind> {
+    let ext = ext.to_lowercase();
+    KINDS.iter().find(|k| k.exts.contains(&ext.as_str()))
+}
+
+impl Kind {
+    /// Whether `bytes` look like this kind.
+    pub(crate) fn fits(&self, bytes: &[u8]) -> bool {
+        (self.fits)(bytes)
+    }
 }
 
 /// What the bytes show a kind to be. One checked by its bytes is what they
@@ -189,15 +284,17 @@ pub(crate) fn checked(kind: &'static Kind, bytes: &[u8]) -> Option<&'static Kind
         .find(|k| k.view == kind.view && k.magic.is_some_and(|magic| magic(bytes)))
 }
 
-/// The kind the bytes are, of those checked by them, whatever a mail says.
+/// The kind the bytes are, whatever a mail says: an image or a PDF, else a
+/// zip. Nothing else can be told by its bytes alone.
 pub(crate) fn sniffed(bytes: &[u8]) -> Option<&'static Kind> {
     KINDS
         .iter()
         .find(|k| k.magic.is_some_and(|magic| magic(bytes)))
+        .or_else(|| zip(bytes).then(|| by_mime("application/zip")).flatten())
 }
 
 /// How a kind gets to the person.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Way {
     /// The Bot's own view, through `buwiz/document`.
     Viewer,
@@ -205,6 +302,9 @@ pub(crate) enum Way {
     System,
     /// This Bot can't, and a newer one could.
     Update,
+    /// Only saved: no Bot hands it to the Mac's app, and this one has no
+    /// view for it.
+    SaveOnly,
 }
 
 pub(crate) fn way(docs: &Documents, kind: &Kind) -> Way {
@@ -212,8 +312,10 @@ pub(crate) fn way(docs: &Documents, kind: &Kind) -> Way {
         Way::Viewer
     } else if kind.system && docs.can(OPEN_WITH) {
         Way::System
-    } else {
+    } else if kind.system {
         Way::Update
+    } else {
+        Way::SaveOnly
     }
 }
 
@@ -277,6 +379,24 @@ mod tests {
             assert_eq!(way(&system, kind), Way::System, "{mime}");
             assert_eq!(way(&none, kind), Way::Update, "{mime}");
         }
+        // legacy Office can carry macros: its own view, or Save alone
+        for mime in [
+            "application/msword",
+            "application/vnd.ms-excel",
+            "application/vnd.ms-powerpoint",
+        ] {
+            let kind = by_mime(mime).unwrap();
+            assert_eq!(way(&system, kind), Way::SaveOnly, "{mime}");
+            assert_eq!(way(&none, kind), Way::SaveOnly, "{mime}");
+        }
+        assert_eq!(
+            way(&all, by_mime("application/msword").unwrap()),
+            Way::Viewer
+        );
+        assert_eq!(
+            way(&all, by_mime("application/vnd.ms-powerpoint").unwrap()),
+            Way::SaveOnly
+        );
     }
 
     #[test]
@@ -295,6 +415,7 @@ mod tests {
         let pdf_kind = by_mime("application/pdf").unwrap();
         assert!(checked(pdf_kind, png_bytes).is_none(), "nor an image a PDF");
         assert!(checked(pdf_kind, b"%PDF-1.7").is_some());
+        assert!(checked(pdf_kind, b"%PDF-").is_none(), "a version follows");
         assert!(checked(by_mime("image/webp").unwrap(), b"RIFF\0\0\0\0WEBPVP8 ").is_some());
         assert!(checked(by_mime("image/heic").unwrap(), b"\0\0\0\x18ftypheic").is_some());
         assert!(checked(by_mime("image/heic").unwrap(), b"\0\0\0\x18ftypisom").is_none());

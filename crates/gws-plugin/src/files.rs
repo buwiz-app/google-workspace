@@ -91,16 +91,11 @@ pub(crate) const PPTX: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 /// What a file says when it says nothing: a mail's parts often do.
 pub(crate) const NO_TYPE: [&str; 2] = ["", "application/octet-stream"];
-/// What can be opened, with its extensions: what the Bot's Word and Spreadsheet
-/// views take, as its own check does. Anything else stays on Drive, since the Bot
-/// would refuse it and the person would see nothing happen.
-const TYPES: [(&str, &[&str]); 5] = [
-    (DOCX, &["docx"]),
-    (XLSX, &["xlsx"]),
-    ("application/msword", &["doc"]),
-    ("application/vnd.ms-excel", &["xls"]),
-    ("text/csv", &["csv"]),
-];
+/// How an attachment was handed over, in its row's `version`: an attachment
+/// has no Drive version, and the store keeps no other place for it. Empty is
+/// the Bot's own view.
+const BY_APP: &str = "open_with";
+const SAVED: &str = "save";
 const OPEN_FIELDS: &str = "id,name,mimeType,size,version,md5Checksum,capabilities(canDownload)";
 const CHECK_FIELDS: &str = "version,md5Checksum,parents";
 
@@ -555,20 +550,12 @@ fn extension(name: &str) -> Option<&str> {
     (!stem.is_empty() && !ext.is_empty() && ext.len() <= EXTENSION_MAX).then_some(ext)
 }
 
-/// The type a file opens as, from what it says it is or, when it says nothing,
-/// from its name. `None` is a kind no viewer takes.
+/// The type a Drive file opens as, from what it says it is or, when it says
+/// nothing, from its name. Only an editable kind: anything else stays on Drive,
+/// since the Bot would refuse it and the person would see nothing happen.
 fn openable(mime: &str, name: &str) -> Option<&'static str> {
-    if NO_TYPE.contains(&mime) {
-        let ext = extension(name)?.to_lowercase();
-        return TYPES
-            .iter()
-            .find(|(_, exts)| exts.contains(&ext.as_str()))
-            .map(|(mime, _)| *mime);
-    }
-    TYPES
-        .iter()
-        .find(|(m, _)| *m == mime)
-        .map(|(mime, _)| *mime)
+    let kind = handoff::declared(mime, extension(name))?;
+    kind.editable.then_some(kind.mime)
 }
 
 /// At most [`NAME_MAX`] bytes, cut in the name and not its extension.
@@ -621,12 +608,7 @@ pub fn safe_name(name: &str) -> String {
 /// and a Doc's export gets its `.docx`.
 fn file_name(name: &str, mime: &str) -> String {
     let name = safe_name(name);
-    let exts = TYPES
-        .iter()
-        .find(|(m, _)| *m == mime)
-        .map(|(_, exts)| *exts)
-        .or_else(|| handoff::by_mime(mime).map(|kind| kind.exts));
-    let Some(exts) = exts else {
+    let Some(exts) = handoff::by_mime(mime).map(|kind| kind.exts) else {
         return name;
     };
     let fits = extension(&name).is_some_and(|e| exts.contains(&e.to_lowercase().as_str()));
@@ -702,11 +684,24 @@ fn path_of(core: &Core, row: &Opened) -> Result<PathBuf, Failure> {
     Ok(folder_of(core, &row.id)?.join(&row.name))
 }
 
-/// An attachment only looked at: an image, a PDF, a kind only the computer's
-/// own app opens, or a copy on its way to Downloads. It has no edit to keep, so
-/// it never waits for an answer and goes as anything unedited does.
+/// An attachment only looked at: an image, a PDF, anything the computer's own
+/// app has, or a copy on its way to Downloads. It has no edit to keep, so it
+/// never waits for an answer, never goes to Drive, and goes as anything
+/// unedited does.
 fn read_only(row: &Opened) -> bool {
-    row.attachment && !TYPES.iter().any(|(mime, _)| *mime == row.mime)
+    row.attachment
+        && (row.version == BY_APP
+            || row.version == SAVED
+            || !handoff::by_mime(&row.mime).is_some_and(|kind| kind.editable))
+}
+
+/// The way an attachment's row says it was handed over.
+fn handed_way(row: &Opened) -> Way {
+    if row.version == BY_APP {
+        Way::System
+    } else {
+        Way::Viewer
+    }
 }
 
 /// Whether the file holds what came. Only a hash can say: the viewer's save
@@ -1011,6 +1006,7 @@ fn handed(core: &Core, path: &Path, row: &Opened) -> Value {
             answer
         }
         Way::Update => needs_update("open"),
+        Way::SaveOnly => save_instead(),
     }
 }
 
@@ -1061,9 +1057,44 @@ fn write_part(dir: &Path, bytes: &[u8]) -> Result<(), Failure> {
             .create_new(true)
             .mode(0o600)
             .open(dir.join(PART))?;
-        part.write_all(bytes)
+        part.write_all(bytes)?;
+        quarantine(&part)
     };
     write().map_err(|_| cant_save())
+}
+
+/// Marks a stranger's file as come from outside, as a browser's download is:
+/// what opens it then asks Gatekeeper first, and an app inside a zip can't run
+/// unasked. The mark goes with the file when it's renamed into place.
+#[cfg(target_os = "macos")]
+fn quarantine(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let value = format!("0083;{now:08x};Buwiz Bot;");
+    // SAFETY: the name is a C string, the value a live buffer of its length,
+    // and the descriptor is the open file's
+    let done = unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            c"com.apple.quarantine".as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    if done == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn quarantine(_: &File) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// `gws_mail_attachment_open`. The name, the type and the id to fetch by all
@@ -1084,8 +1115,13 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
         _ => None,
     };
     if let Some(row) = &here {
-        if row.account == account {
+        let now = handoff::by_mime(&row.mime).map(|kind| handoff::way(&core.documents, kind));
+        if row.account == account && now == Some(handed_way(row)) {
             return reopen(core, row);
+        }
+        // this Bot would hand an edit elsewhere, where it'd be lost
+        if row.account == account && is_edited(core, &path_of(core, row)?, row) {
+            return Ok(needs_update("open"));
         }
         // a download would land on another account's work
         if is_edited(core, &path_of(core, row)?, row) {
@@ -1102,8 +1138,10 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
         return Ok(save_instead());
     };
     // nothing comes down that this Bot couldn't show
-    if handoff::way(&core.documents, kind) == Way::Update {
-        return Ok(needs_update("open"));
+    match handoff::way(&core.documents, kind) {
+        Way::Update => return Ok(needs_update("open")),
+        Way::SaveOnly => return Ok(save_instead()),
+        Way::Viewer | Way::System => {}
     }
     if !attachment_ok(&attachment) {
         return Ok(attachment_gone());
@@ -1114,6 +1152,7 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some(kind) = handoff::checked(kind, &bytes) else {
         return Ok(save_instead());
     };
+    let by_app = handoff::way(&core.documents, kind) == Way::System;
     let dir = start_part(core, &id)?;
     write_part(&dir, &bytes)?;
     let row = Opened {
@@ -1124,7 +1163,7 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
         google: false,
         attachment: true,
         hash: format!("{:x}", Sha256::digest(&bytes)),
-        version: String::new(),
+        version: if by_app { BY_APP } else { "" }.to_owned(),
         md5: String::new(),
         opened_ms: core.clock.now_ms(),
     };
@@ -1132,13 +1171,19 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
     Ok(handed(core, &path, &row))
 }
 
-/// The name a saved copy has: the stranger's, made safe, and ending as an
-/// image or a PDF does when its bytes are one. Nothing else is told by them.
+/// The name a saved copy has: the stranger's, made safe. Its extension stays
+/// only when the bytes look like that kind; else it gets the kind they are, or
+/// `.bin` when they can't say. A page named .pdf is no PDF in Downloads.
 fn saved_name(title: &str, bytes: &[u8]) -> String {
-    match handoff::sniffed(bytes) {
-        Some(kind) => file_name(title, kind.mime),
-        None => safe_name(title),
+    let name = safe_name(title);
+    let kept = extension(&name)
+        .and_then(handoff::by_ext)
+        .is_some_and(|kind| kind.fits(bytes));
+    if kept {
+        return name;
     }
+    let ext = handoff::sniffed(bytes).map_or("bin", |kind| kind.exts[0]);
+    capped(&format!("{name}.{ext}"))
 }
 
 /// `gws_mail_attachment_save`: any attachment, fetched as an open is, for the
@@ -1171,12 +1216,12 @@ fn save_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
         id,
         account,
         name: saved_name(&title, &bytes),
-        // never one an edit is kept for
         mime: NO_TYPE[1].to_owned(),
         google: false,
         attachment: true,
         hash: format!("{:x}", Sha256::digest(&bytes)),
-        version: String::new(),
+        // never one an edit is kept for
+        version: SAVED.to_owned(),
         md5: String::new(),
         opened_ms: core.clock.now_ms(),
     };
@@ -1492,7 +1537,28 @@ mod tests {
         assert_eq!(file_name("receipt.PDF", "application/pdf"), "receipt.PDF");
         assert_eq!(file_name("plans.exe", "application/zip"), "plans.exe.zip");
         assert_eq!(saved_name("Scan", b"%PDF-1.4"), "Scan.pdf");
-        assert_eq!(saved_name("../tool.exe", b"MZ"), "tool.exe");
+        assert_eq!(saved_name("../tool.exe", b"MZ"), "tool.exe.bin");
+        assert_eq!(saved_name("bill.pdf", b"<html>"), "bill.pdf.bin");
+        assert_eq!(
+            saved_name("bill.pdf", b"%PDF-"),
+            "bill.pdf.bin",
+            "no version"
+        );
+        assert_eq!(
+            saved_name("photo.pdf", b"\x89PNG\r\n\x1a\n"),
+            "photo.pdf.png"
+        );
+        assert_eq!(saved_name("plans", b"PK\x03\x04"), "plans.zip");
+        assert_eq!(saved_name("notes.txt", b"hello"), "notes.txt");
+        assert_eq!(saved_name("notes.txt", b"MZ\0\0"), "notes.txt.bin");
+        assert_eq!(
+            saved_name("invite.ICS", b"BEGIN:VCALENDAR\r\n"),
+            "invite.ICS"
+        );
+        assert_eq!(
+            saved_name("old.doc", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"),
+            "old.doc"
+        );
     }
 
     #[test]
@@ -1515,6 +1581,16 @@ mod tests {
         );
         assert_eq!(openable("video/mp4", "film.mp4"), None);
         assert_eq!(openable("application/octet-stream", "x.exe"), None);
+        assert_eq!(
+            openable("Text/CSV", "x"),
+            Some("text/csv"),
+            "said in any case"
+        );
+        assert_eq!(
+            openable("image/png", "x.png"),
+            None,
+            "only what can be edited"
+        );
         assert_eq!(openable("application/vnd.google-apps.form", "x"), None);
     }
 

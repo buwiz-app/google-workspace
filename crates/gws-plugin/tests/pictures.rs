@@ -421,3 +421,80 @@ fn the_persons_own_reply_isnt_the_sender_offered() {
     let mine = data(core.run("gws_mail_thread", &json!({"thread": "ownonly00001"})));
     assert_eq!(mine["pictures"]["from"], Value::Null);
 }
+
+/// However many pictures a mail carries inside it, Gmail is asked for no more
+/// than 20 of them in one go.
+#[test]
+fn no_more_than_20_pictures_inside_a_mail_are_asked_of_gmail() {
+    let google = FakeGoogle::start(Seed::default());
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.resize(100, 0);
+    let parts = (0..25)
+        .map(|n| {
+            (
+                format!("p{n}"),
+                format!("p{n}.png"),
+                "image/png".to_owned(),
+                png.clone(),
+            )
+        })
+        .collect();
+    google.deliver(with_inline("manypics1", parts));
+    let core = signed_in(&google, &paths("manycid"));
+    let view = data(core.run("gws_mail_thread", &json!({"thread": "manypics1"})));
+    let calls = google
+        .log()
+        .into_iter()
+        .filter(|s| s.target.contains("/attachments/"))
+        .count();
+    assert_eq!(calls, gws::pictures::CID_CALLS);
+    assert_eq!(view["images"], 25 - gws::pictures::CID_CALLS as i64);
+}
+
+/// A trusted sender's thread can hold a forged mail in their name: opening it
+/// fetches the pictures of the mail Gmail vouches for, and the forged one's
+/// stay out.
+#[cfg(feature = "stub")]
+#[test]
+fn a_forged_mail_in_a_trusted_senders_thread_stays_blocked() {
+    let (google, _) = rich();
+    let one = |id: &str, picture: &str, at: i64| Mail {
+        id: id.into(),
+        thread: "trustforge01".into(),
+        labels: vec!["INBOX".into()],
+        from: "Weekly Digest <news@digest.example>".into(),
+        to: OWNER.into(),
+        subject: "This week".into(),
+        at,
+        text: "pictures".into(),
+        html: Some(format!(
+            "<p>pictures</p><img src=\"{}/pictures/{picture}\">",
+            google.base()
+        )),
+        message_id: format!("<{id}@example.com>"),
+        attachments: Vec::new(),
+        inline: Vec::new(),
+    };
+    google.deliver(one("trustforge01", "roof2.png", 1_800_000_000_000));
+    google.deliver(one("trustforge02", "hero.png", 1_800_000_100_000));
+    google.forge_sender("trustforge01");
+    let core = signed_in(&google, &paths("trustforge"));
+    data(core.run(
+        "gws_mail_picture_sender_add",
+        &json!({"address": "news@digest.example"}),
+    ));
+    let view = data(core.run("gws_mail_thread", &json!({"thread": "trustforge01"})));
+    assert_eq!(view["pictures"]["trusted"], true, "the newest is real");
+    let asked = data(core.run(
+        "gws_mail_pictures",
+        &json!({"thread": "trustforge01", "trusted": true}),
+    ));
+    assert_eq!(asked["images"], 1, "the forged one stays blocked");
+    let fetched: Vec<String> = google
+        .log()
+        .into_iter()
+        .filter(|s| s.target.starts_with("/pictures/"))
+        .map(|s| s.target)
+        .collect();
+    assert_eq!(fetched, ["/pictures/hero.png"]);
+}

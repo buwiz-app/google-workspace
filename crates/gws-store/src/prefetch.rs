@@ -48,18 +48,32 @@ impl Store {
             "SELECT t.id FROM threads t WHERE t.account = ?1 AND t.at >= ?2 \
              AND NOT EXISTS (SELECT 1 FROM bodies b WHERE b.account = t.account AND b.thread = t.id) \
              AND NOT EXISTS (SELECT 1 FROM thread_labels l WHERE l.account = t.account AND l.thread = t.id AND l.label IN ('SPAM', 'TRASH')) \
-             AND NOT EXISTS (SELECT 1 FROM ahead_passed p WHERE p.account = t.account AND p.thread = t.id AND p.at = t.at) \
+             AND NOT EXISTS (SELECT 1 FROM ahead_passed p WHERE p.account = t.account AND p.thread = t.id AND p.at = t.at AND p.messages = t.messages) \
              ORDER BY t.at DESC, t.id LIMIT ?3",
         )?;
         let rows = q.query_map(params![account, since, take as i64], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// There's nothing to keep of `thread` as its row is now.
-    pub fn pass_thread(&self, account: &str, thread: &str) -> Result<()> {
+    /// `thread`'s row as the store has it: `(at, messages)`.
+    pub fn thread_row(&self, account: &str, thread: &str) -> Result<Option<(i64, i64)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT at, messages FROM threads WHERE account = ? AND id = ?",
+                params![account, thread],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// There's nothing to keep of `thread` while its row is `(at, messages)`,
+    /// the row it was read by: a sync since then that changed it brings it
+    /// back.
+    pub fn pass_thread(&self, account: &str, thread: &str, row: (i64, i64)) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO ahead_passed(account, thread, at) SELECT account, id, at FROM threads WHERE account = ? AND id = ?",
-            params![account, thread],
+            "INSERT OR REPLACE INTO ahead_passed(account, thread, at, messages) VALUES(?, ?, ?, ?)",
+            params![account, thread, row.0, row.1],
         )?;
         Ok(())
     }
@@ -308,10 +322,25 @@ mod tests {
         let s = store("passed");
         s.put_thread("me", &thread("a", 10, &["INBOX"])).unwrap();
         s.put_thread("me", &thread("b", 5, &["INBOX"])).unwrap();
-        s.pass_thread("me", "a").unwrap();
+        s.pass_thread("me", "a", (10, 1)).unwrap();
         assert_eq!(s.unviewed_since("me", 0, 1).unwrap(), ["b"], "moved past");
         s.put_thread("me", &thread("a", 11, &["INBOX"])).unwrap();
         assert_eq!(s.unviewed_since("me", 0, 1).unwrap(), ["a"], "new mail");
+        s.pass_thread("me", "a", (11, 1)).unwrap();
+        let mut grown = thread("a", 11, &["INBOX"]);
+        grown.messages = 2;
+        s.put_thread("me", &grown).unwrap();
+        assert_eq!(
+            s.unviewed_since("me", 0, 1).unwrap(),
+            ["a"],
+            "a message more at the same time is a change too"
+        );
+        s.pass_thread("me", "a", (11, 1)).unwrap();
+        assert_eq!(
+            s.unviewed_since("me", 0, 1).unwrap(),
+            ["a"],
+            "passed by the row read, not by the row a sync left since"
+        );
         s.remove_thread("me", "a").unwrap();
         s.forget_account("me").unwrap();
         assert!(s.accounts().unwrap().is_empty());

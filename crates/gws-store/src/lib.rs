@@ -95,7 +95,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         "CREATE TABLE attachment_bytes(account TEXT NOT NULL, message TEXT NOT NULL, part TEXT NOT NULL, thread TEXT NOT NULL, at INTEGER NOT NULL, name TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL, used INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(account, message, part));
          CREATE INDEX attachment_bytes_of_thread ON attachment_bytes(account, thread);
          CREATE INDEX attachment_bytes_by_date ON attachment_bytes(account, at);
-         CREATE TABLE ahead_passed(account TEXT NOT NULL, thread TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(account, thread)) WITHOUT ROWID;
+         CREATE TABLE ahead_passed(account TEXT NOT NULL, thread TEXT NOT NULL, at INTEGER NOT NULL, messages INTEGER NOT NULL, PRIMARY KEY(account, thread)) WITHOUT ROWID;
          ALTER TABLE bodies ADD COLUMN fetched INTEGER NOT NULL DEFAULT 0;
          ALTER TABLE bodies ADD COLUMN tries INTEGER NOT NULL DEFAULT 0;",
     ),

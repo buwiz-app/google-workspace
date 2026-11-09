@@ -57,18 +57,38 @@ pub enum Whole {
     /// Bigger than the read may take: another read of it comes to the same,
     /// so it's no failure to wait out. What the read said, as a failure.
     TooBig(Failure),
+    /// Begun, and longer coming than the read may take: on this link the
+    /// next read of it takes as long.
+    TooSlow(Failure),
 }
 
-/// Why an answer gave nothing: past its cap, or anything else.
+/// What one whole read may take: its bytes and its time.
+#[derive(Debug, Clone, Copy)]
+pub struct Limit {
+    pub bytes: u64,
+    pub time: Duration,
+}
+
+impl Limit {
+    /// What an open's read of a thread takes.
+    pub const FULL: Self = Self {
+        bytes: FULL_MAX,
+        time: TIMEOUT,
+    };
+}
+
+/// Why an answer gave nothing: past its cap, out of time once it had begun,
+/// or anything else.
 enum Refused {
     TooBig(Failure),
+    TooSlow(Failure),
     Other(Failure),
 }
 
 impl From<Refused> for Failure {
     fn from(refused: Refused) -> Self {
         match refused {
-            Refused::TooBig(f) | Refused::Other(f) => f,
+            Refused::TooBig(f) | Refused::TooSlow(f) | Refused::Other(f) => f,
         }
     }
 }
@@ -258,6 +278,8 @@ impl Gmail {
                 ));
                 match e {
                     ureq::Error::BodyExceedsLimit(_) => Refused::TooBig(failure),
+                    // Gmail answered, and its answer outlasted the read
+                    ureq::Error::Timeout(_) => Refused::TooSlow(failure),
                     _ => Refused::Other(failure),
                 }
             })?;
@@ -503,8 +525,8 @@ impl Gmail {
         )
     }
 
-    /// [`Self::thread_full`], within `cap` bytes, saying apart a thread past it.
-    pub fn thread_whole(&self, auth: &Bearer, id: &str, cap: u64) -> Result<Whole, Failure> {
+    /// [`Self::thread_full`], within `limit`, saying apart a thread past it.
+    pub fn thread_whole(&self, auth: &Bearer, id: &str, limit: Limit) -> Result<Whole, Failure> {
         if !id_ok(id) {
             return Ok(Whole::Gone);
         }
@@ -512,13 +534,14 @@ impl Gmail {
             auth,
             format!("threads/{id}"),
             vec![("format", "full".to_owned())],
-            cap,
-            Some(TIMEOUT),
+            limit.bytes,
+            Some(limit.time),
         );
         match read {
             Ok(Some(v)) => Ok(Whole::Read(v)),
             Ok(None) => Ok(Whole::Gone),
             Err(Refused::TooBig(f)) => Ok(Whole::TooBig(f)),
+            Err(Refused::TooSlow(f)) => Ok(Whole::TooSlow(f)),
             Err(Refused::Other(f)) => Err(f),
         }
     }

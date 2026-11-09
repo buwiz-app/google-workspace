@@ -165,8 +165,16 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
     })
 }
 
+/// The header that has [`write_reply`] send a body a KiB at a time, this many
+/// milliseconds apart, as over a slow link.
+const TRICKLE: &str = "x-stub-trickle-ms";
+
 fn write_reply(mut stream: TcpStream, r: Reply) {
     let Reply(status, kind, body, headers) = r;
+    let trickle = headers
+        .iter()
+        .find(|(k, _)| k == TRICKLE)
+        .and_then(|(_, v)| v.parse::<u64>().ok());
     let extra: String = headers
         .iter()
         .map(|(k, v)| format!("{k}: {v}\r\n"))
@@ -176,7 +184,20 @@ fn write_reply(mut stream: TcpStream, r: Reply) {
         body.len()
     );
     let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(&body);
+    match trickle {
+        Some(ms) => {
+            for chunk in body.chunks(1024) {
+                let _ = stream.flush();
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                if stream.write_all(chunk).is_err() {
+                    return;
+                }
+            }
+        }
+        None => {
+            let _ = stream.write_all(&body);
+        }
+    }
 }
 
 fn listen(port: u16, handle: impl Fn(Request) -> Reply + Send + Sync + 'static) -> u16 {
@@ -585,6 +606,9 @@ struct Account {
     ids_missing: bool,
     /// Whole reads give no attachment sizes.
     sizes_missing: bool,
+    /// Answers to paths ending in this come a KiB at a time, this many
+    /// milliseconds apart.
+    trickle: Option<(String, u64)>,
     /// Reads so far, once attachment ids change with each.
     reads: Option<AtomicU64>,
     /// `(draft id, message id, raw message, thread)`.
@@ -1574,7 +1598,17 @@ impl FakeGoogle {
         let waits = door.clone();
         let port = listen(port, move |r| {
             waits.pass(&r);
-            shared.lock().unwrap().handle(r)
+            let path = r.path().to_owned();
+            let mut account = shared.lock().unwrap();
+            let slow = account
+                .trickle
+                .clone()
+                .filter(|(end, _)| path.ends_with(end.as_str()));
+            let mut reply = account.handle(r);
+            if let Some((_, ms)) = slow {
+                reply.3.push((TRICKLE.to_owned(), ms.to_string()));
+            }
+            reply
         });
         account.lock().unwrap().drive.base = format!("http://127.0.0.1:{port}");
         Self {
@@ -1867,6 +1901,12 @@ impl FakeGoogle {
     /// a 429 is Gmail saying it's busy.
     pub fn thread_reads_fail_after(&self, left: usize, status: u16) {
         self.account.lock().unwrap().thread_reads = Some((left, status));
+    }
+
+    /// Answers to paths ending in `end` come a KiB at a time, `ms` apart, as
+    /// over a slow link: their head at once, then their body. `None` ends it.
+    pub fn trickle(&self, slow: Option<(&str, u64)>) {
+        self.account.lock().unwrap().trickle = slow.map(|(end, ms)| (end.to_owned(), ms));
     }
 
     /// Whether whole reads leave out each part's attachment id.

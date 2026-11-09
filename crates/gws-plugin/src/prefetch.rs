@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::Core;
 use crate::accounts::Bearer;
-use crate::gmail::{self, Failure};
+use crate::gmail::{self, Failure, Limit, Whole};
 use crate::mail::{Viewed, now_ms, read_view, row_of, signed_in, with_own_store, with_store};
 use crate::pictures;
 
@@ -125,16 +125,16 @@ pub fn run(core: &Core) -> Result<(), Failure> {
 }
 
 fn round(core: &Core, now: i64) -> Result<(), Failure> {
-    round_within(core, now, ROUND_MAX, gmail::FULL_MAX)
+    round_within(core, now, ROUND_MAX, Limit::FULL)
 }
 
-/// [`round`], downloading no more than `max`, and no thread past `read_max`.
-fn round_within(core: &Core, now: i64, max: i64, read_max: u64) -> Result<(), Failure> {
+/// [`round`], downloading no more than `max`, and no thread past `read`.
+fn round_within(core: &Core, now: i64, max: i64, read: Limit) -> Result<(), Failure> {
     let (_, account) = signed_in(core)?;
     let since = now - WINDOW_MS;
     let mut spent = 0;
-    bodies(core, &account, since, &mut spent, max, read_max)?;
-    attachments(core, &account, since, &mut spent, max)
+    bodies(core, &account, since, &mut spent, max, read)?;
+    attachments(core, &account, since, &mut spent, max, read)
 }
 
 /// The token to ask Google with, read again before each call: a sign-out or a
@@ -153,7 +153,7 @@ fn bodies(
     since: i64,
     spent: &mut i64,
     max: i64,
-    read_max: u64,
+    limit: Limit,
 ) -> Result<(), Failure> {
     let due = with_store(core, |store| store.unviewed_since(account, since, BATCH))?;
     for id in due {
@@ -165,12 +165,22 @@ fn bodies(
         if held + VIEW_ROOM > BODIES_MAX {
             break;
         }
+        // what's passed is passed as it was read: a sync during the download
+        // that brings new mail brings the thread back
+        let Some(row_read) = with_store(core, |store| store.thread_row(account, &id))? else {
+            continue;
+        };
+        let pass = |core: &Core| {
+            with_own_store(core, account, |store| {
+                store.pass_thread(account, &id, row_read)
+            })
+        };
         let auth = still(core, account)?;
         let before = *spent;
         // every byte that comes counts, the pictures inside the mail among them,
         // and none is asked for past the round's share or after a sign-out
         let (mut over, mut gone) = (false, false);
-        let read = read_view(core, &auth, account, &id, read_max, &mut |bytes| {
+        let read = read_view(core, &auth, account, &id, limit, &mut |bytes| {
             let bytes = bytes as i64;
             *spent += bytes;
             if still(core, account).is_err() {
@@ -190,11 +200,16 @@ fn bodies(
                 with_own_store(core, account, |store| store.remove_thread(account, &id))?;
                 continue;
             }
-            // past what one read takes, it would fail each round and hold up
-            // everything older: an open says why. What came of it counts.
+            // past what one read takes, by its size or on this link by its
+            // time, it would fail each round and hold up everything older: an
+            // open says why. What came of it counts.
             Viewed::TooBig(_) => {
-                *spent += read_max as i64;
-                with_own_store(core, account, |store| store.pass_thread(account, &id))?;
+                *spent += limit.bytes as i64;
+                pass(core)?;
+                continue;
+            }
+            Viewed::TooSlow(_) => {
+                pass(core)?;
                 continue;
             }
         };
@@ -203,7 +218,7 @@ fn bodies(
         // fetches it. Nor is a view kept that Google said too little of a
         // picture for, as if it were whole: the open reads it again.
         if (over && before == 0) || short {
-            with_own_store(core, account, |store| store.pass_thread(account, &id))?;
+            pass(core)?;
             continue;
         }
         // a view short of its pictures isn't what an open makes: next round
@@ -213,7 +228,7 @@ fn bodies(
         let view = view.to_string();
         // what was read is what the row says, or the next sync has news of it
         let Some(row) = row_of(&full) else {
-            with_own_store(core, account, |store| store.pass_thread(account, &id))?;
+            pass(core)?;
             continue;
         };
         let kept = with_own_store(core, account, |store| {
@@ -265,6 +280,7 @@ fn attachments(
     since: i64,
     spent: &mut i64,
     max: i64,
+    limit: Limit,
 ) -> Result<(), Failure> {
     let due = with_store(core, |store| {
         store.views_unfetched_since(account, since, BATCH)
@@ -279,9 +295,23 @@ fn attachments(
             return Ok(());
         }
         let auth = still(core, account)?;
-        let Some(full) = core.gmail.thread_full(&auth, &thread)? else {
-            with_own_store(core, account, |store| store.tried(account, &thread))?;
-            continue;
+        let full = match core.gmail.thread_whole(&auth, &thread, limit)? {
+            Whole::Read(full) => full,
+            Whole::Gone => {
+                with_own_store(core, account, |store| store.tried(account, &thread))?;
+                continue;
+            }
+            // what can't come in one read here is left to the press, and
+            // nothing older waits on it
+            Whole::TooBig(_) => {
+                *spent += limit.bytes as i64;
+                with_own_store(core, account, |store| store.mark_fetched(account, &thread))?;
+                continue;
+            }
+            Whole::TooSlow(_) => {
+                with_own_store(core, account, |store| store.mark_fetched(account, &thread))?;
+                continue;
+            }
         };
         *spent += came(&full);
         let inline = inline_parts(&full);
@@ -515,6 +545,10 @@ mod tests {
         core
     }
 
+    fn id(n: u64) -> String {
+        format!("1a{n:014x}")
+    }
+
     fn has_view(core: &Core, n: u64) -> bool {
         with_store(core, |s| s.view(FAKE_EMAIL, &format!("1a{n:014x}"), 0))
             .unwrap()
@@ -550,7 +584,7 @@ mod tests {
         });
         let core = synced(&google, "too-big");
         for _ in 0..3 {
-            round_within(&core, NOW, 100 * 1024, gmail::FULL_MAX).unwrap();
+            round_within(&core, NOW, 100 * 1024, Limit::FULL).unwrap();
         }
         assert!(has_view(&core, 2), "older mail isn't held up by it");
         assert!(!has_view(&core, 1), "it waits for an open");
@@ -566,12 +600,140 @@ mod tests {
             ..Seed::default()
         });
         let core = synced(&google, "past-read");
+        let small = Limit {
+            bytes: 100 * 1024,
+            ..Limit::FULL
+        };
         // one round, with no backing off: the next thread comes in it
-        round_within(&core, NOW, ROUND_MAX, 100 * 1024).unwrap();
+        round_within(&core, NOW, ROUND_MAX, small).unwrap();
         assert!(has_view(&core, 2), "older mail isn't held up by it");
         assert!(!has_view(&core, 1), "it waits for an open");
-        round_within(&core, NOW, ROUND_MAX, 100 * 1024).unwrap();
+        round_within(&core, NOW, ROUND_MAX, small).unwrap();
         assert_eq!(reads_of(&google, 1), 1, "asked for once, not each round");
+    }
+
+    /// What a read takes on a link too slow for a thread of this size.
+    const SLOW: Limit = Limit {
+        bytes: Limit::FULL.bytes,
+        time: std::time::Duration::from_secs(1),
+    };
+
+    #[test]
+    fn a_thread_too_slow_to_come_is_left_to_its_open_and_older_mail_comes() {
+        let mut big = mail(1, 1);
+        big.text = "x".repeat(64 * 1024);
+        let google = FakeGoogle::start(Seed {
+            mails: vec![big, mail(2, 2)],
+            ..Seed::default()
+        });
+        let core = synced(&google, "slow-read");
+        // a KiB each 50 ms: some 4 s for the thread, its head at once
+        google.trickle(Some((&format!("/threads/{}", id(1)), 50)));
+        round_within(&core, NOW, ROUND_MAX, SLOW).expect("no failure to back off from");
+        assert!(has_view(&core, 2), "older mail isn't held up by it");
+        assert!(!has_view(&core, 1), "it waits for an open");
+        round_within(&core, NOW, ROUND_MAX, SLOW).unwrap();
+        assert_eq!(reads_of(&google, 1), 1, "asked for once, not each round");
+    }
+
+    #[test]
+    fn a_thread_that_never_answers_still_backs_off() {
+        let google = FakeGoogle::start(Seed {
+            mails: vec![mail(1, 1)],
+            ..Seed::default()
+        });
+        let core = synced(&google, "no-answer");
+        google.hold("GET", &format!("/threads/{}", id(1)));
+        let round = round_within(&core, NOW, ROUND_MAX, SLOW);
+        google.release();
+        assert!(round.is_err(), "no answer at all is a failure");
+        assert!(!has_view(&core, 1));
+        round_within(&core, NOW, ROUND_MAX, Limit::FULL).unwrap();
+        assert!(has_view(&core, 1), "not passed");
+    }
+
+    /// A mail of `text` bytes with a small PDF.
+    fn with_file(n: u64, days_ago: i64, text: usize) -> Mail {
+        let mut m = mail(n, days_ago);
+        m.text = "x".repeat(text);
+        m.attachments = vec![(
+            "receipt.pdf".to_owned(),
+            "application/pdf".to_owned(),
+            b"%PDF kept".to_vec(),
+        )];
+        m
+    }
+
+    fn has_file(core: &Core, n: u64) -> bool {
+        with_store(core, |s| s.has_attachment(FAKE_EMAIL, &id(n), "1")).unwrap()
+    }
+
+    #[test]
+    fn an_attachment_read_too_slow_to_come_is_left_to_the_press() {
+        let google = FakeGoogle::start(Seed {
+            mails: vec![with_file(1, 1, 64 * 1024), with_file(2, 2, 1024)],
+            ..Seed::default()
+        });
+        let core = synced(&google, "slow-files");
+        let opened = core.run(crate::tools::MAIL_THREAD, &json!({"thread": id(1)}));
+        assert_ne!(opened["isError"], true, "{opened}");
+        google.trickle(Some((&format!("/threads/{}", id(1)), 50)));
+        round_within(&core, NOW, ROUND_MAX, SLOW).expect("no failure to back off from");
+        assert!(!has_file(&core, 1));
+        assert!(
+            has_file(&core, 2),
+            "older mail's files aren't held up by it"
+        );
+    }
+
+    #[test]
+    fn an_attachment_read_too_big_for_one_read_is_left_to_the_press() {
+        let google = FakeGoogle::start(Seed {
+            mails: vec![with_file(1, 1, 300 * 1024), with_file(2, 2, 1024)],
+            ..Seed::default()
+        });
+        let core = synced(&google, "big-files");
+        let opened = core.run(crate::tools::MAIL_THREAD, &json!({"thread": id(1)}));
+        assert_ne!(opened["isError"], true, "{opened}");
+        let small = Limit {
+            bytes: 200 * 1024,
+            ..Limit::FULL
+        };
+        round_within(&core, NOW, ROUND_MAX, small).expect("no failure to back off from");
+        assert!(!has_file(&core, 1));
+        assert!(
+            has_file(&core, 2),
+            "older mail's files aren't held up by it"
+        );
+    }
+
+    #[test]
+    fn a_thread_passed_while_a_sync_brought_it_mail_comes_again() {
+        let mut big = mail(1, 1);
+        big.text = "x".repeat(64 * 1024);
+        let google = FakeGoogle::start(Seed {
+            mails: vec![big],
+            ..Seed::default()
+        });
+        let core = synced(&google, "passed-mid-sync");
+        // the read takes 2 s and fails, some 3 s short of coming whole
+        google.trickle(Some((&format!("/threads/{}", id(1)), 50)));
+        let slow = Limit {
+            time: std::time::Duration::from_secs(2),
+            ..Limit::FULL
+        };
+        std::thread::scope(|s| {
+            let round = s.spawn(|| round_within(&core, NOW, ROUND_MAX, slow));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            // a reply lands while the round waits on Google
+            let mut reply = mail(9, 0);
+            reply.thread = id(1);
+            google.deliver(reply);
+            crate::mail::sync(&core).unwrap();
+            round.join().unwrap().unwrap();
+        });
+        let due = with_store(&core, |s| s.unviewed_since(FAKE_EMAIL, 0, 10)).unwrap();
+        assert_eq!(due, [id(1)], "passed as it was, not as the sync left it");
     }
 
     #[test]
@@ -586,7 +748,7 @@ mod tests {
         let core = synced(&google, "pictures-share");
         // each picture comes as 67 KiB of base64: the first mail's three make
         // 200, and the second's stop when the next would pass 300
-        round_within(&core, NOW, 300 * 1024, gmail::FULL_MAX).unwrap();
+        round_within(&core, NOW, 300 * 1024, Limit::FULL).unwrap();
         assert!(has_view(&core, 1));
         assert!(!has_view(&core, 2), "short of its pictures, it waits");
         assert!(
@@ -594,7 +756,7 @@ mod tests {
             "{}",
             attachment_reads(&google)
         );
-        round_within(&core, NOW, 300 * 1024, gmail::FULL_MAX).unwrap();
+        round_within(&core, NOW, 300 * 1024, Limit::FULL).unwrap();
         assert!(has_view(&core, 2), "the next round takes it");
     }
 

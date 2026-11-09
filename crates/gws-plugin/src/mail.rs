@@ -15,7 +15,7 @@ use gws_store::mail::{Label, Thread};
 use serde_json::{Value, json};
 
 use crate::accounts::Bearer;
-use crate::gmail::{self, FULL_MAX, Failure, Whole};
+use crate::gmail::{self, Failure, Limit, Whole};
 use crate::tools::{
     MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_DRAFT_DELETE, MAIL_DRAFT_OF, MAIL_DRAFT_READ,
     MAIL_DRAFT_SAVE, MAIL_JOB, MAIL_JOB_START, MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK,
@@ -1195,6 +1195,8 @@ pub(crate) enum Viewed {
     Gone,
     /// Past the read's cap, which another read comes to as well.
     TooBig(Failure),
+    /// Begun, and outlasting the read's time.
+    TooSlow(Failure),
     /// What Google sent, the page made of it, and whether Google said too
     /// little of a picture inside it to fetch it by.
     Read {
@@ -1204,7 +1206,7 @@ pub(crate) enum Viewed {
     },
 }
 
-/// A thread read whole from Google, within `cap` bytes, and made into the page
+/// A thread read whole from Google, within `limit`, and made into the page
 /// an open shows, with what Google sent: an open and a read ahead both keep
 /// what this makes, its pictures inside the mail and what they need to show
 /// among it.
@@ -1217,13 +1219,14 @@ pub(crate) fn read_view(
     auth: &Bearer,
     account: &str,
     id: &str,
-    cap: u64,
+    limit: Limit,
     gate: &mut dyn FnMut(u64) -> bool,
 ) -> Result<Viewed, Failure> {
-    let mut full = match core.gmail.thread_whole(auth, id, cap)? {
+    let mut full = match core.gmail.thread_whole(auth, id, limit)? {
         Whole::Read(full) => full,
         Whole::Gone => return Ok(Viewed::Gone),
         Whole::TooBig(why) => return Ok(Viewed::TooBig(why)),
+        Whole::TooSlow(why) => return Ok(Viewed::TooSlow(why)),
     };
     gate(full.to_string().len() as u64);
     // a picture comes as base64 inside JSON
@@ -1255,10 +1258,10 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     }
     // the sign-in is there, and the Bot can't refresh its token just now
     let auth = auth.ok_or_else(unreached)?;
-    let view = match read_view(core, &auth, &account, &id, FULL_MAX, &mut |_| true)? {
+    let view = match read_view(core, &auth, &account, &id, Limit::FULL, &mut |_| true)? {
         Viewed::Read { view, .. } => view,
         Viewed::Gone => return Ok(fail("not_found", "That conversation is gone.")),
-        Viewed::TooBig(why) => return Err(why),
+        Viewed::TooBig(why) | Viewed::TooSlow(why) => return Err(why),
     };
     with_own_store(core, &account, |store| {
         store.put_view(&account, &id, &view.to_string(), now_ms())

@@ -1323,7 +1323,7 @@ fn an_attachments_hostile_name_stays_in_its_folder() {
 fn read_again(home: &Home) -> Value {
     let auth = home.core.accounts.google().unwrap();
     let mail = home.core.gmail.full(&auth, "18f1aa").unwrap().unwrap();
-    gws::gmail::attachments(&mail)[0].clone()
+    gws::gmail::attachments(&mail, &Default::default())[0].clone()
 }
 
 #[test]

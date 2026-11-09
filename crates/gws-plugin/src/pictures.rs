@@ -100,80 +100,6 @@ fn wanted(message: &Value) -> Vec<String> {
     gmail::html_body(message).map_or_else(Vec::new, |h| clean::clean(&h).images)
 }
 
-/// `cid:<id>`'s id, as a part's `Content-ID` gives it: no angle brackets, and
-/// the URL's percent escapes undone.
-fn cid_of(url: &str) -> Option<String> {
-    let rest = url
-        .get(..4)
-        .filter(|s| s.eq_ignore_ascii_case("cid:"))
-        .map(|_| &url[4..])?;
-    let bytes = rest.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut at = 0;
-    while at < bytes.len() {
-        let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
-        match (bytes[at], bytes.get(at + 1), bytes.get(at + 2)) {
-            (b'%', Some(&h), Some(&l)) if hex(h).is_some() && hex(l).is_some() => {
-                out.push(hex(h)? * 16 + hex(l)?);
-                at += 3;
-            }
-            (b, ..) => {
-                out.push(b);
-                at += 1;
-            }
-        }
-    }
-    let id = String::from_utf8(out).ok()?;
-    let id = id
-        .trim()
-        .trim_start_matches('<')
-        .trim_end_matches('>')
-        .trim();
-    (!id.is_empty()).then(|| id.to_owned())
-}
-
-fn part_header<'a>(part: &'a Value, name: &str) -> Option<&'a str> {
-    part.get("headers")?
-        .as_array()?
-        .iter()
-        .find(|h| {
-            h.get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|n| n.eq_ignore_ascii_case(name))
-        })?
-        .get("value")?
-        .as_str()
-}
-
-/// Every part of `message` with a Content-ID, by that id.
-fn by_content_id(message: &Value) -> HashMap<String, &Value> {
-    fn walk<'a>(part: &'a Value, out: &mut HashMap<String, &'a Value>) {
-        if let Some(id) = part_header(part, "content-id") {
-            let id = id
-                .trim()
-                .trim_start_matches('<')
-                .trim_end_matches('>')
-                .trim();
-            if !id.is_empty() {
-                out.entry(id.to_owned()).or_insert(part);
-            }
-        }
-        for p in part
-            .get("parts")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            walk(p, out);
-        }
-    }
-    let mut out = HashMap::new();
-    if let Some(p) = message.get("payload") {
-        walk(p, &mut out);
-    }
-    out
-}
-
 /// Gmail's base64url, padded or not.
 fn unbase64(data: &str) -> Option<Vec<u8>> {
     let clean: String = data
@@ -318,7 +244,7 @@ impl Placer {
 fn inside(core: &Core, auth: &Bearer, thread: &Value, placer: &mut Placer, by: Instant) {
     let mut calls = 0;
     for (n, m) in messages(thread).iter().enumerate() {
-        let parts = by_content_id(m);
+        let parts = gmail::by_content_id(m);
         if parts.is_empty() {
             continue;
         }
@@ -328,7 +254,7 @@ fn inside(core: &Core, auth: &Bearer, thread: &Value, placer: &mut Placer, by: I
             if placer.full() {
                 return;
             }
-            let Some(part) = cid_of(&url).and_then(|cid| parts.get(&cid).copied()) else {
+            let Some(part) = gmail::cid_of(&url).and_then(|cid| parts.get(&cid).copied()) else {
                 continue;
             };
             if !seen.insert(url.clone()) {
@@ -967,17 +893,6 @@ mod tests {
         ] {
             assert!(public(open.parse().unwrap()), "{open}");
         }
-    }
-
-    #[test]
-    fn a_cid_url_names_its_part() {
-        assert_eq!(cid_of("cid:logo@digest").as_deref(), Some("logo@digest"));
-        assert_eq!(
-            cid_of("CID:%3Clogo%40digest%3E").as_deref(),
-            Some("logo@digest")
-        );
-        assert_eq!(cid_of("cid:"), None);
-        assert_eq!(cid_of("https://a.example/cid:x"), None);
     }
 
     #[test]

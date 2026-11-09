@@ -981,7 +981,8 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some(mail) = core.gmail.full(&auth, &message)? else {
         return Ok(gone());
     };
-    let listed = gmail::attachments(&mail);
+    // any card a view may show, so none of its pictures is left out
+    let listed = gmail::attachments(&mail, &Default::default());
     let Some(found) = listed
         .iter()
         .find(|a| a.get("part").and_then(Value::as_str) == Some(&part))

@@ -6,6 +6,7 @@
 //! blocking, on the tool's own thread. It follows no redirects, so the token
 //! only ever goes to the API base.
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -591,16 +592,18 @@ impl Gmail {
     ///
     /// All of it keeps to [`TWINS_WITHIN`], each fetch to [`TIMEOUT`] at most:
     /// it comes before the thread shows. Out of time, the pairs not yet read
-    /// stay two cards.
-    pub fn mark_twins(&self, auth: &Bearer, thread: &mut Value) {
-        self.mark_twins_by(auth, thread, std::time::Instant::now() + TWINS_WITHIN);
+    /// stay two cards. `false` when a fetch was cut short or failed, so the
+    /// view made from it isn't kept: next time may tell.
+    pub fn mark_twins(&self, auth: &Bearer, thread: &mut Value) -> bool {
+        self.mark_twins_by(auth, thread, std::time::Instant::now() + TWINS_WITHIN)
     }
 
     /// [`Self::mark_twins`], done by `by`.
-    pub fn mark_twins_by(&self, auth: &Bearer, thread: &mut Value, by: std::time::Instant) {
+    pub fn mark_twins_by(&self, auth: &Bearer, thread: &mut Value, by: std::time::Instant) -> bool {
         let Some(messages) = thread.get_mut("messages").and_then(Value::as_array_mut) else {
-            return;
+            return true;
         };
+        let missed = std::cell::Cell::new(false);
         for message in messages {
             let Some(id) = message.get("id").and_then(Value::as_str).map(str::to_owned) else {
                 continue;
@@ -611,10 +614,18 @@ impl Gmail {
                     let att = p.pointer("/body/attachmentId").and_then(Value::as_str)?;
                     let left = by
                         .checked_duration_since(std::time::Instant::now())
-                        .filter(|d| !d.is_zero())?;
-                    self.attachment_within(auth, &id, att, left.min(TIMEOUT))
-                        .ok()
-                        .flatten()
+                        .filter(|d| !d.is_zero());
+                    let Some(left) = left else {
+                        missed.set(true);
+                        return None;
+                    };
+                    match self.attachment_within(auth, &id, att, left.min(TIMEOUT)) {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            missed.set(true);
+                            None
+                        }
+                    }
                 }
             };
             // the calendar part's bytes once, against each file that may be it
@@ -646,6 +657,7 @@ impl Gmail {
                 }
             }
         }
+        !missed.get()
     }
 
     /// The id of the draft in conversation `thread`, among the newest there are.
@@ -920,38 +932,76 @@ fn listed(part: &Value) -> Value {
     serde_json::json!({"name": file_name(part), "mime": part.get("mimeType"), "size": part.pointer("/body/size"), "id": part.pointer("/body/attachmentId"), "part": id})
 }
 
-/// Whether `html` says `cid:<cid>` whole: `cid:logo` isn't `cid:logo2`.
-fn names_cid(html: &str, cid: &str) -> bool {
-    let wanted = format!("cid:{cid}");
-    html.match_indices(&wanted).any(|(at, _)| {
-        html[at + wanted.len()..]
-            .chars()
-            .next()
-            .is_none_or(|c| c.is_whitespace() || "\"'>);&".contains(c))
-    })
+/// A Content-ID as one key, the same from a part's header and from a `cid:`
+/// URL: percent escapes undone, then no angle brackets, in lower case. RFC 2392
+/// makes the URL the header's id escaped, and mail clients match either case,
+/// so `<Logo@a>`, `cid:logo%40a` and `CID:%3Clogo@A%3E` are one.
+pub fn cid_key(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+        match (
+            bytes[at],
+            bytes.get(at + 1).copied().and_then(hex),
+            bytes.get(at + 2).copied().and_then(hex),
+        ) {
+            (b'%', Some(h), Some(l)) => {
+                out.push(h * 16 + l);
+                at += 3;
+            }
+            (b, ..) => {
+                out.push(b);
+                at += 1;
+            }
+        }
+    }
+    let id = String::from_utf8(out).ok()?;
+    let id = id
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim();
+    (!id.is_empty()).then(|| id.to_lowercase())
 }
 
-/// A picture the letter shows: an image whose Content-ID its HTML names as
-/// `cid:`, marked inline or not marked at all (inline too, RFC 2183). Any other
-/// part with a Content-ID, a PDF or a picture the letter never shows, is a file.
-/// `html` is the message's HTML in lower case.
-fn shown_inline(part: &Value, html: &str) -> bool {
-    let image = part
-        .get("mimeType")
-        .and_then(Value::as_str)
-        .is_some_and(|m| m.to_ascii_lowercase().starts_with("image/"));
-    let cid = part_header(part, "content-id")
-        .map(|c| {
-            c.trim()
-                .trim_start_matches('<')
-                .trim_end_matches('>')
-                .trim()
-        })
-        .filter(|c| !c.is_empty());
-    image
-        && cid.is_some_and(|c| names_cid(html, &c.to_ascii_lowercase()))
-        && part_header(part, "content-disposition")
-            .is_none_or(|d| d.trim_start().to_ascii_lowercase().starts_with("inline"))
+/// `cid:<id>`'s [`cid_key`], or none for any other URL.
+pub fn cid_of(url: &str) -> Option<String> {
+    url.get(..4)
+        .filter(|s| s.eq_ignore_ascii_case("cid:"))
+        .and_then(|_| cid_key(&url[4..]))
+}
+
+/// Every part of `message` the letter may show by Content-ID, by its
+/// [`cid_key`]: the first with each id, and none sent as an attachment, which
+/// stays a file (RFC 2183).
+pub fn by_content_id(message: &Value) -> HashMap<String, &Value> {
+    fn walk<'a>(part: &'a Value, out: &mut HashMap<String, &'a Value>) {
+        let attached = part_header(part, "content-disposition").is_some_and(|d| {
+            d.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("attachment")
+        });
+        if let Some(id) = part_header(part, "content-id").and_then(cid_key)
+            && !attached
+        {
+            out.entry(id).or_insert(part);
+        }
+        for p in part
+            .get("parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            walk(p, out);
+        }
+    }
+    let mut out = HashMap::new();
+    if let Some(p) = message.get("payload") {
+        walk(p, &mut out);
+    }
+    out
 }
 
 /// Attachments as the reader shows them: `{name, mime, size, id, part}`.
@@ -960,16 +1010,25 @@ fn shown_inline(part: &Value, html: &str) -> bool {
 /// attachment and nothing else has the empty id, and an empty one can't be told
 /// from none, so that's `root`.
 ///
-/// A picture the letter shows by its Content-ID is the letter's, and not a
-/// file. An invite's event comes twice, as Google sends it: the text/calendar
-/// alternative of the letter and an application/ics file. The alternative goes
-/// once [`Gmail::mark_twins`] has found the file holds the same bytes. Two files
-/// are never made one, whatever their names.
-pub fn attachments(message: &Value) -> Vec<Value> {
-    let html = html_body(message).unwrap_or_default().to_ascii_lowercase();
+/// `shown` is the [`cid_key`]s of the pictures the view put in the letter, and
+/// each of those is the letter's, not a file. A picture referenced but not
+/// shown, too big, of a kind not taken or out of time, stays a card. An invite's
+/// event comes twice, as Google sends it: the text/calendar alternative of the
+/// letter and an application/ics file. The alternative goes once
+/// [`Gmail::mark_twins`] has found the file holds the same bytes. Two files are
+/// never made one, whatever their names.
+pub fn attachments(message: &Value, shown: &HashSet<String>) -> Vec<Value> {
+    let inline = by_content_id(message);
+    let in_letter = |p: &Value| {
+        part_header(p, "content-id")
+            .and_then(cid_key)
+            .filter(|id| shown.contains(id))
+            .and_then(|id| inline.get(&id))
+            .is_some_and(|q| std::ptr::eq(*q, p))
+    };
     named_parts(message)
         .into_iter()
-        .filter(|(p, _)| !shown_inline(p, &html) && p.get(TWIN) != Some(&Value::Bool(true)))
+        .filter(|(p, _)| !in_letter(p) && p.get(TWIN) != Some(&Value::Bool(true)))
         .map(|(p, _)| listed(p))
         .collect()
 }
@@ -1286,20 +1345,28 @@ mod tests {
                 {"partId": "2.0", "mimeType": "text/csv", "filename": "b.csv", "body": {"attachmentId": "y"}},
             ]},
         ]}});
-        let parts: Vec<Value> = attachments(&mixed)
+        let parts: Vec<Value> = attachments(&mixed, &none())
             .iter()
             .map(|a| a["part"].clone())
             .collect();
         assert_eq!(parts, [json!("1"), json!("2.0")]);
         let alone = json!({"payload": {"partId": "", "mimeType": "text/csv", "filename": "a.csv", "body": {"attachmentId": "x"}}});
-        assert_eq!(attachments(&alone)[0]["part"], "root");
+        assert_eq!(attachments(&alone, &none())[0]["part"], "root");
         // one that doesn't say can't pass for another: it opens nothing
         let silent = json!({"payload": {"mimeType": "text/csv", "filename": "a.csv"}});
-        assert_eq!(attachments(&silent)[0]["part"], Value::Null);
+        assert_eq!(attachments(&silent, &none())[0]["part"], Value::Null);
+    }
+
+    fn none() -> HashSet<String> {
+        HashSet::new()
     }
 
     fn names(message: &Value) -> Vec<(String, String)> {
-        attachments(message)
+        shown_names(message, &none())
+    }
+
+    fn shown_names(message: &Value, shown: &HashSet<String>) -> Vec<(String, String)> {
+        attachments(message, shown)
             .iter()
             .map(|a| {
                 (
@@ -1409,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn a_picture_the_letter_shows_by_content_id_is_not_a_file_but_is_carried() {
+    fn a_picture_the_view_put_in_is_not_a_file_but_is_carried() {
         let shown = |disposition: Option<&str>| {
             let mut headers = vec![json!({"name": "Content-ID", "value": "<logo>"})];
             if let Some(d) = disposition {
@@ -1420,45 +1487,61 @@ mod tests {
                 {"partId": "1", "mimeType": "image/png", "filename": "logo.png", "headers": headers, "body": {"attachmentId": "x", "size": 90}},
             ]}})
         };
+        let logo = HashSet::from(["logo".to_owned()]);
         for disposition in [Some("inline; filename=\"logo.png\""), None] {
             let mail = shown(disposition);
-            assert!(attachments(&mail).is_empty(), "{disposition:?}");
+            assert!(attachments(&mail, &logo).is_empty(), "{disposition:?}");
             // a draft or a forward carries it on
             let carried: Vec<Value> = carried(&mail).iter().map(|a| a["part"].clone()).collect();
             assert_eq!(carried, [json!("1")], "{disposition:?}");
+            // named in the letter but not put in, it stays a card
+            assert_eq!(names(&mail), [pair("logo.png", "1")], "{disposition:?}");
         }
-        // sent as a file, it stays one
+    }
+
+    #[test]
+    fn a_picture_sent_as_a_file_stays_one_and_is_not_put_in_the_letter() {
+        let mail = json!({"payload": {"partId": "", "mimeType": "multipart/related", "parts": [
+            {"partId": "0", "mimeType": "text/html", "body": {"data": b64("<img src=cid:logo>")}},
+            {"partId": "1", "mimeType": "image/png", "filename": "logo.png", "headers": [{"name": "Content-ID", "value": "<logo>"}, {"name": "Content-Disposition", "value": "Attachment; filename=\"logo.png\""}], "body": {"attachmentId": "x", "size": 90}},
+        ]}});
+        assert!(by_content_id(&mail).is_empty(), "nothing to put in");
+        let logo = HashSet::from(["logo".to_owned()]);
+        assert_eq!(shown_names(&mail, &logo), [pair("logo.png", "1")]);
+    }
+
+    #[test]
+    fn only_the_part_put_in_leaves_the_cards() {
+        let mail = json!({"payload": {"partId": "", "mimeType": "multipart/related", "parts": [
+            {"partId": "0", "mimeType": "text/html", "body": {"data": b64("<img src=\"CID:%3CR1%3E\">")}},
+            {"partId": "1", "mimeType": "image/png", "filename": "a.png", "headers": [{"name": "Content-ID", "value": "<r1>"}], "body": {"attachmentId": "x", "size": 90}},
+            {"partId": "2", "mimeType": "image/png", "filename": "b.png", "headers": [{"name": "Content-ID", "value": "<R1>"}], "body": {"attachmentId": "y", "size": 90}},
+            {"partId": "3", "mimeType": "image/png", "filename": "c.png", "headers": [{"name": "Content-ID", "value": "<r10>"}], "body": {"attachmentId": "z", "size": 90}},
+        ]}});
+        let shown: HashSet<String> = cid_of("CID:%3CR1%3E").into_iter().collect();
+        // the second with the same id was never put in, nor one with a longer id
         assert_eq!(
-            names(&shown(Some("attachment; filename=\"logo.png\""))),
-            [pair("logo.png", "1")]
+            shown_names(&mail, &shown),
+            [pair("b.png", "2"), pair("c.png", "3")]
         );
     }
 
     #[test]
-    fn a_part_with_a_content_id_is_a_file_unless_the_letter_shows_it() {
-        let mail = |html: &str, mime: &str| {
-            json!({"payload": {"partId": "", "mimeType": "multipart/related", "parts": [
-                {"partId": "0", "mimeType": "text/html", "body": {"data": b64(html)}},
-                {"partId": "1", "mimeType": mime, "filename": "receipt.pdf", "headers": [{"name": "Content-ID", "value": "<r1>"}, {"name": "Content-Disposition", "value": "inline"}], "body": {"attachmentId": "x", "size": 90}},
-            ]}})
-        };
-        // a PDF the letter can't show, even named there
+    fn a_content_id_is_one_key_from_its_header_or_a_cid_url() {
+        assert_eq!(cid_of("cid:logo@digest").as_deref(), Some("logo@digest"));
         assert_eq!(
-            names(&mail("<a href=\"cid:r1\">", "application/pdf")),
-            [pair("receipt.pdf", "1")]
+            cid_of("CID:%3CLogo%40digest%3E").as_deref(),
+            Some("logo@digest")
         );
-        // a picture the letter never shows
+        assert_eq!(cid_key(" <Logo@Digest> ").as_deref(), Some("logo@digest"));
+        assert_eq!(cid_of("cid:"), None);
+        assert_eq!(cid_of("cid:%3C%3E"), None);
+        assert_eq!(cid_of("https://a.example/cid:x"), None);
         assert_eq!(
-            names(&mail("<p>Hi</p>", "image/png")),
-            [pair("receipt.pdf", "1")]
+            cid_of("cid:100%"),
+            Some("100%".to_owned()),
+            "a lone % stays"
         );
-        // nor one it shows by another, longer id
-        assert_eq!(
-            names(&mail("<img src=\"cid:r10\">", "image/png")),
-            [pair("receipt.pdf", "1")]
-        );
-        // shown, in any case, it is the letter's
-        assert!(attachments(&mail("<IMG SRC=\"CID:R1\">", "image/png")).is_empty());
     }
 
     #[test]

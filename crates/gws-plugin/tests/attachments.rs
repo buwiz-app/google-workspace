@@ -252,8 +252,8 @@ fn a_picture_past_the_limit_is_never_fetched_for_a_preview() {
 fn a_preview_takes_only_a_part_the_mail_lists() {
     let google = rich();
     let home = Home::new(&google.base(), "unlisted");
-    // the newsletter's logo is there, but it's the letter's, not a file
-    let answer = home.preview(NEWS, &json!("1"));
+    // a part the mail doesn't have
+    let answer = home.preview(NEWS, &json!("7"));
     assert_eq!(answer["refused"], "not_found", "{answer}");
     let answer = home.preview(PHOTOS, &json!("../1"));
     assert_eq!(answer["refused"], "invalid_args", "{answer}");
@@ -280,6 +280,17 @@ fn a_view_saved_before_this_listing_is_made_again() {
     let files = home.files(INVITE);
     assert_eq!(names(&files), ["invite.ics"], "{files:?}");
     // and the one made now is kept as it is
+    assert_eq!(home.files(INVITE), files);
+    // a view of the last shape, which hid a picture it never showed, too
+    let mut last = old.clone();
+    last["view_version"] = json!(2);
+    {
+        let held = home.core.store().unwrap();
+        let store = held.as_ref().unwrap();
+        store
+            .put_view(&account, INVITE, &last.to_string(), 1_800_000_000_000)
+            .unwrap();
+    }
     assert_eq!(home.files(INVITE), files);
 }
 
@@ -325,11 +336,16 @@ fn out_of_time_the_twin_check_leaves_both_cards() {
     let auth = home.core.accounts.google().unwrap();
     let invite_of = |thread: &Value| thread["messages"][0].clone();
     let mut thread = home.core.gmail.thread_full(&auth, INVITE).unwrap().unwrap();
-    home.core
+    let told = home
+        .core
         .gmail
         .mark_twins_by(&auth, &mut thread, std::time::Instant::now());
+    assert!(!told, "out of time, it can't say");
     assert_eq!(
-        names(&gws::gmail::attachments(&invite_of(&thread))),
+        names(&gws::gmail::attachments(
+            &invite_of(&thread),
+            &Default::default()
+        )),
         ["invite.ics", "invite.ics"]
     );
     assert_eq!(
@@ -338,9 +354,114 @@ fn out_of_time_the_twin_check_leaves_both_cards() {
         "nothing was asked once the time was up"
     );
     let mut thread = home.core.gmail.thread_full(&auth, INVITE).unwrap().unwrap();
-    home.core.gmail.mark_twins(&auth, &mut thread);
+    assert!(home.core.gmail.mark_twins(&auth, &mut thread));
     assert_eq!(
-        names(&gws::gmail::attachments(&invite_of(&thread))),
+        names(&gws::gmail::attachments(
+            &invite_of(&thread),
+            &Default::default()
+        )),
         ["invite.ics"]
     );
+}
+
+#[test]
+fn a_twin_check_cut_short_is_not_kept() {
+    let google = rich();
+    let home = Home::new(&google.base(), "cutshort");
+    let auth = home.core.accounts.google().unwrap();
+    let thread = home.core.gmail.thread_full(&auth, INVITE).unwrap().unwrap();
+    let mut ids = Vec::new();
+    fn walk(part: &Value, ids: &mut Vec<String>) {
+        if part["mimeType"] == "application/ics" {
+            ids.extend(part["body"]["attachmentId"].as_str().map(str::to_owned));
+        }
+        for p in part["parts"].as_array().into_iter().flatten() {
+            walk(p, ids);
+        }
+    }
+    walk(&thread["messages"][0]["payload"], &mut ids);
+    google.hold("GET", &format!("/attachments/{}", ids[0]));
+    assert_eq!(
+        names(&home.files(INVITE)),
+        ["invite.ics", "invite.ics"],
+        "out of time, both stay"
+    );
+    google.release();
+    assert_eq!(
+        names(&home.files(INVITE)),
+        ["invite.ics"],
+        "and next time it says"
+    );
+}
+
+/// A JPEG's start, then `n` bytes in all.
+fn jpeg_of(n: usize) -> Vec<u8> {
+    let mut b = vec![0xff, 0xd8, 0xff, 0xe0];
+    b.resize(n, 7);
+    b
+}
+
+/// A mail whose letter is `html` with these pictures by Content-ID.
+fn letter_with(html: &str, inline: Vec<(&str, &str, &str, Vec<u8>)>) -> Mail {
+    let mut m = mail_with(Vec::new());
+    m.html = Some(html.to_owned());
+    m.inline = inline
+        .into_iter()
+        .map(|(c, n, t, b)| (c.to_owned(), n.to_owned(), t.to_owned(), b))
+        .collect();
+    m
+}
+
+#[test]
+fn a_picture_too_big_to_put_in_the_letter_keeps_its_card() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(letter_with(
+        "<p><img src=\"cid:big\"><img src=\"cid:dot\"></p>",
+        vec![
+            ("big", "big.jpg", "image/jpeg", jpeg_of(3 * 1024 * 1024)),
+            ("dot", "dot.png", "image/png", png_saying(1, 1)),
+        ],
+    ));
+    let home = Home::new(&google.base(), "bigjpeg");
+    let answer = home
+        .core
+        .run("gws_mail_thread", &json!({"thread": "18f1aa"}));
+    let view = &answer["structuredContent"];
+    let page = view["page"].as_str().unwrap();
+    assert!(page.contains("data:image/png"), "the small one shows");
+    assert!(!page.contains("data:image/jpeg"), "the big one can't");
+    assert_eq!(names(view["attachments"].as_array().unwrap()), ["big.jpg"]);
+}
+
+#[test]
+fn a_picture_the_letter_only_links_to_or_names_keeps_its_card() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(letter_with(
+        "<p><a href=\"cid:plan\">the plan</a>, and cid:roof as words</p>",
+        vec![
+            ("plan", "plan.png", "image/png", png_saying(1, 1)),
+            ("roof", "roof.png", "image/png", png_saying(1, 1)),
+        ],
+    ));
+    let home = Home::new(&google.base(), "linked");
+    assert_eq!(names(&home.files("18f1aa")), ["plan.png", "roof.png"]);
+}
+
+#[test]
+fn a_picture_named_in_another_case_or_escaped_shows_and_is_no_card() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(letter_with(
+        "<p><img src=\"cid:Dot%40Mail\"></p>",
+        vec![("dot@mail", "dot.png", "image/png", png_saying(1, 1))],
+    ));
+    let home = Home::new(&google.base(), "cidcase");
+    let answer = home
+        .core
+        .run("gws_mail_thread", &json!({"thread": "18f1aa"}));
+    let view = &answer["structuredContent"];
+    assert!(
+        view["page"].as_str().unwrap().contains("data:image/png"),
+        "{view}"
+    );
+    assert_eq!(view["attachments"], json!([]));
 }

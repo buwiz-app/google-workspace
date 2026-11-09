@@ -230,9 +230,20 @@ fn a_google_file_is_exported_as_its_office_kind() {
 fn a_hostile_name_never_gets_out_of_its_folder() {
     let google = FakeGoogle::start(Seed::default());
     let long = format!("{}.docx", "n".repeat(5000));
+    // A name that climbs to the root from wherever this test's folder is,
+    // then down to a marker beside it: a fixed `../` count and a shared path
+    // like /tmp would prove nothing on a deeper temp folder.
+    let canary =
+        std::env::temp_dir().join(format!("gws-files-hostile-{}-escaped", std::process::id()));
+    let _ = fs::remove_file(&canary);
+    let escape = format!(
+        "{}{}",
+        "../".repeat(canary.components().count() + 8),
+        canary.strip_prefix("/").unwrap().display()
+    );
     let names = [
         "../../x",
-        "../../../../../../tmp/gws-escaped",
+        escape.as_str(),
         "/etc/passwd",
         "/",
         "..",
@@ -249,6 +260,11 @@ fn a_hostile_name_never_gets_out_of_its_folder() {
         google.seed_file(FakeFile::new(&format!("drv-h{n}"), name, DOCX).holding(b"PK"));
     }
     let home = Home::new(&google.base(), "hostile");
+    // The name does reach the marker from the open folder, written plainly.
+    fs::create_dir_all(home.open_dir()).unwrap();
+    fs::write(home.open_dir().join(&escape), "").unwrap();
+    assert!(canary.exists(), "{escape:?} misses the marker");
+    fs::remove_file(&canary).unwrap();
     // a push no longer opens the store, and what's to compare is what's in it
     drop(home.core.store().unwrap());
     let before: Vec<PathBuf> = every_path(&home.dir)
@@ -277,7 +293,7 @@ fn a_hostile_name_never_gets_out_of_its_folder() {
         .filter(|p| !p.starts_with(home.open_dir()))
         .collect();
     assert_eq!(after, before, "nothing landed anywhere else");
-    assert!(!Path::new("/tmp/gws-escaped").exists());
+    assert!(!canary.exists(), "{escape:?} got out");
 }
 
 #[test]

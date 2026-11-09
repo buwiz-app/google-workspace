@@ -76,7 +76,10 @@ pub fn kick(core: &Arc<Core>) {
         loop {
             let done = Done(&running.busy);
             while running.again.swap(false, Ordering::AcqRel) {
-                let _ = run(&core);
+                match run(&core) {
+                    Ok(()) | Err(Failure::AccountRequired) => {}
+                    Err(e) => eprintln!("buwiz-gws: mail ahead stopped for now: {e:?}"),
+                }
             }
             drop(done);
             // one asked for after the last look, and before busy went
@@ -87,9 +90,10 @@ pub fn kick(core: &Arc<Core>) {
     });
 }
 
-/// One round: the views due, then the attachments of what's kept. It stops at
-/// the first failure, a busy answer from Google among them, and then no round
-/// starts until the wait after it is over.
+/// One round: the views due, then the attachments of what's kept. A thread or
+/// file Gmail refuses is counted and passed over; the round stops at a failure
+/// with no answer about it (no connection, a busy answer, a sign-in gone), and
+/// then no round starts until the wait after it is over.
 pub fn run(core: &Core) -> Result<(), Failure> {
     let now = core.clock.now_ms();
     let running = &core.prefetch;
@@ -212,6 +216,15 @@ fn bodies(
                 pass(core)?;
                 continue;
             }
+            // refused by Gmail's answer, as one failing for good would be
+            // each round, holding up everything older: counted as a miss, and
+            // after a few left to its open. A round goes on to older mail.
+            Viewed::Failed(_) => {
+                with_own_store(core, account, |store| {
+                    store.missed_thread(account, &id, row_read)
+                })?;
+                continue;
+            }
         };
         // a thread that alone passes a round's share would come again each
         // round and never be kept, and nothing older after it: an open
@@ -250,8 +263,9 @@ fn bodies(
     Ok(())
 }
 
-/// What a kept view lists that could be kept ahead: `(message, part)`.
-fn wanted(core: &Core, account: &str, view: &str) -> Result<Vec<(String, String)>, Failure> {
+/// What a kept view lists that could be kept ahead: `(message, part, size)`,
+/// the size as the view says it, -1 for none.
+fn wanted(core: &Core, account: &str, view: &str) -> Result<Vec<(String, String, i64)>, Failure> {
     let view: Value = serde_json::from_str(view).unwrap_or_default();
     let listed = view.get("attachments").and_then(Value::as_array);
     let mut out = Vec::new();
@@ -266,7 +280,7 @@ fn wanted(core: &Core, account: &str, view: &str) -> Result<Vec<(String, String)
             && opens(core, text("mime"), text("name"))
             && !with_store(core, |store| store.has_attachment(account, message, part))?
         {
-            out.push((message.to_owned(), part.to_owned()));
+            out.push((message.to_owned(), part.to_owned(), size));
         }
     }
     Ok(out)
@@ -291,19 +305,27 @@ fn attachments(
     let due = with_store(core, |store| {
         store.views_unfetched_since(account, since, BATCH)
     })?;
-    for (thread, at, view) in due {
+    'threads: for (thread, at, view) in due {
         let wanted = wanted(core, account, &view)?;
         if wanted.is_empty() {
             with_own_store(core, account, |store| store.mark_fetched(account, &thread))?;
             continue;
         }
         if *spent >= max {
-            return Ok(());
+            break;
+        }
+        // full of newer mail's, even for its smallest: nothing older is worth
+        // reading the thread for
+        let smallest = wanted.iter().map(|w| w.2.max(0)).min().unwrap_or(0);
+        if !with_store(core, |store| store.attachment_room(account, at, smallest))? {
+            break;
         }
         let auth = still(core, account)?;
         let full = match core.gmail.thread_whole(&auth, &thread, limit)? {
             Whole::Read(full) => full,
-            Whole::Gone => {
+            // gone, or refused by Gmail's answer: tried again after the others,
+            // and after a few rounds left to the press
+            Whole::Gone | Whole::Failed(_) => {
                 with_own_store(core, account, |store| store.tried(account, &thread))?;
                 continue;
             }
@@ -323,11 +345,13 @@ fn attachments(
         let inline = inline_parts(&full);
         let messages = full.get("messages").and_then(Value::as_array);
         let mut whole = true;
-        for (message, part) in wanted {
-            let found = messages
+        for (message, part, _) in wanted {
+            let mail = messages
                 .into_iter()
                 .flatten()
-                .filter(|m| m.get("id").and_then(Value::as_str) == Some(&message))
+                .find(|m| m.get("id").and_then(Value::as_str) == Some(&message));
+            let found = mail
+                .into_iter()
                 // any card a view may show, so none of its pictures is left out
                 .flat_map(|m| gmail::attachments(m, &HashSet::new()))
                 .find(|a| a.get("part").and_then(Value::as_str) == Some(&part));
@@ -344,37 +368,56 @@ fn attachments(
             if size >= ATTACHMENT_MAX || !opens(core, mime, name) {
                 continue;
             }
-            // Google said too little to fetch it by: another read may say more
-            if !id_ok(id) || size < 0 {
-                whole = false;
-                continue;
-            }
-            if *spent + encoded(size) > max {
-                return Ok(());
-            }
-            // full of newer mail's: nothing older is worth asking for
-            if !with_store(core, |store| store.attachment_room(account, at, size))? {
-                return Ok(());
-            }
-            let auth = still(core, account)?;
-            let bytes = match core
-                .gmail
-                .attachment_whole(&auth, &message, id, limit.file_time)?
-            {
-                File::Bytes(bytes) => bytes,
-                File::Gone => {
-                    whole = false;
-                    continue;
+            // a small file can come in its own part, as the open reads it: it
+            // came with the thread
+            let in_part = id
+                .is_empty()
+                .then(|| mail.and_then(|m| gmail::part_bytes(m, &part)))
+                .flatten();
+            let bytes = match in_part {
+                Some(bytes) => {
+                    if !with_store(core, |store| {
+                        store.attachment_room(account, at, bytes.len() as i64)
+                    })? {
+                        break 'threads;
+                    }
+                    bytes
                 }
-                // begun, and too much for this link: left to the press, and
-                // not tried again until the thread changes
-                File::TooBig(_) => {
-                    *spent += encoded(size);
-                    continue;
+                None => {
+                    // Google said too little to fetch it by: another read may
+                    // say more
+                    if !id_ok(id) || size < 0 {
+                        whole = false;
+                        continue;
+                    }
+                    if *spent + encoded(size) > max {
+                        break 'threads;
+                    }
+                    // full of newer mail's: nothing older is worth asking for
+                    if !with_store(core, |store| store.attachment_room(account, at, size))? {
+                        break 'threads;
+                    }
+                    let auth = still(core, account)?;
+                    let bytes = match core.gmail.attachment_whole(&auth, &message, id, limit)? {
+                        File::Bytes(bytes) => bytes,
+                        // gone, or refused: tried again in a later round, and
+                        // after a few left to the press
+                        File::Gone | File::Failed(_) => {
+                            whole = false;
+                            continue;
+                        }
+                        // begun, and too much for this link: left to the press,
+                        // and not tried again until the thread changes
+                        File::TooBig(_) => {
+                            *spent += encoded(size);
+                            continue;
+                        }
+                        File::TooSlow(_) => continue,
+                    };
+                    *spent += encoded(bytes.len() as i64);
+                    bytes
                 }
-                File::TooSlow(_) => continue,
             };
-            *spent += encoded(bytes.len() as i64);
             // the size was Google's word; what counts is what came
             if bytes.len() as i64 >= ATTACHMENT_MAX {
                 continue;
@@ -392,7 +435,7 @@ fn attachments(
                 store.put_attachment(account, &saved, now_ms())
             })?;
             if !kept {
-                return Ok(());
+                break 'threads;
             }
         }
         with_own_store(core, account, |store| {
@@ -804,6 +847,90 @@ mod tests {
         });
         let due = with_store(&core, |s| s.unviewed_since(FAKE_EMAIL, 0, 10)).unwrap();
         assert_eq!(due, [id(1)], "passed as it was, not as the sync left it");
+    }
+
+    #[test]
+    fn a_thread_gmail_keeps_refusing_is_left_to_its_open_and_older_mail_comes() {
+        let google = FakeGoogle::start(Seed {
+            mails: vec![mail(1, 1), mail(2, 2)],
+            ..Seed::default()
+        });
+        let core = synced(&google, "refused");
+        google.refuse(Some((&format!("/threads/{}", id(1)), 500)));
+        for round in 1..=3 {
+            round_within(&core, NOW, ROUND_MAX, Limit::FULL).expect("Gmail answered");
+            assert_eq!(reads_of(&google, 1), round, "asked again in round {round}");
+        }
+        assert!(has_view(&core, 2), "older mail isn't held up by it");
+        round_within(&core, NOW, ROUND_MAX, Limit::FULL).unwrap();
+        assert_eq!(reads_of(&google, 1), 3, "left to its open");
+        assert!(!has_view(&core, 1));
+    }
+
+    #[test]
+    fn an_attachments_read_gmail_refuses_lets_older_files_come() {
+        let google = FakeGoogle::start(Seed {
+            mails: vec![with_file(1, 1, 1024), with_file(2, 2, 1024)],
+            ..Seed::default()
+        });
+        let core = synced(&google, "refused-files");
+        let opened = core.run(crate::tools::MAIL_THREAD, &json!({"thread": id(1)}));
+        assert_ne!(opened["isError"], true, "{opened}");
+        google.refuse(Some((&format!("/threads/{}", id(1)), 503)));
+        round_within(&core, NOW, ROUND_MAX, Limit::FULL).expect("Gmail answered");
+        assert!(!has_file(&core, 1));
+        assert!(
+            has_file(&core, 2),
+            "older mail's files aren't held up by it"
+        );
+    }
+
+    #[test]
+    fn a_file_gmail_keeps_refusing_lets_older_files_come() {
+        let google = FakeGoogle::start(Seed {
+            mails: vec![with_file(1, 1, 1024), with_file(2, 2, 1024)],
+            ..Seed::default()
+        });
+        let core = synced(&google, "refused-file");
+        google.refuse(Some((&format!("/attachments/att-{}-0-0", id(1)), 500)));
+        round_within(&core, NOW, ROUND_MAX, Limit::FULL).expect("Gmail answered");
+        assert!(!has_file(&core, 1));
+        assert!(
+            has_file(&core, 2),
+            "older mail's files aren't held up by it"
+        );
+    }
+
+    #[test]
+    fn a_file_too_big_for_its_download_is_left_to_the_press() {
+        let mut big = with_file(1, 1, 1024);
+        big.attachments[0].2 = b"%PDF big".repeat(8 * 1024);
+        let google = FakeGoogle::start(Seed {
+            mails: vec![big, with_file(2, 2, 1024)],
+            ..Seed::default()
+        });
+        let core = synced(&google, "big-file");
+        let small_files = Limit {
+            file_bytes: 16 * 1024,
+            ..Limit::FULL
+        };
+        round_within(&core, NOW, ROUND_MAX, small_files).expect("no failure to back off from");
+        assert!(!has_file(&core, 1));
+        assert!(
+            has_file(&core, 2),
+            "older mail's files aren't held up by it"
+        );
+        let path = format!("/attachments/att-{}-0-0", id(1));
+        let asked = || {
+            google
+                .log()
+                .iter()
+                .filter(|s| s.target.ends_with(&path))
+                .count()
+        };
+        assert_eq!(asked(), 1);
+        round_within(&core, NOW, ROUND_MAX, small_files).unwrap();
+        assert_eq!(asked(), 1, "left to the press, not asked for each round");
     }
 
     #[test]

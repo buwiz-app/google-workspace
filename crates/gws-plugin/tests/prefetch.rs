@@ -206,14 +206,14 @@ fn a_round_stops_at_a_busy_answer_and_the_next_goes_on() {
 }
 
 #[test]
-fn a_round_stops_at_a_failure_too() {
+fn threads_gmail_refuses_are_passed_over_and_come_once_it_answers() {
     let google = seeded((1..=3).map(|n| mail(n, n as i64)).collect());
     let core = synced(&google, "fails");
     google.thread_reads_fail_after(0, 500);
-    assert!(gws::prefetch::run(&core).is_err());
-    assert_eq!(thread_reads(&google).len(), 1);
+    gws::prefetch::run(&core).expect("Gmail answered: no wait to back off");
+    assert_eq!(thread_reads(&google).len(), 3, "each asked, none held up");
+    assert!((1..=3).all(|n| !has_view(&core, &id(n))));
     google.thread_reads_work();
-    later(&core, gws::prefetch::BACKOFF_MIN_MS);
     gws::prefetch::run(&core).unwrap();
     assert!((1..=3).all(|n| has_view(&core, &id(n))));
 }
@@ -804,7 +804,8 @@ fn a_wake_during_a_round_brings_one_more_after_it() {
 fn a_sign_out_ends_the_wait_after_a_failure() {
     let google = seeded(vec![mail(1, 2)]);
     let core = synced(&google, "wait-out");
-    google.thread_reads_fail_after(0, 500);
+    // Gmail busy: a failure the round backs off from
+    google.thread_reads_fail_after(0, 429);
     assert!(gws::prefetch::run(&core).is_err());
     google.thread_reads_work();
     core.account(
@@ -823,7 +824,8 @@ fn a_sign_out_ends_the_wait_after_a_failure() {
 fn another_account_has_no_wait_from_the_last_ones_failure() {
     let google = seeded(vec![mail(1, 2)]);
     let core = synced(&google, "wait-switch");
-    google.thread_reads_fail_after(0, 500);
+    // Gmail busy: a failure the round backs off from
+    google.thread_reads_fail_after(0, 429);
     assert!(gws::prefetch::run(&core).is_err());
     google.thread_reads_work();
     let mut other = sign_in(4_000_000_000);
@@ -1008,4 +1010,58 @@ fn a_picture_that_never_comes_leaves_its_thread_to_the_open_after_three_rounds()
         !has_view(&core, &id(1)),
         "nothing kept short of its picture"
     );
+}
+
+#[test]
+fn with_the_budget_full_no_thread_is_read_for_its_attachments() {
+    let google = seeded(vec![with_file(
+        1,
+        3,
+        "old.docx",
+        b"PK\x03\x04 old".to_vec(),
+    )]);
+    let core = synced(&google, "room-first");
+    {
+        let held = core.store().unwrap();
+        held.as_ref()
+            .unwrap()
+            .conn()
+            .execute_batch(&format!(
+                "INSERT INTO attachment_bytes(account, message, part, thread, at, name, mime, size, used, bytes) VALUES('{FAKE_EMAIL}', 'newer', '1', 'newer', {NOW}, 'n.docx', 'x', {}, 1, x'00')",
+                gws_store::prefetch::ATTACHMENTS_MAX
+            ))
+            .unwrap();
+    }
+    gws::prefetch::run(&core).unwrap();
+    assert!(has_view(&core, &id(1)));
+    assert_eq!(
+        thread_reads(&google).len(),
+        1,
+        "the view's read, and no other"
+    );
+    gws::prefetch::run(&core).unwrap();
+    assert_eq!(thread_reads(&google).len(), 1, "nor in the next round");
+}
+
+#[test]
+fn a_small_file_in_its_part_is_kept_from_the_thread() {
+    let google = seeded(vec![with_file(
+        1,
+        2,
+        "receipt.docx",
+        b"PK\x03\x04 small".to_vec(),
+    )]);
+    google.small_files_in_parts(1024);
+    let core = synced(&google, "in-part");
+    gws::prefetch::run(&core).unwrap();
+    assert!(has_file(&core, &id(1), "1"), "kept as the open reads it");
+    assert!(fetched(&core, &id(1)), "done with it");
+    assert_eq!(attachment_reads(&google), 0);
+    assert_eq!(
+        thread_reads(&google).len(),
+        2,
+        "the view's read and one more"
+    );
+    gws::prefetch::run(&core).unwrap();
+    assert_eq!(thread_reads(&google).len(), 2, "not read again");
 }

@@ -1266,6 +1266,8 @@ pub(crate) enum Viewed {
     TooBig(Failure),
     /// Begun, and outlasting the read's time.
     TooSlow(Failure),
+    /// Refused by Gmail's answer, as [`Whole::Failed`].
+    Failed(Failure),
     /// What Google sent, the page made of it, and what its pictures and its
     /// invite's twin check came to: a view kept is only a whole one.
     Read {
@@ -1296,9 +1298,11 @@ pub(crate) fn read_view(
         Whole::Gone => return Ok(Viewed::Gone),
         Whole::TooBig(why) => return Ok(Viewed::TooBig(why)),
         Whole::TooSlow(why) => return Ok(Viewed::TooSlow(why)),
+        Whole::Failed(why) => return Ok(Viewed::Failed(why)),
     };
-    gate(full.to_string().len() as u64);
-    let told = core.gmail.mark_twins(auth, &mut full);
+    // past the round's share or after a sign-out, the twin check asks nothing
+    let go_on = gate(full.to_string().len() as u64);
+    let told = go_on && core.gmail.mark_twins(auth, &mut full);
     // a picture comes as base64 inside JSON
     let mut asks = |size: u64| gate(size.saturating_mul(4).div_ceil(3));
     let (mut view, made) = pictures::view_within(core, auth, account, &mut full, &mut asks);
@@ -1335,7 +1339,7 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (view, made) = match read_view(core, &auth, &account, &id, Limit::FULL, &mut |_| true)? {
         Viewed::Read { view, made, .. } => (view, made),
         Viewed::Gone => return Ok(fail("not_found", "That conversation is gone.")),
-        Viewed::TooBig(why) | Viewed::TooSlow(why) => return Err(why),
+        Viewed::TooBig(why) | Viewed::TooSlow(why) | Viewed::Failed(why) => return Err(why),
     };
     // a twin check or a picture cut short isn't kept, so the next open can
     // finish it

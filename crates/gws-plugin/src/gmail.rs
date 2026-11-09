@@ -61,14 +61,19 @@ pub enum Whole {
     /// Begun, and longer coming than the read may take: on this link the
     /// next read of it takes as long.
     TooSlow(Failure),
+    /// Gmail answered, and refused this one: an error status, or a 200 that
+    /// isn't JSON. Not a 401, a missing scope or a busy answer, which are the
+    /// account's or Gmail's and not the thread's.
+    Failed(Failure),
 }
 
-/// What one whole read may take: its bytes and its time, and the time of a
-/// file's download.
+/// What one whole read may take: its bytes and its time, and a file
+/// download's.
 #[derive(Debug, Clone, Copy)]
 pub struct Limit {
     pub bytes: u64,
     pub time: Duration,
+    pub file_bytes: u64,
     pub file_time: Duration,
 }
 
@@ -77,6 +82,7 @@ impl Limit {
     pub const FULL: Self = Self {
         bytes: FULL_MAX,
         time: TIMEOUT,
+        file_bytes: ATTACHMENT_MAX,
         file_time: UPLOAD_TIMEOUT,
     };
 }
@@ -91,20 +97,23 @@ pub enum File {
     /// comes to the same.
     TooBig(Failure),
     TooSlow(Failure),
+    /// Gmail answered, and refused this one, as [`Whole::Failed`].
+    Failed(Failure),
 }
 
 /// Why an answer gave nothing: past its cap, out of time once it had begun,
-/// or anything else.
+/// refused by an answer of Gmail's about this one, or anything else.
 enum Refused {
     TooBig(Failure),
     TooSlow(Failure),
+    Failed(Failure),
     Other(Failure),
 }
 
 impl From<Refused> for Failure {
     fn from(refused: Refused) -> Self {
         match refused {
-            Refused::TooBig(f) | Refused::TooSlow(f) | Refused::Other(f) => f,
+            Refused::TooBig(f) | Refused::TooSlow(f) | Refused::Failed(f) | Refused::Other(f) => f,
         }
     }
 }
@@ -299,7 +308,13 @@ impl Gmail {
                     _ => Refused::Other(failure),
                 }
             })?;
-        Self::answered(status, &body).map_err(Refused::Other)
+        Self::answered(status, &body).map_err(|failure| match (&failure, status) {
+            // the account's, or Gmail asking for a wait: no one thread's
+            (Failure::AccountRequired | Failure::NeedsAccess, _) | (_, 429) => {
+                Refused::Other(failure)
+            }
+            _ => Refused::Failed(failure),
+        })
     }
 
     /// What Gmail's answer with `status` and `body` says.
@@ -558,6 +573,7 @@ impl Gmail {
             Ok(None) => Ok(Whole::Gone),
             Err(Refused::TooBig(f)) => Ok(Whole::TooBig(f)),
             Err(Refused::TooSlow(f)) => Ok(Whole::TooSlow(f)),
+            Err(Refused::Failed(f)) => Ok(Whole::Failed(f)),
             Err(Refused::Other(f)) => Err(f),
         }
     }
@@ -678,26 +694,28 @@ impl Gmail {
         id: &str,
         within: Duration,
     ) -> Result<Option<Vec<u8>>, Failure> {
-        match self.attachment_sized(auth, message, id, within) {
+        match self.attachment_sized(auth, message, id, within, ATTACHMENT_MAX) {
             Ok(bytes) => Ok(bytes),
             Err(refused) => Err(refused.into()),
         }
     }
 
-    /// [`Self::attachment_within`], saying apart a download that began and
-    /// was too big or too long coming.
+    /// [`Self::attachment_within`] within `limit`'s file bytes and time,
+    /// saying apart a download that began and was too big or too long coming,
+    /// and one Gmail refused.
     pub fn attachment_whole(
         &self,
         auth: &Bearer,
         message: &str,
         id: &str,
-        within: Duration,
+        limit: Limit,
     ) -> Result<File, Failure> {
-        match self.attachment_sized(auth, message, id, within) {
+        match self.attachment_sized(auth, message, id, limit.file_time, limit.file_bytes) {
             Ok(Some(bytes)) => Ok(File::Bytes(bytes)),
             Ok(None) => Ok(File::Gone),
             Err(Refused::TooBig(f)) => Ok(File::TooBig(f)),
             Err(Refused::TooSlow(f)) => Ok(File::TooSlow(f)),
+            Err(Refused::Failed(f)) => Ok(File::Failed(f)),
             Err(Refused::Other(f)) => Err(f),
         }
     }
@@ -708,6 +726,7 @@ impl Gmail {
         message: &str,
         id: &str,
         within: Duration,
+        cap: u64,
     ) -> Result<Option<Vec<u8>>, Refused> {
         let url = format!("{}/messages/{message}/attachments/{id}", self.base);
         let req = self
@@ -718,7 +737,7 @@ impl Gmail {
             .build()
             .header("authorization", auth.header())
             .header("accept", "application/json");
-        let Some(v) = Self::answer_sized(req.call(), ATTACHMENT_MAX)? else {
+        let Some(v) = Self::answer_sized(req.call(), cap)? else {
             return Ok(None);
         };
         let data = v.get("data").and_then(Value::as_str).unwrap_or_default();

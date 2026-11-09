@@ -630,6 +630,8 @@ struct Account {
     /// Answers to paths ending in this come a KiB at a time, this many
     /// milliseconds apart.
     trickle: Option<(String, u64)>,
+    /// Requests for paths ending in this get this status, every time.
+    refuse: Option<(String, u16)>,
     attachment_reads_fail: bool,
     /// Reads so far, once attachment ids change with each.
     reads: Option<AtomicU64>,
@@ -1638,7 +1640,25 @@ impl FakeGoogle {
                 .trickle
                 .clone()
                 .filter(|(end, _)| path.ends_with(end.as_str()));
-            let mut reply = account.handle(r);
+            let refused = account
+                .refuse
+                .clone()
+                .filter(|(end, _)| path.ends_with(end.as_str()));
+            let mut reply = match refused {
+                Some((_, status)) => {
+                    account.log.push(Seen {
+                        method: r.method.clone(),
+                        target: r.target.clone(),
+                        authorization: r.authorization.clone(),
+                        body: String::new(),
+                    });
+                    Reply::json(
+                        status,
+                        json!({"error": {"code": status, "message": "Backend error"}}),
+                    )
+                }
+                None => account.handle(r),
+            };
             if let Some((_, ms)) = slow {
                 reply.3.push((TRICKLE.to_owned(), ms.to_string()));
             }
@@ -1952,6 +1972,12 @@ impl FakeGoogle {
     /// over a slow link: their head at once, then their body. `None` ends it.
     pub fn trickle(&self, slow: Option<(&str, u64)>) {
         self.account.lock().unwrap().trickle = slow.map(|(end, ms)| (end.to_owned(), ms));
+    }
+
+    /// Requests for paths ending in `end` answer `status`, every time, as for
+    /// one thread or file Gmail keeps failing on. `None` ends it.
+    pub fn refuse(&self, failing: Option<(&str, u16)>) {
+        self.account.lock().unwrap().refuse = failing.map(|(end, status)| (end.to_owned(), status));
     }
 
     /// Whether whole reads leave out each part's attachment id.

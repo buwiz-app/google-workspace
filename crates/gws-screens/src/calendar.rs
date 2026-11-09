@@ -15,7 +15,7 @@ pub mod time;
 mod cards;
 mod detail;
 mod editor;
-mod event;
+pub(crate) mod event;
 mod grid;
 
 use std::future::Future;

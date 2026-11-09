@@ -48,6 +48,10 @@ pub enum Failure {
     Plain(String),
 }
 
+/// What an attachment whose bytes won't decode fails with: a try again
+/// brings the same.
+pub const DAMAGED: &str = "That attachment came back damaged.";
+
 /// The Gmail API at a base URL.
 #[derive(Clone)]
 pub struct Gmail {
@@ -580,7 +584,7 @@ impl Gmail {
         let data = v.get("data").and_then(Value::as_str).unwrap_or_default();
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(data.trim_end_matches('='))
-            .map_err(|_| Failure::Plain("That attachment came back damaged.".to_owned()))?;
+            .map_err(|_| Failure::Plain(DAMAGED.to_owned()))?;
         Ok(Some(bytes))
     }
 

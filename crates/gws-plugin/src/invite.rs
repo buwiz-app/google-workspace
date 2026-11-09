@@ -18,9 +18,9 @@ use serde_json::{Value, json};
 use crate::accounts::Bearer;
 use crate::calendar;
 use crate::gmail::{self, Failure, HEADER_MAX, cap_bytes};
-use crate::mail::{now_ms, signed_in, with_store};
+use crate::mail::{now_ms, signed_in, with_own_store, with_store};
 use crate::tools::{MAIL_INVITE, MAIL_INVITE_REPLY, fail, failed, ok};
-use crate::{Core, js};
+use crate::{Core, js, pictures};
 
 /// The most of an `.ics` read: Google's run to a few KiB.
 pub const ICS_MAX: usize = 256 * 1024;
@@ -36,6 +36,7 @@ const DAYS_MAX: i64 = 3660;
 
 const NOT_YET: &str = "Not in your Calendar yet.";
 const DIFFERS: &str = "This invite doesn't match your Calendar.";
+const UNVERIFIED: &str = "Gmail couldn't confirm this invite came from its organiser.";
 const CANCELLED: &str = "This event was cancelled.";
 
 /// What an invite asks.
@@ -305,41 +306,150 @@ fn wall_of(s: &str) -> Option<NaiveDateTime> {
     date_of(&s[..8])?.and_hms_opt(digits(s, 9..11)?, digits(s, 11..13)?, digits(s, 13..15)?)
 }
 
-/// Outlook names zones as Windows does. The common ones, by their IANA names.
+/// Outlook names zones as Windows does: CLDR's windowsZones table, each by
+/// the IANA zone it gives for the whole world ("001"), and the old names
+/// Windows has since renamed.
 fn windows_zone(name: &str) -> Option<&'static str> {
     Some(match name {
         "UTC" | "Coordinated Universal Time" => "UTC",
         "Dateline Standard Time" => "Etc/GMT+12",
+        "UTC-11" => "Etc/GMT+11",
+        "Aleutian Standard Time" => "America/Adak",
         "Hawaiian Standard Time" => "Pacific/Honolulu",
+        "Marquesas Standard Time" => "Pacific/Marquesas",
         "Alaskan Standard Time" => "America/Anchorage",
+        "UTC-09" => "Etc/GMT+9",
+        "Pacific Standard Time (Mexico)" => "America/Tijuana",
+        "UTC-08" => "Etc/GMT+8",
         "Pacific Standard Time" => "America/Los_Angeles",
         "US Mountain Standard Time" => "America/Phoenix",
+        "Mountain Standard Time (Mexico)" | "Mexico Standard Time 2" => "America/Mazatlan",
         "Mountain Standard Time" => "America/Denver",
+        "Yukon Standard Time" => "America/Whitehorse",
+        "Central America Standard Time" => "America/Guatemala",
         "Central Standard Time" => "America/Chicago",
+        "Easter Island Standard Time" => "Pacific/Easter",
+        "Central Standard Time (Mexico)" | "Mexico Standard Time" => "America/Mexico_City",
+        "Canada Central Standard Time" => "America/Regina",
+        "SA Pacific Standard Time" => "America/Bogota",
+        "Eastern Standard Time (Mexico)" => "America/Cancun",
         "Eastern Standard Time" => "America/New_York",
+        "Haiti Standard Time" => "America/Port-au-Prince",
+        "Cuba Standard Time" => "America/Havana",
+        "US Eastern Standard Time" => "America/Indiana/Indianapolis",
+        "Turks And Caicos Standard Time" => "America/Grand_Turk",
+        "Paraguay Standard Time" => "America/Asuncion",
         "Atlantic Standard Time" => "America/Halifax",
+        "Venezuela Standard Time" => "America/Caracas",
+        "Central Brazilian Standard Time" => "America/Cuiaba",
+        "SA Western Standard Time" => "America/La_Paz",
+        "Pacific SA Standard Time" => "America/Santiago",
+        "Newfoundland Standard Time" => "America/St_Johns",
+        "Tocantins Standard Time" => "America/Araguaina",
         "E. South America Standard Time" => "America/Sao_Paulo",
-        "Greenwich Standard Time" => "Atlantic/Reykjavik",
+        "SA Eastern Standard Time" => "America/Cayenne",
+        "Argentina Standard Time" => "America/Argentina/Buenos_Aires",
+        "Greenland Standard Time" => "America/Nuuk",
+        "Montevideo Standard Time" => "America/Montevideo",
+        "Magallanes Standard Time" => "America/Punta_Arenas",
+        "Saint Pierre Standard Time" => "America/Miquelon",
+        "Bahia Standard Time" => "America/Bahia",
+        "UTC-02" | "Mid-Atlantic Standard Time" => "Etc/GMT+2",
+        "Azores Standard Time" => "Atlantic/Azores",
+        "Cape Verde Standard Time" => "Atlantic/Cape_Verde",
         "GMT Standard Time" => "Europe/London",
+        "Greenwich Standard Time" => "Atlantic/Reykjavik",
+        "Sao Tome Standard Time" => "Africa/Sao_Tome",
+        "Morocco Standard Time" => "Africa/Casablanca",
         "W. Europe Standard Time" => "Europe/Berlin",
-        "Romance Standard Time" => "Europe/Paris",
         "Central Europe Standard Time" => "Europe/Budapest",
+        "Romance Standard Time" => "Europe/Paris",
         "Central European Standard Time" => "Europe/Warsaw",
-        "E. Europe Standard Time" => "Europe/Chisinau",
-        "FLE Standard Time" => "Europe/Kiev",
+        "W. Central Africa Standard Time" => "Africa/Lagos",
+        "Jordan Standard Time" => "Asia/Amman",
         "GTB Standard Time" => "Europe/Bucharest",
-        "Russian Standard Time" => "Europe/Moscow",
+        "Middle East Standard Time" => "Asia/Beirut",
+        "Egypt Standard Time" => "Africa/Cairo",
+        "E. Europe Standard Time" => "Europe/Chisinau",
+        "Syria Standard Time" => "Asia/Damascus",
+        "West Bank Standard Time" => "Asia/Hebron",
         "South Africa Standard Time" => "Africa/Johannesburg",
+        "FLE Standard Time" => "Europe/Kiev",
+        "Israel Standard Time" => "Asia/Jerusalem",
+        "South Sudan Standard Time" => "Africa/Juba",
+        "Kaliningrad Standard Time" => "Europe/Kaliningrad",
+        "Sudan Standard Time" => "Africa/Khartoum",
+        "Libya Standard Time" => "Africa/Tripoli",
+        "Namibia Standard Time" => "Africa/Windhoek",
+        "Arabic Standard Time" => "Asia/Baghdad",
+        "Turkey Standard Time" => "Europe/Istanbul",
+        "Arab Standard Time" => "Asia/Riyadh",
+        "Belarus Standard Time" => "Europe/Minsk",
+        "Russian Standard Time" => "Europe/Moscow",
+        "E. Africa Standard Time" => "Africa/Nairobi",
+        "Volgograd Standard Time" => "Europe/Volgograd",
+        "Iran Standard Time" => "Asia/Tehran",
         "Arabian Standard Time" => "Asia/Dubai",
+        "Astrakhan Standard Time" => "Europe/Astrakhan",
+        "Azerbaijan Standard Time" => "Asia/Baku",
+        "Russia Time Zone 3" => "Europe/Samara",
+        "Mauritius Standard Time" => "Indian/Mauritius",
+        "Saratov Standard Time" => "Europe/Saratov",
+        "Georgian Standard Time" => "Asia/Tbilisi",
+        "Caucasus Standard Time" | "Armenian Standard Time" => "Asia/Yerevan",
+        "Afghanistan Standard Time" => "Asia/Kabul",
+        "West Asia Standard Time" => "Asia/Tashkent",
+        "Ekaterinburg Standard Time" => "Asia/Yekaterinburg",
+        "Pakistan Standard Time" => "Asia/Karachi",
+        "Qyzylorda Standard Time" => "Asia/Qyzylorda",
         "India Standard Time" => "Asia/Kolkata",
+        "Sri Lanka Standard Time" => "Asia/Colombo",
+        "Nepal Standard Time" => "Asia/Kathmandu",
+        "Central Asia Standard Time" => "Asia/Bishkek",
+        "Bangladesh Standard Time" => "Asia/Dhaka",
+        "Omsk Standard Time" => "Asia/Omsk",
+        "Myanmar Standard Time" => "Asia/Yangon",
         "SE Asia Standard Time" => "Asia/Bangkok",
+        "Altai Standard Time" => "Asia/Barnaul",
+        "W. Mongolia Standard Time" => "Asia/Hovd",
+        "North Asia Standard Time" => "Asia/Krasnoyarsk",
+        "N. Central Asia Standard Time" => "Asia/Novosibirsk",
+        "Tomsk Standard Time" => "Asia/Tomsk",
         "China Standard Time" => "Asia/Shanghai",
+        "North Asia East Standard Time" => "Asia/Irkutsk",
         "Singapore Standard Time" => "Asia/Singapore",
+        "W. Australia Standard Time" => "Australia/Perth",
         "Taipei Standard Time" => "Asia/Taipei",
+        "Ulaanbaatar Standard Time" => "Asia/Ulaanbaatar",
+        "Aus Central W. Standard Time" => "Australia/Eucla",
+        "Transbaikal Standard Time" => "Asia/Chita",
         "Tokyo Standard Time" => "Asia/Tokyo",
+        "North Korea Standard Time" => "Asia/Pyongyang",
         "Korea Standard Time" => "Asia/Seoul",
+        "Yakutsk Standard Time" => "Asia/Yakutsk",
+        "Cen. Australia Standard Time" => "Australia/Adelaide",
+        "AUS Central Standard Time" => "Australia/Darwin",
+        "E. Australia Standard Time" => "Australia/Brisbane",
         "AUS Eastern Standard Time" => "Australia/Sydney",
+        "West Pacific Standard Time" => "Pacific/Port_Moresby",
+        "Tasmania Standard Time" => "Australia/Hobart",
+        "Vladivostok Standard Time" => "Asia/Vladivostok",
+        "Lord Howe Standard Time" => "Australia/Lord_Howe",
+        "Bougainville Standard Time" => "Pacific/Bougainville",
+        "Russia Time Zone 10" => "Asia/Srednekolymsk",
+        "Magadan Standard Time" => "Asia/Magadan",
+        "Norfolk Standard Time" => "Pacific/Norfolk",
+        "Sakhalin Standard Time" => "Asia/Sakhalin",
+        "Central Pacific Standard Time" => "Pacific/Guadalcanal",
+        "Russia Time Zone 11" | "Kamchatka Standard Time" => "Asia/Kamchatka",
         "New Zealand Standard Time" => "Pacific/Auckland",
+        "UTC+12" => "Etc/GMT-12",
+        "Fiji Standard Time" => "Pacific/Fiji",
+        "Chatham Islands Standard Time" => "Pacific/Chatham",
+        "UTC+13" => "Etc/GMT-13",
+        "Tonga Standard Time" => "Pacific/Tongatapu",
+        "Samoa Standard Time" => "Pacific/Apia",
+        "Line Islands Standard Time" => "Pacific/Kiritimati",
         _ => return None,
     })
 }
@@ -450,7 +560,8 @@ fn duration_of(v: &str) -> Option<TimeDelta> {
             return None;
         }
     }
-    (secs <= DAYS_MAX * 86_400).then(|| TimeDelta::seconds(secs))
+    // an event of no length is no meeting to answer
+    (secs > 0 && secs <= DAYS_MAX * 86_400).then(|| TimeDelta::seconds(secs))
 }
 
 /// A `mailto:` value's address, if it's a plain one, as Compose takes them.
@@ -677,25 +788,77 @@ fn text_of(part: &Value) -> Option<String> {
     Some(gmail::in_charset(bytes, &gmail::part_charset(part)))
 }
 
-/// The newest message in `messages` with an invite part.
-fn newest(messages: &[Value]) -> Option<usize> {
-    messages.iter().rposition(|m| !invite_parts(m).is_empty())
+/// Whether the mail comes from who sends the organiser's invites: Gmail's
+/// own Authentication-Results vouch for its From ([`pictures::vouched`]),
+/// and that From is the organiser's domain, or Google Calendar's own. The
+/// `.ics` is the sender's to write, UID and all, so only this says who sent it.
+fn sent_by_organizer(message: &Value, organizer: &str) -> bool {
+    let domain = |a: &str| a.rsplit_once('@').map(|(_, d)| d.to_ascii_lowercase());
+    let (Some(from), Some(theirs)) = (pictures::from_of(message), domain(organizer)) else {
+        return false;
+    };
+    let Some(from) = domain(&from) else {
+        return false;
+    };
+    pictures::vouched(message)
+        && (from == "google.com"
+            || pictures::aligned(&from, &theirs)
+            || pictures::aligned(&theirs, &from))
+}
+
+/// The thread view's `invite` for a message, `None` for a reply that says
+/// nothing.
+fn json_of(message: &Value, event: &Event) -> Option<Value> {
+    let mut v = event.json(&js::string_or_empty(message.get("id")))?;
+    v["sender_ok"] = json!(sent_by_organizer(message, &event.organizer.address));
+    Some(v)
+}
+
+/// What a message's invite parts came to.
+enum Found {
+    Reads(Value),
+    /// Its bytes were wanted and didn't come: there's no answer yet.
+    NotIn,
+    /// Gmail sent bytes that won't decode, which a try again won't change.
+    Damaged,
+    Nothing,
 }
 
 /// The thread view's `invite` for `thread` (a `format=full` thread): the
-/// newest message's that has one, or null, read once. Its bytes are brought
-/// into its parts, as Gmail sends a named part by attachment id. `None` when
-/// they were wanted and didn't come: then there's no answer yet, and a view
-/// saved with none would say "no invite" for good.
-/// A sign-in that's gone or doesn't cover Gmail is said as itself.
-pub fn fill(core: &Core, auth: &Bearer, thread: &mut Value) -> Result<Option<Value>, Failure> {
+/// newest invite in it that reads, or null. A part that doesn't read, or
+/// came back damaged, never hides an older one that does; one whose bytes
+/// didn't come stops the search, as it may be the newest that reads, and
+/// gives `None`: then there's no answer yet, and a view saved with none
+/// would say "no invite" for good. `{"damaged": true}` when nothing reads
+/// and a part came back damaged.
+///
+/// With `fetch`, a part Gmail sends by attachment id is fetched; without,
+/// it's not in. A sign-in that's gone or doesn't cover Gmail is said as itself.
+pub fn fill(fetch: Option<(&Core, &Bearer)>, thread: &mut Value) -> Result<Option<Value>, Failure> {
     let Some(messages) = thread.get_mut("messages").and_then(Value::as_array_mut) else {
         return Ok(Some(Value::Null));
     };
-    let Some(i) = newest(messages) else {
-        return Ok(Some(Value::Null));
-    };
-    invite_of(core, auth, &mut messages[i])
+    in_messages(fetch, messages)
+}
+
+fn in_messages(
+    fetch: Option<(&Core, &Bearer)>,
+    messages: &mut [Value],
+) -> Result<Option<Value>, Failure> {
+    let mut damaged = false;
+    for message in messages.iter_mut().rev() {
+        match in_message(fetch, message)? {
+            Found::Reads(v) => return Ok(Some(v)),
+            Found::NotIn => return Ok(None),
+            Found::Damaged => damaged = true,
+            Found::Nothing => {}
+        }
+    }
+    Ok(Some(if damaged {
+        json!({"damaged": true})
+    } else {
+        Value::Null
+    }))
 }
 
 /// What a thread view says of an invite whose bytes didn't come.
@@ -703,46 +866,57 @@ pub fn pending() -> Value {
     json!({"pending": true})
 }
 
-/// One message's invite, as [`fill`] gives it.
-fn invite_of(core: &Core, auth: &Bearer, message: &mut Value) -> Result<Option<Value>, Failure> {
-    let id = js::string_or_empty(message.get("id"));
-    let Some(event) = fill_message(core, auth, message)? else {
-        return Ok(None);
-    };
-    Ok(Some(event.and_then(|e| e.json(&id)).unwrap_or(Value::Null)))
-}
-
 /// The letter's part first; the file only when the letter's gives no event.
-fn fill_message(
-    core: &Core,
-    auth: &Bearer,
-    message: &mut Value,
-) -> Result<Option<Option<Event>>, Failure> {
+fn in_message(fetch: Option<(&Core, &Bearer)>, message: &mut Value) -> Result<Found, Failure> {
+    let mut damaged = false;
     for at in invite_parts(message) {
-        if !fill_at(core, auth, message, &at)? {
-            return Ok(None);
+        match bytes_in(fetch, message, &at)? {
+            Bytes::In => {}
+            Bytes::NotIn => return Ok(Found::NotIn),
+            Bytes::Damaged => {
+                damaged = true;
+                continue;
+            }
         }
-        if let Some(event) = event_at(message, &at) {
-            return Ok(Some(Some(event)));
+        if let Some(v) = event_at(message, &at).and_then(|e| json_of(message, &e)) {
+            return Ok(Found::Reads(v));
         }
     }
-    Ok(Some(None))
+    Ok(if damaged {
+        Found::Damaged
+    } else {
+        Found::Nothing
+    })
 }
 
-/// How long an `.ics` may take: it's on the way to a thread opening.
+/// How long an `.ics` may take.
 const FETCH_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn fill_at(core: &Core, auth: &Bearer, message: &mut Value, at: &str) -> Result<bool, Failure> {
+enum Bytes {
+    /// In the part, or never coming: too big, or gone from Gmail.
+    In,
+    NotIn,
+    Damaged,
+}
+
+fn bytes_in(
+    fetch: Option<(&Core, &Bearer)>,
+    message: &mut Value,
+    at: &str,
+) -> Result<Bytes, Failure> {
     let id = js::string_or_empty(message.get("id"));
     let Some(part) = message.pointer_mut(at) else {
-        return Ok(true);
+        return Ok(Bytes::In);
     };
     let size = part.pointer("/body/size").and_then(Value::as_u64);
     let attachment = part.pointer("/body/attachmentId").and_then(Value::as_str);
     // one too big is no invite whenever it's asked, so that answer stands
     let wanted = part.pointer("/body/data").is_none() && size.is_some_and(|s| s <= ICS_MAX as u64);
     let (true, Some(attachment)) = (wanted, attachment) else {
-        return Ok(true);
+        return Ok(Bytes::In);
+    };
+    let Some((core, auth)) = fetch else {
+        return Ok(Bytes::NotIn);
     };
     match core
         .gmail
@@ -751,25 +925,22 @@ fn fill_at(core: &Core, auth: &Bearer, message: &mut Value, at: &str) -> Result<
         Ok(Some(bytes)) if bytes.len() <= ICS_MAX => {
             part["body"]["data"] =
                 json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes));
-            Ok(true)
+            Ok(Bytes::In)
         }
         // too big, or gone from Gmail: that lasts
-        Ok(_) => Ok(true),
+        Ok(_) => Ok(Bytes::In),
+        Err(Failure::Plain(why)) if why == gmail::DAMAGED => Ok(Bytes::Damaged),
         Err(e @ (Failure::AccountRequired | Failure::NeedsAccess)) => Err(e),
-        Err(_) => Ok(false),
+        Err(_) => Ok(Bytes::NotIn),
     }
 }
 
-/// [`fill`]'s answer for messages whose bytes are all in.
+/// [`fill`]'s answer for messages whose bytes are all in, else pending.
 #[cfg(test)]
 fn of(messages: &[Value]) -> Value {
-    let Some(i) = newest(messages) else {
-        return Value::Null;
-    };
-    let m = &messages[i];
-    let event = invite_parts(m).iter().find_map(|at| event_at(m, at));
-    let id = js::string_or_empty(m.get("id"));
-    event.and_then(|e| e.json(&id)).unwrap_or(Value::Null)
+    in_messages(None, &mut messages.to_vec())
+        .unwrap()
+        .unwrap_or_else(pending)
 }
 
 // --- The tools -------------------------------------------------------------------
@@ -778,9 +949,16 @@ fn refusal(code: &str, why: &str) -> Value {
     ok(json!({"refused": code, "message": why}))
 }
 
-/// The invite in thread `id`: from its saved view, else from Gmail. A view
-/// saved before invites were read has no `invite` at all, which is "not read
-/// yet", not "none". `None` when its bytes didn't come: ask again.
+/// Whether a saved view's `invite` is a whole answer: not pending, and read
+/// since invites carried who sent them. A view saved before invites were
+/// read has no `invite` at all, which is "not read yet", not "none".
+fn settled(invite: &Value) -> bool {
+    invite.is_null() || invite.get("damaged").is_some() || invite.get("sender_ok").is_some()
+}
+
+/// The invite in thread `id`: from its saved view, else from Gmail, then
+/// kept in that view so the next look needn't fetch it again. `None` when its
+/// bytes didn't come: ask again.
 fn of_thread(
     core: &Core,
     auth: &Bearer,
@@ -791,14 +969,38 @@ fn of_thread(
     if let Some(invite) = saved
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|mut v| v.get_mut("invite").map(Value::take))
-        .filter(|i| *i != pending())
+        .filter(settled)
     {
         return Ok(Some(invite));
     }
     let Some(mut full) = core.gmail.thread_full(auth, id)? else {
         return Ok(Some(Value::Null));
     };
-    fill(core, auth, &mut full)
+    let invite = fill(Some((core, auth)), &mut full)?;
+    if let Some(invite) = &invite {
+        keep(core, account, id, invite);
+    }
+    Ok(invite)
+}
+
+/// `invite` into thread `id`'s saved view, if it has one. Only a thread's
+/// opening saves a view; this one is a cache, so a miss costs a fetch later.
+fn keep(core: &Core, account: &str, id: &str, invite: &Value) {
+    let saved = with_store(core, |store| store.view(account, id, now_ms()));
+    let Some(mut view) = saved
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    else {
+        return;
+    };
+    view["invite"] = invite.clone();
+    let put = with_own_store(core, account, |store| {
+        store.put_view(account, id, &view.to_string(), now_ms())
+    });
+    if put.is_err() {
+        eprintln!("buwiz-gws: couldn't keep an invite in its thread's view");
+    }
 }
 
 /// The invite a thread's saved view holds, for a view made again from it.
@@ -809,10 +1011,10 @@ pub fn saved(core: &Core, account: &str, id: &str) -> Option<Value> {
 }
 
 fn of_message(core: &Core, auth: &Bearer, id: &str) -> Result<Option<Value>, Failure> {
-    let Some(mut message) = core.gmail.full(auth, id)? else {
+    let Some(message) = core.gmail.full(auth, id)? else {
         return Ok(Some(Value::Null));
     };
-    invite_of(core, auth, &mut message)
+    in_messages(Some((core, auth)), &mut [message])
 }
 
 /// An invite whose bytes didn't come: a try again, never "no invite".
@@ -862,42 +1064,35 @@ fn side_of(event: &Value, key: &str) -> Option<String> {
     )
 }
 
-fn text_in(v: &Value, key: &str) -> String {
-    v.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
-}
-
 /// Calendar's event as the card shows it, held to one line each as the
 /// invite's words are: what a press answers is what Calendar holds.
 fn shown(event: &Value) -> Value {
     let organizer = event.get("organizer").unwrap_or(&Value::Null);
-    let name = match text_in(organizer, "displayName") {
-        name if name.trim().is_empty() => text_in(organizer, "email"),
+    let name = match calendar::text(organizer, "displayName") {
+        name if name.trim().is_empty() => calendar::text(organizer, "email"),
         name => name,
     };
     json!({
-        "title": one_line(&text_in(event, "summary")),
+        "title": one_line(&calendar::text(event, "summary")),
         "start": side_of(event, "start"),
         "end": side_of(event, "end"),
         "all_day": event.pointer("/start/date").is_some(),
-        "place": one_line(&text_in(event, "location")),
+        "place": one_line(&calendar::text(event, "location")),
         "organizer": one_line(&name),
     })
 }
 
 /// Whether Calendar's event is the one the invite describes: same
 /// organiser, start, title and place. Each of those is the sender's to write
-/// as much as the UID is, so this can't tell a forger from the organiser;
-/// what it holds is that a press answers only an event that reads as the
-/// invite did, and the card shows Calendar's own words.
+/// as much as the UID is, so this alone can't tell a forger from the
+/// organiser ([`sent_by_organizer`] does); what it holds is that a press
+/// answers only an event that reads as the invite did.
 fn matches(invite: &Value, event: &Value) -> bool {
     let organizer = event
         .pointer("/organizer/email")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let named = text_in(invite, "organizer_address");
+    let named = calendar::text(invite, "organizer_address");
     let start = invite.get("start").and_then(Value::as_str);
     let ours = shown(event);
     !named.is_empty()
@@ -906,6 +1101,37 @@ fn matches(invite: &Value, event: &Value) -> bool {
         && side_of(event, "start").as_deref() == start
         && ours["title"] == invite["title"]
         && ours["place"] == invite["place"]
+}
+
+/// A failure in the words a person reads.
+fn words_of(e: Failure) -> String {
+    let v = failed(e);
+    v.pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("Calendar didn't answer just now. Try again.")
+        .to_owned()
+}
+
+/// What Calendar says of an invitation. Nothing of the event when it doesn't
+/// match: a forger's words must not show under Calendar's name. Calendar not
+/// answering is a line on the card, which keeps what Gmail sent.
+fn calendar_says(core: &Core, auth: &Bearer, account: &str, invite: &Value) -> Value {
+    if invite.get("sender_ok") != Some(&Value::Bool(true)) {
+        return json!({"unverified": true});
+    }
+    let uid = js::string_or_empty(invite.get("uid"));
+    match in_calendar(core, auth, account, &uid) {
+        Err(e) => json!({"error": words_of(e)}),
+        Ok(None) => json!({"found": false}),
+        Ok(Some((_, event))) if is_cancelled(&event) => json!({"found": true, "cancelled": true}),
+        Ok(Some((_, event))) if !matches(invite, &event) => {
+            json!({"found": true, "cancelled": false, "matches": false})
+        }
+        Ok(Some((_, event))) => {
+            let me = mine(&event, account);
+            json!({"found": true, "cancelled": false, "matches": true, "guest": me.is_some(), "response": me.and_then(|a| a.get("responseStatus")), "event": shown(&event)})
+        }
+    }
 }
 
 /// `gws_mail_invite`: the invite, and for an invitation whether Calendar has
@@ -926,21 +1152,14 @@ fn look(core: &Core, args: &Value) -> Result<Value, Failure> {
     if invite.get("method").and_then(Value::as_str) != Some("request") {
         return Ok(ok(json!({"invite": invite, "calendar": null})));
     }
-    let uid = js::string_or_empty(invite.get("uid"));
-    let calendar = match in_calendar(core, &auth, &account, &uid)? {
-        None => json!({"found": false}),
-        Some((_, event)) if is_cancelled(&event) => json!({"found": true, "cancelled": true}),
-        Some((_, event)) => {
-            let me = mine(&event, &account);
-            json!({"found": true, "cancelled": false, "matches": matches(&invite, &event), "guest": me.is_some(), "response": me.and_then(|a| a.get("responseStatus")), "event": shown(&event)})
-        }
-    };
+    let calendar = calendar_says(core, &auth, &account, &invite);
     Ok(ok(json!({"invite": invite, "calendar": calendar})))
 }
 
 /// `gws_mail_invite_reply`: the person's Yes, No or Maybe, through Calendar.
 /// It always tells the organiser: that's what answering an invite is for.
-/// Once the answer is written it's sent, whatever the read after it finds.
+/// Once the answer is written it's sent, and said at once: Calendar's sync
+/// comes after, so a slow one can't make a second press send it again.
 fn reply(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (auth, account) = signed_in(core)?;
     let message = js::trim(&js::string_or_empty(args.get("message"))).to_owned();
@@ -967,6 +1186,9 @@ fn reply(core: &Core, args: &Value) -> Result<Value, Failure> {
         }
         None => return Ok(refusal("not_found", "This mail holds no invite.")),
     }
+    if invite.get("sender_ok") != Some(&Value::Bool(true)) {
+        return Ok(refusal("unverified", UNVERIFIED));
+    }
     let uid = js::string_or_empty(invite.get("uid"));
     let Some((calendar, event)) = in_calendar(core, &auth, &account, &uid)? else {
         return Ok(refusal("not_found", NOT_YET));
@@ -978,7 +1200,11 @@ fn reply(core: &Core, args: &Value) -> Result<Value, Failure> {
         return Ok(refusal("changed", DIFFERS));
     }
     let args = json!({"calendar": calendar, "id": event.get("id"), "response": response});
-    let answer = calendar::rsvp_with(core, &args, Some(event), true)?;
+    let how = calendar::Answering {
+        notify_all: true,
+        stands_after_write: true,
+    };
+    let answer = calendar::rsvp_with(core, &args, Some(event), how)?;
     let content = &answer["structuredContent"];
     if answer.get("isError") == Some(&Value::Bool(true)) || content.get("refused").is_some() {
         return Ok(answer);
@@ -1389,8 +1615,35 @@ mod tests {
             let ics = GOOGLE.replace("DTEND:20261110T030000Z", &format!("DURATION:{empty}"));
             assert_eq!(read(&ics), None, "{empty}");
         }
-        let ics = GOOGLE.replace("DTEND:20261110T030000Z", "DURATION:P0D");
-        assert!(read(&ics).is_some(), "zero is a length");
+        // nor does one of no length at all
+        for zero in ["P0D", "PT0S", "P0W", "PT0H0M"] {
+            let ics = GOOGLE.replace("DTEND:20261110T030000Z", &format!("DURATION:{zero}"));
+            assert_eq!(read(&ics), None, "{zero}");
+        }
+        let ics = GOOGLE.replace("DTEND:20261110T030000Z", "DURATION:PT1S");
+        assert!(read(&ics).is_some());
+    }
+
+    #[test]
+    fn every_windows_zone_names_a_zone_and_the_rarer_ones_read() {
+        let names = include_str!("invite.rs")
+            .lines()
+            .skip_while(|l| !l.starts_with("fn windows_zone"))
+            .take_while(|l| !l.starts_with('}'))
+            .filter(|l| l.contains(" => \""))
+            .flat_map(|l| l.split(" => ").next().unwrap().split(" | "))
+            .map(|n| n.trim().trim_matches('"').to_owned())
+            .collect::<Vec<_>>();
+        assert!(names.len() > 130, "{}", names.len());
+        for name in &names {
+            let iana = windows_zone(name).unwrap_or_else(|| panic!("{name}"));
+            assert!(iana.parse::<Tz>().is_ok(), "{name}: {iana}");
+        }
+        // 09:30 in Hobart in December is daylight time, 22:30 UTC the day before
+        let ics = OUTLOOK.replace("Pacific Standard Time", "Tasmania Standard Time");
+        assert_eq!(read(&ics).unwrap().start, at("2026-12-02T22:30:00Z"));
+        let ics = OUTLOOK.replace("Pacific Standard Time", "Nepal Standard Time");
+        assert_eq!(read(&ics).unwrap().start, at("2026-12-03T03:45:00Z"));
     }
 
     #[test]
@@ -1449,6 +1702,60 @@ mod tests {
             (v["message"].as_str(), v["method"].as_str()),
             (Some("m2"), Some("cancel"))
         );
+        assert_eq!(v["sender_ok"], false, "no Authentication-Results");
+    }
+
+    #[test]
+    fn the_newest_invite_that_reads_wins_over_a_newer_one_that_doesnt() {
+        let first = message("m1", json!([part("text/calendar", GOOGLE)]));
+        let broken = message("m2", json!([part("text/calendar", "BEGIN:VCALENDAR\r\n")]));
+        let silent_reply = message(
+            "m3",
+            json!([part(
+                "text/calendar",
+                &GOOGLE
+                    .replace("METHOD:REQUEST", "METHOD:REPLY")
+                    .replace("PARTSTAT=ACCEPTED", "PARTSTAT=NEEDS-ACTION"),
+            )]),
+        );
+        let v = of(&[first.clone(), broken.clone(), silent_reply]);
+        assert_eq!(v["message"], "m1", "{v}");
+        // one whose bytes haven't come may be the newest that reads: not yet
+        let unfetched = message(
+            "m4",
+            json!([{"mimeType": "text/calendar", "body": {"attachmentId": "a1", "size": 900}}]),
+        );
+        assert_eq!(of(&[first, broken, unfetched]), pending());
+    }
+
+    fn signed(from: &str, results: &str) -> Value {
+        json!({"id": "m1", "payload": {"headers": [{"name": "Authentication-Results", "value": results}, {"name": "From", "value": from}]}})
+    }
+
+    #[test]
+    fn only_a_vouched_for_sender_of_the_organisers_domain_or_google_calendar_sends_an_invite() {
+        let pass = |d: &str| format!("mx.google.com; dkim=pass header.i=@{d}; dmarc=pass header.from={d}");
+        let fail = "mx.google.com; spf=softfail smtp.mailfrom=x; dmarc=fail header.from=google.com";
+        let cases = [
+            ("Ana <calendar-notification@google.com>", pass("google.com"), true),
+            ("Ana <ana@example.com>", pass("example.com"), true),
+            ("Ana <ana@mail.example.com>", pass("mail.example.com"), true),
+            ("Ana <calendar-notification@google.com>", fail.to_owned(), false),
+            ("Mallory <m@evil.example>", pass("evil.example"), false),
+            ("Mallory <m@notexample.com>", pass("notexample.com"), false),
+        ];
+        for (from, results, ok) in cases {
+            assert_eq!(
+                sent_by_organizer(&signed(from, &results), "ana@example.com"),
+                ok,
+                "{from} {results}"
+            );
+        }
+        // Gmail's verdict is the top one: one further down is the sender's own
+        let planted = json!({"id": "m1", "payload": {"headers": [{"name": "Authentication-Results", "value": fail}, {"name": "Authentication-Results", "value": pass("google.com")}, {"name": "From", "value": "calendar-notification@google.com"}]}});
+        assert!(!sent_by_organizer(&planted, "ana@example.com"));
+        // no organiser to align with
+        assert!(!sent_by_organizer(&signed("ana@example.com", &pass("example.com")), ""));
     }
 
     #[test]
@@ -1461,12 +1768,12 @@ mod tests {
         assert_eq!(of(&[plain]), Value::Null);
         let broken = message("m1", json!([part("text/calendar", "BEGIN:VCALENDAR\r\n")]));
         assert_eq!(of(&[broken]), Value::Null);
-        // bytes not yet brought in
+        // bytes not yet brought in: not none, not read yet
         let unfetched = message(
             "m1",
             json!([{"mimeType": "text/calendar", "body": {"attachmentId": "a1", "size": 900}}]),
         );
-        assert_eq!(of(&[unfetched]), Value::Null);
+        assert_eq!(of(&[unfetched]), pending());
         let huge = message(
             "m1",
             json!([{"mimeType": "text/calendar", "body": {"data": "A".repeat(ICS_MAX * 2)}}]),

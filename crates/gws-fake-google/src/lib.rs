@@ -557,6 +557,8 @@ struct Account {
     draft_reads_fail: bool,
     attachments_fail: Option<u16>,
     attachments_gone: bool,
+    /// Attachment reads answer with bytes that won't decode.
+    attachments_damaged: bool,
     /// Reads so far, once attachment ids change with each.
     reads: Option<AtomicU64>,
     /// `(draft id, message id, raw message, thread)`.
@@ -1045,6 +1047,9 @@ impl Account {
                 None => not_found(),
             },
             ("GET", ["messages", _, "attachments", _]) if self.attachments_gone => not_found(),
+            ("GET", ["messages", _, "attachments", _]) if self.attachments_damaged => {
+                Reply::json(200, json!({"size": 4, "data": "!!not base64!!"}))
+            }
             ("GET", ["messages", _, "attachments", _]) if self.attachments_fail.is_some() => {
                 let code = self.attachments_fail.unwrap_or(500);
                 let why = match code {
@@ -1644,6 +1649,16 @@ impl FakeGoogle {
     /// Calendar writes a PATCH and answers it with nothing of the event.
     pub fn calendar_patch_answers_empty(&self, empty: bool) {
         self.account.lock().unwrap().calendars.patch_answers_empty = empty;
+    }
+
+    /// Calendar writes a PATCH and answers 200 with a body cut off mid-way.
+    pub fn calendar_patch_answers_junk(&self, junk: bool) {
+        self.account.lock().unwrap().calendars.patch_answers_junk = junk;
+    }
+
+    /// Attachment reads answer with bytes that won't decode.
+    pub fn attachments_damaged(&self, damaged: bool) {
+        self.account.lock().unwrap().attachments_damaged = damaged;
     }
 
     /// Attachment reads find nothing, as for one Gmail no longer holds.

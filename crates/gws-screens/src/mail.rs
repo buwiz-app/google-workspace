@@ -256,9 +256,9 @@ struct Mail {
     problem: Signal<Option<String>>,
     seq: Signal<i64>,
     help: Signal<bool>,
-    /// The open conversation's invite card, kept out of the page so showing
-    /// the page again leaves it be.
-    invite: Signal<Option<invite::Held>>,
+    /// Each conversation's invite card, kept out of the page so showing the
+    /// page again leaves it be.
+    invite: Signal<invite::Cards>,
 }
 
 /// A file on a mail in the open conversation.
@@ -634,6 +634,7 @@ async fn show(b: Bridge, m: Mail, thread: String) {
                     .collect(),
             );
             pictures::opened(&b, m, &v, turn);
+            invite::opened(&b, m, &thread);
             m.attachments.set(attachments_in(&v));
             m.page.set(Some(
                 v.get("page")
@@ -659,6 +660,7 @@ fn switched(b: &Bridge, m: Mail) {
     m.chosen.set(None);
     m.picked.set(Vec::new());
     m.undo.set(None);
+    m.invite.set(invite::Cards::new());
     m.open_turn.ask();
     m.page.set(None);
     m.seq.set(-1);
@@ -1698,7 +1700,7 @@ pub fn build(bridge: Bridge) -> Root {
             loading: signal(true),
             seq: signal(-1),
             help: signal(false),
-            invite: signal(None),
+            invite: signal(invite::Cards::new()),
         };
         keys(b.clone(), m);
         b.spawn(load_list(b.clone(), m, 0));

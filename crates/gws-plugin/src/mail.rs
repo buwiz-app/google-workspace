@@ -1132,15 +1132,15 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some(mut full) = core.gmail.thread_full(&auth, &id)? else {
         return Ok(fail("not_found", "That conversation is gone."));
     };
-    // an invite that didn't come must be asked for again, not kept as none
-    let invite = crate::invite::fill(core, &auth, &mut full)?;
+    // an `.ics` Gmail sends apart is the invite card's to fetch, so a slow
+    // or refused one never holds up the thread; until then it's pending,
+    // never none
+    let invite = crate::invite::fill(None, &mut full)?;
     let mut view = pictures::view(core, &auth, &account, &mut full);
-    view["invite"] = invite.clone().unwrap_or_else(crate::invite::pending);
-    if invite.is_some() {
-        with_own_store(core, &account, |store| {
-            store.put_view(&account, &id, &view.to_string(), now_ms())
-        })?;
-    }
+    view["invite"] = invite.unwrap_or_else(crate::invite::pending);
+    with_own_store(core, &account, |store| {
+        store.put_view(&account, &id, &view.to_string(), now_ms())
+    })?;
     Ok(pictures::answer(core, &account, view))
 }
 

@@ -34,6 +34,11 @@ struct Fake {
     /// Replies wait for [`Fake::release`].
     hold_replies: Mutex<bool>,
     held: Mutex<Vec<(Value, Done)>>,
+    /// Looks wait for [`Fake::release_looks`].
+    hold_looks: Mutex<bool>,
+    held_looks: Mutex<Vec<Done>>,
+    /// A reply whose answer says it failed still reaches Calendar.
+    went_anyway: Mutex<bool>,
     calls: Mutex<Vec<(String, Value)>>,
 }
 
@@ -46,6 +51,29 @@ impl Fake {
             }
             assert!(std::time::Instant::now() < by, "no reply was held");
             std::thread::yield_now();
+        }
+    }
+
+    /// Answers every held look with what `gws_mail_invite` answers now.
+    fn release_looks(&self) {
+        *self.hold_looks.lock().unwrap() = false;
+        let by = std::time::Instant::now() + WAIT;
+        while self.held_looks.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < by, "no look was held");
+            std::thread::yield_now();
+        }
+        let held: Vec<Done> = self.held_looks.lock().unwrap().drain(..).collect();
+        let answer = self.invite.lock().unwrap().clone();
+        for done in held {
+            done(Ok(answer.clone()));
+        }
+    }
+
+    /// Calendar now holds `response` as the person's answer.
+    fn answered(&self, response: &Value) {
+        let mut invite = self.invite.lock().unwrap();
+        if invite["calendar"]["guest"] == true {
+            invite["calendar"]["response"] = response.clone();
         }
     }
 
@@ -95,10 +123,17 @@ impl Host for Fake {
                 let why = self.look_fails.lock().unwrap().clone().unwrap();
                 return done(Err(BuwizError::new("busy", false, why)));
             }
+            "gws_mail_invite" if args["thread"] == "t20" && *self.hold_looks.lock().unwrap() => {
+                return self.held_looks.lock().unwrap().push(done);
+            }
             "gws_mail_invite" if args["thread"] == "t20" => self.invite.lock().unwrap().clone(),
             "gws_mail_invite" => json!({"invite": null}),
             "gws_mail_invite_reply" => {
-                self.reply.lock().unwrap().clone().unwrap_or_else(
+                let said = self.reply.lock().unwrap().clone();
+                if said.is_none() || *self.went_anyway.lock().unwrap() {
+                    self.answered(&args["response"]);
+                }
+                said.unwrap_or_else(
                     || json!({"sent": true, "event": {"response": args["response"]}}),
                 )
             }
@@ -248,18 +283,20 @@ fn an_invite_not_in_calendar_shows_with_its_buttons_off() {
 }
 
 #[test]
-fn an_invite_unlike_its_calendar_event_shows_with_its_buttons_off() {
+fn an_invite_unlike_its_calendar_event_shows_only_that_and_no_buttons() {
     let (mut app, _, fake) = opened(
-        json!({"invite": invite("request"), "calendar": {"found": true, "matches": false, "guest": true, "response": "needsAction"}}),
+        json!({"invite": invite("request"), "calendar": {"found": true, "cancelled": false, "matches": false}}),
     );
-    assert!(app.screen().shows("Roof inspection"));
+    assert!(!app.screen().shows("Roof inspection"), "none of its words");
+    assert!(!app.screen().shows("Ana Reyes invited you"));
     assert!(
         app.screen()
             .shows("This invite doesn't match your Calendar.")
     );
     for label in ["Answer yes", "Answer no", "Answer maybe"] {
-        assert!(
-            !app.screen().enabled(&format!("label:{label}")).unwrap(),
+        assert_eq!(
+            app.screen().count(&format!("label:{label}")).unwrap(),
+            0,
             "{label}"
         );
     }
@@ -402,4 +439,164 @@ fn a_page_shown_again_mid_reply_keeps_the_reply_and_sends_it_once() {
         .expect("it says so");
     assert_eq!(fake.called("gws_mail_invite_reply").len(), 1);
     assert!(app.screen().selected("label:Answer yes").unwrap());
+}
+
+fn not_yet() -> Value {
+    json!({"invite": invite("request"), "calendar": {"found": false}})
+}
+
+fn lit(app: &Headless) -> bool {
+    app.screen().enabled("label:Answer yes").unwrap()
+}
+
+#[test]
+fn not_in_calendar_yet_is_the_mails_words_and_can_check_again() {
+    let (mut app, _, fake) = opened(not_yet());
+    assert!(app.screen().shows("From the mail, not checked with Calendar."));
+    assert!(!lit(&app));
+    *fake.invite.lock().unwrap() = in_calendar("needsAction");
+    app.press("label:Look in Calendar again").expect("it presses");
+    settle(&mut app);
+    assert!(lit(&app), "Calendar has it now");
+    assert!(!app.screen().shows("Not in your Calendar yet."));
+}
+
+#[test]
+fn a_conversation_opened_again_looks_again() {
+    let (mut app, _, fake) = opened(not_yet());
+    assert!(!lit(&app));
+    *fake.invite.lock().unwrap() = in_calendar("needsAction");
+    app.press("text:Invitation: Roof inspection")
+        .expect("the row presses");
+    settle(&mut app);
+    assert!(lit(&app), "Calendar has it now");
+}
+
+#[test]
+fn a_try_again_pressed_twice_while_it_looks_asks_once() {
+    let fake = Arc::new(Fake::default());
+    *fake.invite.lock().unwrap() = in_calendar("needsAction");
+    *fake.look_fails.lock().unwrap() = Some("Gmail didn't send this invite just now.".to_owned());
+    let def = gws_screens::screens()
+        .iter()
+        .find(|s| s.id == "gws.mail")
+        .expect("Mail");
+    let root = (def.build)(Bridge::new(fake.clone()));
+    let mut app = Headless::start(EngineConfig::new(root)).expect("the engine starts");
+    app.set_viewport(size(px(1000.0), px(600.0)))
+        .expect("the viewport sets");
+    app.wait_for_within("text:Invitation: Roof inspection", WAIT)
+        .expect("the inbox shows");
+    app.press("text:Invitation: Roof inspection")
+        .expect("the row presses");
+    app.wait_for_within("label:Read this invite again", WAIT)
+        .expect("it says why");
+    *fake.look_fails.lock().unwrap() = None;
+    *fake.hold_looks.lock().unwrap() = true;
+    let before = fake.called("gws_mail_invite").len();
+    app.press("label:Read this invite again").expect("it presses");
+    settle(&mut app);
+    let _ = app.press("label:Read this invite again");
+    settle(&mut app);
+    assert_eq!(fake.called("gws_mail_invite").len(), before + 1);
+    fake.release_looks();
+    app.wait_for_within("text:Ana Reyes invited you", WAIT)
+        .expect("the card comes");
+}
+
+#[test]
+fn the_buttons_stay_busy_until_a_fresh_look_shows_the_answer() {
+    let (mut app, _, fake) = opened(in_calendar("needsAction"));
+    *fake.hold_looks.lock().unwrap() = true;
+    app.press("label:Answer yes").expect("Yes presses");
+    settle(&mut app);
+    assert_eq!(fake.called("gws_mail_invite_reply").len(), 1);
+    assert!(!lit(&app), "busy while Calendar is asked");
+    let _ = app.press("label:Answer yes");
+    settle(&mut app);
+    assert_eq!(fake.called("gws_mail_invite_reply").len(), 1, "not twice");
+    fake.release_looks();
+    app.wait_for_within("text:Your reply was sent.", WAIT)
+        .expect("it says so");
+    assert!(lit(&app));
+    assert!(app.screen().selected("label:Answer yes").unwrap());
+}
+
+#[test]
+fn a_reply_whose_answer_was_lost_but_went_is_said_to_be_sent() {
+    let (mut app, _, fake) = opened(in_calendar("needsAction"));
+    *fake.reply.lock().unwrap() = Some(
+        json!({"isError": true, "content": [{"type": "text", "text": "The plugin took too long to answer."}]}),
+    );
+    *fake.went_anyway.lock().unwrap() = true;
+    app.press("label:Answer yes").expect("Yes presses");
+    app.wait_for_within("text:Your reply was sent.", WAIT)
+        .expect("Calendar shows it went");
+    assert!(app.screen().selected("label:Answer yes").unwrap());
+    assert!(!app.screen().shows("The plugin took too long to answer."));
+}
+
+#[test]
+fn another_conversations_look_never_lands_on_an_answer_on_its_way() {
+    let (mut app, _, fake) = opened(in_calendar("needsAction"));
+    *fake.hold_replies.lock().unwrap() = true;
+    app.press("label:Answer yes").expect("Yes presses");
+    settle(&mut app);
+    app.press("text:Photos").expect("the row presses");
+    settle(&mut app);
+    app.press("text:Invitation: Roof inspection")
+        .expect("the row presses");
+    settle(&mut app);
+    assert!(!lit(&app), "still on its way");
+    let _ = app.press("label:Answer yes");
+    settle(&mut app);
+    fake.release();
+    app.wait_for_within("text:Your reply was sent.", WAIT)
+        .expect("it says so");
+    assert_eq!(fake.called("gws_mail_invite_reply").len(), 1);
+}
+
+#[test]
+fn calendar_not_answering_keeps_the_invite_with_the_reason_and_no_answer() {
+    let (app, _, _) = opened(
+        json!({"invite": invite("request"), "calendar": {"error": "Calendar is busy right now. Try again in a moment."}}),
+    );
+    assert!(app.screen().shows("Roof inspection"));
+    assert!(app.screen().shows("Calendar is busy right now. Try again in a moment."));
+    assert!(!lit(&app));
+}
+
+#[test]
+fn an_invite_gmail_couldnt_vouch_for_answers_nothing() {
+    let (app, _, _) = opened(json!({"invite": invite("request"), "calendar": {"unverified": true}}));
+    assert!(app.screen().shows("Gmail couldn't confirm this invite came from its organiser."));
+    assert!(!lit(&app));
+}
+
+#[test]
+fn a_damaged_invite_says_so_for_good() {
+    let (app, _, _) = opened(json!({"invite": {"damaged": true}, "calendar": null}));
+    assert!(app.screen().shows("Can't read this invite."));
+    assert_eq!(app.screen().count("label:Read this invite again").unwrap(), 0);
+}
+
+#[test]
+fn a_lapsed_sign_in_shows_the_sign_in_steps_not_a_blank() {
+    let fake = Arc::new(Fake::default());
+    *fake.invite.lock().unwrap() = in_calendar("needsAction");
+    *fake.look_fails.lock().unwrap() = Some("Sign in to Google to use this.".to_owned());
+    let def = gws_screens::screens()
+        .iter()
+        .find(|s| s.id == "gws.mail")
+        .expect("Mail");
+    let root = (def.build)(Bridge::new(fake.clone()));
+    let mut app = Headless::start(EngineConfig::new(root)).expect("the engine starts");
+    app.set_viewport(size(px(1000.0), px(600.0)))
+        .expect("the viewport sets");
+    app.wait_for_within("text:Invitation: Roof inspection", WAIT)
+        .expect("the inbox shows");
+    app.press("text:Invitation: Roof inspection")
+        .expect("the row presses");
+    app.wait_for_within("text:Make a Google Cloud project", WAIT)
+        .expect("the sign-in steps show");
 }

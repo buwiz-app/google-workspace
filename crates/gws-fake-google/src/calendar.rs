@@ -90,6 +90,8 @@ pub(crate) struct Calendars {
     pub(crate) writes: Vec<CalendarWrite>,
     /// A PATCH is written, and answered with nothing of the event.
     pub(crate) patch_answers_empty: bool,
+    /// A PATCH is written, and answered 200 with a body that isn't JSON.
+    pub(crate) patch_answers_junk: bool,
 }
 
 fn error(code: u16, message: &str) -> Reply {
@@ -821,6 +823,9 @@ impl Calendars {
         self.record(r, calendar, id, sent);
         if self.patch_answers_empty {
             return Reply::json(200, json!({}));
+        }
+        if self.patch_answers_junk {
+            return Reply(200, "application/json", b"{\"kind\": \"calendar#ev".to_vec(), Vec::new());
         }
         match self.list[at].event(id) {
             Some(event) => Reply::json(200, event),

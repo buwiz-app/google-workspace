@@ -363,7 +363,7 @@ fn address_ok(address: &str) -> bool {
 }
 
 /// A message's From address, in lower case, if it's one.
-fn from_of(message: &Value) -> Option<String> {
+pub(crate) fn from_of(message: &Value) -> Option<String> {
     let (_, address) = mail::sender_of(&gmail::short_header(message, "From"));
     let address = address.to_lowercase();
     address_ok(&address).then_some(address)
@@ -384,7 +384,7 @@ fn no_comments(text: &str) -> String {
 }
 
 /// Whether `domain` is `signer` or below it: what DKIM's alignment allows.
-fn aligned(domain: &str, signer: &str) -> bool {
+pub(crate) fn aligned(domain: &str, signer: &str) -> bool {
     let signer = signer.trim_end_matches('.').to_ascii_lowercase();
     !signer.is_empty() && (domain == signer || domain.ends_with(&format!(".{signer}")))
 }
@@ -835,7 +835,7 @@ fn show(core: &Core, args: &Value) -> Result<Value, Failure> {
     let placer = placer.into_inner().unwrap_or_else(|e| e.into_inner());
     placer.finish(&mut thread);
     let mut view = mail::view_of(&thread);
-    // the invite was read as the thread opened: the view made again keeps it
+    // the invite the saved view holds, read or pending: the view made again keeps it
     if let Some(invite) = crate::invite::saved(core, &account, &id) {
         view["invite"] = invite;
     }

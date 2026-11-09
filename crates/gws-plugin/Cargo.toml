@@ -40,8 +40,8 @@ ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
 # what tells an edit from what Drive sent
 sha2 = "0.10"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# the quarantine mark on a stranger's file
+[target.'cfg(unix)'.dependencies]
+# the quarantine mark on a stranger's file, and opening one without following a link
 libc = "0.2"
 
 [dev-dependencies]

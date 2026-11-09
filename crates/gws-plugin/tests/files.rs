@@ -1766,7 +1766,9 @@ fn save_hands_over_every_kind_as_it_came() {
         "Scan.pdf",
         "evil.bin",
     ];
-    for (n, (_, _, bytes)) in all.iter().enumerate() {
+    for (n, (_, _, came)) in all.iter().enumerate() {
+        // the edit is the person's work, so it's what's saved
+        let bytes: &[u8] = if n == 2 { b"PK\x03\x04 mine" } else { came };
         let answer = save_attachment(&home, n);
         assert_eq!(data(answer.clone())["saved"], true, "{answer}");
         assert_eq!(answer["structuredContent"]["name"], names[n]);
@@ -1774,12 +1776,109 @@ fn save_hands_over_every_kind_as_it_came() {
         assert_eq!(key, "buwiz/save");
         assert_eq!(answer["_meta"]["buwiz/save"]["name"], names[n]);
         assert_eq!(name_on_disk(&path), names[n]);
-        assert_eq!(fs::read(&path).unwrap(), *bytes);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(path.ancestors().nth(2).unwrap(), real(&home.open_dir()));
         assert_ne!(path.parent(), edited.parent(), "a folder of its own");
     }
     assert_eq!(fs::read(&edited).unwrap(), b"PK\x03\x04 mine");
     assert_eq!(home.edits().len(), 1, "the edit, and no saved copy");
+}
+
+#[test]
+fn save_hands_over_an_unsaved_edit_in_the_bots_view_and_keeps_it() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK\x03\x04report")]));
+    let home = Home::new(&google.base(), "saveedit");
+    bot_can(&home, &EVERYTHING);
+    let (path, id) = edited_attachment(&home);
+    let fetched = fetches(&google);
+    let answer = save_attachment(&home, 0);
+    let (key, saved) = handed(&answer);
+    assert_eq!(key, "buwiz/save", "{answer}");
+    assert_eq!(fs::read(&saved).unwrap(), b"PK mine", "not Gmail's bytes");
+    assert_eq!(fetches(&google), fetched, "nothing fetched from Gmail");
+    assert_eq!(fs::read(&path).unwrap(), b"PK mine", "the edit stays");
+    assert_eq!(home.edits().len(), 1, "still the person's to answer");
+    // once it's discarded, Gmail's copy is the one
+    data(home.core.run("gws_file_discard", &json!({"id": id})));
+    let saved = handed(&save_attachment(&home, 0)).1;
+    assert_eq!(fs::read(&saved).unwrap(), b"PK\x03\x04report");
+    // another account's edit is never handed to this one
+    let (path, _) = edited_attachment(&home);
+    second_account_in_use(&home);
+    let saved = handed(&save_attachment(&home, 0)).1;
+    assert_eq!(fs::read(&saved).unwrap(), b"PK\x03\x04report");
+    assert_eq!(fs::read(&path).unwrap(), b"PK mine");
+}
+
+#[test]
+fn an_edit_that_cant_be_read_as_a_file_is_refused_by_save_and_not_worked_round() {
+    use std::os::unix::fs::PermissionsExt;
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK\x03\x04report")]));
+    let home = Home::new(&google.base(), "saveodd");
+    bot_can(&home, &EVERYTHING);
+    let (path, _) = edited_attachment(&home);
+    let outside = home.dir.join("outside.docx");
+    fs::write(&outside, b"PK not the attachment").unwrap();
+    let fetched = fetches(&google);
+    let refused_now = |home: &Home| {
+        let answer = save_attachment(home, 0);
+        assert_eq!(refusal(&answer), "unreadable", "{answer}");
+        assert_eq!(
+            says(&answer),
+            "Your edit to this attachment here can't be read, so nothing was saved."
+        );
+        assert_eq!(answer.get("_meta"), None);
+    };
+    // a link where the edit was
+    fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&outside, &path).unwrap();
+    refused_now(&home);
+    // a folder
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    refused_now(&home);
+    // a file that can't be read
+    fs::remove_dir(&path).unwrap();
+    fs::write(&path, b"PK mine").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    refused_now(&home);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        fetches(&google),
+        fetched,
+        "Gmail's copy wasn't saved instead"
+    );
+    assert_eq!(fs::read(&outside).unwrap(), b"PK not the attachment");
+}
+
+#[test]
+fn a_saved_copy_changed_here_is_handed_back_and_never_written_over() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("IMG_4250.png", "image/png", PNG),
+        ("receipt.pdf", "application/pdf", PDF),
+    ]));
+    let home = Home::new(&google.base(), "savekept");
+    bot_can(&home, &EVERYTHING);
+    let first = handed(&save_attachment(&home, 0)).1;
+    fs::write(&first, b"\x89PNG\r\n\x1a\n changed").unwrap();
+    let fetched = fetches(&google);
+    let answer = save_attachment(&home, 0);
+    assert_eq!(data(answer.clone())["name"], "IMG_4250.png");
+    assert_eq!(handed(&answer), ("buwiz/save".to_owned(), first.clone()));
+    assert_eq!(fs::read(&first).unwrap(), b"\x89PNG\r\n\x1a\n changed");
+    assert_eq!(
+        fetches(&google),
+        fetched,
+        "nothing fetched to write over it"
+    );
+    // one as it was written is made again
+    let other = handed(&save_attachment(&home, 1)).1;
+    assert_eq!(handed(&save_attachment(&home, 1)).1, other);
+    assert_eq!(fs::read(&other).unwrap(), PDF);
+    assert_eq!(fetches(&google), fetched + 2);
 }
 
 #[test]
@@ -1979,7 +2078,9 @@ fn legacy_office_files_are_never_handed_to_the_macs_app() {
     assert_eq!(refusal(&open_attachment(&home, 2)), "unsupported");
 }
 
-/// Both editable kinds, with no view for them: the Mac's own app has them.
+/// Both editable kinds, with no view for them: the Mac's own app has them. The
+/// Bot hands that app a copy of its own, so nothing should ever write here;
+/// this writes anyway, to show it changes nothing.
 fn opened_in_the_macs_app(home: &Home) -> Vec<(PathBuf, String)> {
     bot_can(home, &["open_with"]);
     (0..2)
@@ -1987,7 +2088,7 @@ fn opened_in_the_macs_app(home: &Home) -> Vec<(PathBuf, String)> {
             let answer = open_attachment(home, n);
             let (key, path) = handed(&answer);
             assert_eq!(key, "buwiz/open_with", "{answer}");
-            fs::write(&path, b"PK\x03\x04 edited in Pages").unwrap();
+            fs::write(&path, b"PK\x03\x04 written here").unwrap();
             let id = path.parent().unwrap().file_name().unwrap();
             let id = id.to_str().unwrap().to_owned();
             (path, id)
@@ -1996,7 +2097,7 @@ fn opened_in_the_macs_app(home: &Home) -> Vec<(PathBuf, String)> {
 }
 
 #[test]
-fn a_change_in_the_macs_app_stays_until_saved_or_discarded_and_never_goes_to_drive() {
+fn a_copy_for_the_macs_app_is_only_read_and_goes_at_24_hours_and_at_sign_out() {
     let google = FakeGoogle::start(Seed::default());
     google.deliver(mail_with(vec![
         ("report.docx", DOCX, b"PK\x03\x04report"),
@@ -2004,10 +2105,6 @@ fn a_change_in_the_macs_app_stays_until_saved_or_discarded_and_never_goes_to_dri
     ]));
     let home = Home::new(&google.base(), "byapp");
     let files = opened_in_the_macs_app(&home);
-    let (changed, changed_id) = &files[0];
-    // the person left the budget as it came
-    let (unchanged, _) = &files[1];
-    fs::write(unchanged, b"PK\x03\x04budget").unwrap();
     assert_eq!(home.edits(), Vec::<Value>::new(), "not the Bot's edit");
     for (_, id) in &files {
         assert_eq!(refusal(&home.upload(id, "copy")), "not_edited", "{id}");
@@ -2015,35 +2112,25 @@ fn a_change_in_the_macs_app_stays_until_saved_or_discarded_and_never_goes_to_dri
     assert_eq!(drive_writes(&google), Vec::<String>::new());
     home.later(LIFE_MS);
     gws::files::sweep(&home.core);
-    assert!(!unchanged.exists(), "an unchanged one goes at 24 hours");
-    assert_eq!(fs::read(changed).unwrap(), b"PK\x03\x04 edited in Pages");
+    for (path, _) in &files {
+        assert!(!path.exists(), "{path:?} goes at 24 hours");
+    }
+    let files = opened_in_the_macs_app(&home);
     home.sign_out();
-    assert_eq!(
-        fs::read(changed).unwrap(),
-        b"PK\x03\x04 edited in Pages",
-        "and stays through a sign-out"
-    );
+    for (path, _) in &files {
+        assert!(!path.exists(), "{path:?} goes at sign-out");
+    }
     home.core.account("buwiz.account.set", &push(FAKE_EMAIL));
-    let path = handed(&open_attachment(&home, 1)).1;
-    home.sign_out();
-    assert!(!path.exists(), "an unchanged one goes at sign-out");
-    home.core.account("buwiz.account.set", &push(FAKE_EMAIL));
-    // Save hands over the person's work, not Gmail's copy
+    // Save hands over the mail's own copy
+    opened_in_the_macs_app(&home);
     bot_can(&home, &["open_with", "save"]);
-    let fetched = fetches(&google);
-    let answer = save_attachment(&home, 0);
-    let (key, saved) = handed(&answer);
-    assert_eq!(key, "buwiz/save", "{answer}");
-    assert_eq!(fs::read(&saved).unwrap(), b"PK\x03\x04 edited in Pages");
-    assert_eq!(name_on_disk(&saved), "report.docx");
-    assert_eq!(fetches(&google), fetched, "nothing fetched from Gmail");
-    assert!(!changed.exists(), "saved, so answered");
-    assert!(!home.folder(changed_id).exists());
+    let saved = handed(&save_attachment(&home, 0)).1;
+    assert_eq!(fs::read(&saved).unwrap(), b"PK\x03\x04report");
     assert_eq!(drive_writes(&google), Vec::<String>::new());
 }
 
 #[test]
-fn a_change_in_the_macs_app_goes_when_discarded() {
+fn a_copy_for_the_macs_app_goes_when_discarded() {
     let google = FakeGoogle::start(Seed::default());
     google.deliver(mail_with(vec![
         ("report.docx", DOCX, b"PK\x03\x04report"),
@@ -2095,37 +2182,73 @@ fn an_edit_in_the_bots_view_isnt_handed_to_the_macs_app() {
 }
 
 #[test]
-fn an_edit_in_the_macs_app_isnt_fetched_over_by_another_way_or_account() {
+fn a_copy_for_the_macs_app_is_fetched_again_another_way_or_for_another_account() {
     let google = FakeGoogle::start(Seed::default());
     google.deliver(mail_with(vec![
         ("report.docx", DOCX, b"PK\x03\x04report"),
         ("budget.xlsx", XLSX, b"PK\x03\x04budget"),
     ]));
-    let home = Home::new(&google.base(), "appedit");
-    let files = opened_in_the_macs_app(&home);
-    let (path, _) = &files[0];
-    // the Bot has its own view now, which would fetch it again
+    let home = Home::new(&google.base(), "appagain");
+    opened_in_the_macs_app(&home);
+    // the Bot has its own view now
     bot_can(&home, &EVERYTHING);
-    let answer = open_attachment(&home, 0);
-    assert_eq!(refusal(&answer), "in_use", "{answer}");
-    assert!(
-        says(&answer).contains("changes in another app on this Mac"),
-        "{answer}"
+    let (key, path) = handed(&open_attachment(&home, 0));
+    assert_eq!(key, "buwiz/document");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"PK\x03\x04report",
+        "Gmail's copy"
     );
-    assert_eq!(answer.get("_meta"), None);
-    assert_eq!(fs::read(path).unwrap(), b"PK\x03\x04 edited in Pages");
-    // and another account's open would land on it
+    // and another account's open gets its own
+    opened_in_the_macs_app(&home);
     second_account_in_use(&home);
-    bot_can(&home, &["open_with"]);
-    let answer = open_attachment(&home, 0);
-    assert_eq!(refusal(&answer), "in_use", "{answer}");
-    assert_eq!(fs::read(path).unwrap(), b"PK\x03\x04 edited in Pages");
-    // one the app left alone is fetched again, the new way
-    let (other, _) = &files[1];
-    fs::write(other, b"PK\x03\x04budget").unwrap();
-    bot_can(&home, &EVERYTHING);
-    let answer = open_attachment(&home, 1);
-    assert_eq!(handed(&answer).0, "buwiz/document", "{answer}");
+    let fetched = fetches(&google);
+    let (key, path) = handed(&open_attachment(&home, 1));
+    assert_eq!(key, "buwiz/open_with");
+    assert_eq!(fs::read(&path).unwrap(), b"PK\x03\x04budget");
+    assert_eq!(fetches(&google), fetched + 1);
+}
+
+/// What the sweep finds through a link, it neither reads nor removes: the link
+/// goes, as itself.
+#[test]
+fn a_sweep_never_reads_or_removes_through_a_link() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK\x03\x04report")]));
+    let home = Home::new(&google.base(), "sweeplink");
+    let (path, id) = edited_attachment(&home);
+    // the edit's folder swapped for a link to one elsewhere holding the same name
+    let elsewhere = home.dir.join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::write(elsewhere.join("report.docx"), b"PK someone else's").unwrap();
+    fs::remove_dir_all(home.folder(&id)).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, home.folder(&id)).unwrap();
+    // and strays: a link to a folder, and a FIFO
+    let stray = home.open_dir().join("att-stray");
+    std::os::unix::fs::symlink(&elsewhere, &stray).unwrap();
+    let fifo = home.open_dir().join("att-fifo");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    home.later(LIFE_MS);
+    let runs = home.core.hashes.runs();
+    gws::files::sweep(&home.core);
+    assert_eq!(
+        home.core.hashes.runs(),
+        runs,
+        "nothing read through the link"
+    );
+    for gone in [home.folder(&id), stray, fifo] {
+        assert!(fs::symlink_metadata(&gone).is_err(), "{gone:?} stays");
+    }
+    assert_eq!(
+        fs::read(elsewhere.join("report.docx")).unwrap(),
+        b"PK someone else's"
+    );
+    assert!(!path.exists());
+    assert_eq!(home.edits(), Vec::<Value>::new(), "its row went with it");
 }
 
 #[test]
@@ -2136,11 +2259,14 @@ fn an_old_office_or_text_kind_its_bytes_dont_bear_out_is_only_saved() {
         ("old.doc", "application/msword", b"PK\x03\x04 not ole"),
         ("old.xls", "application/vnd.ms-excel", b"<html>"),
         ("data.csv", "text/csv", b"MZ\0\0\x90\0"),
-        ("notes.txt", "text/plain", b"\xff\xfe\0h\0i"),
+        ("notes.txt", "text/plain", b"h\0i"),
         ("invite.ics", "application/ics", b"<html>BEGIN:VCALENDAR"),
         ("fine.xls", "application/vnd.ms-excel", ole),
         ("fine.csv", "text/csv", b"a,b\n1,2\n"),
         ("fine.ics", "application/ics", b"\r\nBEGIN:VCALENDAR\r\n"),
+        ("latin.csv", "text/csv", b"caf\xe9,cr\xe8me\r\n"),
+        ("wide.csv", "text/csv", b"\xff\xfea\0,\0b\0"),
+        ("wide.txt", "text/plain", b"\xfe\xff\0h\0i"),
     ]));
     let home = Home::new(&google.base(), "nottext");
     bot_can(&home, &EVERYTHING);
@@ -2156,6 +2282,10 @@ fn an_old_office_or_text_kind_its_bytes_dont_bear_out_is_only_saved() {
     assert_eq!(handed(&open_attachment(&home, 5)).0, "buwiz/document");
     assert_eq!(handed(&open_attachment(&home, 6)).0, "buwiz/document");
     assert_eq!(handed(&open_attachment(&home, 7)).0, "buwiz/open_with");
+    // text that isn't UTF-8 is still text
+    assert_eq!(handed(&open_attachment(&home, 8)).0, "buwiz/document");
+    assert_eq!(handed(&open_attachment(&home, 9)).0, "buwiz/document");
+    assert_eq!(handed(&open_attachment(&home, 10)).0, "buwiz/open_with");
 }
 
 #[test]

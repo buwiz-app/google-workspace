@@ -17,8 +17,10 @@
 //!
 //! An attachment can also be an image, a PDF or a kind the computer's own app
 //! opens (`handoff.rs` says which way each goes), or a copy for Downloads. Those
-//! are only looked at: they never count as edited, so they go as anything
-//! unedited does.
+//! are only read: the Bot hands the Mac's app a read-only copy of its own and
+//! never this path, so nothing here can hold an edit of them. They never count
+//! as edited, and go at 24 hours and at sign-out whatever their bytes. A copy
+//! for Downloads of an attachment edited in the Bot's view holds that edit.
 //!
 //! We never write over a Google Doc, Sheet or Slides: Google says an update
 //! replaces "the full contents of the document", and doesn't say what becomes
@@ -672,13 +674,41 @@ fn make_folder(root: &Path, dir: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
-/// A regular file at `path`, and no link to one: an upload sends what's here.
+/// A regular file at `path`, in a real folder, and no link to either: an
+/// upload sends what's here.
 fn file_here(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+    path.parent()
+        .is_some_and(|dir| fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()))
+        && fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+}
+
+/// `path` for reading if it's a regular file, and never what a link there
+/// points to: a link swapped in after a check fails to open, and a FIFO opens
+/// without waiting for a writer and is refused.
+fn open_regular(path: &Path) -> std::io::Result<File> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(file)
+}
+
+/// Takes `path` as the entry it is, by lstat: a real folder with all that's in
+/// it, and anything else, a link or a FIFO, by itself. Nothing a link points to
+/// is touched.
+fn remove_entry(path: &Path) -> std::io::Result<()> {
+    if fs::symlink_metadata(path)?.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
 }
 
 fn hash_of(path: &Path) -> std::io::Result<String> {
-    let mut file = File::open(path)?;
+    let mut file = open_regular(path)?;
     let (mut hash, mut buffer) = (Sha256::new(), vec![0; 64 * 1024]);
     loop {
         let n = file.read(&mut buffer)?;
@@ -693,29 +723,16 @@ fn path_of(core: &Core, row: &Opened) -> Result<PathBuf, Failure> {
     Ok(folder_of(core, &row.id)?.join(&row.name))
 }
 
-/// An attachment only looked at: an image, a PDF, anything the computer's own
-/// app has, or a copy on its way to Downloads. It has no edit to keep, so it
-/// never waits for an answer, never goes to Drive, and goes as anything
-/// unedited does.
+/// An attachment only read: an image, a PDF, any kind with no Bot view that
+/// edits it, one handed to the computer's own app (which gets the Bot's own
+/// copy, never this file), or a copy on its way to Downloads. It has no edit to
+/// keep, so it never waits for an answer, never goes to Drive, and goes at 24
+/// hours and at sign-out.
 fn read_only(row: &Opened) -> bool {
     row.attachment
         && (row.version == BY_APP
             || row.version == SAVED
             || !handoff::by_mime(&row.mime).is_some_and(|kind| kind.editable))
-}
-
-/// Whether the Mac's own app changed a file it was handed: read-only here, so
-/// [`is_edited`] never says, and only a hash against what came can.
-fn changed_in_app(core: &Core, path: &Path, row: &Opened) -> bool {
-    row.version == BY_APP
-        && file_here(path)
-        && core.hashes.run(path).map_or(true, |hash| hash != row.hash)
-}
-
-/// Whether a file holds the person's work: an edit in the Bot's view, or a
-/// change the Mac's own app made. Either stays until the person answers it.
-fn has_work(core: &Core, path: &Path, row: &Opened) -> bool {
-    is_edited(core, path, row) || changed_in_app(core, path, row)
 }
 
 /// The way an attachment's row says it was handed over.
@@ -743,7 +760,7 @@ fn seems_edited(core: &Core, path: &Path, row: &Opened) -> bool {
     if read_only(row) {
         return false;
     }
-    let Ok(meta) = fs::metadata(path) else {
+    let Ok(meta) = fs::symlink_metadata(path) else {
         return false;
     };
     let stamp = Stamp::of(&meta);
@@ -769,7 +786,7 @@ fn remove(core: &Core, id: &str) -> Result<(), Failure> {
     let dir = folder_of(core, id)?;
     let forgotten = with_store(core, |store| store.forget_opened(id));
     core.hashes.held().remove(id);
-    match fs::remove_dir_all(dir) {
+    match remove_entry(&dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => {
@@ -1164,13 +1181,10 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
         if row.account == account && now == Some(handed_way(row)) {
             return reopen(core, row);
         }
-        // a download would land on the person's work: read once, as only one
-        // of the two can be true of a row
-        if has_work(core, &path_of(core, row)?, row) {
+        // a download would land on the person's work
+        if is_edited(core, &path_of(core, row)?, row) {
             let why = if row.account != account {
                 "Another of your Google accounts has edits to this attachment here."
-            } else if row.version == BY_APP {
-                "This attachment has changes in another app on this Mac. Save or discard them first."
             } else {
                 "This attachment has edits here that aren't saved. Save them to Drive or discard them first."
             };
@@ -1229,29 +1243,91 @@ fn saved_name(title: &str, bytes: &[u8]) -> String {
     ending(name, kept, ext)
 }
 
-/// The copy the Mac's own app changed, if this account has one: what Save
-/// hands over in place of Gmail's, since the person's work is in it. Its turn
-/// is held by the caller.
-fn changed_copy(
-    core: &Core,
-    account: &str,
-    id: &str,
-) -> Result<Option<(Opened, Vec<u8>)>, Failure> {
+/// What Save hands over from this Mac's copies.
+enum Here {
+    /// Nothing that holds the person's work: Gmail's copy is the one.
+    Nothing,
+    /// An edit in the Bot's view, unanswered: its name and its bytes.
+    Edit(String, Vec<u8>),
+    /// A copy here that can't be shown to be what it should be. Nothing is
+    /// saved on a guess, so it's said.
+    Unreadable,
+}
+
+/// This account's edit of the attachment in the Bot's view, if there's one:
+/// the person's work is in it, so Save hands it over in place of Gmail's. It's
+/// read through [`open_regular`] and hashed as read, so what's compared is what
+/// goes. Its turn is held by the caller.
+fn pending_edit(core: &Core, account: &str, id: &str) -> Result<Here, Failure> {
+    let Some(row) = with_store(core, |store| store.opened(id))? else {
+        return Ok(Here::Nothing);
+    };
+    if row.account != account || read_only(&row) {
+        return Ok(Here::Nothing);
+    }
+    let path = path_of(core, &row)?;
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Here::Nothing),
+        Ok(_) if file_here(&path) => {}
+        _ => return Ok(Here::Unreadable),
+    }
+    let mut bytes = Vec::new();
+    if open_regular(&path)
+        .and_then(|mut file| file.read_to_end(&mut bytes))
+        .is_err()
+    {
+        return Ok(Here::Unreadable);
+    }
+    if format!("{:x}", Sha256::digest(&bytes)) == row.hash {
+        return Ok(Here::Nothing);
+    }
+    Ok(Here::Edit(row.name, bytes))
+}
+
+/// The copy for Downloads already here, if something changed it since it was
+/// written: nothing here writes over it, so the Bot gets it back as it is.
+fn changed_save(core: &Core, account: &str, id: &str) -> Result<Option<Value>, Failure> {
     let Some(row) = with_store(core, |store| store.opened(id))? else {
         return Ok(None);
     };
     let path = path_of(core, &row)?;
-    if row.account != account || !changed_in_app(core, &path, &row) {
+    if !file_here(&path) {
         return Ok(None);
     }
-    let bytes = fs::read(&path).map_err(|_| cant_save())?;
-    Ok(Some((row, bytes)))
+    match core.hashes.run(&path) {
+        Ok(hash) if hash == row.hash => return Ok(None),
+        Ok(_) => {}
+        Err(_) => return Ok(Some(unreadable("The saved copy of this attachment"))),
+    }
+    if row.account != account {
+        return Ok(Some(refusal(
+            "in_use",
+            "Another of your Google accounts has a copy of this attachment here.",
+        )));
+    }
+    let path = fs::canonicalize(&path).map_err(|_| cant_save())?;
+    Ok(Some(saved(&path, &row.name)))
+}
+
+/// A copy here that Save can't read, said so rather than worked round.
+fn unreadable(what: &str) -> Value {
+    refusal(
+        "unreadable",
+        &format!("{what} here can't be read, so nothing was saved."),
+    )
+}
+
+/// The answer that hands a copy to the Bot for Downloads.
+fn saved(path: &Path, name: &str) -> Value {
+    let mut answer = ok(json!({"saved": true, "name": name}));
+    answer["_meta"] = json!({"buwiz/save": {"path": path, "name": name}});
+    answer
 }
 
 /// `gws_mail_attachment_save`: any attachment, fetched as an open is, for the
-/// Bot to copy to Downloads. Its copy here is only looked at, and goes as an
-/// unedited open does. One the Mac's own app changed is what's saved, and once
-/// its copy is made it's answered, so it goes.
+/// Bot to copy to Downloads. An edit in the Bot's view not yet answered is
+/// what's saved, and it stays to be answered. The copy here is only read, and
+/// goes at 24 hours and at sign-out.
 fn save_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (auth, account) = signed_in(core)?;
     let Some((message, part)) = attachment_args(args) else {
@@ -1269,10 +1345,15 @@ fn save_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some(_opened_turn) = turn(core, &opened_id) else {
         return Ok(busy());
     };
-    let changed = changed_copy(core, &account, &opened_id)?;
-    let (title, bytes) = match &changed {
-        Some((row, bytes)) => (row.name.clone(), bytes.clone()),
-        None => {
+    if let Some(answer) = changed_save(core, &account, &id)? {
+        return Ok(answer);
+    }
+    let (title, bytes) = match pending_edit(core, &account, &opened_id)? {
+        Here::Edit(name, bytes) => (name, bytes),
+        Here::Unreadable => {
+            return Ok(unreadable("Your edit to this attachment"));
+        }
+        Here::Nothing => {
             let Some((title, _, attachment)) = listed_part(core, &auth, &message, &part)? else {
                 return Ok(attachment_gone());
             };
@@ -1301,13 +1382,7 @@ fn save_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
         opened_ms: core.clock.now_ms(),
     };
     let path = keep(core, &dir, &row)?;
-    // the person's work is in the saved copy now
-    if changed.is_some() {
-        let _ = remove(core, &opened_id);
-    }
-    let mut answer = ok(json!({"saved": true, "name": row.name}));
-    answer["_meta"] = json!({"buwiz/save": {"path": path, "name": row.name}});
-    Ok(answer)
+    Ok(saved(&path, &row.name))
 }
 
 /// `gws_file_edits`: what's here and edited, with whether Drive moved too. Found
@@ -1383,7 +1458,7 @@ fn upload(core: &Core, args: &Value) -> Result<Value, Failure> {
             "This file has no changes here, so there's nothing to upload.",
         ));
     }
-    let mut file = File::open(&path).map_err(|_| cant_save())?;
+    let mut file = open_regular(&path).map_err(|_| cant_save())?;
     let length = file.metadata().map_err(|_| cant_save())?.len();
     // a save that was cut off mustn't become a new revision
     if length == 0 {
@@ -1466,10 +1541,13 @@ fn discard(core: &Core, args: &Value) -> Result<Value, Failure> {
     Ok(ok(json!({"discarded": true})))
 }
 
-/// Takes what's had its time: a file past its 24 hours, unless it's edited and
-/// unanswered; a row whose file went; a folder nothing here knows of, which is
-/// what a crash leaves. What's being worked on now is left alone. Each file is
-/// seen to on its own, so one that won't go doesn't keep the rest.
+/// Takes what's had its time: a file past its 24 hours, unless it's an edit in
+/// the Bot's view still unanswered; a row whose file went or is no regular file
+/// in a real folder; an entry nothing here knows of, which is what a crash
+/// leaves. Each entry is looked at with lstat and nothing a link points to is
+/// read or removed: a link or a FIFO goes as itself. What's being worked on now
+/// is left alone. Each file is seen to on its own, so one that won't go doesn't
+/// keep the rest.
 pub fn sweep(core: &Core) {
     let Ok(rows) = with_store(core, Store::all_opened) else {
         return;
@@ -1485,7 +1563,7 @@ pub fn sweep(core: &Core) {
         let over = now - row.opened_ms >= LIFE_MS;
         // the stamps can keep a file and never take one: what would go is read
         let done = !file_here(&path)
-            || (over && !seems_edited(core, &path, row) && !has_work(core, &path, row));
+            || (over && !seems_edited(core, &path, row) && !is_edited(core, &path, row));
         if done && let Some(_turn) = turn(core, &row.id) {
             let _ = remove(core, &row.id);
         }
@@ -1509,25 +1587,25 @@ pub fn sweep(core: &Core) {
         };
         if matches!(with_store(core, |store| store.opened(&name)), Ok(None)) {
             let was = entry.path();
-            let _ = fs::remove_dir_all(&was).or_else(|_| fs::remove_file(&was));
+            let _ = remove_entry(&was);
         }
     }
 }
 
 /// `account` is no longer signed in: what can be fetched again goes with it. A
-/// file edited here and unanswered, or changed in the Mac's own app, stays,
-/// with its row, for that account to come back to.
+/// file edited in the Bot's view and unanswered stays, with its row, for that
+/// account to come back to.
 pub fn forget_account(core: &Core, store: &Store, account: &str) -> gws_store::Result<()> {
     for row in store
         .all_opened()?
         .iter()
         .filter(|row| row.account == account)
     {
-        if path_of(core, row).is_ok_and(|path| has_work(core, &path, row)) {
+        if path_of(core, row).is_ok_and(|path| is_edited(core, &path, row)) {
             continue;
         }
         if let Ok(dir) = folder_of(core, &row.id) {
-            let _ = fs::remove_dir_all(dir);
+            let _ = remove_entry(&dir);
         }
         store.forget_opened(&row.id)?;
     }
@@ -1756,6 +1834,27 @@ mod tests {
         assert!(turn(&core, "b2").is_some(), "another file goes on");
         drop(first);
         assert!(turn(&core, "a1").is_some());
+    }
+
+    #[test]
+    fn a_hash_never_reads_through_a_link_or_waits_on_a_fifo() {
+        let dir = std::env::temp_dir().join(format!("gws-nofollow-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real");
+        fs::write(&real, b"PK").unwrap();
+        assert!(hash_of(&real).is_ok());
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(hash_of(&link).is_err(), "a link is no file");
+        let fifo = dir.join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert!(hash_of(&fifo).is_err(), "a FIFO is refused, not waited on");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Stamps that lie can only keep a file. No save can make them lie from

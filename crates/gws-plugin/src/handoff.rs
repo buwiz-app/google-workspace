@@ -11,8 +11,9 @@
 //! anything, and matches the Bot's: png, jpg, jpeg, gif, webp, heic, pdf, txt,
 //! csv, docx, xlsx, pptx, pages, numbers, key and ics. No legacy Office file,
 //! which can carry macros, and no zip, which Archive Utility would unpack here,
-//! beyond the Bot's checks: those are saved. Whatever the Mac's own app has is
-//! only looked at: an edit made there is never taken to Drive.
+//! beyond the Bot's checks: those are saved. The Mac's own app gets the Bot's
+//! own read-only copy and never the plugin's file, so nothing it does comes
+//! back here or goes to Drive.
 
 use std::sync::Mutex;
 
@@ -137,12 +138,12 @@ fn ole(b: &[u8]) -> bool {
     b.starts_with(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
 }
 
-/// Text: no NUL, and UTF-8 as far as it's read, a cut character at the end
-/// aside.
+/// Text, in whatever encoding: UTF-16 with its mark, or anything with no NUL in
+/// its first block. A csv from Excel is often Latin-1 or UTF-16, and the app its
+/// name picks reads either.
 fn text(b: &[u8]) -> bool {
     let head = &b[..b.len().min(8192)];
-    !head.contains(&0)
-        && std::str::from_utf8(head).map_or_else(|e| e.error_len().is_none(), |_| true)
+    head.starts_with(b"\xff\xfe") || head.starts_with(b"\xfe\xff") || !head.contains(&0)
 }
 
 fn ics(b: &[u8]) -> bool {
@@ -429,6 +430,26 @@ mod tests {
             checked(txt, b"anything").is_some(),
             "the app its name picks"
         );
+    }
+
+    #[test]
+    fn text_in_any_encoding_is_text_and_a_nul_isnt() {
+        let csv = by_mime("text/csv").unwrap();
+        let txt = by_mime("text/plain").unwrap();
+        for bytes in [
+            &b"caf\xe9,cr\xe8me\r\n"[..],
+            b"\xff\xfea\0,\0b\0",
+            b"\xfe\xff\0a\0,\0b",
+            b"\xef\xbb\xbfa,b\n",
+            b"",
+        ] {
+            assert!(checked(csv, bytes).is_some(), "{bytes:?}");
+            assert!(checked(txt, bytes).is_some(), "{bytes:?}");
+        }
+        for bytes in [&b"MZ\0\0"[..], b"a,b\n\0"] {
+            assert!(checked(csv, bytes).is_none(), "{bytes:?}");
+            assert!(checked(txt, bytes).is_none(), "{bytes:?}");
+        }
     }
 
     #[test]

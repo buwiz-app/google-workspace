@@ -1086,6 +1086,21 @@ fn pre(text: &str) -> String {
     )
 }
 
+/// A thread read whole from Google and made into the page an open shows, with
+/// what Google sent: an open and a read ahead both keep what this makes.
+/// `None` when the thread is gone.
+pub(crate) fn read_view(
+    core: &Core,
+    auth: &Bearer,
+    id: &str,
+) -> Result<Option<(Value, Value)>, Failure> {
+    let Some(full) = core.gmail.thread_full(auth, id)? else {
+        return Ok(None);
+    };
+    let view = view_of(&full);
+    Ok(Some((full, view)))
+}
+
 fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (auth, account) = reader(core)?;
     let id = js::trim(&js::string_or_empty(args.get("thread"))).to_owned();
@@ -1109,10 +1124,9 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     }
     // read as the sign-in the Bot can't refresh just now: it says so itself
     let auth = auth.ok_or(Failure::AccountRequired)?;
-    let Some(full) = core.gmail.thread_full(&auth, &id)? else {
+    let Some((_, view)) = read_view(core, &auth, &id)? else {
         return Ok(fail("not_found", "That conversation is gone."));
     };
-    let view = view_of(&full);
     with_own_store(core, &account, |store| {
         store.put_view(&account, &id, &view.to_string(), now_ms())
     })?;

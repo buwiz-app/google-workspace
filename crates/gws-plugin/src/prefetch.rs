@@ -1,6 +1,6 @@
 //! Recent mail on this computer ahead of time, so it opens at once and with no
 //! connection: after each list sync, the views of the last 30 days' threads,
-//! made as an open makes them, and their attachments under 5 MB.
+//! made by the open's own [`read_view`], and their attachments under 5 MB.
 //!
 //! It runs on a thread of its own, so the list sync never waits for it, and it
 //! holds the store only to read and write, never while Google answers, so a
@@ -16,7 +16,7 @@ use serde_json::Value;
 use crate::Core;
 use crate::accounts::Bearer;
 use crate::gmail::{self, Failure};
-use crate::mail::{now_ms, row_of, signed_in, view_of, with_own_store, with_store};
+use crate::mail::{now_ms, read_view, row_of, signed_in, with_own_store, with_store};
 
 /// How far back mail is kept ahead.
 pub const WINDOW_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -69,14 +69,15 @@ pub fn bodies(core: &Core, auth: &Bearer, account: &str, since: i64) -> Result<(
         if core.sync.stopping() {
             break;
         }
-        let Some(full) = core.gmail.thread_full(auth, &id)? else {
+        // made as an open makes it, so what's kept is what an open would show
+        let Some((full, view)) = read_view(core, auth, &id)? else {
             continue;
         };
         // what was read is what the row says, or the next sync has news of it
         let Some(row) = row_of(&full) else {
             continue;
         };
-        let view = view_of(&full).to_string();
+        let view = view.to_string();
         let kept = with_own_store(core, account, |store| {
             store.put_view_ahead(account, &id, (row.at, row.messages), &view, now_ms(), since)
         })?;

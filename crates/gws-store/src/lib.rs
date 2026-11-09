@@ -81,7 +81,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     // recent mail ahead of time: small attachments, the bytes last so a sum of
     // sizes needn't read them, and which views have had theirs looked at
     (
-        10,
+        12,
         "CREATE TABLE attachment_bytes(account TEXT NOT NULL, message TEXT NOT NULL, part TEXT NOT NULL, thread TEXT NOT NULL, name TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL, used INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(account, message, part));
          CREATE INDEX attachment_bytes_of_thread ON attachment_bytes(account, thread);
          ALTER TABLE bodies ADD COLUMN fetched INTEGER NOT NULL DEFAULT 0;",

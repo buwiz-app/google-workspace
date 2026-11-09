@@ -74,11 +74,9 @@ pub(crate) struct Kind {
     pub editable: bool,
     /// Its first bytes, for a kind an open checks by them.
     magic: Option<fn(&[u8]) -> bool>,
-    /// A zip inside, whatever it's called: an open checks for the header, so
-    /// what the Bot's view or the Mac's app gets is at least that.
-    container: bool,
-    /// Whether bytes look like this kind at all: what a saved copy's name is
-    /// kept by.
+    /// Whether bytes look like this kind at all: a zip header for what's a zip
+    /// inside, the old Office header for doc and xls, text for txt, csv and
+    /// ics. An open needs it, and a saved copy's name is kept by it.
     fits: fn(&[u8]) -> bool,
 }
 
@@ -95,16 +93,7 @@ const fn kind(
         system: true,
         editable: false,
         magic: None,
-        container: false,
         fits: zip,
-    }
-}
-
-/// A kind that's a zip inside.
-const fn in_zip(kind: Kind) -> Kind {
-    Kind {
-        container: true,
-        ..kind
     }
 }
 
@@ -204,12 +193,12 @@ fn pdf(b: &[u8]) -> bool {
 /// Every kind an attachment opens as, and the only kinds Drive opens: the
 /// editable ones. Anything else is only saved.
 pub(crate) const KINDS: [Kind; 19] = [
-    in_zip(edited(super::files::DOCX, &["docx"], WORD, zip)),
+    edited(super::files::DOCX, &["docx"], WORD, zip),
     Kind {
         system: false,
         ..edited("application/msword", &["doc"], WORD, ole)
     },
-    in_zip(edited(super::files::XLSX, &["xlsx"], SHEET, zip)),
+    edited(super::files::XLSX, &["xlsx"], SHEET, zip),
     Kind {
         system: false,
         ..edited("application/vnd.ms-excel", &["xls"], SHEET, ole)
@@ -234,16 +223,16 @@ pub(crate) const KINDS: [Kind; 19] = [
         fits: text,
         ..kind("text/plain", &["txt"], None)
     },
-    in_zip(kind(super::files::PPTX, &["pptx"], None)),
+    kind(super::files::PPTX, &["pptx"], None),
     // saved only: it can carry macros
     Kind {
         system: false,
         fits: ole,
         ..kind("application/vnd.ms-powerpoint", &["ppt"], None)
     },
-    in_zip(kind("application/vnd.apple.pages", &["pages"], None)),
-    in_zip(kind("application/vnd.apple.numbers", &["numbers"], None)),
-    in_zip(kind("application/vnd.apple.keynote", &["key"], None)),
+    kind("application/vnd.apple.pages", &["pages"], None),
+    kind("application/vnd.apple.numbers", &["numbers"], None),
+    kind("application/vnd.apple.keynote", &["key"], None),
     Kind {
         aliases: &["application/ics"],
         fits: ics,
@@ -291,11 +280,8 @@ impl Kind {
 /// are, if they're the same sort of thing: a PNG sent as a JPEG is a PNG. One
 /// they don't bear out is nothing that can open.
 pub(crate) fn checked(kind: &'static Kind, bytes: &[u8]) -> Option<&'static Kind> {
-    if kind.container {
-        return zip(bytes).then_some(kind);
-    }
     if kind.magic.is_none() {
-        return Some(kind);
+        return kind.fits(bytes).then_some(kind);
     }
     KINDS
         .iter()

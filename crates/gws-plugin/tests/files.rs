@@ -2108,6 +2108,10 @@ fn an_edit_in_the_macs_app_isnt_fetched_over_by_another_way_or_account() {
     bot_can(&home, &EVERYTHING);
     let answer = open_attachment(&home, 0);
     assert_eq!(refusal(&answer), "in_use", "{answer}");
+    assert!(
+        says(&answer).contains("changes in another app on this Mac"),
+        "{answer}"
+    );
     assert_eq!(answer.get("_meta"), None);
     assert_eq!(fs::read(path).unwrap(), b"PK\x03\x04 edited in Pages");
     // and another account's open would land on it
@@ -2122,6 +2126,36 @@ fn an_edit_in_the_macs_app_isnt_fetched_over_by_another_way_or_account() {
     bot_can(&home, &EVERYTHING);
     let answer = open_attachment(&home, 1);
     assert_eq!(handed(&answer).0, "buwiz/document", "{answer}");
+}
+
+#[test]
+fn an_old_office_or_text_kind_its_bytes_dont_bear_out_is_only_saved() {
+    let ole: &[u8] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1 sheet";
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("old.doc", "application/msword", b"PK\x03\x04 not ole"),
+        ("old.xls", "application/vnd.ms-excel", b"<html>"),
+        ("data.csv", "text/csv", b"MZ\0\0\x90\0"),
+        ("notes.txt", "text/plain", b"\xff\xfe\0h\0i"),
+        ("invite.ics", "application/ics", b"<html>BEGIN:VCALENDAR"),
+        ("fine.xls", "application/vnd.ms-excel", ole),
+        ("fine.csv", "text/csv", b"a,b\n1,2\n"),
+        ("fine.ics", "application/ics", b"\r\nBEGIN:VCALENDAR\r\n"),
+    ]));
+    let home = Home::new(&google.base(), "nottext");
+    bot_can(&home, &EVERYTHING);
+    for n in 0..5 {
+        let answer = open_attachment(&home, n);
+        assert_eq!(refusal(&answer), "unsupported", "{n}: {answer}");
+        assert_eq!(
+            says(&answer),
+            "This kind of file can't open here. Save it instead."
+        );
+    }
+    assert!(!home.open_dir().exists(), "nothing stays");
+    assert_eq!(handed(&open_attachment(&home, 5)).0, "buwiz/document");
+    assert_eq!(handed(&open_attachment(&home, 6)).0, "buwiz/document");
+    assert_eq!(handed(&open_attachment(&home, 7)).0, "buwiz/open_with");
 }
 
 #[test]

@@ -23,20 +23,27 @@ fn signed_in(google: &FakeGoogle, paths: &gws_store::Paths) -> Core {
     core
 }
 
+/// A port nothing holds, so the rich mail can name the stub before it starts.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
 /// The stub, with the rich mail pointing its web pictures at it.
 fn rich() -> (FakeGoogle, String) {
-    let google = FakeGoogle::start(Seed::default());
-    let mails = Seed::default().with_rich_mail(&google.base()).mails;
-    let news = mails
+    let port = free_port();
+    let seed = Seed::default().with_rich_mail(&format!("http://127.0.0.1:{port}"));
+    let news = seed
+        .mails
         .iter()
         .find(|m| m.subject.starts_with("Five roofs"))
         .unwrap()
         .thread
         .clone();
-    for mail in mails.into_iter().rev() {
-        google.deliver(mail);
-    }
-    (google, news)
+    (FakeGoogle::start_on(port, seed), news)
 }
 
 fn data(r: Value) -> Value {

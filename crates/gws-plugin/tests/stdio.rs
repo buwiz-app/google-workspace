@@ -1523,17 +1523,20 @@ fn the_manifest_command_prints_this_version_for_protocol_1_0() {
 fn the_model_can_never_fetch_a_mails_pictures() {
     use gws_fake_google::{FakeGoogle, Seed};
 
-    let google = FakeGoogle::start(Seed::default());
-    let mails = Seed::default().with_rich_mail(&google.base()).mails;
-    let news = mails
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let seed = Seed::default().with_rich_mail(&format!("http://127.0.0.1:{port}"));
+    let news = seed
+        .mails
         .iter()
         .find(|m| m.subject.starts_with("Five roofs"))
         .unwrap()
         .thread
         .clone();
-    for mail in mails.into_iter().rev() {
-        google.deliver(mail);
-    }
+    let google = FakeGoogle::start_on(port, seed);
     let manifest = manifest_file("pictures-model");
     let data = std::env::temp_dir().join(format!("gws-stdio-pictures-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data);

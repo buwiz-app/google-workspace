@@ -1415,6 +1415,26 @@ mod tests {
         assert!(!vouched(&under));
     }
 
+    /// Gmail adds its own verdict last, so it's on top: a sender's copy of one
+    /// that says pass, however much it looks like Gmail's, sits below and
+    /// counts for nothing.
+    #[test]
+    fn a_forged_pass_below_gmails_own_fail_is_ignored() {
+        let message = json!({"labelIds": ["INBOX"], "payload": {"headers": [
+            {"name": "Authentication-Results", "value": "mx.google.com; spf=softfail (google.com: domain of transitioning news@digest.example does not designate 192.0.2.9 as permitted sender) smtp.mailfrom=news@digest.example; dmarc=fail (p=NONE sp=NONE dis=NONE) header.from=digest.example"},
+            {"name": "Received", "value": "from evil.example by mx.google.com"},
+            {"name": "Authentication-Results", "value": "mx.google.com; dkim=pass header.i=@digest.example header.d=digest.example; dmarc=pass (p=REJECT) header.from=digest.example"},
+            {"name": "ARC-Authentication-Results", "value": "i=1; mx.google.com; dkim=pass header.d=digest.example; dmarc=pass header.from=digest.example"},
+            {"name": "From", "value": "Weekly Digest <news@digest.example>"},
+        ]}});
+        assert!(!vouched(&message));
+        assert_eq!(
+            sender(&json!({"messages": [message]}), "owner@example.com"),
+            Some(("news@digest.example".to_owned(), false)),
+            "offered, as a stranger"
+        );
+    }
+
     #[test]
     fn the_persons_own_mail_offers_no_always() {
         let me = "owner@example.com";

@@ -32,7 +32,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{Read as _, SeekFrom, Write as _};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -708,7 +708,12 @@ fn remove_entry(path: &Path) -> std::io::Result<()> {
 }
 
 fn hash_of(path: &Path) -> std::io::Result<String> {
-    let mut file = open_regular(path)?;
+    hash_file(&mut open_regular(path)?)
+}
+
+/// The hash of an open file, from its start.
+fn hash_file(file: &mut File) -> std::io::Result<String> {
+    file.seek(SeekFrom::Start(0))?;
     let (mut hash, mut buffer) = (Sha256::new(), vec![0; 64 * 1024]);
     loop {
         let n = file.read(&mut buffer)?;
@@ -721,6 +726,60 @@ fn hash_of(path: &Path) -> std::io::Result<String> {
 
 fn path_of(core: &Core, row: &Opened) -> Result<PathBuf, Failure> {
     Ok(folder_of(core, &row.id)?.join(&row.name))
+}
+
+/// What's at a row's place, by lstat alone and never through a link.
+#[derive(PartialEq, Eq)]
+enum Entry {
+    /// Its folder, or the file in it, is gone.
+    Missing,
+    /// A regular file in a real folder: [`file_here`].
+    File,
+    /// Something else: the folder is a link or no folder, or the file is a
+    /// link, a folder or a FIFO. Nothing in it is read.
+    Odd,
+}
+
+fn entry_of(path: &Path) -> Entry {
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let Some(dir) = path.parent() else {
+        return Entry::Odd;
+    };
+    match fs::symlink_metadata(dir) {
+        Err(e) if gone(&e) => return Entry::Missing,
+        Ok(meta) if meta.is_dir() => {}
+        _ => return Entry::Odd,
+    }
+    match fs::symlink_metadata(path) {
+        Err(e) if gone(&e) => Entry::Missing,
+        Ok(meta) if meta.is_file() => Entry::File,
+        _ => Entry::Odd,
+    }
+}
+
+/// A kind that can be edited, with something odd in its place: it's kept as
+/// the person's work, and nothing downloads over it.
+fn odd_edit(core: &Core, row: &Opened) -> Result<bool, Failure> {
+    Ok(!read_only(row) && entry_of(&path_of(core, row)?) == Entry::Odd)
+}
+
+fn odd_here() -> Value {
+    refusal(
+        "unreadable",
+        "Your edit to this file here can't be read, so it's kept as it is. Discard it to open this again.",
+    )
+}
+
+/// Whether a row's place holds the person's work, as far as can be told
+/// without following a link: an edit by its hash, or, for a kind that can be
+/// edited, anything odd there, which can't be shown to be unedited. Nothing
+/// goes on a guess.
+fn has_edit(core: &Core, path: &Path, row: &Opened) -> bool {
+    match entry_of(path) {
+        Entry::Missing => false,
+        Entry::File => is_edited(core, path, row),
+        Entry::Odd => !read_only(row),
+    }
 }
 
 /// An attachment only read: an image, a PDF, any kind with no Bot view that
@@ -759,6 +818,11 @@ fn is_edited(core: &Core, path: &Path, row: &Opened) -> bool {
 fn seems_edited(core: &Core, path: &Path, row: &Opened) -> bool {
     if read_only(row) {
         return false;
+    }
+    match entry_of(path) {
+        Entry::Missing => return false,
+        Entry::Odd => return true,
+        Entry::File => {}
     }
     let Ok(meta) = fs::symlink_metadata(path) else {
         return false;
@@ -883,6 +947,11 @@ fn open(core: &Core, args: &Value) -> Result<Value, Failure> {
         return Ok(busy());
     };
     let held = with_store(core, |store| store.opened(&id))?;
+    if let Some(row) = &held
+        && odd_edit(core, row)?
+    {
+        return Ok(odd_here());
+    }
     // a row is the file's only way of being told from an edit, so one with no
     // file is no copy at all
     let here = match held {
@@ -1172,6 +1241,11 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
         return Ok(busy());
     };
     let held = with_store(core, |store| store.opened(&id))?;
+    if let Some(row) = &held
+        && odd_edit(core, row)?
+    {
+        return Ok(odd_here());
+    }
     let here = match held {
         Some(row) if file_here(&path_of(core, &row)?) => Some(row),
         _ => None,
@@ -1266,10 +1340,10 @@ fn pending_edit(core: &Core, account: &str, id: &str) -> Result<Here, Failure> {
         return Ok(Here::Nothing);
     }
     let path = path_of(core, &row)?;
-    match fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Here::Nothing),
-        Ok(_) if file_here(&path) => {}
-        _ => return Ok(Here::Unreadable),
+    match entry_of(&path) {
+        Entry::Missing => return Ok(Here::Nothing),
+        Entry::Odd => return Ok(Here::Unreadable),
+        Entry::File => {}
     }
     let mut bytes = Vec::new();
     if open_regular(&path)
@@ -1285,7 +1359,8 @@ fn pending_edit(core: &Core, account: &str, id: &str) -> Result<Here, Failure> {
 }
 
 /// The copy for Downloads already here, if something changed it since it was
-/// written: nothing here writes over it, so the Bot gets it back as it is.
+/// written: nothing here writes over it with Gmail's, so the Bot gets it back
+/// as it is. A pending edit in the Bot's view is asked first, and wins.
 fn changed_save(core: &Core, account: &str, id: &str) -> Result<Option<Value>, Failure> {
     let Some(row) = with_store(core, |store| store.opened(id))? else {
         return Ok(None);
@@ -1345,15 +1420,22 @@ fn save_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some(_opened_turn) = turn(core, &opened_id) else {
         return Ok(busy());
     };
-    if let Some(answer) = changed_save(core, &account, &id)? {
-        return Ok(answer);
-    }
+    // a pending edit is newer than any copy saved before it, changed or not
     let (title, bytes) = match pending_edit(core, &account, &opened_id)? {
+        Here::Edit(_, bytes) if bytes.is_empty() => {
+            return Ok(refusal(
+                "empty",
+                "Your edit to this attachment is empty here, so nothing was saved.",
+            ));
+        }
         Here::Edit(name, bytes) => (name, bytes),
         Here::Unreadable => {
             return Ok(unreadable("Your edit to this attachment"));
         }
         Here::Nothing => {
+            if let Some(answer) = changed_save(core, &account, &id)? {
+                return Ok(answer);
+            }
             let Some((title, _, attachment)) = listed_part(core, &auth, &message, &part)? else {
                 return Ok(attachment_gone());
             };
@@ -1503,14 +1585,20 @@ fn upload(core: &Core, args: &Value) -> Result<Value, Failure> {
         Ok(place) => place,
         Err(answer) => return Ok(write_refused(answer)),
     };
+    // what goes is what this holds now; a save during the send is a new edit
+    let sent = hash_file(&mut file).map_err(|_| cant_save())?;
     let done = match core.transfers.send(&place, &mut file, length)? {
         Sent::Done(v) => v,
         Sent::Refused(answer) => return Ok(write_refused(answer)),
     };
     drop(file);
     // Drive has it, and that's the answer. What won't go from here has lost its
-    // row, so it can't be sent twice, and the sweep finishes it
-    let _ = remove(core, &id);
+    // row, so it can't be sent twice, and the sweep finishes it. An edit saved
+    // while it went, which a send can take half an hour over, stays as it is,
+    // with its row, for the person to answer
+    if hash_of(&path).is_ok_and(|now| now == sent) {
+        let _ = remove(core, &id);
+    }
     // the new revision or copy shows when the changes sync brings it
     core.sync.wake();
     let mut answer = json!({"uploaded": true, "mode": mode});
@@ -1562,8 +1650,11 @@ pub fn sweep(core: &Core) {
         }
         let over = now - row.opened_ms >= LIFE_MS;
         // the stamps can keep a file and never take one: what would go is read
-        let done = !file_here(&path)
-            || (over && !seems_edited(core, &path, row) && !is_edited(core, &path, row));
+        let done = match entry_of(&path) {
+            Entry::Missing => true,
+            Entry::Odd => read_only(row),
+            Entry::File => over && !seems_edited(core, &path, row) && !is_edited(core, &path, row),
+        };
         if done && let Some(_turn) = turn(core, &row.id) {
             let _ = remove(core, &row.id);
         }
@@ -1601,7 +1692,7 @@ pub fn forget_account(core: &Core, store: &Store, account: &str) -> gws_store::R
         .iter()
         .filter(|row| row.account == account)
     {
-        if path_of(core, row).is_ok_and(|path| is_edited(core, &path, row)) {
+        if path_of(core, row).is_ok_and(|path| has_edit(core, &path, row)) {
             continue;
         }
         if let Ok(dir) = folder_of(core, &row.id) {

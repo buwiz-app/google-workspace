@@ -567,6 +567,39 @@ fn update_makes_a_new_revision_after_reading_drive_and_the_local_file_goes() {
 }
 
 #[test]
+fn an_edit_saved_while_an_upload_goes_stays_for_the_person() {
+    let google = FakeGoogle::start(Seed::default());
+    google.seed_file(a_docx("drv-a"));
+    let home = Home::new(&google.base(), "midsend");
+    let path = home.open("drv-a");
+    fs::write(&path, b"PK edited here").unwrap();
+    google.hold("PUT", "/files/drv-a");
+    let answer = std::thread::scope(|threads| {
+        let sending = threads.spawn(|| home.upload("drv-a", "update"));
+        google.wait_for_held();
+        // the viewer saves again, with the first edit's bytes on their way
+        fs::write(&path, b"PK edited again").unwrap();
+        google.release();
+        sending.join().unwrap()
+    });
+    assert_eq!(data(answer)["uploaded"], true);
+    assert_eq!(
+        google.drive_file("drv-a").unwrap().content,
+        b"PK edited here"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"PK edited again",
+        "not deleted unsent"
+    );
+    assert_eq!(
+        home.edits().len(),
+        1,
+        "still edited, for the person to answer"
+    );
+}
+
+#[test]
 fn a_big_edit_goes_up_in_pieces_and_arrives_whole() {
     let google = FakeGoogle::start(Seed::default());
     google.seed_file(a_docx("drv-a"));
@@ -1854,6 +1887,68 @@ fn an_edit_that_cant_be_read_as_a_file_is_refused_by_save_and_not_worked_round()
 }
 
 #[test]
+fn an_edit_whose_folder_is_a_link_is_refused_by_save_not_saved_from_gmail() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK\x03\x04report")]));
+    let home = Home::new(&google.base(), "saveparent");
+    bot_can(&home, &EVERYTHING);
+    let (_, id) = edited_attachment(&home);
+    // a link to a folder without the file: the name isn't found through it
+    let elsewhere = home.dir.join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::remove_dir_all(home.folder(&id)).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, home.folder(&id)).unwrap();
+    let fetched = fetches(&google);
+    let answer = save_attachment(&home, 0);
+    assert_eq!(refusal(&answer), "unreadable", "{answer}");
+    assert_eq!(answer.get("_meta"), None);
+    assert_eq!(
+        fetches(&google),
+        fetched,
+        "Gmail's copy wasn't saved instead"
+    );
+}
+
+#[test]
+fn a_newer_edit_wins_over_a_changed_saved_copy() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK\x03\x04report")]));
+    let home = Home::new(&google.base(), "savenewer");
+    bot_can(&home, &EVERYTHING);
+    let first = handed(&save_attachment(&home, 0)).1;
+    fs::write(&first, b"PK\x03\x04 changed here").unwrap();
+    let (path, _) = edited_attachment(&home);
+    let saved = handed(&save_attachment(&home, 0)).1;
+    assert_eq!(
+        fs::read(&saved).unwrap(),
+        b"PK mine",
+        "the edit, not the old copy"
+    );
+    fs::write(&path, b"PK mine, again").unwrap();
+    let saved = handed(&save_attachment(&home, 0)).1;
+    assert_eq!(fs::read(&saved).unwrap(), b"PK mine, again");
+}
+
+#[test]
+fn an_empty_edit_isnt_saved() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK\x03\x04report")]));
+    let home = Home::new(&google.base(), "saveempty");
+    bot_can(&home, &EVERYTHING);
+    let (path, _) = edited_attachment(&home);
+    fs::write(&path, b"").unwrap();
+    let fetched = fetches(&google);
+    let answer = save_attachment(&home, 0);
+    assert_eq!(refusal(&answer), "empty", "{answer}");
+    assert_eq!(
+        says(&answer),
+        "Your edit to this attachment is empty here, so nothing was saved."
+    );
+    assert_eq!(answer.get("_meta"), None);
+    assert_eq!(fetches(&google), fetched, "nor Gmail's copy in its place");
+}
+
+#[test]
 fn a_saved_copy_changed_here_is_handed_back_and_never_written_over() {
     let google = FakeGoogle::start(Seed::default());
     google.deliver(mail_with(vec![
@@ -2209,8 +2304,9 @@ fn a_copy_for_the_macs_app_is_fetched_again_another_way_or_for_another_account()
     assert_eq!(fetches(&google), fetched + 1);
 }
 
-/// What the sweep finds through a link, it neither reads nor removes: the link
-/// goes, as itself.
+/// What the sweep finds through a link, it neither reads nor removes. An edit's
+/// folder swapped for a link can't be shown to be unedited, so it stays as it
+/// is; a stray link or FIFO goes as itself.
 #[test]
 fn a_sweep_never_reads_or_removes_through_a_link() {
     let google = FakeGoogle::start(Seed::default());
@@ -2240,15 +2336,100 @@ fn a_sweep_never_reads_or_removes_through_a_link() {
         runs,
         "nothing read through the link"
     );
-    for gone in [home.folder(&id), stray, fifo] {
+    for gone in [stray, fifo] {
         assert!(fs::symlink_metadata(&gone).is_err(), "{gone:?} stays");
     }
+    let kept = fs::symlink_metadata(home.folder(&id)).unwrap();
+    assert!(kept.file_type().is_symlink(), "the edit's place stays");
+    home.sign_out();
+    home.core.account("buwiz.account.set", &push(FAKE_EMAIL));
+    assert!(
+        fs::symlink_metadata(home.folder(&id)).is_ok(),
+        "through a sign-out"
+    );
+    let runs = home.core.hashes.runs();
+    let edits = home.edits();
+    assert_eq!(edits.len(), 1, "listed for the person to answer: {edits:?}");
+    assert_eq!(home.core.hashes.runs(), runs, "and still never read");
+    // the person's discard takes the link, as itself
+    data(home.core.run("gws_file_discard", &json!({"id": id})));
+    assert!(fs::symlink_metadata(home.folder(&id)).is_err());
     assert_eq!(
         fs::read(elsewhere.join("report.docx")).unwrap(),
         b"PK someone else's"
     );
     assert!(!path.exists());
-    assert_eq!(home.edits(), Vec::<Value>::new(), "its row went with it");
+}
+
+/// What Save says it kept, the sweep and a sign-out keep, and an open doesn't
+/// download over.
+#[test]
+fn an_edit_save_couldnt_read_stays_through_the_sweep_a_sign_out_and_an_open() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![("report.docx", DOCX, b"PK\x03\x04report")]));
+    let home = Home::new(&google.base(), "oddkept");
+    bot_can(&home, &EVERYTHING);
+    let fifo = |at: &Path| {
+        let made = std::process::Command::new("mkfifo")
+            .arg(at)
+            .status()
+            .unwrap();
+        assert!(made.success());
+    };
+    let outside = home.dir.join("outside.docx");
+    fs::write(&outside, b"PK not the attachment").unwrap();
+    type Make<'a> = Box<dyn Fn(&Path) + 'a>;
+    let odd: [(&str, Make); 3] = [
+        (
+            "a link",
+            Box::new(|at: &Path| std::os::unix::fs::symlink(&outside, at).unwrap()),
+        ),
+        (
+            "a folder",
+            Box::new(|at: &Path| fs::create_dir(at).unwrap()),
+        ),
+        ("a FIFO", Box::new(fifo)),
+    ];
+    for (what, make) in odd {
+        let (path, id) = edited_attachment(&home);
+        fs::remove_file(&path).unwrap();
+        make(&path);
+        assert_eq!(refusal(&save_attachment(&home, 0)), "unreadable", "{what}");
+        home.later(LIFE_MS * 3);
+        gws::files::sweep(&home.core);
+        assert!(fs::symlink_metadata(&path).is_ok(), "{what}: past its time");
+        home.sign_out();
+        assert!(
+            fs::symlink_metadata(&path).is_ok(),
+            "{what}: through a sign-out"
+        );
+        home.core.account("buwiz.account.set", &push(FAKE_EMAIL));
+        let fetched = fetches(&google);
+        let answer = open_attachment(&home, 0);
+        assert_eq!(refusal(&answer), "unreadable", "{what}: {answer}");
+        assert_eq!(
+            fetches(&google),
+            fetched,
+            "{what}: nothing downloaded over it"
+        );
+        assert!(fs::symlink_metadata(&path).is_ok(), "{what}: and an open");
+        data(home.core.run("gws_file_discard", &json!({"id": id})));
+        home.later(0);
+    }
+    assert_eq!(fs::read(&outside).unwrap(), b"PK not the attachment");
+}
+
+#[test]
+fn an_odd_copy_of_a_kind_that_cant_be_edited_still_goes() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![("IMG_4250.png", "image/png", PNG)]));
+    let home = Home::new(&google.base(), "oddimage");
+    bot_can(&home, &EVERYTHING);
+    let path = path_in(&open_attachment(&home, 0));
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    gws::files::sweep(&home.core);
+    assert!(fs::symlink_metadata(&path).is_err(), "no edit to keep");
 }
 
 #[test]

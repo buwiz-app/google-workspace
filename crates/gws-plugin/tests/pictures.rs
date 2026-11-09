@@ -201,6 +201,26 @@ fn the_model_reading_a_mail_fetches_no_picture() {
     let read = data(core.run_for_model("gws_read_mail", &json!({"id": news})));
     assert!(read.to_string().contains("Five roofs"), "{read}");
     assert_eq!(pictures_fetched(&google), 0);
+    // and were the loop's check ever bypassed, the model's own path refuses
+    for (tool, args) in [
+        ("gws_mail_pictures", json!({"thread": news})),
+        (
+            "gws_mail_picture_sender_add",
+            json!({"address": "news@digest.example"}),
+        ),
+    ] {
+        let refused = core.run_for_model(tool, &args);
+        assert_eq!(
+            refused["structuredContent"]["code"], "permission_denied",
+            "{tool}"
+        );
+        let refused = core.run_for_chat(tool, &args);
+        assert_eq!(
+            refused["structuredContent"]["code"], "permission_denied",
+            "{tool}"
+        );
+    }
+    assert_eq!(pictures_fetched(&google), 0);
     for tool in [
         "gws_mail_pictures",
         "gws_mail_picture_sender_add",
@@ -272,4 +292,132 @@ fn a_trusted_ask_fetches_only_the_trusted_senders_pictures() {
     ));
     assert_eq!(view["images"], 0);
     assert_eq!(view["pictures"]["trusted"], true);
+}
+
+/// A From anyone can write is no sender to trust: a mail Gmail doesn't vouch
+/// for shows its bar as a stranger's, and a trusted ask fetches nothing of it.
+#[cfg(feature = "stub")]
+#[test]
+fn a_forged_sender_is_never_trusted() {
+    let (google, news) = rich();
+    google.forge_sender(&news);
+    let core = signed_in(&google, &paths("forged"));
+    data(core.run(
+        "gws_mail_picture_sender_add",
+        &json!({"address": "news@digest.example"}),
+    ));
+    let view = data(core.run("gws_mail_thread", &json!({"thread": news})));
+    assert_eq!(view["pictures"]["from"], "news@digest.example");
+    assert_eq!(view["pictures"]["trusted"], false, "{}", view["pictures"]);
+    let asked = data(core.run(
+        "gws_mail_pictures",
+        &json!({"thread": news, "trusted": true}),
+    ));
+    assert_eq!(asked["images"], 2);
+    assert_eq!(pictures_fetched(&google), 0);
+}
+
+/// One thread, two senders, each with a web picture of their own.
+#[cfg(feature = "stub")]
+fn two_senders(google: &FakeGoogle) {
+    let one = |id: &str, from: &str, picture: &str, at: i64| Mail {
+        id: id.into(),
+        thread: "twosenders01".into(),
+        labels: vec!["INBOX".into()],
+        from: from.into(),
+        to: OWNER.into(),
+        subject: "Both of us".into(),
+        at,
+        text: "pictures".into(),
+        html: Some(format!(
+            "<p>pictures</p><img src=\"{}/pictures/{picture}\">",
+            google.base()
+        )),
+        message_id: format!("<{id}@example.com>"),
+        attachments: Vec::new(),
+        inline: Vec::new(),
+    };
+    google.deliver(one(
+        "twosenders01",
+        "Ana <ana@example.com>",
+        "hero.png",
+        1_800_000_000_000,
+    ));
+    google.deliver(one(
+        "twosenders02",
+        "Ben <ben@example.com>",
+        "roof2.png",
+        1_800_000_100_000,
+    ));
+}
+
+#[cfg(feature = "stub")]
+#[test]
+fn always_from_a_sender_fetches_only_that_senders_pictures() {
+    let (google, _) = rich();
+    two_senders(&google);
+    let core = signed_in(&google, &paths("from"));
+    let view = data(core.run(
+        "gws_mail_pictures",
+        &json!({"thread": "twosenders01", "from": "Ana@Example.com"}),
+    ));
+    assert_eq!(view["images"], 1, "Ben's stays out");
+    assert_eq!(pictures_fetched(&google), 1);
+    assert!(
+        google
+            .log()
+            .iter()
+            .any(|s| s.target == "/pictures/hero.png")
+    );
+    // and Show pictures takes both
+    let all = data(core.run("gws_mail_pictures", &json!({"thread": "twosenders01"})));
+    assert_eq!(all["images"], 0);
+}
+
+/// The sender offered is the newest who isn't the person, never the person.
+#[test]
+fn the_persons_own_reply_isnt_the_sender_offered() {
+    let google = FakeGoogle::start(Seed::default());
+    let mail = |id: &str, from: &str, labels: Vec<String>, at: i64| Mail {
+        id: id.into(),
+        thread: if id.starts_with("ownonly") {
+            id
+        } else {
+            "ownreply0001"
+        }
+        .into(),
+        labels,
+        from: from.into(),
+        to: OWNER.into(),
+        subject: "Re: hi".into(),
+        at,
+        text: "hi".into(),
+        html: None,
+        message_id: format!("<{id}@example.com>"),
+        attachments: Vec::new(),
+        inline: Vec::new(),
+    };
+    google.deliver(mail(
+        "ownreply0001",
+        "Ana <ana@example.com>",
+        vec!["INBOX".into()],
+        1_800_000_000_000,
+    ));
+    google.deliver(mail(
+        "ownreply0002",
+        &format!("Me <{OWNER}>"),
+        vec!["SENT".into()],
+        1_800_000_100_000,
+    ));
+    let core = signed_in(&google, &paths("own"));
+    let view = data(core.run("gws_mail_thread", &json!({"thread": "ownreply0001"})));
+    assert_eq!(view["pictures"]["from"], "ana@example.com");
+    google.deliver(mail(
+        "ownonly00001",
+        &format!("Me <{OWNER}>"),
+        vec!["SENT".into()],
+        1_800_000_200_000,
+    ));
+    let mine = data(core.run("gws_mail_thread", &json!({"thread": "ownonly00001"})));
+    assert_eq!(mine["pictures"]["from"], Value::Null);
 }

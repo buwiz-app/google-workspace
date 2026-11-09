@@ -1081,7 +1081,7 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some(mut full) = core.gmail.thread_full(&auth, &id)? else {
         return Ok(fail("not_found", "That conversation is gone."));
     };
-    let view = pictures::view(core, &auth, &mut full);
+    let view = pictures::view(core, &auth, &account, &mut full);
     with_own_store(core, &account, |store| {
         store.put_view(&account, &id, &view.to_string(), now_ms())
     })?;

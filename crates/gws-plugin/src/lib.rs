@@ -174,6 +174,10 @@ impl Core {
         if tool == tools::MAIL_DRAFT_SAVE {
             return compose::save_for_model(self, args);
         }
+        // the loop refuses these already: a fetch is a person's, whatever asks
+        if pictures::is_tool(tool) {
+            return tools::fail("permission_denied", "Only a person can do this.");
+        }
         self.run(tool, args)
     }
 

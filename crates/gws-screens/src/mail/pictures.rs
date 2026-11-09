@@ -74,21 +74,24 @@ pub(super) fn opened(b: &Bridge, m: Mail, v: &Value, turn: u64) {
     let ask = pictures.trusted && pictures.hidden > 0 && !pictures.thread.is_empty();
     m.images.set(pictures);
     if ask {
-        fetch(b, m, true);
+        fetch(b, m, json!({"trusted": true}));
     }
 }
 
 /// Asks the plugin for the page with its pictures in, now, and puts the answer
-/// in when it comes, if the person is still on that conversation.
-fn fetch(b: &Bridge, m: Mail, trusted: bool) {
+/// in when it comes, if the person is still on that conversation. `only` says
+/// whose: `{}` for every message, `{"from": address}` for that sender's, or
+/// `{"trusted": true}` for a trusted sender's.
+fn fetch(b: &Bridge, m: Mail, only: Value) {
     let shown = m.images.get_untracked();
     if shown.thread.is_empty() || shown.getting {
         return;
     }
-    let call = b.call(
-        "gws_mail_pictures",
-        json!({"thread": shown.thread, "trusted": trusted}),
-    );
+    let mut args = json!({"thread": shown.thread});
+    for (k, v) in only.as_object().into_iter().flatten() {
+        args[k] = v.clone();
+    }
+    let call = b.call("gws_mail_pictures", args);
     let turn = shown.turn;
     m.images.update(|p| {
         p.getting = true;
@@ -199,7 +202,7 @@ pub(super) fn bar(b: Bridge, m: Mail) -> impl IntoElement {
                         "Show pictures".to_owned(),
                         None,
                     )
-                    .on_press(move || fetch(&b, m, false)),
+                    .on_press(move || fetch(&b, m, json!({}))),
                 );
             }
         }
@@ -225,7 +228,8 @@ pub(super) fn bar(b: Bridge, m: Mail) -> impl IntoElement {
                     )
                     .on_press(move || {
                         trust(&b, m, from.clone(), true);
-                        fetch(&b, m, false);
+                        // only theirs: the press was about this sender
+                        fetch(&b, m, json!({"from": from.clone()}));
                     }),
                 );
             }

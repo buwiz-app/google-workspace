@@ -173,10 +173,7 @@ fn a_strangers_pictures_wait_for_the_press() {
     app.press(&format!("label:{}", PRESSES[0]))
         .expect("Show pictures presses");
     settle(&mut app);
-    assert_eq!(
-        fake.called("gws_mail_pictures"),
-        [json!({"thread": "t1", "trusted": false})]
-    );
+    assert_eq!(fake.called("gws_mail_pictures"), [json!({"thread": "t1"})]);
     assert!(!app.screen().shows("Pictures are hidden."), "the bar went");
     assert!(fake.called("gws_mail_picture_sender_add").is_empty());
 }
@@ -193,7 +190,11 @@ fn always_from_a_sender_trusts_them_shows_their_pictures_and_can_stop() {
         fake.called("gws_mail_picture_sender_add"),
         [json!({"address": NEWS})]
     );
-    assert_eq!(fake.called("gws_mail_pictures").len(), 1);
+    assert_eq!(
+        fake.called("gws_mail_pictures"),
+        [json!({"thread": "t1", "from": NEWS})],
+        "only that sender's pictures"
+    );
     assert!(
         app.screen()
             .shows(&format!("Pictures from {NEWS} always show."))

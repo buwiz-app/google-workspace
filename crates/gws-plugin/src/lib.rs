@@ -10,6 +10,7 @@
 
 pub mod accounts;
 pub mod apis;
+pub mod attachment_preview;
 pub mod calendar;
 pub mod clean;
 pub mod compose;
@@ -17,6 +18,7 @@ pub mod drive;
 pub mod files;
 pub mod fold;
 pub mod gmail;
+pub mod handoff;
 pub mod js;
 pub mod mail;
 pub mod manifest;
@@ -91,6 +93,8 @@ pub struct Core {
     pub hashes: files::Hashes,
     /// What an open file's 24 hours are counted by.
     pub clock: files::Clock,
+    /// What the Bot said at `initialize` it can do with a file.
+    pub documents: handoff::Documents,
     /// What fetches a mail's web pictures, at a person's press.
     pub pictures: pictures::Fetcher,
     /// Whether recent mail is being fetched ahead.
@@ -124,6 +128,7 @@ impl Core {
             working: files::Working::default(),
             hashes: files::Hashes::default(),
             clock: files::Clock::default(),
+            documents: handoff::Documents::default(),
             pictures: pictures::Fetcher::new(apis),
             prefetch: prefetch::Running::default(),
             pushed: std::sync::atomic::AtomicBool::new(false),
@@ -164,6 +169,7 @@ impl Core {
             .or_else(|| drive::run(self, tool, args))
             .or_else(|| drive::write::run(self, tool, args))
             .or_else(|| files::run(self, tool, args))
+            .or_else(|| attachment_preview::run(self, tool, args))
             .or_else(|| pictures::run(self, tool, args))
             .unwrap_or_else(|| tools::run(&self.gmail, &self.accounts, tool, args));
         // nobody signed out: the Bot can't refresh the token right now, so the

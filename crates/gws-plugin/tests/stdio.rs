@@ -591,9 +591,11 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
             "gws_file_upload",
             "gws_file_discard",
             "gws_mail_attachment_open",
+            "gws_mail_attachment_save",
             "gws_mail_pictures",
             "gws_mail_picture_sender_add",
             "gws_mail_picture_sender_remove",
+            "gws_mail_attachment_preview",
             "gws_resolve"
         ]
     );
@@ -1237,6 +1239,14 @@ fn a_press_gets_its_document_through_the_real_server_and_the_model_gets_nothing(
             "gws_mail_attachment_open",
             json!({"message": "m1", "part": "1"}),
         ),
+        (
+            "gws_mail_attachment_preview",
+            json!({"message": "m1", "part": "1"}),
+        ),
+        (
+            "gws_mail_attachment_save",
+            json!({"message": "m1", "part": "1"}),
+        ),
     ];
     for caller in [
         json!({"origin": "agent"}),
@@ -1252,6 +1262,122 @@ fn a_press_gets_its_document_through_the_real_server_and_the_model_gets_nothing(
         }
     }
     assert_eq!(google.writes().len(), writes);
+    drop(ask);
+    drop(stdin);
+    child.wait().unwrap();
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// What the Bot says it can do at `initialize` reaches the tools through the
+/// real loop: a photo hands over to its viewer, Save to Downloads, and neither
+/// the model nor a routine gets so far.
+#[cfg(feature = "stub")]
+#[test]
+fn the_bots_word_at_initialize_opens_a_photo_and_saves_it_and_the_model_gets_nothing() {
+    use gws_fake_google::{FakeGoogle, Seed};
+
+    let google = FakeGoogle::start(Seed::default().with_rich_mail("http://127.0.0.1:1"));
+    let manifest = manifest_file("attachment-save");
+    let data = std::env::temp_dir().join(format!("gws-stdio-save-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data);
+    let mut child = plugin()
+        .arg("mcp")
+        .env("BUWIZ_PLUGIN_MANIFEST", &manifest)
+        .env("GWS_STUB_BASE", google.base())
+        .env("GWS_DATA_DIR", &data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {"experimental": {"buwiz/documents": ["word", "sheet", "image", "pdf", "open_with", "save"]}}, "clientInfo": {"name": "t", "version": "1"}}})).unwrap();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let mut id = 1;
+    let mut ask = |name: &str, args: Value, caller: Value| -> Value {
+        id += 1;
+        writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args, "_meta": {"buwiz/caller": caller}}})).unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["id"], id, "{line}");
+        v["result"].clone()
+    };
+    let provision = provision();
+    ask(
+        "buwiz.provision",
+        provision["params"]["arguments"].clone(),
+        json!({}),
+    );
+    ask(
+        "buwiz.account.set",
+        json!({"account": "google", "label": "default", "subject": FAKE_SUBJECT, "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}),
+        json!({}),
+    );
+    let plan = gws::manifest::unsigned(gws::manifest::RELEASE_KEY_ID);
+    let entry = buwiz_plugin::manifest::app(&plan, "mail").unwrap();
+    let not_after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 3_600_000;
+    let open_id = buwiz_plugin::b64::encode(&[7; 16]);
+    let session = ask(
+        "buwiz.session.open",
+        json!({"app": "mail", "open_id": open_id, "ks_pub": buwiz_plugin::b64::encode(&[2; 32]), "perms_sha256": buwiz_plugin::manifest::permissions_digest(entry).unwrap(), "not_after": not_after}),
+        Value::Null,
+    );
+    assert_ne!(session["isError"], true, "{session}");
+    let press = json!({"origin": "app", "plugin": "app.buwiz.google-workspace", "app": "mail", "open_id": open_id, "ts": 1});
+
+    let thread = ask(
+        "gws_mail_thread",
+        json!({"thread": "000019f00000001e"}),
+        press.clone(),
+    );
+    let photo = thread["structuredContent"]["attachments"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{thread}"))
+        .iter()
+        .find(|a| a["name"] == "IMG_4250.png")
+        .unwrap()
+        .clone();
+    let args = json!({"message": photo["message"], "part": photo["part"]});
+    let opened = ask("gws_mail_attachment_open", args.clone(), press.clone());
+    let document = &opened["_meta"]["buwiz/document"];
+    assert_eq!(document["mime"], "image/png", "{opened}");
+    let path = std::path::PathBuf::from(document["path"].as_str().unwrap());
+    assert!(
+        path.starts_with(std::fs::canonicalize(&data).unwrap()),
+        "{path:?}"
+    );
+    assert_eq!(path.file_name().unwrap(), "IMG_4250.png");
+    let saved = ask("gws_mail_attachment_save", args.clone(), press.clone());
+    assert_eq!(saved["structuredContent"]["saved"], true, "{saved}");
+    let copy = saved["_meta"]["buwiz/save"]["path"].as_str().unwrap();
+    assert_eq!(std::fs::read(copy).unwrap(), std::fs::read(&path).unwrap());
+    for answer in [&opened, &saved] {
+        assert!(
+            !answer["content"].to_string().contains("gws-stdio"),
+            "the path is in _meta alone: {answer}"
+        );
+    }
+
+    for caller in [
+        json!({"origin": "agent"}),
+        json!({"origin": "routine", "routine": "r1"}),
+    ] {
+        for tool in ["gws_mail_attachment_open", "gws_mail_attachment_save"] {
+            let answer = ask(tool, args.clone(), caller.clone());
+            assert_eq!(
+                answer["structuredContent"]["code"], "permission_denied",
+                "{tool}: {answer}"
+            );
+            assert_eq!(answer.get("_meta"), None, "{tool}");
+        }
+    }
     drop(ask);
     drop(stdin);
     child.wait().unwrap();

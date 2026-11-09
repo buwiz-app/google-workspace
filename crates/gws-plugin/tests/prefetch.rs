@@ -49,6 +49,8 @@ fn plugin(base: &str, name: &str, fresh: bool) -> Arc<Core> {
     }
     let core = Core::new(&Apis::at(base), Ok(gws_store::Paths::in_dir(dir)));
     core.unlock("seed");
+    // a Bot that shows each kind, as one that keeps them ahead would
+    core.documents.heard(&json!({"params": {"capabilities": {"experimental": {"buwiz/documents": ["word", "sheet", "image", "pdf", "open_with", "save"]}}}}));
     let set = core.account("buwiz.account.set", &sign_in(4_000_000_000));
     assert_ne!(set["isError"], true, "{set}");
     core.clock.set(NOW);
@@ -328,7 +330,7 @@ fn a_kept_attachment_opens_with_no_call_to_google() {
     with_file.attachments = vec![(
         "receipt.docx".to_owned(),
         DOCX.to_owned(),
-        b"PK fake receipt".to_vec(),
+        b"PK\x03\x04 fake receipt".to_vec(),
     )];
     let google = seeded(vec![with_file]);
     google.attachment_ids_change();
@@ -344,7 +346,7 @@ fn a_kept_attachment_opens_with_no_call_to_google() {
     let path = opened["_meta"]["buwiz/document"]["path"]
         .as_str()
         .unwrap_or_else(|| panic!("{opened}"));
-    assert_eq!(std::fs::read(path).unwrap(), b"PK fake receipt");
+    assert_eq!(std::fs::read(path).unwrap(), b"PK\x03\x04 fake receipt");
     assert_eq!(opened["_meta"]["buwiz/document"]["mime"], DOCX);
     assert_eq!(google.log().len(), asked, "Google was asked nothing");
 }
@@ -497,7 +499,8 @@ fn offline_only_the_active_accounts_saved_mail_shows() {
                 .put_view(
                     who,
                     thread,
-                    &json!({"id": thread, "page": words}).to_string(),
+                    &json!({"id": thread, "page": words, "view_version": gws::mail::VIEW_VERSION})
+                        .to_string(),
                     1,
                 )
                 .unwrap();
@@ -569,7 +572,12 @@ fn fetched(core: &Core, thread: &str) -> bool {
 
 #[test]
 fn offline_a_kept_attachment_still_opens() {
-    let google = seeded(vec![with_file(1, 2, "receipt.docx", b"PK kept".to_vec())]);
+    let google = seeded(vec![with_file(
+        1,
+        2,
+        "receipt.docx",
+        b"PK\x03\x04 kept".to_vec(),
+    )]);
     let core = synced(&google, "offline-file");
     gws::prefetch::run(&core).unwrap();
     assert!(has_file(&core, &id(1), "1"));
@@ -583,7 +591,7 @@ fn offline_a_kept_attachment_still_opens() {
     let path = opened["_meta"]["buwiz/document"]["path"]
         .as_str()
         .unwrap_or_else(|| panic!("{opened}"));
-    assert_eq!(std::fs::read(path).unwrap(), b"PK kept");
+    assert_eq!(std::fs::read(path).unwrap(), b"PK\x03\x04 kept");
 }
 
 #[test]

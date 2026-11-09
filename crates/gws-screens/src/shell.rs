@@ -146,7 +146,7 @@ pub(crate) fn link_bar(link: Signal<Option<String>>) -> impl IntoElement {
                             drop(open_url(target.clone()));
                         })
                         .child(
-                            text("Open").app_class(Some(
+                            text("Open link").app_class(Some(
                                 "text-[12px] text-white dark:text-[#10151c]".into(),
                             )),
                         ),

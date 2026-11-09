@@ -20,7 +20,7 @@ use crate::Core;
 use crate::accounts::Bearer;
 use crate::gmail::{self, Failure, File, Limit, Whole};
 use crate::mail::{Viewed, now_ms, read_view, row_of, signed_in, with_own_store, with_store};
-use crate::pictures;
+use crate::pictures::Made;
 
 /// How far back mail is kept ahead.
 pub const WINDOW_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -193,8 +193,8 @@ fn bodies(
         if gone {
             return Err(Failure::AccountRequired);
         }
-        let (full, view, short) = match read {
-            Viewed::Read { full, view, short } => (full, view, short),
+        let (full, view, made) = match read {
+            Viewed::Read { full, view, made } => (full, view, made),
             Viewed::Gone => {
                 // gone at Google, as a list sync would find
                 with_own_store(core, account, |store| store.remove_thread(account, &id))?;
@@ -217,7 +217,7 @@ fn bodies(
         // round and never be kept, and nothing older after it: an open
         // fetches it. Nor is a view kept that Google said too little of a
         // picture for, as if it were whole: the open reads it again.
-        if (over && before == 0) || short {
+        if (over && before == 0) || made == Made::Short {
             pass(core)?;
             continue;
         }
@@ -254,7 +254,7 @@ fn wanted(core: &Core, account: &str, view: &str) -> Result<Vec<(String, String)
             && part_ok(part)
             // no size said is no reason to leave it: the fresh read may say one
             && size < ATTACHMENT_MAX
-            && opens(text("mime"), text("name"))
+            && opens(core, text("mime"), text("name"))
             && !with_store(core, |store| store.has_attachment(account, message, part))?
         {
             out.push((message.to_owned(), part.to_owned()));
@@ -263,12 +263,9 @@ fn wanted(core: &Core, account: &str, view: &str) -> Result<Vec<(String, String)
     Ok(out)
 }
 
-/// What can be opened here: the kinds an open takes, and pictures and PDFs.
-/// Nothing else is worth a byte of the budget.
-fn opens(mime: &str, name: &str) -> bool {
-    crate::files::openable(mime, name).is_some()
-        || mime.starts_with("image/")
-        || mime == "application/pdf"
+/// What an open takes on this Bot. Nothing else is worth a byte of the budget.
+fn opens(core: &Core, mime: &str, name: &str) -> bool {
+    crate::files::attachment_opens(core, mime, name)
 }
 
 /// The attachments under [`ATTACHMENT_MAX`] of kept recent views. The thread is
@@ -322,7 +319,8 @@ fn attachments(
                 .into_iter()
                 .flatten()
                 .filter(|m| m.get("id").and_then(Value::as_str) == Some(&message))
-                .flat_map(gmail::attachments)
+                // any card a view may show, so none of its pictures is left out
+                .flat_map(|m| gmail::attachments(m, &HashSet::new()))
                 .find(|a| a.get("part").and_then(Value::as_str) == Some(&part));
             let Some(found) = found else {
                 whole = false;
@@ -334,7 +332,7 @@ fn attachments(
             let text = |key: &str| found.get(key).and_then(Value::as_str).unwrap_or_default();
             let (id, mime, name) = (text("id"), text("mime"), text("name"));
             let size = found.get("size").and_then(Value::as_i64).unwrap_or(-1);
-            if size >= ATTACHMENT_MAX || !opens(mime, name) {
+            if size >= ATTACHMENT_MAX || !opens(core, mime, name) {
                 continue;
             }
             // Google said too little to fetch it by: another read may say more
@@ -400,8 +398,7 @@ fn attachments(
 }
 
 /// `(message, part)` of each part shown inside its mail by Content-ID, not
-/// attached to it, and of each attached one its page shows all the same: the
-/// page shows those itself.
+/// attached to it: the page shows those itself.
 fn inline_parts(thread: &Value) -> HashSet<(String, String)> {
     fn walk(message: &str, part: &Value, out: &mut HashSet<(String, String)>) {
         let header = |name: &str| {
@@ -447,11 +444,6 @@ fn inline_parts(thread: &Value) -> HashSet<(String, String)> {
     {
         if let (Some(id), Some(payload)) = (m.get("id").and_then(Value::as_str), m.get("payload")) {
             walk(id, payload, &mut out);
-            // an attached part the page shows is a picture of the view's,
-            // which came with it: not to be fetched again
-            for part in pictures::shown_inside(m) {
-                out.insert((id.to_owned(), part));
-            }
         }
     }
     out
@@ -551,6 +543,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let core = Core::new(&Apis::at(&google.base()), Ok(gws_store::Paths::in_dir(dir)));
         core.unlock("seed");
+        // a Bot that shows each kind, as one that keeps them ahead would
+        core.documents.heard(&json!({"params": {"capabilities": {"experimental": {"buwiz/documents": ["word", "sheet", "image", "pdf", "open_with", "save"]}}}}));
         let set = core.account("buwiz.account.set", &json!({"account": "google", "label": "default", "provider": "google", "subject": FAKE_EMAIL, "scopes": ["https://www.googleapis.com/auth/gmail.modify"], "access_token": "fake-access-1", "token_type": "Bearer", "expires_at": 4_000_000_000u64}));
         assert_ne!(set["isError"], true, "{set}");
         core.clock.set(NOW);
@@ -825,27 +819,5 @@ mod tests {
         );
         round_within(&core, NOW, 300 * 1024, Limit::FULL).unwrap();
         assert!(has_view(&core, 2), "the next round takes it");
-    }
-
-    fn part(id: &str, cid: &str, disposition: &str) -> Value {
-        json!({"partId": id, "mimeType": "image/png", "filename": format!("{cid}.png"), "headers": [{"name": "Content-ID", "value": format!("<{cid}>")}, {"name": "Content-Disposition", "value": disposition}], "body": {"attachmentId": "att", "size": 1024}})
-    }
-
-    #[test]
-    fn an_attached_picture_the_page_shows_is_the_pages_and_an_unshown_one_isnt() {
-        use base64::Engine as _;
-        let html = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode("<p><img src=\"cid:logo\"></p>");
-        let thread = json!({"messages": [{"id": "m1", "payload": {"partId": "", "mimeType": "multipart/related", "parts": [
-            {"partId": "0", "mimeType": "text/html", "body": {"data": html, "size": 10}},
-            part("1", "logo", "attachment; filename=\"logo.png\""),
-            part("2", "outlook", "attachment; filename=\"quote.png\""),
-            part("3", "kept", "inline"),
-        ]}}]});
-        let inline = inline_parts(&thread);
-        let has = |p: &str| inline.contains(&("m1".to_owned(), p.to_owned()));
-        assert!(has("1"), "shown in the page: not fetched twice");
-        assert!(!has("2"), "an attachment named by nothing is an attachment");
-        assert!(has("3"));
     }
 }

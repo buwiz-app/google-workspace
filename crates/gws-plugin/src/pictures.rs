@@ -100,80 +100,6 @@ fn wanted(message: &Value) -> Vec<String> {
     gmail::html_body(message).map_or_else(Vec::new, |h| clean::clean(&h).images)
 }
 
-/// `cid:<id>`'s id, as a part's `Content-ID` gives it: no angle brackets, and
-/// the URL's percent escapes undone.
-fn cid_of(url: &str) -> Option<String> {
-    let rest = url
-        .get(..4)
-        .filter(|s| s.eq_ignore_ascii_case("cid:"))
-        .map(|_| &url[4..])?;
-    let bytes = rest.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut at = 0;
-    while at < bytes.len() {
-        let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
-        match (bytes[at], bytes.get(at + 1), bytes.get(at + 2)) {
-            (b'%', Some(&h), Some(&l)) if hex(h).is_some() && hex(l).is_some() => {
-                out.push(hex(h)? * 16 + hex(l)?);
-                at += 3;
-            }
-            (b, ..) => {
-                out.push(b);
-                at += 1;
-            }
-        }
-    }
-    let id = String::from_utf8(out).ok()?;
-    let id = id
-        .trim()
-        .trim_start_matches('<')
-        .trim_end_matches('>')
-        .trim();
-    (!id.is_empty()).then(|| id.to_owned())
-}
-
-fn part_header<'a>(part: &'a Value, name: &str) -> Option<&'a str> {
-    part.get("headers")?
-        .as_array()?
-        .iter()
-        .find(|h| {
-            h.get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|n| n.eq_ignore_ascii_case(name))
-        })?
-        .get("value")?
-        .as_str()
-}
-
-/// Every part of `message` with a Content-ID, by that id.
-fn by_content_id(message: &Value) -> HashMap<String, &Value> {
-    fn walk<'a>(part: &'a Value, out: &mut HashMap<String, &'a Value>) {
-        if let Some(id) = part_header(part, "content-id") {
-            let id = id
-                .trim()
-                .trim_start_matches('<')
-                .trim_end_matches('>')
-                .trim();
-            if !id.is_empty() {
-                out.entry(id.to_owned()).or_insert(part);
-            }
-        }
-        for p in part
-            .get("parts")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            walk(p, out);
-        }
-    }
-    let mut out = HashMap::new();
-    if let Some(p) = message.get("payload") {
-        walk(p, &mut out);
-    }
-    out
-}
-
 /// Gmail's base64url, padded or not.
 fn unbase64(data: &str) -> Option<Vec<u8>> {
     let clean: String = data
@@ -203,8 +129,8 @@ fn attachment_ok(id: &str) -> bool {
 /// `by`, and nothing past [`PICTURE_MAX`] fetched at all. `calls` counts the
 /// attachment calls, which stop at [`CID_CALLS`]. Nothing is fetched that
 /// `fits` says can't be kept, and `gate` hears only of what's asked for.
-/// `short` is set when Google said too little of a part to fetch it by, which
-/// another read may not.
+/// `missed` is set when time ran out or Gmail failed, which another try may
+/// not; `short` when Google said too little of a part to fetch it by.
 #[allow(clippy::too_many_arguments)]
 fn part_picture(
     core: &Core,
@@ -215,6 +141,7 @@ fn part_picture(
     calls: &mut usize,
     fits: &dyn Fn(u64) -> bool,
     gate: &mut dyn FnMut(u64) -> bool,
+    missed: &mut bool,
     short: &mut bool,
 ) -> Option<String> {
     if let Some(data) = part.pointer("/body/data").and_then(Value::as_str) {
@@ -242,16 +169,21 @@ fn part_picture(
         return None;
     }
     // a press out of time asks for nothing, and so charges nothing
-    let left = left(by)?;
+    let Some(left) = left(by) else {
+        *missed = true;
+        return None;
+    };
     if !gate(size) {
         return None;
     }
     *calls += 1;
-    let bytes = core
-        .gmail
-        .attachment_within(auth, message, id, left)
-        .ok()??;
-    data_url(&bytes)
+    match core.gmail.attachment_within(auth, message, id, left) {
+        Ok(bytes) => data_url(&bytes?),
+        Err(_) => {
+            *missed = true;
+            None
+        }
+    }
 }
 
 /// What's left of the time until `by`, if any is.
@@ -346,8 +278,8 @@ impl Placer {
 }
 
 /// The pictures inside `thread`'s mail, by Content-ID, offered to `placer` by
-/// `by`, with no more than [`CID_CALLS`] calls to Gmail for them. True when
-/// Google said too little of one to fetch it by.
+/// `by`, with no more than [`CID_CALLS`] calls to Gmail for them, and what
+/// that came to.
 fn inside(
     core: &Core,
     auth: &Bearer,
@@ -355,11 +287,15 @@ fn inside(
     placer: &mut Placer,
     by: Instant,
     gate: &mut dyn FnMut(u64) -> bool,
-) -> bool {
-    let mut short = false;
-    let mut calls = 0;
+) -> Made {
+    let (mut calls, mut missed, mut short) = (0, false, false);
+    let made = |missed: bool, short: bool| match (missed, short) {
+        (true, _) => Made::Missed,
+        (_, true) => Made::Short,
+        _ => Made::Whole,
+    };
     for (n, m) in messages(thread).iter().enumerate() {
-        let parts = by_content_id(m);
+        let parts = gmail::by_content_id(m);
         if parts.is_empty() {
             continue;
         }
@@ -367,9 +303,9 @@ fn inside(
         let mut seen = HashSet::new();
         for url in placer.uses[n].clone() {
             if placer.full() {
-                return short;
+                return made(missed, short);
             }
-            let Some(part) = cid_of(&url).and_then(|cid| parts.get(&cid).copied()) else {
+            let Some(part) = gmail::cid_of(&url).and_then(|cid| parts.get(&cid).copied()) else {
                 continue;
             };
             if !seen.insert(url.clone()) {
@@ -377,39 +313,36 @@ fn inside(
             }
             let room = |size| placer.fits(&[n], &url, size);
             let picture = part_picture(
-                core, auth, id, part, by, &mut calls, &room, gate, &mut short,
+                core,
+                auth,
+                id,
+                part,
+                by,
+                &mut calls,
+                &room,
+                gate,
+                &mut missed,
+                &mut short,
             );
             if let Some(data) = picture {
                 placer.offer(&[n], &url, data);
             }
         }
     }
-    short
+    made(missed, short)
 }
 
-/// The parts of `message` its page shows by Content-ID: named by a picture in
-/// its HTML, and within [`PICTURE_MAX`], whatever their disposition says. By
-/// Gmail's part id, the root's as `root`.
-pub(crate) fn shown_inside(message: &Value) -> HashSet<String> {
-    let parts = by_content_id(message);
-    if parts.is_empty() {
-        return HashSet::new();
-    }
-    wanted(message)
-        .iter()
-        .filter_map(|url| parts.get(&cid_of(url)?).copied())
-        .filter(|part| {
-            part.pointer("/body/data").is_some()
-                || part
-                    .pointer("/body/size")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|size| size <= PICTURE_MAX as u64)
-        })
-        .filter_map(|part| match part.get("partId")?.as_str()? {
-            "" => Some("root".to_owned()),
-            id => Some(id.to_owned()),
-        })
-        .collect()
+/// What the pictures inside a thread's mail came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Made {
+    /// Each that could be fetched was.
+    Whole,
+    /// One was missed for time or a failure, which another try may not be:
+    /// the view isn't kept.
+    Missed,
+    /// Google said too little of one to fetch it by: the view isn't kept as
+    /// if whole.
+    Short,
 }
 
 /// Takes out anything that looks like what [`Placer`] puts in.
@@ -534,25 +467,24 @@ fn named(thread: &Value, account: &str) -> Value {
 }
 
 /// The thread's view, with the pictures inside its mail shown, and who its
-/// pictures are from: for the thread view, which the store keeps. `gate` is
-/// asked before each picture is fetched from Gmail, with its size: a read
-/// ahead keeps to its round's bytes and its sign-in by it. True beside it when
-/// Google said too little of a picture to fetch it by.
+/// pictures are from, and what its pictures came to. `gate` is asked before
+/// each picture is fetched from Gmail, with its size: a read ahead keeps to
+/// its round's bytes and its sign-in by it.
 pub fn view_within(
     core: &Core,
     auth: &Bearer,
     account: &str,
     thread: &mut Value,
     gate: &mut dyn FnMut(u64) -> bool,
-) -> (Value, bool) {
+) -> (Value, Made) {
     let by = Instant::now() + ALL_WITHIN;
     unplace(thread);
     let mut placer = Placer::new(thread);
-    let short = inside(core, auth, thread, &mut placer, by, gate);
+    let made = inside(core, auth, thread, &mut placer, by, gate);
     placer.finish(thread);
     let mut view = mail::view_of(thread);
     view["pictures"] = named(thread, account);
-    (view, short)
+    (view, made)
 }
 
 /// `view` with whether its sender is trusted now, as a tool's answer: only a
@@ -881,6 +813,9 @@ fn show(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some(mut thread) = core.gmail.thread_full_within(&auth, &id, ALL_WITHIN)? else {
         return Ok(fail("not_found", "That conversation is gone."));
     };
+    // the press shows its own cards, so an invite's twin goes here too
+    let twins_by = (Instant::now() + gmail::TWINS_WITHIN).min(by);
+    core.gmail.mark_twins_by(&auth, &mut thread, twins_by);
     unplace(&mut thread);
     let only_trusted = args.get("trusted") == Some(&Value::Bool(true));
     let only_from = args
@@ -989,7 +924,7 @@ mod tests {
         assert_ne!(set["isError"], true, "{set}");
         let (auth, _) = core.accounts.session().expect("signed in");
         let part = json!({"partId": "1", "mimeType": "image/png", "body": {"attachmentId": "att-1", "size": 1024}});
-        let (mut calls, mut charged, mut short) = (0, 0u64, false);
+        let (mut calls, mut charged, mut missed, mut short) = (0, 0u64, false, false);
         let picture = part_picture(
             &core,
             &auth,
@@ -1002,11 +937,13 @@ mod tests {
                 charged += size;
                 true
             },
+            &mut missed,
             &mut short,
         );
         assert_eq!(picture, None);
         assert_eq!(charged, 0, "nothing asked for is nothing spent");
         assert_eq!(calls, 0);
+        assert!(missed, "out of time, the view isn't whole");
         assert!(!short);
     }
 
@@ -1081,17 +1018,6 @@ mod tests {
         ] {
             assert!(public(open.parse().unwrap()), "{open}");
         }
-    }
-
-    #[test]
-    fn a_cid_url_names_its_part() {
-        assert_eq!(cid_of("cid:logo@digest").as_deref(), Some("logo@digest"));
-        assert_eq!(
-            cid_of("CID:%3Clogo%40digest%3E").as_deref(),
-            Some("logo@digest")
-        );
-        assert_eq!(cid_of("cid:"), None);
-        assert_eq!(cid_of("https://a.example/cid:x"), None);
     }
 
     #[test]

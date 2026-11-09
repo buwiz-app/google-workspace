@@ -140,7 +140,7 @@ impl Letter {
                 let size = a.get("size").and_then(Value::as_u64).unwrap_or(0);
                 File {
                     key: key as u64,
-                    keep: Some(json!({"message": holder, "id": a.get("id"), "name": name, "mime": a.get("mime")})),
+                    keep: Some(json!({"message": holder, "id": a.get("id"), "part": a.get("part"), "name": name, "mime": a.get("mime")})),
                     name: name.to_owned(),
                     size,
                     arrived: size,
@@ -432,8 +432,22 @@ async fn save(b: &Bridge, c: Compose, armed: &Value) -> Result<bool, String> {
         l.message_id = text("message_id");
         // those attachments' ids left with the old message: the plugin holds them now
         for held in kept.into_iter().flatten() {
-            let id = held.get("id");
-            let was = |f: &&mut File| f.keep.as_ref().and_then(|k| k.get("id")) == id;
+            // a small file has no id, only its part
+            let text = |v: Option<&Value>, k: &str| {
+                v.and_then(|v| v.get(k))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let (id, part) = (text(Some(held), "id"), text(Some(held), "part"));
+            let was = |f: &&mut File| {
+                let k = f.keep.as_ref();
+                if id.is_empty() {
+                    !part.is_empty() && text(k, "id").is_empty() && text(k, "part") == part
+                } else {
+                    text(k, "id") == id
+                }
+            };
             if let Some(file) = l.files.iter_mut().find(was) {
                 file.keep = None;
                 file.upload = held

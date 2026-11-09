@@ -16,13 +16,14 @@ use serde_json::{Value, json};
 
 use crate::accounts::Bearer;
 use crate::gmail::{self, Failure, Limit, Whole};
+use crate::pictures::{self, Made};
 use crate::tools::{
     MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_DRAFT_DELETE, MAIL_DRAFT_OF, MAIL_DRAFT_READ,
     MAIL_DRAFT_SAVE, MAIL_JOB, MAIL_JOB_START, MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK,
     MAIL_REPLY_START, MAIL_SEND, MAIL_SEND_ARM, MAIL_SEND_DISARM, MAIL_THREAD, MAIL_TRASH,
     MAIL_UNDO, PEOPLE_SUGGEST, SEARCH_MAIL, UPLOAD_CHUNK, UPLOAD_DROP, fail, failed, ok,
 };
-use crate::{Core, clean, compose, fold, js, pictures};
+use crate::{Core, clean, compose, fold, js};
 
 /// Rows a list page holds.
 pub const PAGE: i64 = 50;
@@ -1033,6 +1034,8 @@ pub fn view_of(thread: &Value) -> Value {
     let hidden = fold::hidden(&open);
     // each message, its history folded, and what its row says: the words
     // before the fold
+    // and the Content-IDs of the pictures that went in, whose cards go
+    let mut shown: Vec<HashSet<String>> = Vec::with_capacity(list.len());
     let (mut parts, snippets): (Vec<Part>, Vec<String>) = list
         .iter()
         .map(|m| {
@@ -1041,17 +1044,35 @@ pub fn view_of(thread: &Value) -> Value {
                 Some(h) => {
                     // the pictures picked for it go in first, so what folds
                     // folds with them
-                    let mut c = clean::clean_with(&h, &|url| pictures::inline(m, url));
-                    let (folded, cut) = fold::quotes(&c.html);
-                    let fresh = cut.map(|cut| clean::visible_text(&c.html[..cut]));
-                    c.html = folded;
-                    let snippet = gmail::snippet_of(fresh.as_deref().unwrap_or(&text));
-                    (Part::Html(c, text), snippet)
+                    let put = std::cell::RefCell::new(HashSet::new());
+                    let c = clean::clean_with(&h, &|url| {
+                        let data = pictures::inline(m, url);
+                        if data.is_some() {
+                            put.borrow_mut().insert(url.to_owned());
+                        }
+                        data
+                    });
+                    // what the cleaner turned down stays out
+                    let put = put.into_inner();
+                    shown.push(
+                        put.iter()
+                            .filter(|url| !c.images.contains(url))
+                            .filter_map(|url| gmail::cid_of(url))
+                            .collect(),
+                    );
+                    let quoted = fold::quotes(&c.html).unwrap_or_default();
+                    let snippet = gmail::snippet_of(if quoted.regions.is_empty() {
+                        &text
+                    } else {
+                        &quoted.fresh
+                    });
+                    (Part::Html(c, quoted.regions, text), snippet)
                 }
                 None => {
-                    let cut = fold::plain_cut(&text).unwrap_or(text.len());
-                    let snippet = gmail::snippet_of(&text[..cut]);
-                    (Part::Text(text), snippet)
+                    shown.push(HashSet::new());
+                    let cut = fold::plain_cut(&text);
+                    let snippet = gmail::snippet_of(&text[..cut.unwrap_or(text.len())]);
+                    (Part::Text(text, cut), snippet)
                 }
             }
         })
@@ -1087,15 +1108,18 @@ pub fn view_of(thread: &Value) -> Value {
         escape(&gmail::cap_bytes(&subject, gmail::HEADER_MAX))
     );
     // an attachment is fetched from its own message, so it says which that is
-    let attachments: Vec<Value> = list
-        .iter()
-        .flat_map(|m| {
-            gmail::attachments(m).into_iter().map(|mut a| {
-                a["message"] = m.get("id").cloned().unwrap_or(Value::Null);
-                a
+    let files = |shown: &[HashSet<String>]| -> Vec<Value> {
+        list.iter()
+            .zip(shown)
+            .flat_map(|(m, shown)| {
+                gmail::attachments(m, shown).into_iter().map(|mut a| {
+                    a["message"] = m.get("id").cloned().unwrap_or(Value::Null);
+                    a
+                })
             })
-        })
-        .collect();
+            .collect()
+    };
+    let mut attachments = files(&shown);
     // what's counted is what's sent: the markup, as JSON
     let mut size = sent(&title)
         + meta.iter().map(|(b, a)| sent(b) + sent(a)).sum::<usize>()
@@ -1115,13 +1139,25 @@ pub fn view_of(thread: &Value) -> Value {
             }
         }
     }
+    // a message given way to text shows no pictures, so its cards come back
+    let mut lost = false;
+    for (part, shown) in parts.iter().zip(&mut shown) {
+        if !matches!(part, Part::Html(..)) && !shown.is_empty() {
+            shown.clear();
+            lost = true;
+        }
+    }
+    if lost {
+        attachments = files(&shown);
+    }
     let (mut page, mut links, mut images) = (title, Vec::new(), 0);
     for ((before, after), part) in meta.iter().zip(parts) {
         page.push_str(before);
         match part {
-            Part::Html(c, _) => {
+            Part::Html(c, regions, _) => {
                 let (base, count) = (links.len(), c.links.len());
-                page.push_str(&clean::rewrite(&c.html, "gws-link:", |n, out| {
+                let html = fold::wrap(&c.html, &regions);
+                page.push_str(&clean::rewrite(&html, "gws-link:", |n, out| {
                     let known = n < count;
                     if known {
                         out.push_str(&format!("\"gws-link:{}\"", n + base));
@@ -1131,7 +1167,7 @@ pub fn view_of(thread: &Value) -> Value {
                 images += c.images.len();
                 links.extend(c.links);
             }
-            Part::Text(t) => page.push_str(&fold::plain(&t)),
+            Part::Text(t, cut) => page.push_str(&fold::split(&t, cut)),
             Part::TooLong => page.push_str(TOO_LONG),
         }
         page.push_str(after);
@@ -1140,32 +1176,59 @@ pub fn view_of(thread: &Value) -> Value {
 }
 
 /// One message of a thread, as much of it as fits.
+/// A text keeps where its fold starts, so its row and its fold agree.
 enum Part {
-    Html(clean::Cleaned, String),
-    Text(String),
+    /// The cleaned HTML, what of it folds, and the message's plain text.
+    Html(clean::Cleaned, Vec<fold::Region>, String),
+    Text(String, Option<usize>),
     TooLong,
 }
 
 impl Part {
     fn size(&self) -> usize {
         match self {
-            Part::Html(c, _) => sent(&c.html) + json!(c.links).to_string().len(),
-            Part::Text(t) => sent(&fold::plain(t)),
+            // the fold's markup measured where it goes, nothing built
+            Part::Html(c, regions, _) => {
+                let mut html = 2;
+                fold::pieces(&c.html, regions, |p| html += sent(p) - 2);
+                let links = c.links.iter().map(|l| sent(l) + 1).sum::<usize>();
+                html + links.max(1) + 1
+            }
+            Part::Text(t, cut) => sent(&fold::split(t, *cut)),
             Part::TooLong => TOO_LONG.len(),
         }
     }
 
     fn shrink(&mut self) {
         *self = match std::mem::replace(self, Part::TooLong) {
-            Part::Html(_, text) => Part::Text(text),
+            // as plain text it keeps the fold where the HTML had it, worked
+            // out only now that it's needed
+            Part::Html(c, regions, text) => {
+                match regions.first().and_then(|r| fold::shrunk(&c.html, r.start)) {
+                    Some((shown, cut)) => Part::Text(shown, Some(cut)),
+                    None => {
+                        let cut = fold::plain_cut(&text);
+                        Part::Text(text, cut)
+                    }
+                }
+            }
             _ => Part::TooLong,
         };
     }
 }
 
-/// `text`'s size in a JSON result.
+/// `text`'s size in a JSON result, as serde_json writes it, counted without
+/// writing it.
 fn sent(text: &str) -> usize {
-    Value::from(text).to_string().len()
+    let escapes: usize = text
+        .bytes()
+        .map(|b| match b {
+            b'"' | b'\\' | b'\x08' | b'\x0c' | b'\n' | b'\r' | b'\t' => 1,
+            0..=0x1f => 5,
+            _ => 0,
+        })
+        .sum();
+    text.len() + escapes + 2
 }
 
 /// Whether Gmail marks this one message unread.
@@ -1189,6 +1252,12 @@ fn day(at: &str) -> String {
     }
 }
 
+/// What a saved view was made by. A view of an older shape is made again: a
+/// migration that clears them all (as 6, 7 and 10 did) runs once, and this
+/// holds for each change after. Raise it whenever `view_of` or what it lists
+/// changes.
+pub const VIEW_VERSION: i64 = 3;
+
 /// What [`read_view`] came to.
 pub(crate) enum Viewed {
     /// Gone at Google.
@@ -1197,12 +1266,12 @@ pub(crate) enum Viewed {
     TooBig(Failure),
     /// Begun, and outlasting the read's time.
     TooSlow(Failure),
-    /// What Google sent, the page made of it, and whether Google said too
-    /// little of a picture inside it to fetch it by.
+    /// What Google sent, the page made of it, and what its pictures and its
+    /// invite's twin check came to: a view kept is only a whole one.
     Read {
         full: Value,
         view: Value,
-        short: bool,
+        made: Made,
     },
 }
 
@@ -1229,10 +1298,14 @@ pub(crate) fn read_view(
         Whole::TooSlow(why) => return Ok(Viewed::TooSlow(why)),
     };
     gate(full.to_string().len() as u64);
+    let told = core.gmail.mark_twins(auth, &mut full);
     // a picture comes as base64 inside JSON
     let mut asks = |size: u64| gate(size.saturating_mul(4).div_ceil(3));
-    let (view, short) = pictures::view_within(core, auth, account, &mut full, &mut asks);
-    Ok(Viewed::Read { full, view, short })
+    let (mut view, made) = pictures::view_within(core, auth, account, &mut full, &mut asks);
+    view["view_version"] = VIEW_VERSION.into();
+    // a twin check cut short is a picture missed: the next read may finish it
+    let made = if told { made } else { Made::Missed };
+    Ok(Viewed::Read { full, view, made })
 }
 
 fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
@@ -1253,19 +1326,24 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     }
     if let Some(saved) = with_store(core, |store| store.view(&account, &id, now_ms()))?
         && let Ok(view) = serde_json::from_str::<Value>(&saved)
+        && view.get("view_version").and_then(Value::as_i64) == Some(VIEW_VERSION)
     {
         return Ok(pictures::answer(core, &account, view));
     }
     // the sign-in is there, and the Bot can't refresh its token just now
     let auth = auth.ok_or_else(unreached)?;
-    let view = match read_view(core, &auth, &account, &id, Limit::FULL, &mut |_| true)? {
-        Viewed::Read { view, .. } => view,
+    let (view, made) = match read_view(core, &auth, &account, &id, Limit::FULL, &mut |_| true)? {
+        Viewed::Read { view, made, .. } => (view, made),
         Viewed::Gone => return Ok(fail("not_found", "That conversation is gone.")),
         Viewed::TooBig(why) | Viewed::TooSlow(why) => return Err(why),
     };
-    with_own_store(core, &account, |store| {
-        store.put_view(&account, &id, &view.to_string(), now_ms())
-    })?;
+    // a twin check or a picture cut short isn't kept, so the next open can
+    // finish it
+    if made == Made::Whole {
+        with_own_store(core, &account, |store| {
+            store.put_view(&account, &id, &view.to_string(), now_ms())
+        })?;
+    }
     Ok(pictures::answer(core, &account, view))
 }
 
@@ -1975,6 +2053,44 @@ mod tests {
         ]}})
     }
 
+    /// [`message`] with a picture by Content-ID that the view put in.
+    fn with_picture(id: &str, html: &str) -> Value {
+        let mut m = message(id, &format!("<img src=\"cid:dot\">{html}"));
+        let alternative = m["payload"].take();
+        m["payload"] = json!({"mimeType": "multipart/related", "headers": alternative["headers"].clone(), "parts": [
+            alternative,
+            {"partId": "1", "mimeType": "image/png", "filename": "dot.png", "headers": [{"name": "Content-ID", "value": "<dot>"}], "body": {"attachmentId": "x", "size": 70}},
+        ]});
+        m["gwsPictures"] = json!({"cid:dot": "data:image/png;base64,iVBORw0KGgo="});
+        m
+    }
+
+    #[test]
+    fn a_message_given_way_to_text_gets_its_pictures_cards_back() {
+        let small = view_of(&json!({"id": "t", "messages": [with_picture("one", "<p>Hi</p>")]}));
+        assert!(small["page"].as_str().unwrap().contains("data:image/png"));
+        assert_eq!(small["attachments"], json!([]), "shown, it's the letter's");
+        // markup enough to give way, and words few enough to fit then
+        let big = "<b>.</b>".repeat(120_000);
+        let view = view_of(&json!({"id": "t", "messages": [
+            with_picture("old", &big),
+            with_picture("new", "<p>Hi</p>"),
+        ]}));
+        let page = view["page"].as_str().unwrap();
+        assert_eq!(
+            page.matches("data:image/png").count(),
+            1,
+            "the newest shows it"
+        );
+        let cards: Vec<&Value> = view["attachments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| &a["message"])
+            .collect();
+        assert_eq!(cards, [&json!("old")], "the oldest went to text");
+    }
+
     #[test]
     fn an_oversized_thread_gives_up_the_oldest_first() {
         let big = format!("<p>{}</p>", "x".repeat(500 * 1024));
@@ -2175,6 +2291,104 @@ mod tests {
         );
         assert!(
             page[fold..].contains("On Nov 6, 2026, Ana &lt;ana@example.com&gt; wrote:"),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn a_message_shrunk_to_text_keeps_its_fold() {
+        let heavy = format!(
+            r#"<p>Fresh words</p><div class="gmail_quote">{}</div>"#,
+            "<b>x</b>".repeat(120_000)
+        );
+        let view = view_of(&json!({"id": "t", "messages": [
+            labelled("a", &heavy, &["INBOX"]),
+            labelled("b", "<p>last</p>", &["INBOX"]),
+        ]}));
+        let page = view["page"].as_str().unwrap();
+        assert!(!page.contains("<b>x</b>"), "the oldest gave way to text");
+        let fold = page
+            .find(r#"<details class="gws-quote"><summary>•••</summary><pre"#)
+            .expect("the fold stays");
+        assert!(page[..fold].contains(r#"<span class="gws-snip">Fresh words</span>"#));
+        assert!(page[..fold].contains(">Fresh words</pre>"));
+        assert!(page[fold..].starts_with(
+            r#"<details class="gws-quote"><summary>•••</summary><pre style="white-space:pre-wrap;font:inherit;margin:0">xxx"#
+        ));
+    }
+
+    /// The page of a thread whose first message is too big for HTML.
+    fn shrunk_page(html: &str) -> String {
+        let heavy = format!("<p>Fresh words</p>{}{html}", "<b>x</b>".repeat(120_000));
+        let view = view_of(&json!({"id": "t", "messages": [
+            labelled("a", &heavy, &["INBOX"]),
+            labelled("b", "<p>last</p>", &["INBOX"]),
+        ]}));
+        let page = view["page"].as_str().unwrap().to_owned();
+        assert!(!page.contains("<b>x</b>"), "the oldest gave way to text");
+        page
+    }
+
+    #[test]
+    fn a_shrunk_message_with_a_plain_reply_still_folds_it() {
+        let page = shrunk_page("<p>On Nov 6, 2026, Ana wrote:</p><p>&gt; Can we?</p>");
+        let fold = page
+            .find(r#"<details class="gws-quote"><summary>•••</summary><pre"#)
+            .expect("the fold stays");
+        assert!(
+            page[fold..].contains(">On Nov 6, 2026, Ana wrote:"),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn a_shrunk_message_whose_first_quote_is_hidden_still_folds_the_rest() {
+        let page = shrunk_page(
+            r#"<div style="display:none"><blockquote type="cite">INJECT</blockquote></div><blockquote type="cite">Old words</blockquote>"#,
+        );
+        assert!(!page.contains("INJECT"), "{page}");
+        let fold = page
+            .find(r#"<details class="gws-quote"><summary>•••</summary><pre"#)
+            .expect("the fold stays");
+        assert!(page[fold..].contains(">Old words</pre>"), "{page}");
+    }
+
+    #[test]
+    fn a_parts_size_is_what_it_sends_counted_without_building_it() {
+        let c = clean::clean(
+            r#"<div><a href="https://a.example/?q=&quot;">Sounds</a> "good".<br><i>On Nov 6, 2026, Ana wrote:</i></div><blockquote type="cite">Old	\</blockquote>"#,
+        );
+        let regions = fold::quotes(&c.html).unwrap().regions;
+        assert!(!regions[0].reopen.is_empty(), "the fold reopens an element");
+        let expected = sent(&fold::wrap(&c.html, &regions)) + json!(c.links).to_string().len();
+        let part = Part::Html(c, regions, String::new());
+        let (size, made) = fold::allocations(|| part.size());
+        assert_eq!((size, made), (expected, 0));
+        let empty = Part::Html(clean::clean("<p>x</p>"), Vec::new(), String::new());
+        assert_eq!(empty.size(), sent("<p>x</p>") + 2);
+        for text in ["", "plain", "\"\\\n\r\t\u{8}\u{c}\u{1}\u{1f}\u{7f}é😀</>"] {
+            assert_eq!(sent(text), Value::from(text).to_string().len(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_shrunk_message_shows_none_of_what_its_page_hides() {
+        let page = shrunk_page(
+            r#"<div style="display:none"><blockquote type="cite">INJECT</blockquote></div>"#,
+        );
+        assert!(!page.contains("INJECT"), "{page}");
+    }
+
+    #[test]
+    fn a_bare_attribution_and_a_quote_is_not_a_row_of_its_own() {
+        let view = view_of(&json!({"id": "t", "messages": [
+            labelled("a", r#"<div>On Nov 6, 2026, Ana wrote:</div><blockquote type="cite"><div>Old words</div></blockquote>"#, &["INBOX"]),
+            labelled("b", "<p>last</p>", &["INBOX"]),
+        ]}));
+        let page = view["page"].as_str().unwrap();
+        assert!(!page.contains("gws-quote"), "{page}");
+        assert!(
+            page.contains(r#"<span class="gws-snip">On Nov 6, 2026, Ana wrote: Old words</span>"#),
             "{page}"
         );
     }

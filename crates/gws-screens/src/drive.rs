@@ -11,7 +11,7 @@
 mod card;
 mod detail;
 mod edits;
-mod file;
+pub(crate) mod file;
 mod list;
 mod mover;
 mod share;

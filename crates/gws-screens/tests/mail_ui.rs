@@ -72,6 +72,8 @@ struct Fake {
     labels: Mutex<Option<Value>>,
     /// A search finds nothing.
     no_match: Mutex<bool>,
+    /// The inbox's saved mail is none, as with a lapsed sign-in that kept nothing.
+    nothing_saved: Mutex<bool>,
     /// What a mail card reads.
     card: Mutex<Value>,
     /// Google's sign-in went: lists fail as the plugin says so.
@@ -237,6 +239,10 @@ impl Host for Fake {
             "gws_mail_list" if args["query"].is_string() && *self.no_match.lock().unwrap() => (
                 String::new(),
                 json!({"threads": [], "more": false, "saved": false}),
+            ),
+            "gws_mail_list" if *self.nothing_saved.lock().unwrap() => (
+                args["label"].as_str().unwrap_or_default().to_owned(),
+                json!({"threads": [], "more": false, "saved": true}),
             ),
             "gws_mail_card" => (String::new(), self.card.lock().unwrap().clone()),
             "gws_mail_list" => {
@@ -1915,6 +1921,29 @@ fn offline_an_empty_list_claims_no_saved_mail() {
         !app.screen()
             .shows("Can't reach Google. Showing saved mail."),
         "nothing listed is nothing saved"
+    );
+}
+
+#[test]
+fn a_lapsed_sign_in_with_no_saved_inbox_claims_neither_mail_nor_an_empty_inbox() {
+    let (mut app, fake) = start();
+    *fake.nothing_saved.lock().unwrap() = true;
+    *fake.status.lock().unwrap() = "offline".to_owned();
+    *fake.changed.lock().unwrap() = true;
+    app.wait(Duration::from_secs(16)).expect("the watch looks");
+    let texts = app.screen().texts();
+    assert!(!app.screen().shows("Subject 0"), "{texts:?}");
+    assert!(app.screen().shows("Can't reach Google."), "{texts:?}");
+    assert!(app.screen().shows("No mail saved here yet."), "{texts:?}");
+    assert!(
+        !app.screen()
+            .shows("Can't reach Google. Showing saved mail."),
+        "{texts:?}"
+    );
+    assert!(
+        !app.screen()
+            .shows("Your inbox is empty. Press Write to start a message."),
+        "{texts:?}"
     );
 }
 

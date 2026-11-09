@@ -1196,22 +1196,23 @@ fn day(at: &str) -> String {
 ///
 /// `gate` hears of every byte that comes for it, as Gmail sends it: the thread
 /// once it's here, and each picture inside it before it's asked for, which a
-/// false answer stops.
+/// false answer stops. The last of the three is true when Google said too
+/// little of a picture inside it to fetch it by.
 pub(crate) fn read_view(
     core: &Core,
     auth: &Bearer,
     account: &str,
     id: &str,
     gate: &mut dyn FnMut(u64) -> bool,
-) -> Result<Option<(Value, Value)>, Failure> {
+) -> Result<Option<(Value, Value, bool)>, Failure> {
     let Some(mut full) = core.gmail.thread_full(auth, id)? else {
         return Ok(None);
     };
     gate(full.to_string().len() as u64);
     // a picture comes as base64 inside JSON
     let mut asks = |size: u64| gate(size.saturating_mul(4).div_ceil(3));
-    let view = pictures::view_within(core, auth, account, &mut full, &mut asks);
-    Ok(Some((full, view)))
+    let (view, short) = pictures::view_within(core, auth, account, &mut full, &mut asks);
+    Ok(Some((full, view, short)))
 }
 
 fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
@@ -1237,7 +1238,7 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     }
     // the sign-in is there, and the Bot can't refresh its token just now
     let auth = auth.ok_or_else(unreached)?;
-    let Some((_, view)) = read_view(core, &auth, &account, &id, &mut |_| true)? else {
+    let Some((_, view, _)) = read_view(core, &auth, &account, &id, &mut |_| true)? else {
         return Ok(fail("not_found", "That conversation is gone."));
     };
     with_own_store(core, &account, |store| {

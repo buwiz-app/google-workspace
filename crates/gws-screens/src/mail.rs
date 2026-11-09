@@ -170,6 +170,7 @@ pub fn notice(status: &str, saved: bool, empty: bool) -> Option<&'static str> {
         ("needs_access", _) => {
             Some("Your Google sign-in needs more access. Sign in again on this app's page.")
         }
+        ("failed", _) if empty => Some("Couldn't update your mail."),
         ("failed", _) => Some("Couldn't update your mail. Showing what's saved."),
         _ => None,
     }
@@ -1832,6 +1833,15 @@ mod tests {
         assert_eq!(
             notice("offline", false, true),
             Some("Can't reach Google."),
+            "no saved mail claimed over none"
+        );
+        assert_eq!(
+            notice("failed", false, false),
+            Some("Couldn't update your mail. Showing what's saved.")
+        );
+        assert_eq!(
+            notice("failed", false, true),
+            Some("Couldn't update your mail."),
             "no saved mail claimed over none"
         );
         assert!(

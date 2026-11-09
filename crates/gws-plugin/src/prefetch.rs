@@ -20,6 +20,7 @@ use crate::Core;
 use crate::accounts::Bearer;
 use crate::gmail::{self, Failure};
 use crate::mail::{now_ms, read_view, row_of, signed_in, with_own_store, with_store};
+use crate::pictures;
 
 /// How far back mail is kept ahead.
 pub const WINDOW_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -124,11 +125,16 @@ pub fn run(core: &Core) -> Result<(), Failure> {
 }
 
 fn round(core: &Core, now: i64) -> Result<(), Failure> {
+    round_within(core, now, ROUND_MAX)
+}
+
+/// [`round`], downloading no more than `max`.
+fn round_within(core: &Core, now: i64, max: i64) -> Result<(), Failure> {
     let (_, account) = signed_in(core)?;
     let since = now - WINDOW_MS;
     let mut spent = 0;
-    bodies(core, &account, since, &mut spent)?;
-    attachments(core, &account, since, &mut spent)
+    bodies(core, &account, since, &mut spent, max)?;
+    attachments(core, &account, since, &mut spent, max)
 }
 
 /// The token to ask Google with, read again before each call: a sign-out or a
@@ -141,10 +147,16 @@ fn still(core: &Core, account: &str) -> Result<Bearer, Failure> {
 }
 
 /// Views of recent threads that have none, newest first.
-fn bodies(core: &Core, account: &str, since: i64, spent: &mut i64) -> Result<(), Failure> {
+fn bodies(
+    core: &Core,
+    account: &str,
+    since: i64,
+    spent: &mut i64,
+    max: i64,
+) -> Result<(), Failure> {
     let due = with_store(core, |store| store.unviewed_since(account, since, BATCH))?;
     for id in due {
-        if *spent >= ROUND_MAX {
+        if *spent >= max {
             break;
         }
         // a full budget is known before a download, not after it
@@ -153,6 +165,7 @@ fn bodies(core: &Core, account: &str, since: i64, spent: &mut i64) -> Result<(),
             break;
         }
         let auth = still(core, account)?;
+        let before = *spent;
         // every byte that comes counts, the pictures inside the mail among them,
         // and none is asked for past the round's share or after a sign-out
         let (mut over, mut gone) = (false, false);
@@ -161,7 +174,7 @@ fn bodies(core: &Core, account: &str, since: i64, spent: &mut i64) -> Result<(),
             *spent += bytes;
             if still(core, account).is_err() {
                 gone = true;
-            } else if *spent > ROUND_MAX {
+            } else if *spent > max {
                 over = true;
             }
             !(gone || over)
@@ -169,11 +182,19 @@ fn bodies(core: &Core, account: &str, since: i64, spent: &mut i64) -> Result<(),
         if gone {
             return Err(Failure::AccountRequired);
         }
-        let Some((full, view)) = read else {
+        let Some((full, view, short)) = read else {
             // gone at Google, as a list sync would find
             with_own_store(core, account, |store| store.remove_thread(account, &id))?;
             continue;
         };
+        // a thread that alone passes a round's share would come again each
+        // round and never be kept, and nothing older after it: an open
+        // fetches it. Nor is a view kept that Google said too little of a
+        // picture for, as if it were whole: the open reads it again.
+        if (over && before == 0) || short {
+            with_own_store(core, account, |store| store.pass_thread(account, &id))?;
+            continue;
+        }
         // a view short of its pictures isn't what an open makes: next round
         if over {
             break;
@@ -227,7 +248,13 @@ fn opens(mime: &str, name: &str) -> bool {
 /// The attachments under [`ATTACHMENT_MAX`] of kept recent views. The thread is
 /// read fresh for them: attachment ids change between reads, and only the mail
 /// says which parts are pictures shown inside it, which the page has already.
-fn attachments(core: &Core, account: &str, since: i64, spent: &mut i64) -> Result<(), Failure> {
+fn attachments(
+    core: &Core,
+    account: &str,
+    since: i64,
+    spent: &mut i64,
+    max: i64,
+) -> Result<(), Failure> {
     let due = with_store(core, |store| {
         store.views_unfetched_since(account, since, BATCH)
     })?;
@@ -237,7 +264,7 @@ fn attachments(core: &Core, account: &str, since: i64, spent: &mut i64) -> Resul
             with_own_store(core, account, |store| store.mark_fetched(account, &thread))?;
             continue;
         }
-        if *spent >= ROUND_MAX {
+        if *spent >= max {
             return Ok(());
         }
         let auth = still(core, account)?;
@@ -274,7 +301,7 @@ fn attachments(core: &Core, account: &str, since: i64, spent: &mut i64) -> Resul
                 whole = false;
                 continue;
             }
-            if *spent + encoded(size) > ROUND_MAX {
+            if *spent + encoded(size) > max {
                 return Ok(());
             }
             // full of newer mail's: nothing older is worth asking for
@@ -319,7 +346,8 @@ fn attachments(core: &Core, account: &str, since: i64, spent: &mut i64) -> Resul
 }
 
 /// `(message, part)` of each part shown inside its mail by Content-ID, not
-/// attached to it: the page shows those itself.
+/// attached to it, and of each attached one its page shows all the same: the
+/// page shows those itself.
 fn inline_parts(thread: &Value) -> HashSet<(String, String)> {
     fn walk(message: &str, part: &Value, out: &mut HashSet<(String, String)>) {
         let header = |name: &str| {
@@ -365,6 +393,11 @@ fn inline_parts(thread: &Value) -> HashSet<(String, String)> {
     {
         if let (Some(id), Some(payload)) = (m.get("id").and_then(Value::as_str), m.get("payload")) {
             walk(id, payload, &mut out);
+            // an attached part the page shows is a picture of the view's,
+            // which came with it: not to be fetched again
+            for part in pictures::shown_inside(m) {
+                out.insert((id.to_owned(), part));
+            }
         }
     }
     out
@@ -405,4 +438,157 @@ fn id_ok(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apis::Apis;
+    use gws_fake_google::{FAKE_EMAIL, FakeGoogle, Mail, Seed};
+    use serde_json::json;
+
+    const DAY: i64 = 86_400_000;
+    const NOW: i64 = 1_800_000_000_000;
+
+    fn mail(n: u64, days_ago: i64) -> Mail {
+        let id = format!("1a{n:014x}");
+        Mail {
+            id: id.clone(),
+            thread: id,
+            labels: vec!["INBOX".to_owned()],
+            from: "Ana Reyes <ana@example.com>".to_owned(),
+            to: FAKE_EMAIL.to_owned(),
+            subject: format!("Mail {n}"),
+            at: NOW - days_ago * DAY,
+            text: format!("Fake mail number {n}."),
+            html: None,
+            attachments: Vec::new(),
+            message_id: String::new(),
+            inline: Vec::new(),
+        }
+    }
+
+    /// A mail with `count` pictures inside it of `size` bytes each.
+    fn with_pictures(n: u64, days_ago: i64, count: usize, size: usize) -> Mail {
+        let mut m = mail(n, days_ago);
+        m.html = Some(
+            (0..count)
+                .map(|i| format!("<img src=\"cid:p{i}\">"))
+                .collect(),
+        );
+        m.inline = (0..count)
+            .map(|i| {
+                let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+                png.resize(size, i as u8);
+                (
+                    format!("p{i}"),
+                    format!("p{i}.png"),
+                    "image/png".to_owned(),
+                    png,
+                )
+            })
+            .collect();
+        m
+    }
+
+    fn synced(google: &FakeGoogle, name: &str) -> Core {
+        let dir =
+            std::env::temp_dir().join(format!("gws-ahead-unit-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let core = Core::new(&Apis::at(&google.base()), Ok(gws_store::Paths::in_dir(dir)));
+        core.unlock("seed");
+        let set = core.account("buwiz.account.set", &json!({"account": "google", "label": "default", "provider": "google", "subject": FAKE_EMAIL, "scopes": ["https://www.googleapis.com/auth/gmail.modify"], "access_token": "fake-access-1", "token_type": "Bearer", "expires_at": 4_000_000_000u64}));
+        assert_ne!(set["isError"], true, "{set}");
+        core.clock.set(NOW);
+        crate::mail::sync(&core).unwrap();
+        core
+    }
+
+    fn has_view(core: &Core, n: u64) -> bool {
+        with_store(core, |s| s.view(FAKE_EMAIL, &format!("1a{n:014x}"), 0))
+            .unwrap()
+            .is_some()
+    }
+
+    fn reads_of(google: &FakeGoogle, n: u64) -> usize {
+        let id = format!("1a{n:014x}");
+        google
+            .log()
+            .iter()
+            .filter(|s| {
+                s.target.contains(&format!("/threads/{id}")) && s.target.contains("format=full")
+            })
+            .count()
+    }
+
+    fn attachment_reads(google: &FakeGoogle) -> usize {
+        google
+            .log()
+            .iter()
+            .filter(|s| s.target.contains("/attachments/"))
+            .count()
+    }
+
+    #[test]
+    fn a_thread_bigger_than_a_round_is_left_to_its_open_and_older_mail_comes() {
+        let mut big = mail(1, 1);
+        big.text = "x".repeat(200 * 1024);
+        let google = FakeGoogle::start(Seed {
+            mails: vec![big, mail(2, 2)],
+            ..Seed::default()
+        });
+        let core = synced(&google, "too-big");
+        for _ in 0..3 {
+            round_within(&core, NOW, 100 * 1024).unwrap();
+        }
+        assert!(has_view(&core, 2), "older mail isn't held up by it");
+        assert!(!has_view(&core, 1), "it waits for an open");
+        assert_eq!(reads_of(&google, 1), 1, "downloaded once, not each round");
+    }
+
+    #[test]
+    fn the_pictures_inside_a_mail_count_against_the_round() {
+        let google = FakeGoogle::start(Seed {
+            mails: vec![
+                with_pictures(1, 1, 3, 50 * 1024),
+                with_pictures(2, 2, 3, 50 * 1024),
+            ],
+            ..Seed::default()
+        });
+        let core = synced(&google, "pictures-share");
+        // each picture comes as 67 KiB of base64: the first mail's three make
+        // 200, and the second's stop when the next would pass 300
+        round_within(&core, NOW, 300 * 1024).unwrap();
+        assert!(has_view(&core, 1));
+        assert!(!has_view(&core, 2), "short of its pictures, it waits");
+        assert!(
+            attachment_reads(&google) < 6,
+            "{}",
+            attachment_reads(&google)
+        );
+        round_within(&core, NOW, 300 * 1024).unwrap();
+        assert!(has_view(&core, 2), "the next round takes it");
+    }
+
+    fn part(id: &str, cid: &str, disposition: &str) -> Value {
+        json!({"partId": id, "mimeType": "image/png", "filename": format!("{cid}.png"), "headers": [{"name": "Content-ID", "value": format!("<{cid}>")}, {"name": "Content-Disposition", "value": disposition}], "body": {"attachmentId": "att", "size": 1024}})
+    }
+
+    #[test]
+    fn an_attached_picture_the_page_shows_is_the_pages_and_an_unshown_one_isnt() {
+        use base64::Engine as _;
+        let html = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode("<p><img src=\"cid:logo\"></p>");
+        let thread = json!({"messages": [{"id": "m1", "payload": {"partId": "", "mimeType": "multipart/related", "parts": [
+            {"partId": "0", "mimeType": "text/html", "body": {"data": html, "size": 10}},
+            part("1", "logo", "attachment; filename=\"logo.png\""),
+            part("2", "outlook", "attachment; filename=\"quote.png\""),
+            part("3", "kept", "inline"),
+        ]}}]});
+        let inline = inline_parts(&thread);
+        let has = |p: &str| inline.contains(&("m1".to_owned(), p.to_owned()));
+        assert!(has("1"), "shown in the page: not fetched twice");
+        assert!(!has("2"), "an attachment named by nothing is an attachment");
+        assert!(has("3"));
+    }
 }

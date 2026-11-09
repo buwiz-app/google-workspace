@@ -904,23 +904,6 @@ fn with_pictures(n: u64, days_ago: i64, count: usize, size: usize) -> Mail {
 }
 
 #[test]
-fn the_pictures_inside_a_mail_count_against_the_round() {
-    let mib = 1024 * 1024;
-    let google = seeded(vec![
-        with_pictures(1, 1, 20, 3 * mib / 2),
-        with_pictures(2, 2, 20, 3 * mib / 2),
-    ]);
-    let core = synced(&google, "pictures-share");
-    gws::prefetch::run(&core).unwrap();
-    // each comes as 2 MiB of base64: the first mail's twenty make 40, and the
-    // second's stop when the next would pass the round's 50
-    let asked = attachment_reads(&google);
-    assert!(asked < 30, "{asked} asked");
-    assert!(has_view(&core, &id(1)));
-    assert!(!has_view(&core, &id(2)), "short of its pictures, it waits");
-}
-
-#[test]
 fn a_sign_out_stops_the_pictures_inside_a_mail_too() {
     let google = seeded(vec![with_pictures(1, 1, 3, 1024)]);
     let core = synced(&google, "pictures-gone");
@@ -936,4 +919,34 @@ fn a_sign_out_stops_the_pictures_inside_a_mail_too() {
         assert!(round.join().unwrap().is_err());
     });
     assert_eq!(attachment_reads(&google), 1, "no picture asked after it");
+}
+
+#[test]
+fn a_picture_too_big_to_keep_in_its_view_is_never_fetched() {
+    let google = seeded(vec![with_pictures(1, 1, 1, 1024 * 1024)]);
+    let core = synced(&google, "pictures-room");
+    gws::prefetch::run(&core).unwrap();
+    assert!(has_view(&core, &id(1)));
+    assert_eq!(
+        attachment_reads(&google),
+        0,
+        "no room for it, so no download"
+    );
+}
+
+#[test]
+fn a_picture_google_said_too_little_of_leaves_its_thread_to_the_open() {
+    let google = seeded(vec![with_pictures(1, 1, 1, 1024), mail(2, 2)]);
+    let core = synced(&google, "pictures-short");
+    google.attachment_sizes_missing(true);
+    gws::prefetch::run(&core).unwrap();
+    assert!(!has_view(&core, &id(1)), "not kept as if it were whole");
+    assert!(has_view(&core, &id(2)), "older mail goes on");
+    let reads = thread_reads(&google).len();
+    gws::prefetch::run(&core).unwrap();
+    assert_eq!(thread_reads(&google).len(), reads, "not read each round");
+    google.attachment_sizes_missing(false);
+    let opened = data(core.run("gws_mail_thread", &json!({"thread": id(1)})));
+    let page = opened["page"].as_str().unwrap();
+    assert_eq!(page.matches("data:image/png;base64,").count(), 1, "{page}");
 }

@@ -960,17 +960,19 @@ pub fn view_of(thread: &Value) -> Value {
                 Some(h) => {
                     // the pictures picked for it go in first, so what folds
                     // folds with them
-                    let mut c = clean::clean_with(&h, &|url| pictures::inline(m, url));
-                    let (folded, cut) = fold::quotes(&c.html);
-                    let fresh = cut.map(|cut| clean::visible_text(&c.html[..cut]));
-                    c.html = folded;
-                    let snippet = gmail::snippet_of(fresh.as_deref().unwrap_or(&text));
-                    (Part::Html(c, text), snippet)
+                    let c = clean::clean_with(&h, &|url| pictures::inline(m, url));
+                    let quoted = fold::quotes(&c.html).unwrap_or_default();
+                    let snippet = gmail::snippet_of(if quoted.regions.is_empty() {
+                        &text
+                    } else {
+                        &quoted.fresh
+                    });
+                    (Part::Html(c, quoted.regions, text), snippet)
                 }
                 None => {
-                    let cut = fold::plain_cut(&text).unwrap_or(text.len());
-                    let snippet = gmail::snippet_of(&text[..cut]);
-                    (Part::Text(text), snippet)
+                    let cut = fold::plain_cut(&text);
+                    let snippet = gmail::snippet_of(&text[..cut.unwrap_or(text.len())]);
+                    (Part::Text(text, cut), snippet)
                 }
             }
         })
@@ -1038,9 +1040,10 @@ pub fn view_of(thread: &Value) -> Value {
     for ((before, after), part) in meta.iter().zip(parts) {
         page.push_str(before);
         match part {
-            Part::Html(c, _) => {
+            Part::Html(c, regions, _) => {
                 let (base, count) = (links.len(), c.links.len());
-                page.push_str(&clean::rewrite(&c.html, "gws-link:", |n, out| {
+                let html = fold::wrap(&c.html, &regions);
+                page.push_str(&clean::rewrite(&html, "gws-link:", |n, out| {
                     let known = n < count;
                     if known {
                         out.push_str(&format!("\"gws-link:{}\"", n + base));
@@ -1050,7 +1053,7 @@ pub fn view_of(thread: &Value) -> Value {
                 images += c.images.len();
                 links.extend(c.links);
             }
-            Part::Text(t) => page.push_str(&fold::plain(&t)),
+            Part::Text(t, cut) => page.push_str(&fold::split(&t, cut)),
             Part::TooLong => page.push_str(TOO_LONG),
         }
         page.push_str(after);
@@ -1059,32 +1062,59 @@ pub fn view_of(thread: &Value) -> Value {
 }
 
 /// One message of a thread, as much of it as fits.
+/// A text keeps where its fold starts, so its row and its fold agree.
 enum Part {
-    Html(clean::Cleaned, String),
-    Text(String),
+    /// The cleaned HTML, what of it folds, and the message's plain text.
+    Html(clean::Cleaned, Vec<fold::Region>, String),
+    Text(String, Option<usize>),
     TooLong,
 }
 
 impl Part {
     fn size(&self) -> usize {
         match self {
-            Part::Html(c, _) => sent(&c.html) + json!(c.links).to_string().len(),
-            Part::Text(t) => sent(&fold::plain(t)),
+            // the fold's markup measured where it goes, nothing built
+            Part::Html(c, regions, _) => {
+                let mut html = 2;
+                fold::pieces(&c.html, regions, |p| html += sent(p) - 2);
+                let links = c.links.iter().map(|l| sent(l) + 1).sum::<usize>();
+                html + links.max(1) + 1
+            }
+            Part::Text(t, cut) => sent(&fold::split(t, *cut)),
             Part::TooLong => TOO_LONG.len(),
         }
     }
 
     fn shrink(&mut self) {
         *self = match std::mem::replace(self, Part::TooLong) {
-            Part::Html(_, text) => Part::Text(text),
+            // as plain text it keeps the fold where the HTML had it, worked
+            // out only now that it's needed
+            Part::Html(c, regions, text) => {
+                match regions.first().and_then(|r| fold::shrunk(&c.html, r.start)) {
+                    Some((shown, cut)) => Part::Text(shown, Some(cut)),
+                    None => {
+                        let cut = fold::plain_cut(&text);
+                        Part::Text(text, cut)
+                    }
+                }
+            }
             _ => Part::TooLong,
         };
     }
 }
 
-/// `text`'s size in a JSON result.
+/// `text`'s size in a JSON result, as serde_json writes it, counted without
+/// writing it.
 fn sent(text: &str) -> usize {
-    Value::from(text).to_string().len()
+    let escapes: usize = text
+        .bytes()
+        .map(|b| match b {
+            b'"' | b'\\' | b'\x08' | b'\x0c' | b'\n' | b'\r' | b'\t' => 1,
+            0..=0x1f => 5,
+            _ => 0,
+        })
+        .sum();
+    text.len() + escapes + 2
 }
 
 /// Whether Gmail marks this one message unread.
@@ -2000,6 +2030,104 @@ mod tests {
         );
         assert!(
             page[fold..].contains("On Nov 6, 2026, Ana &lt;ana@example.com&gt; wrote:"),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn a_message_shrunk_to_text_keeps_its_fold() {
+        let heavy = format!(
+            r#"<p>Fresh words</p><div class="gmail_quote">{}</div>"#,
+            "<b>x</b>".repeat(120_000)
+        );
+        let view = view_of(&json!({"id": "t", "messages": [
+            labelled("a", &heavy, &["INBOX"]),
+            labelled("b", "<p>last</p>", &["INBOX"]),
+        ]}));
+        let page = view["page"].as_str().unwrap();
+        assert!(!page.contains("<b>x</b>"), "the oldest gave way to text");
+        let fold = page
+            .find(r#"<details class="gws-quote"><summary>•••</summary><pre"#)
+            .expect("the fold stays");
+        assert!(page[..fold].contains(r#"<span class="gws-snip">Fresh words</span>"#));
+        assert!(page[..fold].contains(">Fresh words</pre>"));
+        assert!(page[fold..].starts_with(
+            r#"<details class="gws-quote"><summary>•••</summary><pre style="white-space:pre-wrap;font:inherit;margin:0">xxx"#
+        ));
+    }
+
+    /// The page of a thread whose first message is too big for HTML.
+    fn shrunk_page(html: &str) -> String {
+        let heavy = format!("<p>Fresh words</p>{}{html}", "<b>x</b>".repeat(120_000));
+        let view = view_of(&json!({"id": "t", "messages": [
+            labelled("a", &heavy, &["INBOX"]),
+            labelled("b", "<p>last</p>", &["INBOX"]),
+        ]}));
+        let page = view["page"].as_str().unwrap().to_owned();
+        assert!(!page.contains("<b>x</b>"), "the oldest gave way to text");
+        page
+    }
+
+    #[test]
+    fn a_shrunk_message_with_a_plain_reply_still_folds_it() {
+        let page = shrunk_page("<p>On Nov 6, 2026, Ana wrote:</p><p>&gt; Can we?</p>");
+        let fold = page
+            .find(r#"<details class="gws-quote"><summary>•••</summary><pre"#)
+            .expect("the fold stays");
+        assert!(
+            page[fold..].contains(">On Nov 6, 2026, Ana wrote:"),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn a_shrunk_message_whose_first_quote_is_hidden_still_folds_the_rest() {
+        let page = shrunk_page(
+            r#"<div style="display:none"><blockquote type="cite">INJECT</blockquote></div><blockquote type="cite">Old words</blockquote>"#,
+        );
+        assert!(!page.contains("INJECT"), "{page}");
+        let fold = page
+            .find(r#"<details class="gws-quote"><summary>•••</summary><pre"#)
+            .expect("the fold stays");
+        assert!(page[fold..].contains(">Old words</pre>"), "{page}");
+    }
+
+    #[test]
+    fn a_parts_size_is_what_it_sends_counted_without_building_it() {
+        let c = clean::clean(
+            r#"<div><a href="https://a.example/?q=&quot;">Sounds</a> "good".<br><i>On Nov 6, 2026, Ana wrote:</i></div><blockquote type="cite">Old	\</blockquote>"#,
+        );
+        let regions = fold::quotes(&c.html).unwrap().regions;
+        assert!(!regions[0].reopen.is_empty(), "the fold reopens an element");
+        let expected = sent(&fold::wrap(&c.html, &regions)) + json!(c.links).to_string().len();
+        let part = Part::Html(c, regions, String::new());
+        let (size, made) = fold::allocations(|| part.size());
+        assert_eq!((size, made), (expected, 0));
+        let empty = Part::Html(clean::clean("<p>x</p>"), Vec::new(), String::new());
+        assert_eq!(empty.size(), sent("<p>x</p>") + 2);
+        for text in ["", "plain", "\"\\\n\r\t\u{8}\u{c}\u{1}\u{1f}\u{7f}é😀</>"] {
+            assert_eq!(sent(text), Value::from(text).to_string().len(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_shrunk_message_shows_none_of_what_its_page_hides() {
+        let page = shrunk_page(
+            r#"<div style="display:none"><blockquote type="cite">INJECT</blockquote></div>"#,
+        );
+        assert!(!page.contains("INJECT"), "{page}");
+    }
+
+    #[test]
+    fn a_bare_attribution_and_a_quote_is_not_a_row_of_its_own() {
+        let view = view_of(&json!({"id": "t", "messages": [
+            labelled("a", r#"<div>On Nov 6, 2026, Ana wrote:</div><blockquote type="cite"><div>Old words</div></blockquote>"#, &["INBOX"]),
+            labelled("b", "<p>last</p>", &["INBOX"]),
+        ]}));
+        let page = view["page"].as_str().unwrap();
+        assert!(!page.contains("gws-quote"), "{page}");
+        assert!(
+            page.contains(r#"<span class="gws-snip">On Nov 6, 2026, Ana wrote: Old words</span>"#),
             "{page}"
         );
     }

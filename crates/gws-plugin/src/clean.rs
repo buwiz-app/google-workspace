@@ -377,6 +377,44 @@ pub fn clean_with(html: &str, inline: &dyn Fn(&str) -> Option<String>) -> Cleane
     }
 }
 
+/// Whether a font size is too small to read: up to 1px or 1pt, a tenth of an
+/// em, or 10%, or a bare 0. A unit it doesn't know, or a size that isn't
+/// one, reads.
+fn tiny_font(value: &str) -> bool {
+    let unit = value
+        .find(|c: char| c.is_ascii_alphabetic() || c == '%')
+        .unwrap_or(value.len());
+    let Ok(n) = value[..unit].parse::<f32>() else {
+        return false;
+    };
+    n >= 0.0
+        && match &value[unit..] {
+            "" => n == 0.0,
+            "px" | "pt" => n <= 1.0,
+            "em" | "rem" => n <= 0.1,
+            "%" => n <= 10.0,
+            _ => false,
+        }
+}
+
+/// Whether a transform scales what's in it down to nothing: some `scale`
+/// at 5% or less.
+fn scaled_away(value: &str) -> bool {
+    value.match_indices("scale").any(|(at, _)| {
+        let rest = value[at + "scale".len()..].trim_start_matches(['x', 'y', 'z', '3', 'd']);
+        let Some(inside) = rest.strip_prefix('(').and_then(|r| r.split(')').next()) else {
+            return false;
+        };
+        inside.split([',', ' ']).filter(|n| !n.is_empty()).any(|n| {
+            let number = match n.strip_suffix('%') {
+                Some(p) => p.parse::<f32>().map(|p| p / 100.0),
+                None => n.parse::<f32>(),
+            };
+            number.is_ok_and(|n| n.abs() <= 0.05)
+        })
+    })
+}
+
 /// A length a style says is nothing, or next to it.
 fn no_size(value: &str, at_most: f32) -> bool {
     let number = value.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == '%');
@@ -385,17 +423,50 @@ fn no_size(value: &str, at_most: f32) -> bool {
 
 type Rgba = [u8; 4];
 
+/// CSS's named colours, each as `name:rrggbb`.
+const NAMED: &str = "aliceblue:f0f8ff antiquewhite:faebd7 aqua:00ffff aquamarine:7fffd4 azure:f0ffff \
+    beige:f5f5dc bisque:ffe4c4 black:000000 blanchedalmond:ffebcd blue:0000ff \
+    blueviolet:8a2be2 brown:a52a2a burlywood:deb887 cadetblue:5f9ea0 chartreuse:7fff00 \
+    chocolate:d2691e coral:ff7f50 cornflowerblue:6495ed cornsilk:fff8dc crimson:dc143c \
+    cyan:00ffff darkblue:00008b darkcyan:008b8b darkgoldenrod:b8860b darkgray:a9a9a9 \
+    darkgreen:006400 darkgrey:a9a9a9 darkkhaki:bdb76b darkmagenta:8b008b darkolivegreen:556b2f \
+    darkorange:ff8c00 darkorchid:9932cc darkred:8b0000 darksalmon:e9967a darkseagreen:8fbc8f \
+    darkslateblue:483d8b darkslategray:2f4f4f darkslategrey:2f4f4f darkturquoise:00ced1 \
+    darkviolet:9400d3 deeppink:ff1493 deepskyblue:00bfff dimgray:696969 dimgrey:696969 \
+    dodgerblue:1e90ff firebrick:b22222 floralwhite:fffaf0 forestgreen:228b22 fuchsia:ff00ff \
+    gainsboro:dcdcdc ghostwhite:f8f8ff gold:ffd700 goldenrod:daa520 gray:808080 green:008000 \
+    greenyellow:adff2f grey:808080 honeydew:f0fff0 hotpink:ff69b4 indianred:cd5c5c \
+    indigo:4b0082 ivory:fffff0 khaki:f0e68c lavender:e6e6fa lavenderblush:fff0f5 \
+    lawngreen:7cfc00 lemonchiffon:fffacd lightblue:add8e6 lightcoral:f08080 lightcyan:e0ffff \
+    lightgoldenrodyellow:fafad2 lightgray:d3d3d3 lightgreen:90ee90 lightgrey:d3d3d3 \
+    lightpink:ffb6c1 lightsalmon:ffa07a lightseagreen:20b2aa lightskyblue:87cefa \
+    lightslategray:778899 lightslategrey:778899 lightsteelblue:b0c4de lightyellow:ffffe0 \
+    lime:00ff00 limegreen:32cd32 linen:faf0e6 magenta:ff00ff maroon:800000 \
+    mediumaquamarine:66cdaa mediumblue:0000cd mediumorchid:ba55d3 mediumpurple:9370db \
+    mediumseagreen:3cb371 mediumslateblue:7b68ee mediumspringgreen:00fa9a \
+    mediumturquoise:48d1cc mediumvioletred:c71585 midnightblue:191970 mintcream:f5fffa \
+    mistyrose:ffe4e1 moccasin:ffe4b5 navajowhite:ffdead navy:000080 oldlace:fdf5e6 \
+    olive:808000 olivedrab:6b8e23 orange:ffa500 orangered:ff4500 orchid:da70d6 \
+    palegoldenrod:eee8aa palegreen:98fb98 paleturquoise:afeeee palevioletred:db7093 \
+    papayawhip:ffefd5 peachpuff:ffdab9 peru:cd853f pink:ffc0cb plum:dda0dd powderblue:b0e0e6 \
+    purple:800080 rebeccapurple:663399 red:ff0000 rosybrown:bc8f8f royalblue:4169e1 \
+    saddlebrown:8b4513 salmon:fa8072 sandybrown:f4a460 seagreen:2e8b57 seashell:fff5ee \
+    sienna:a0522d silver:c0c0c0 skyblue:87ceeb slateblue:6a5acd slategray:708090 \
+    slategrey:708090 snow:fffafa springgreen:00ff7f steelblue:4682b4 tan:d2b48c teal:008080 \
+    thistle:d8bfd8 tomato:ff6347 turquoise:40e0d0 violet:ee82ee wheat:f5deb3 white:ffffff \
+    whitesmoke:f5f5f5 yellow:ffff00 yellowgreen:9acd32";
+
 /// A CSS colour as red, green, blue and alpha, for the forms mail uses.
 fn colour(value: &str) -> Option<Rgba> {
     let value = value.trim().to_ascii_lowercase();
-    match value.as_str() {
-        "transparent" => return Some([0, 0, 0, 0]),
-        "black" => return Some([0, 0, 0, 255]),
-        "white" | "snow" | "ivory" | "ghostwhite" | "whitesmoke" | "floralwhite" | "mintcream"
-        | "azure" | "aliceblue" | "seashell" | "honeydew" | "lavenderblush" => {
-            return Some([255, 255, 255, 255]);
-        }
-        _ => {}
+    if value == "transparent" {
+        return Some([0, 0, 0, 0]);
+    }
+    if let Some(hex) = NAMED.split_whitespace().find_map(|n| {
+        n.strip_prefix(value.as_str())
+            .and_then(|h| h.strip_prefix(':'))
+    }) {
+        return colour(&format!("#{hex}"));
     }
     if let Some(inside) = value
         .strip_prefix("hsla(")
@@ -471,7 +542,7 @@ fn unreadable(ink: Rgba, paper: Rgba) -> bool {
 }
 
 /// A `style`, reduced to the declarations a browser would read.
-fn declarations(style: &str) -> Vec<(String, String)> {
+pub(crate) fn declarations(style: &str) -> Vec<(String, String)> {
     let style = no_comments(style).to_ascii_lowercase();
     style
         .split(';')
@@ -496,16 +567,16 @@ fn hidden(style: &str) -> bool {
             "display" => value == "none",
             "visibility" => value == "hidden" || value == "collapse",
             "opacity" => no_size(value, 0.05),
-            "font-size" => no_size(value, 1.0),
+            "font-size" => tiny_font(value),
             "font" => words(value).iter().any(|w| {
                 let size = w.split('/').next().unwrap_or_default();
-                size.starts_with(|c: char| c.is_ascii_digit()) && no_size(size, 1.0)
+                size.starts_with(|c: char| c.is_ascii_digit() || c == '.') && tiny_font(size)
             }),
             "mso-hide" => value == "all",
             "width" | "height" | "max-width" | "max-height" => no_size(value, 0.0),
             "clip" => value.starts_with("rect(0"),
             "clip-path" => value.starts_with("inset(50%") || value.starts_with("inset(100%"),
-            "transform" => value.contains("scale(0"),
+            "transform" => scaled_away(value),
             "text-indent" | "left" | "top" | "margin-left" | "margin-top" => far_off(value),
             _ => false,
         })
@@ -544,15 +615,36 @@ pub(crate) fn attribute(tag: &str, name: &str) -> Option<String> {
     Some(gmail::decode_entities(value.split('"').next()?))
 }
 
-/// The tag's own background, if it gives one that can be read.
-fn background(tag: &str) -> Option<Rgba> {
+/// What text is drawn on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Paper {
+    Plain(Rgba),
+    /// A picture, a gradient or a see-through colour: what's under the text
+    /// can't be told, so any ink on it may be read.
+    Unknown,
+}
+
+/// The tag's own background, if it gives one; none for a transparent one.
+fn background(tag: &str) -> Option<Paper> {
+    let pictured = |v: &str| {
+        ["url(", "gradient(", "image("]
+            .iter()
+            .any(|f| v.contains(f))
+    };
     let style = attribute(tag, "style").unwrap_or_default();
+    if declared(&style, &["background-image"]).is_some_and(|v| pictured(&v)) {
+        return Some(Paper::Unknown);
+    }
     let value = declared(&style, &["background-color", "background"])
         .or_else(|| attribute(tag, "bgcolor"))?;
-    words(&value)
-        .iter()
-        .find_map(|w| colour(w))
-        .filter(|c| c[3] > 0)
+    if pictured(&value) {
+        return Some(Paper::Unknown);
+    }
+    match words(&value).iter().find_map(|w| colour(w))? {
+        [.., 0] => None,
+        c @ [.., 255] => Some(Paper::Plain(c)),
+        _ => Some(Paper::Unknown),
+    }
 }
 
 /// The tag's own text colour: its style's, else `<font color>`'s.
@@ -562,6 +654,32 @@ fn ink(tag: &str) -> Option<Rgba> {
         .or_else(|| declared(&style, &["color"]))
         .or_else(|| attribute(tag, "color"))?;
     colour(&value)
+}
+
+/// The colours an element's text is drawn in and on, as what's in it
+/// inherits them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Paint {
+    paper: Option<Paper>,
+    ink: Option<Rgba>,
+}
+
+/// Whether a start tag, inside `around`, hides what's in it from a person,
+/// by its style or by text the colour of what it's on, and the paint it hands
+/// on. The one rule for what a person sees: [`visible_text`] reads by it, and
+/// so does the fold.
+pub(crate) fn sight(tag: &str, around: Paint) -> (bool, Paint) {
+    let paint = Paint {
+        paper: background(tag).or(around.paper),
+        ink: ink(tag).or(around.ink),
+    };
+    let unseen = paint.ink.is_some_and(|ink| match paint.paper {
+        Some(Paper::Unknown) => ink[3] < 13,
+        Some(Paper::Plain(paper)) => unreadable(ink, paper),
+        None => unreadable(ink, PAGE),
+    });
+    let hides = unseen || attribute(tag, "style").is_some_and(|s| hidden(&s));
+    (hides, paint)
 }
 
 /// `html` as plain text, read from the markup the reader shows, without what
@@ -574,8 +692,8 @@ pub fn visible_text(html: &str) -> String {
     let mut text = String::new();
     // inside a hidden element: its name, and how many of that name are open
     let mut hiding: Option<(String, usize)> = None;
-    // the backgrounds and text colours of the elements open now, innermost last
-    let mut open: Vec<(String, Option<Rgba>, Option<Rgba>)> = Vec::new();
+    // the elements open now and their paint, innermost last
+    let mut open: Vec<(String, Paint)> = Vec::new();
     let mut rest = html.as_str();
     while !rest.is_empty() {
         let lt = rest.find('<').unwrap_or(rest.len());
@@ -610,17 +728,14 @@ pub fn visible_text(html: &str) -> String {
                 open.truncate(at);
             }
         } else if !void {
-            let paper = background(tag)
-                .or_else(|| open.iter().rev().find_map(|(_, bg, _)| *bg))
-                .unwrap_or(PAGE);
             // a colour is inherited, and can meet a background further in
-            let text = ink(tag).or_else(|| open.iter().rev().find_map(|(.., ink)| *ink));
-            let unseen = text.is_some_and(|ink| unreadable(ink, paper));
-            if unseen || attribute(tag, "style").is_some_and(|s| hidden(&s)) {
+            let around = open.last().map_or_else(Paint::default, |(_, p)| *p);
+            let (hides, paint) = sight(tag, around);
+            if hides {
                 hiding = Some((name, 1));
                 continue;
             }
-            open.push((name.clone(), background(tag), ink(tag)));
+            open.push((name.clone(), paint));
         }
         if gmail::BLOCKS.contains(&name.as_str()) {
             text.push('\n');
@@ -766,6 +881,28 @@ mod tests {
         // what the reader shows stays
         assert_eq!(
             visible_text(r#"<p style="color:#123;font-size:12px;height:20px">seen</p>"#),
+            "seen"
+        );
+    }
+
+    #[test]
+    fn text_on_a_picture_or_a_see_through_colour_reads() {
+        let (_, white) = sight(r#"<div style="color:#fff">"#, Paint::default());
+        for tag in [
+            r#"<td style="background:url(x.png)">"#,
+            r#"<td style="background-image:url(x.png)">"#,
+            r#"<td style="background-image:linear-gradient(#000,#fff)">"#,
+            r#"<td style="background:hsla(0,0%,0%,0.5)">"#,
+        ] {
+            assert!(!sight(tag, white).0, "{tag}");
+        }
+        // transparent ink is unseen on anything; white on white is still hidden
+        let (_, clear) = sight(r#"<div style="color:transparent">"#, Paint::default());
+        assert!(sight(r#"<td style="background:url(x.png)">"#, clear).0);
+        assert!(sight(r#"<td style="background:white">"#, white).0);
+        assert!(!sight(r#"<td bgcolor="navy">"#, white).0);
+        assert_eq!(
+            visible_text(r#"<p style="color:navy;background:navy">IGNORE</p><p>seen</p>"#),
             "seen"
         );
     }

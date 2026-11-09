@@ -21,19 +21,39 @@ fn theme(dark: bool) -> &'static str {
          *{color:#f0f0f0!important;background-color:transparent!important;background-image:none!important;border-color:#3a3a3a!important}\
          a[href],a[href] *{color:#7fb2ff!important}\
          .gws-meta,.gws-meta *{color:#a0a0a0!important}\
-         .gws-meta b{color:#f0f0f0!important}"
+         details>summary>.gws-snip,details>summary>.gws-date,details.gws-more>summary{color:#a0a0a0!important}\
+         details.gws-quote>summary{background-color:#3a3a3a!important;color:#d0d0d0!important}"
     } else {
         "html,body{background:#fff;color:#1c1c1c}\
-         .gws-meta{color:#5c5c5c;border-color:#e5e5e2}\
-         .gws-meta b{color:#1c1c1c}"
+         .gws-meta{color:#5c5c5c}\
+         details.gws-msg,details.gws-more>summary{border-color:#e5e5e2}\
+         details>summary>.gws-snip,details>summary>.gws-date,details.gws-more>summary{color:#5f6368}\
+         details.gws-quote>summary{background:#e8eaed;color:#3c4043}"
     }
 }
+
+/// The plugin's folds, as Gmail draws them: a message is a row of who, the
+/// start of what they said and when, with no disclosure triangle; quoted
+/// history is a ••• pill. Each rule names `details` or `summary`, which no
+/// mail can write, so a mail's own `class` can't dress up as one.
+const FOLDS: &str = "details>summary{list-style:none;cursor:default}\
+     details>summary::-webkit-details-marker{display:none}\
+     details>summary::marker{content:\"\"}\
+     details.gws-msg{border-top:1px solid;padding-bottom:4px}\
+     details.gws-msg>summary{display:block;padding:10px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\
+     details.gws-msg>summary>.gws-date{float:right;margin-left:12px;font-size:12px}\
+     details.gws-msg>summary>.gws-from{font-weight:600;margin-right:12px}\
+     details.gws-msg[open]>summary>.gws-snip{display:none}\
+     details.gws-more>summary{display:block;padding:8px 0;border-top:1px solid;font-size:12px;text-align:center}\
+     details.gws-more>summary>.gws-less,details.gws-more[open]>summary>.gws-n{display:none}\
+     details.gws-more[open]>summary>.gws-less{display:inline}\
+     details.gws-quote>summary{display:inline-block;margin:8px 0;padding:0 8px;border-radius:8px;font-size:11px;line-height:14px;letter-spacing:1px}";
 
 /// `html` with [`MAIL_CSP`] ahead of everything else in it, in the Bot's theme.
 pub fn seal(html: &str, dark: bool) -> String {
     let theme = theme(dark);
     format!(
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"{MAIL_CSP}\"><style>html,body{{margin:0;padding:12px;font:14px -apple-system,sans-serif;overflow-wrap:anywhere}}img{{max-width:100%;height:auto}}.gws-meta{{font-size:12px;margin:14px 0 6px;border-top:1px solid;padding-top:10px}}{theme}</style></head><body>{html}</body></html>"
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"{MAIL_CSP}\"><style>html,body{{margin:0;padding:12px;font:14px -apple-system,sans-serif;overflow-wrap:anywhere}}img{{max-width:100%;height:auto}}.gws-meta{{font-size:12px;margin:0 0 10px}}{FOLDS}{theme}</style></head><body>{html}</body></html>"
     )
 }
 
@@ -95,6 +115,36 @@ mod tests {
             "a dead link is plain text, not blue"
         );
         assert!(seal("x", false).contains("html,body{background:#fff"));
+    }
+
+    #[test]
+    fn folds_look_like_gmails_rows_in_both_themes() {
+        for dark in [false, true] {
+            let page = seal("x", dark);
+            assert!(
+                page.contains("details>summary::-webkit-details-marker{display:none}")
+                    && page.contains("details>summary{list-style:none"),
+                "no disclosure triangle"
+            );
+            assert!(page.contains("details.gws-msg[open]>summary>.gws-snip{display:none}"));
+            // an opened run keeps a row that folds it again
+            assert!(!page.contains("details.gws-more[open]>summary{display:none}"));
+            assert!(page.contains("details.gws-more[open]>summary>.gws-less{display:inline}"));
+            let pill = if dark {
+                "details.gws-quote>summary{background-color:#3a3a3a!important"
+            } else {
+                "details.gws-quote>summary{background:#e8eaed"
+            };
+            assert!(page.contains(pill), "the ••• pill shows on {dark}");
+            // the folds' rules come after the mail's base, so the theme wins
+            assert!(
+                page.find("details.gws-quote>summary{display").unwrap() < page.find(pill).unwrap()
+            );
+        }
+        // every fold rule is on markup only the plugin writes
+        for rule in FOLDS.split('}').filter(|r| !r.is_empty()) {
+            assert!(rule.starts_with("details"), "{rule}");
+        }
     }
 
     #[test]

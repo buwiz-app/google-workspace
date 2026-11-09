@@ -77,6 +77,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
         9,
         "CREATE TABLE sign_ins(label TEXT NOT NULL PRIMARY KEY, subject TEXT NOT NULL) WITHOUT ROWID;",
     ),
+    // a stored mail view shows every message open: fetched again, it folds
+    (10, "DELETE FROM bodies;"),
 ];
 
 /// Why the store didn't open or answer: a stable `code` and a message for people.
@@ -627,6 +629,24 @@ mod tests {
                  DROP TABLE sign_ins;
                  ALTER TABLE drive_files DROP COLUMN can;
                  PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&paths, &key()).unwrap();
+        assert_eq!(store.view("a", "t", 2).unwrap(), None);
+    }
+
+    /// One kept from before folds shows every message open.
+    #[test]
+    fn a_stored_mail_view_from_before_folds_goes() {
+        let dir = Dir::new("folds");
+        let paths = Paths::in_dir(&dir.0);
+        let store = Store::open(&paths, &key()).unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "INSERT INTO bodies(account, thread, view, size, used) VALUES('a', 't', '{}', 2, 1);
+                 PRAGMA user_version = 9;",
             )
             .unwrap();
         drop(store);

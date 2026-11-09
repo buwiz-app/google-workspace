@@ -70,20 +70,17 @@ fn wrote(first: &str, last: &str) -> bool {
 
 /// Whether a line names a day, a time or an address, as a header does.
 fn dated(line: &str) -> bool {
-    const NAMES: &[&str] = &[
-        "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun", "monday",
-        "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "jan", "feb", "mar",
-        "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec", "january",
-        "february", "march", "april", "june", "july", "august", "september", "october",
-        "november", "december",
-    ];
+    const NAMES: &str = "mon tue tues wed thu thur thurs fri sat sun monday tuesday \
+        wednesday thursday friday saturday sunday jan feb mar apr may jun jul aug sep sept oct \
+        nov dec january february march april june july august september october november \
+        december";
     let address = |w: &str| {
         let w = w.trim_matches(|c: char| !c.is_alphanumeric());
         w.find('@').is_some_and(|at| at > 0 && at + 1 < w.len())
     };
     let name = |w: &str| {
         w.starts_with(|c: char| c.is_ascii_uppercase())
-            && NAMES.iter().any(|n| n.eq_ignore_ascii_case(w))
+            && NAMES.split_whitespace().any(|n| n.eq_ignore_ascii_case(w))
     };
     line.bytes().any(|b| b.is_ascii_digit())
         || line.split_whitespace().any(address)
@@ -402,7 +399,10 @@ fn words(html: &str, n: &Node) -> bool {
         rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{a0}');
         match rest.strip_prefix("&nbsp;") {
             Some(after) => rest = after,
-            None if ["&amp;", "&lt;", "&gt;"].iter().any(|e| rest.starts_with(e)) => {
+            None if ["&amp;", "&lt;", "&gt;"]
+                .iter()
+                .any(|e| rest.starts_with(e)) =>
+            {
                 return true;
             }
             None if rest.starts_with('&') => return said(html, n).is_some(),
@@ -466,7 +466,10 @@ fn attributed(html: &str, nodes: &[Node], open: usize) -> (usize, Vec<usize>) {
     let mut i = open;
     loop {
         // the node before, or None at the edge of what the quote is in
-        let edge = i.checked_sub(1).map(|p| &nodes[p]).filter(|n| n.depth >= depth);
+        let edge = i
+            .checked_sub(1)
+            .map(|p| &nodes[p])
+            .filter(|n| n.depth >= depth);
         if let Some(n) = edge {
             i -= 1;
             if let Some(w) = said(html, n) {
@@ -878,7 +881,11 @@ mod tests {
         ] {
             assert!(wrote(line, line), "{line}");
         }
-        for line in ["On reflection, Ana wrote:", "On the may list, Ana wrote:", "On @ wrote:"] {
+        for line in [
+            "On reflection, Ana wrote:",
+            "On the may list, Ana wrote:",
+            "On @ wrote:",
+        ] {
             assert!(!wrote(line, line), "{line}");
         }
     }

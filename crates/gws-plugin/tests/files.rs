@@ -1594,7 +1594,6 @@ fn each_kind_of_attachment_takes_its_own_way_to_the_bot() {
         (0, "buwiz/document", Some("image/png"), "IMG_4250.png"),
         (1, "buwiz/document", Some("application/pdf"), "receipt.pdf"),
         (2, "buwiz/document", Some(DOCX), "report.docx"),
-        (3, "buwiz/open_with", None, "site-plans.zip"),
         (4, "buwiz/open_with", None, "invite.ics"),
         (5, "buwiz/open_with", None, "notes.txt"),
     ] {
@@ -1602,7 +1601,11 @@ fn each_kind_of_attachment_takes_its_own_way_to_the_bot() {
         let (got, path) = handed(&answer);
         assert_eq!(got, key, "{name}: {answer}");
         assert_eq!(name_on_disk(&path), name);
+        // the one shape the Bot takes: <data>/open-<install id>/<folder>/<file>
         assert_eq!(path.ancestors().nth(2).unwrap(), real(&home.open_dir()));
+        assert_eq!(path.ancestors().nth(3).unwrap(), real(&home.dir));
+        let root = home.open_dir();
+        assert!(name_on_disk(&root).starts_with("open-"), "{root:?}");
         assert_eq!(
             answer["_meta"][key].get("mime").and_then(Value::as_str),
             mime
@@ -1616,7 +1619,7 @@ fn each_kind_of_attachment_takes_its_own_way_to_the_bot() {
         );
     }
     let before = fetches(&google);
-    for n in [6, 7] {
+    for n in [3, 6, 7] {
         let answer = open_attachment(&home, n);
         assert_eq!(refusal(&answer), "unsupported", "{answer}");
         assert_eq!(
@@ -1642,8 +1645,11 @@ fn the_rich_mails_photo_pdf_zip_and_invite_each_hand_over() {
                 "gws_mail_attachment_open",
                 &json!({"message": message, "part": listed["part"]}),
             );
-            let (key, path) = handed(&answer);
-            seen.push((name_on_disk(&path).to_owned(), key));
+            let way = match answer["structuredContent"]["refused"].as_str() {
+                Some(refused) => refused.to_owned(),
+                None => handed(&answer).0,
+            };
+            seen.push((listed["name"].as_str().unwrap().to_owned(), way));
         }
     }
     let seen: Vec<(&str, &str)> = seen.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
@@ -1652,7 +1658,7 @@ fn the_rich_mails_photo_pdf_zip_and_invite_each_hand_over() {
         [
             ("IMG_4250.png", "buwiz/document"),
             ("receipt.pdf", "buwiz/document"),
-            ("site-plans.zip", "buwiz/open_with"),
+            ("site-plans.zip", "unsupported"),
             ("invite.ics", "buwiz/open_with"),
             ("invite.ics", "buwiz/open_with"),
         ]
@@ -1712,7 +1718,7 @@ fn the_name_on_disk_ends_as_its_bytes_are() {
     google.deliver(mail_with(vec![
         ("Scan", "application/pdf", PDF),
         ("IMG_9.PNG", "application/octet-stream", PNG),
-        ("../plans", "application/zip", b"PK"),
+        ("../plans", "application/vnd.apple.pages", b"PK"),
         ("schedule.ics.exe", "application/ics", b"BEGIN:VCALENDAR"),
     ]));
     let home = Home::new(&google.base(), "diskname");
@@ -1720,7 +1726,7 @@ fn the_name_on_disk_ends_as_its_bytes_are() {
     for (n, name) in [
         (0, "Scan.pdf"),
         (1, "IMG_9.PNG"),
-        (2, "plans.zip"),
+        (2, "plans.pages"),
         (3, "schedule.ics.exe.ics"),
     ] {
         assert_eq!(name_on_disk(&handed(&open_attachment(&home, n)).1), name);
@@ -1778,7 +1784,7 @@ fn each_press_a_bot_cant_answer_says_to_update_it() {
     google.deliver(mail_with(vec![
         ("IMG_4250.png", "image/png", PNG),
         ("receipt.pdf", "application/pdf", PDF),
-        ("site-plans.zip", "application/zip", b"PK"),
+        ("notes.txt", "text/plain", b"hello"),
         ("report.docx", DOCX, b"PK report"),
         ("budget.xlsx", XLSX, b"PK budget"),
     ]));
@@ -1830,7 +1836,7 @@ fn an_image_or_pdf_never_shows_as_edited() {
     google.deliver(mail_with(vec![
         ("IMG_4250.png", "image/png", PNG),
         ("receipt.pdf", "application/pdf", PDF),
-        ("site-plans.zip", "application/zip", b"PK"),
+        ("notes.txt", "text/plain", b"hello"),
     ]));
     let home = Home::new(&google.base(), "readonly");
     bot_can(&home, &EVERYTHING);
@@ -1909,9 +1915,10 @@ fn every_attachment_written_here_is_quarantined() {
     let google = FakeGoogle::start(Seed::default());
     google.deliver(mail_with(vec![
         ("IMG_4250.png", "image/png", PNG),
-        ("site-plans.zip", "application/zip", b"PK\x05\x06"),
+        ("invite.ics", "application/ics", b"BEGIN:VCALENDAR"),
         ("report.docx", DOCX, b"PK report"),
         ("run.command", "application/octet-stream", b"#!/bin/sh"),
+        ("site-plans.zip", "application/zip", b"PK\x05\x06"),
     ]));
     let home = Home::new(&google.base(), "quarantine");
     bot_can(&home, &EVERYTHING);
@@ -1920,7 +1927,7 @@ fn every_attachment_written_here_is_quarantined() {
         handed(&open_attachment(&home, 1)).1,
         handed(&open_attachment(&home, 2)).1,
     ];
-    for n in 0..4 {
+    for n in 0..5 {
         paths.push(handed(&save_attachment(&home, n)).1);
     }
     for path in &paths {

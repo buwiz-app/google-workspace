@@ -8,10 +8,11 @@
 //! the bytes are. An image or a PDF is checked by its first bytes, since a
 //! stranger's word for it is no proof. The other kinds go only to the app their
 //! extension names, so that list holds only what opens without running
-//! anything: no legacy Office file, which can carry macros, and a zip only
-//! because what lands here is quarantined, so an app inside it meets
-//! Gatekeeper. Whatever the Mac's own app has is only looked at: an edit made
-//! there is never taken to Drive.
+//! anything, and matches the Bot's: png, jpg, jpeg, gif, webp, heic, pdf, txt,
+//! csv, docx, xlsx, pptx, pages, numbers, key and ics. No legacy Office file,
+//! which can carry macros, and no zip, which Archive Utility would unpack here,
+//! beyond the Bot's checks: those are saved. Whatever the Mac's own app has is
+//! only looked at: an edit made there is never taken to Drive.
 
 use std::sync::Mutex;
 
@@ -236,8 +237,10 @@ pub(crate) const KINDS: [Kind; 19] = [
         fits: ics,
         ..kind("text/calendar", &["ics"], None)
     },
+    // saved only: Archive Utility would unpack it beside itself
     Kind {
         aliases: &["application/x-zip-compressed", "application/x-zip"],
+        system: false,
         ..kind("application/zip", &["zip"], None)
     },
 ];
@@ -369,7 +372,6 @@ mod tests {
             ("application/pdf", true),
             (super::super::files::DOCX, true),
             ("text/csv", true),
-            ("application/zip", false),
             ("text/calendar", false),
             ("text/plain", false),
         ] {
@@ -384,6 +386,7 @@ mod tests {
             "application/msword",
             "application/vnd.ms-excel",
             "application/vnd.ms-powerpoint",
+            "application/zip",
         ] {
             let kind = by_mime(mime).unwrap();
             assert_eq!(way(&system, kind), Way::SaveOnly, "{mime}");
@@ -420,9 +423,9 @@ mod tests {
         assert!(checked(by_mime("image/heic").unwrap(), b"\0\0\0\x18ftypheic").is_some());
         assert!(checked(by_mime("image/heic").unwrap(), b"\0\0\0\x18ftypisom").is_none());
         assert!(checked(by_mime("image/gif").unwrap(), b"GIF89a").is_some());
-        let zip = by_mime("application/zip").unwrap();
+        let txt = by_mime("text/plain").unwrap();
         assert!(
-            checked(zip, b"anything").is_some(),
+            checked(txt, b"anything").is_some(),
             "the app its name picks"
         );
     }

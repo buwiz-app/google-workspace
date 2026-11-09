@@ -61,6 +61,9 @@ pub const APPS: [App; 3] = [
             tools::UPLOAD_CHUNK,
             tools::UPLOAD_DROP,
             tools::MAIL_ATTACHMENT_OPEN,
+            tools::MAIL_PICTURES,
+            tools::MAIL_PICTURE_SENDER_ADD,
+            tools::MAIL_PICTURE_SENDER_REMOVE,
         ],
         card: true,
         files: true,
@@ -272,11 +275,25 @@ mod tests {
             .iter()
             .find(|a| a.tools.contains(&tools::MAIL_LIST))
             .unwrap();
-        let screen = include_str!("../../gws-screens/src/mail.rs");
+        let screens = [
+            include_str!("../../gws-screens/src/mail.rs"),
+            include_str!("../../gws-screens/src/mail/pictures.rs"),
+        ];
         for def in tools::defs() {
-            if screen.contains(&format!("\"{}\"", def.name)) {
+            if screens
+                .iter()
+                .any(|s| s.contains(&format!("\"{}\"", def.name)))
+            {
                 assert!(mail.tools.contains(&def.name), "{}", def.name);
             }
+        }
+        // the tie only means something while the screen makes these calls
+        for name in [
+            tools::MAIL_PICTURES,
+            tools::MAIL_PICTURE_SENDER_ADD,
+            tools::MAIL_PICTURE_SENDER_REMOVE,
+        ] {
+            assert!(screens[1].contains(&format!("\"{name}\"")), "{name}");
         }
     }
 

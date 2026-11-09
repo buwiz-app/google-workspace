@@ -21,6 +21,7 @@ pub mod calendar;
 pub mod drive;
 pub mod mail;
 pub mod open;
+pub mod prefetch;
 
 pub const DATA_DIR_ENV: &str = "GWS_DATA_DIR";
 /// How long a locked store is waited for.
@@ -76,6 +77,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         9,
         "CREATE TABLE sign_ins(label TEXT NOT NULL PRIMARY KEY, subject TEXT NOT NULL) WITHOUT ROWID;",
+    ),
+    // recent mail ahead of time: small attachments, the bytes last so a sum of
+    // sizes needn't read them, and which views have had theirs looked at
+    (
+        10,
+        "CREATE TABLE attachment_bytes(account TEXT NOT NULL, message TEXT NOT NULL, part TEXT NOT NULL, thread TEXT NOT NULL, name TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL, used INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(account, message, part));
+         CREATE INDEX attachment_bytes_of_thread ON attachment_bytes(account, thread);
+         ALTER TABLE bodies ADD COLUMN fetched INTEGER NOT NULL DEFAULT 0;",
     ),
 ];
 
@@ -625,6 +634,8 @@ mod tests {
             .execute_batch(
                 "INSERT INTO bodies(account, thread, view, size, used) VALUES('a', 't', '{}', 2, 1);
                  DROP TABLE sign_ins;
+                 DROP TABLE attachment_bytes;
+                 ALTER TABLE bodies DROP COLUMN fetched;
                  ALTER TABLE drive_files DROP COLUMN can;
                  PRAGMA user_version = 6;",
             )

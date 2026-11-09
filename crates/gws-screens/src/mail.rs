@@ -162,7 +162,7 @@ fn now_ms() -> i64 {
 /// The line under the search box, when there is something to say.
 pub fn notice(status: &str, saved: bool) -> Option<&'static str> {
     match (status, saved) {
-        (_, true) | ("offline", _) => Some("Showing saved mail"),
+        (_, true) | ("offline", _) => Some("Can't reach Google. Showing saved mail."),
         ("needs_access", _) => {
             Some("Your Google sign-in needs more access. Sign in again on this app's page.")
         }
@@ -1832,8 +1832,14 @@ mod tests {
     fn the_notice_says_what_a_person_can_use() {
         assert_eq!(notice("ok", false), None);
         assert_eq!(notice("syncing", false), None);
-        assert_eq!(notice("ok", true), Some("Showing saved mail"));
-        assert_eq!(notice("offline", false), Some("Showing saved mail"));
+        assert_eq!(
+            notice("ok", true),
+            Some("Can't reach Google. Showing saved mail.")
+        );
+        assert_eq!(
+            notice("offline", false),
+            Some("Can't reach Google. Showing saved mail.")
+        );
         assert!(
             notice("needs_access", false)
                 .unwrap()

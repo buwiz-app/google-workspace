@@ -319,7 +319,7 @@ impl Tickets {
 
 /// A card's rows, each with a ticket to open it by.
 fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (auth, account) = signed_in(core)?;
+    let (auth, account) = reader(core)?;
     let held = core
         .tickets
         .lock()
@@ -329,7 +329,11 @@ fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some(Subject::Search(query)) = held else {
         return Ok(fail("not_found", "This card is out of date."));
     };
-    let (rows, saved) = match search(core, &auth, &account, &query) {
+    let found = match &auth {
+        Some(auth) => search(core, auth, &account, &query),
+        None => Err(unreached()),
+    };
+    let (rows, saved) = match found {
         Ok(rows) => (rows, false),
         Err(Failure::Offline(_)) => (
             with_store(core, |store| {
@@ -365,7 +369,7 @@ impl Waker {
         self.wake();
     }
 
-    fn stopping(&self) -> bool {
+    pub(crate) fn stopping(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
 
@@ -460,7 +464,9 @@ pub fn start(core: Arc<Core>) -> JoinHandle<()> {
                 return;
             }
             if core.provisioned() {
-                let _ = sync(&core);
+                if sync(&core).is_ok() {
+                    crate::prefetch::kick(&core);
+                }
                 crate::files::sweep(&core);
             }
         }
@@ -594,6 +600,22 @@ pub(crate) fn with_store<T>(
 
 pub(crate) fn signed_in(core: &Core) -> Result<(Bearer, String), Failure> {
     core.accounts.session().ok_or(Failure::AccountRequired)
+}
+
+/// Whose saved mail a screen reads, with their token while it's live. A lapsed
+/// one is still their sign-in: with no connection the Bot can't refresh it, and
+/// what's saved is still theirs to read. No token means Google can't be asked.
+fn reader(core: &Core) -> Result<(Option<Bearer>, String), Failure> {
+    if let Some((auth, account)) = core.accounts.session() {
+        return Ok((Some(auth), account));
+    }
+    let (account, _) = core.accounts.signed_in().ok_or(Failure::AccountRequired)?;
+    Ok((None, account))
+}
+
+/// What a call to Google comes to with no live token.
+fn unreached() -> Failure {
+    Failure::Offline(crate::tools::GOOGLE_UNREACHED.to_owned())
 }
 
 /// `Ana Reyes <ana@example.com>` as (name, address); a bare address is both.
@@ -801,14 +823,14 @@ fn row_json(t: &Thread) -> Value {
 }
 
 fn labels(core: &Core) -> Result<Value, Failure> {
-    let (_, account) = signed_in(core)?;
+    let (_, account) = reader(core)?;
     let list = with_store(core, |store| store.labels(&account))?;
     let rows: Vec<Value> = list.iter().map(|l| json!({"id": l.id, "name": l.name, "kind": l.kind, "unread": l.unread, "total": l.total})).collect();
     Ok(ok(json!({"labels": rows})))
 }
 
 fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (auth, account) = signed_in(core)?;
+    let (auth, account) = reader(core)?;
     let mut query = js::trim(&js::string_or_empty(args.get("query"))).to_owned();
     // a card's search, carried to the full screen by its ticket
     if let Some(Subject::Search(q)) = core
@@ -820,7 +842,11 @@ fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
         query = q.clone();
     }
     if !query.is_empty() {
-        return Ok(match search(core, &auth, &account, &query) {
+        let found = match &auth {
+            Some(auth) => search(core, auth, &account, &query),
+            None => Err(unreached()),
+        };
+        return Ok(match found {
             Ok(rows) => ok(
                 json!({"threads": rows.iter().map(row_json).collect::<Vec<_>>(), "more": false, "saved": false}),
             ),
@@ -841,10 +867,16 @@ fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
     }
     let skip = args.get("skip").and_then(Value::as_i64).unwrap_or(0).max(0);
     let stored = with_store(core, |store| store.threads(&account, &label, skip, PAGE))?;
+    let mut saved = false;
     if (stored.len() as i64) < PAGE {
         // the store has less than a page here: ask Google for the next one
-        match fill(core, &auth, &account, &label) {
-            Ok(_) | Err(Failure::Offline(_)) => {}
+        let filled = match &auth {
+            Some(auth) => fill(core, auth, &account, &label),
+            None => Err(unreached()),
+        };
+        match filled {
+            Ok(_) => {}
+            Err(Failure::Offline(_)) => saved = true,
             Err(e) => return Err(e),
         }
     }
@@ -855,7 +887,7 @@ fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
     let more =
         with_store(core, |store| store.state(&account, &page_key(&label)))?.as_deref() != Some("");
     Ok(ok(
-        json!({"threads": rows.iter().map(row_json).collect::<Vec<_>>(), "more": more || skip + PAGE < total, "saved": false}),
+        json!({"threads": rows.iter().map(row_json).collect::<Vec<_>>(), "more": more || skip + PAGE < total, "saved": saved}),
     ))
 }
 
@@ -1055,7 +1087,7 @@ fn pre(text: &str) -> String {
 }
 
 fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (auth, account) = signed_in(core)?;
+    let (auth, account) = reader(core)?;
     let id = js::trim(&js::string_or_empty(args.get("thread"))).to_owned();
     // a card's row opens by ticket
     let id = match core
@@ -1075,6 +1107,8 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     {
         return Ok(ok(view));
     }
+    // read as the sign-in the Bot can't refresh just now: it says so itself
+    let auth = auth.ok_or(Failure::AccountRequired)?;
     let Some(full) = core.gmail.thread_full(&auth, &id)? else {
         return Ok(fail("not_found", "That conversation is gone."));
     };
@@ -1086,7 +1120,7 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
 }
 
 fn changes(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (_, account) = signed_in(core)?;
+    let (auth, account) = reader(core)?;
     let since = args.get("since").and_then(Value::as_i64).unwrap_or(-1);
     let (seq, status) = with_store(core, |store| {
         Ok((
@@ -1097,8 +1131,13 @@ fn changes(core: &Core, args: &Value) -> Result<Value, Failure> {
             store.state(&account, STATUS)?,
         ))
     })?;
+    // with no live token the sync can't run, and what it last said is old news
+    let status = match auth {
+        Some(_) => status.unwrap_or_else(|| "syncing".to_owned()),
+        None => "offline".to_owned(),
+    };
     Ok(ok(
-        json!({"seq": seq, "changed": seq != since, "status": status.unwrap_or_else(|| "syncing".to_owned())}),
+        json!({"seq": seq, "changed": seq != since, "status": status}),
     ))
 }
 

@@ -978,27 +978,40 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
         }
     }
     let gone = || refusal("not_found", "That attachment is gone from the mail.");
-    let Some(mail) = core.gmail.full(&auth, &message)? else {
-        return Ok(gone());
-    };
-    let listed = gmail::attachments(&mail);
-    let Some(found) = listed
-        .iter()
-        .find(|a| a.get("part").and_then(Value::as_str) == Some(&part))
-    else {
-        return Ok(gone());
-    };
-    let text = |key: &str| found.get(key).and_then(Value::as_str).unwrap_or_default();
-    let (title, mime, attachment) = (text("name"), text("mime"), text("id"));
-    let Some(kind) = openable(mime, title) else {
-        return Ok(unsupported());
-    };
-    if !attachment_ok(attachment) {
-        return Ok(gone());
-    }
-    let Some(bytes) = core.gmail.attachment(&auth, &message, attachment)? else {
-        return Ok(gone());
-    };
+    // kept ahead: no Google call, and its name and type are checked the same
+    let (title, kind, bytes) =
+        match crate::prefetch::saved_attachment(core, &account, &message, &part) {
+            Some(kept) => {
+                let Some(kind) = openable(&kept.mime, &kept.name) else {
+                    return Ok(unsupported());
+                };
+                (kept.name, kind, kept.bytes)
+            }
+            None => {
+                let Some(mail) = core.gmail.full(&auth, &message)? else {
+                    return Ok(gone());
+                };
+                let listed = gmail::attachments(&mail);
+                let Some(found) = listed
+                    .iter()
+                    .find(|a| a.get("part").and_then(Value::as_str) == Some(&part))
+                else {
+                    return Ok(gone());
+                };
+                let text = |key: &str| found.get(key).and_then(Value::as_str).unwrap_or_default();
+                let (title, mime, attachment) = (text("name"), text("mime"), text("id"));
+                let Some(kind) = openable(mime, title) else {
+                    return Ok(unsupported());
+                };
+                if !attachment_ok(attachment) {
+                    return Ok(gone());
+                }
+                let Some(bytes) = core.gmail.attachment(&auth, &message, attachment)? else {
+                    return Ok(gone());
+                };
+                (title.to_owned(), kind, bytes)
+            }
+        };
     let dir = start_part(core, &id)?;
     let write = || -> std::io::Result<()> {
         let mut part = fs::OpenOptions::new()
@@ -1012,7 +1025,7 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
     let row = Opened {
         id,
         account,
-        name: file_name(title, kind),
+        name: file_name(&title, kind),
         mime: kind.to_owned(),
         google: false,
         attachment: true,

@@ -19,6 +19,7 @@ pub mod gmail;
 pub mod js;
 pub mod mail;
 pub mod manifest;
+pub mod prefetch;
 pub mod serve;
 pub mod tools;
 
@@ -88,6 +89,8 @@ pub struct Core {
     pub hashes: files::Hashes,
     /// What an open file's 24 hours are counted by.
     pub clock: files::Clock,
+    /// Whether recent mail is being fetched ahead.
+    pub prefetch: prefetch::Running,
 }
 
 impl Core {
@@ -117,6 +120,7 @@ impl Core {
             working: files::Working::default(),
             hashes: files::Hashes::default(),
             clock: files::Clock::default(),
+            prefetch: prefetch::Running::default(),
             pushed: std::sync::atomic::AtomicBool::new(false),
             settle: mail::Settle::default(),
         }

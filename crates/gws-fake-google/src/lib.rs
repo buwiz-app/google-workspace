@@ -527,6 +527,8 @@ struct Account {
     wrote: bool,
     reads_fail_after_write: bool,
     draft_reads_fail: bool,
+    /// How many more whole-thread reads go through, and what each after gets.
+    thread_reads: Option<(usize, u16)>,
     /// Reads so far, once attachment ids change with each.
     reads: Option<AtomicU64>,
     /// `(draft id, message id, raw message, thread)`.
@@ -1045,7 +1047,25 @@ impl Account {
                 }
                 Reply::json(200, Self::page(found, "threads", start, max))
             }
+            ("GET", ["threads", _])
+                if format == "full" && matches!(self.thread_reads, Some((0, _))) =>
+            {
+                let status = self.thread_reads.map_or(500, |(_, s)| s);
+                let message = match status {
+                    429 => "Too many concurrent requests for user",
+                    _ => "Backend error",
+                };
+                Reply::json(
+                    status,
+                    json!({"error": {"code": status, "message": message}}),
+                )
+            }
             ("GET", ["threads", id]) => {
+                if format == "full"
+                    && let Some((left, _)) = &mut self.thread_reads
+                {
+                    *left -= 1;
+                }
                 let drafts = self.draft_mails();
                 let mut mails: Vec<&Mail> = self
                     .mails
@@ -1765,6 +1785,17 @@ impl FakeGoogle {
     /// Lists answer `n` to a page, whatever was asked for.
     pub fn calendar_page(&self, n: usize) {
         self.account.lock().unwrap().calendars.page = Some(n);
+    }
+
+    /// `left` more whole-thread reads go through, and then each gets `status`:
+    /// a 429 is Gmail saying it's busy.
+    pub fn thread_reads_fail_after(&self, left: usize, status: u16) {
+        self.account.lock().unwrap().thread_reads = Some((left, status));
+    }
+
+    /// Ends the failures above.
+    pub fn thread_reads_work(&self) {
+        self.account.lock().unwrap().thread_reads = None;
     }
 
     /// Forgets history before now, as Google does after a while.

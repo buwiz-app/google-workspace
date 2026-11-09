@@ -4,6 +4,8 @@
 //! What a picture is comes from its bytes, never from the mail: a sender names
 //! a file and its type as they like. Only png, jpeg, gif and webp show, as a
 //! `data:` address of the kind the bytes are, which the screen checks again.
+//! HEIC has no preview: the card shows its kind mark, and Open still opens it.
+//! A picture also has to say it's no more than [`PIXELS_MAX`] pixels.
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -19,9 +21,9 @@ use crate::{Core, js};
 /// the picture once, with room for the rest.
 pub const PREVIEW_MAX: u64 = (1024 * 1024 - 1024) / 4 * 3;
 
-/// The most pixels a preview may hold. A small file can say it's 30000 by
-/// 30000, and the Bot would make room for every pixel to show it.
-pub const PIXELS_MAX: u64 = 40_000_000;
+/// The most pixels a preview may hold: plenty for a thumbnail. A small file
+/// can say it's 30000 by 30000, and the Bot would make room for every pixel.
+pub const PIXELS_MAX: u64 = 16_000_000;
 
 fn refusal(code: &str, why: &str) -> Value {
     ok(json!({"refused": code, "message": why}))
@@ -197,11 +199,16 @@ fn preview(core: &Core, args: &Value) -> Result<Value, Failure> {
         Some(size) if size <= PREVIEW_MAX => {}
         _ => return Ok(too_big()),
     }
+    // a small file can come in its own part, with no id to fetch it by
     let id = found.get("id").and_then(Value::as_str).unwrap_or_default();
-    if !attachment_ok(id) {
-        return Ok(gone());
-    }
-    let Some(bytes) = core.gmail.attachment(&auth, &message, id)? else {
+    let bytes = if id.is_empty() {
+        gmail::part_bytes(&mail, &part)
+    } else if attachment_ok(id) {
+        core.gmail.attachment(&auth, &message, id)?
+    } else {
+        None
+    };
+    let Some(bytes) = bytes else {
         return Ok(gone());
     };
     if bytes.len() as u64 > PREVIEW_MAX {
@@ -330,12 +337,14 @@ mod tests {
     }
 
     #[test]
-    fn past_forty_million_pixels_is_too_big_whatever_the_file_weighs() {
+    fn past_sixteen_million_pixels_is_too_big_whatever_the_file_weighs() {
         let fits = |b: &[u8]| {
             size(b)
                 .is_some_and(|(w, h)| w > 0 && h > 0 && u64::from(w) * u64::from(h) <= PIXELS_MAX)
         };
-        assert!(fits(&png(8000, 5000)));
+        assert!(fits(&png(4000, 4000)));
+        assert!(!fits(&png(4000, 4001)));
+        assert!(!fits(&png(8000, 5000)));
         assert!(!fits(&png(30000, 30000)));
         assert!(!fits(&png(0, 10)));
         assert!(!fits(&jpeg(65535, 65535)));

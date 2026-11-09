@@ -107,8 +107,10 @@ fn kind_line(a: &Attachment) -> String {
     }
 }
 
+/// The message and the part are what a press fetches by. A small file can have
+/// no attachment id of its own: the plugin reads it from the message.
 fn can_press(a: &Attachment) -> bool {
-    !a.message.is_empty() && !a.id.is_empty() && !a.part.is_empty()
+    !a.message.is_empty() && !a.part.is_empty()
 }
 
 /// Worth asking a picture of: a small file that says it's one. The plugin
@@ -259,7 +261,7 @@ fn card(b: Bridge, m: Mail, c: Cards, at: usize, a: Attachment) -> View {
             }
         })
         .child(top);
-    // one inline in its mail has no id of its own, and so no way to fetch it
+    // one that doesn't say where it is has no way to fetch it
     if !can_press(&a) {
         return card;
     }
@@ -418,8 +420,11 @@ mod tests {
         assert!(!previewable(&file("a.png", "image/png", None)));
         assert!(!previewable(&file("a.svg", "image/svg+xml", Some(1000))));
         assert!(!previewable(&file("a.pdf", "application/pdf", Some(1000))));
-        let mut inline = file("a.png", "image/png", Some(1000));
-        inline.id.clear();
-        assert!(!previewable(&inline));
+        // a small one in its message's own part still has a preview
+        let mut small = file("a.png", "image/png", Some(1000));
+        small.id.clear();
+        assert!(previewable(&small));
+        small.part.clear();
+        assert!(!previewable(&small));
     }
 }

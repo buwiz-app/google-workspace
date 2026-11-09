@@ -1106,6 +1106,12 @@ fn day(at: &str) -> String {
     }
 }
 
+/// What a saved view was made by. A view of an older shape is made again: a
+/// migration that clears them all (as 7, 8 and 10 did) runs once, and this
+/// holds for each change after. Raise it whenever `view_of` or what it lists
+/// changes.
+pub const VIEW_VERSION: i64 = 2;
+
 fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (auth, account) = signed_in(core)?;
     let id = js::trim(&js::string_or_empty(args.get("thread"))).to_owned();
@@ -1124,6 +1130,7 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
     }
     if let Some(saved) = with_store(core, |store| store.view(&account, &id, now_ms()))?
         && let Ok(view) = serde_json::from_str::<Value>(&saved)
+        && view.get("view_version").and_then(Value::as_i64) == Some(VIEW_VERSION)
     {
         return Ok(ok(view));
     }
@@ -1131,7 +1138,8 @@ fn thread(core: &Core, args: &Value) -> Result<Value, Failure> {
         return Ok(fail("not_found", "That conversation is gone."));
     };
     core.gmail.mark_twins(&auth, &mut full);
-    let view = view_of(&full);
+    let mut view = view_of(&full);
+    view["view_version"] = VIEW_VERSION.into();
     with_own_store(core, &account, |store| {
         store.put_view(&account, &id, &view.to_string(), now_ms())
     })?;

@@ -751,6 +751,31 @@ fn a_forward_keeps_the_letters_pictures_and_every_part() {
     assert_eq!(files("000019f000000014"), ["invite.ics", "invite.ics"]);
 }
 
+/// The newsletter's logo comes in its part, with no attachment id, as Gmail
+/// sends a small one: the forward still carries it, through a real save.
+#[test]
+fn a_forward_carries_a_small_inline_picture_from_its_part() {
+    let google = FakeGoogle::start(Seed::default().with_rich_mail("http://127.0.0.1:1"));
+    google.small_files_in_parts(64 * 1024);
+    let core = signed_in(&google, "forward-small");
+    let start = data(core.run(
+        "gws_mail_reply_start",
+        &json!({"thread": "000019f000000028", "mode": "forward"}),
+    ));
+    let files = start["attachments"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "{start}");
+    assert_eq!(files[0]["id"], Value::Null, "this is the case being tested");
+    let keep = json!([{"message": start["source"], "id": files[0]["id"], "part": files[0]["part"], "name": files[0]["name"], "mime": files[0]["mime"]}]);
+    let forward = json!({"to": ["ben@example.com"], "subject": start["subject"], "body": start["body"], "keep": keep});
+    let saved = data(core.run("gws_mail_draft_save", &forward));
+    assert_eq!(saved["kept"].as_array().map(Vec::len), Some(1), "{saved}");
+    data(send(&core, &saved));
+    let sent = google.sent();
+    let logo = &sent.last().unwrap().attachments[0];
+    assert_eq!(logo.0, "logo.png");
+    assert_eq!(&logo.2[..8], b"\x89PNG\r\n\x1a\n");
+}
+
 #[test]
 fn sent_and_drafts_name_who_the_mail_is_for() {
     let google = FakeGoogle::start(Seed::demo(3));

@@ -68,6 +68,9 @@ fn thread(id: &str) -> Value {
             {"name": "scan.png", "mime": "image/png", "size": 2_000_000, "id": "att-5", "part": "5", "message": "m5"},
             {"name": "scan.png", "mime": "image/png", "size": 2_100_000, "id": "att-6", "part": "6", "message": "m5"},
         ])
+    } else if id == "t8" {
+        // small enough to come in the message itself, with no attachment id
+        json!([{"name": "small.png", "mime": "image/png", "size": 200, "id": null, "part": "1", "message": "m8"}])
     } else if id == "t6" {
         // more than the cards' room holds
         (1..=16)
@@ -1948,6 +1951,28 @@ fn pictures_are_asked_for_one_at_a_time_and_only_for_cards_in_view() {
         .map(|a| a["part"].as_str().unwrap().to_owned())
         .collect();
     assert_eq!(parts.len(), after.len(), "none asked for twice");
+}
+
+#[test]
+fn a_small_file_with_no_attachment_id_still_opens_saves_and_shows_its_picture() {
+    let (mut app, fake) = open_cards(8, "small.png");
+    assert_eq!(
+        fake.called("gws_mail_attachment_preview"),
+        [json!({"message": "m8", "part": "1"})]
+    );
+    assert_eq!(
+        app.screen()
+            .count("label:Preview of this attachment")
+            .unwrap(),
+        1
+    );
+    app.press("label:Open this attachment").expect("it presses");
+    settle(&mut app);
+    assert_eq!(
+        fake.called("gws_mail_attachment_open"),
+        [json!({"message": "m8", "part": "1"})]
+    );
+    assert!(app.screen().matches("label:Save this attachment").unwrap());
 }
 
 #[test]

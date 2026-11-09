@@ -215,13 +215,16 @@ fn a_small_file_that_says_it_is_a_huge_picture_has_no_preview() {
     let google = FakeGoogle::start(Seed::default());
     google.deliver(mail_with(vec![
         ("bomb.png", "image/png", png_saying(30000, 30000)),
-        ("ok.png", "image/png", png_saying(8000, 5000)),
+        ("big.png", "image/png", png_saying(8000, 5000)),
+        ("ok.png", "image/png", png_saying(4000, 4000)),
     ]));
     let home = Home::new(&google.base(), "bomb");
     let answer = home.preview("18f1aa", &json!("1"));
     assert_eq!(answer["refused"], "too_big", "{answer}");
     assert_eq!(answer.get("preview"), None);
     let answer = home.preview("18f1aa", &json!("2"));
+    assert_eq!(answer["refused"], "too_big", "40 megapixels: {answer}");
+    let answer = home.preview("18f1aa", &json!("3"));
     assert!(answer["preview"].is_string(), "{answer}");
 }
 
@@ -254,4 +257,63 @@ fn a_preview_takes_only_a_part_the_mail_lists() {
     assert_eq!(answer["refused"], "not_found", "{answer}");
     let answer = home.preview(PHOTOS, &json!("../1"));
     assert_eq!(answer["refused"], "invalid_args", "{answer}");
+}
+
+#[test]
+fn a_view_saved_before_this_listing_is_made_again() {
+    let google = rich();
+    let home = Home::new(&google.base(), "oldview");
+    // opens the store, as any read does
+    home.files(NEWS);
+    let account = home.core.accounts.session().unwrap().1;
+    let old = json!({"page": "<p>old</p>", "links": [], "images": 0, "attachments": [
+        {"name": "invite.ics", "mime": "text/calendar", "size": 640, "id": "a", "part": "0.2", "message": INVITE},
+        {"name": "invite.ics", "mime": "application/ics", "size": 640, "id": "b", "part": "1", "message": INVITE},
+    ]});
+    {
+        let held = home.core.store().unwrap();
+        let store = held.as_ref().unwrap();
+        store
+            .put_view(&account, INVITE, &old.to_string(), 1_800_000_000_000)
+            .unwrap();
+    }
+    let files = home.files(INVITE);
+    assert_eq!(names(&files), ["invite.ics"], "{files:?}");
+    // and the one made now is kept as it is
+    assert_eq!(home.files(INVITE), files);
+}
+
+/// A file small enough for Gmail to send in its part, with no attachment id.
+fn small_file_home(name: &str, mime: &str, bytes: Vec<u8>, tag: &str) -> (FakeGoogle, Home) {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![(name, mime, bytes)]));
+    google.small_files_in_parts(4096);
+    let home = Home::new(&google.base(), tag);
+    (google, home)
+}
+
+#[test]
+fn a_small_file_in_its_part_opens_from_the_message() {
+    const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    let (google, home) = small_file_home("note.docx", DOCX, b"PK small".to_vec(), "smallopen");
+    let files = home.files("18f1aa");
+    assert_eq!(files[0]["id"], Value::Null, "this is the case being tested");
+    let answer = home.core.run(
+        "gws_mail_attachment_open",
+        &json!({"message": "18f1aa", "part": files[0]["part"]}),
+    );
+    let path = answer["_meta"]["buwiz/document"]["path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{answer}"));
+    assert_eq!(fs::read(path).unwrap(), b"PK small");
+    assert_eq!(fetches(&google), 0);
+}
+
+#[test]
+fn a_small_picture_in_its_part_has_a_preview() {
+    let (_google, home) = small_file_home("dot.png", "image/png", png_saying(1, 1), "smallpic");
+    let files = home.files("18f1aa");
+    assert_eq!(files[0]["id"], Value::Null);
+    let answer = home.preview("18f1aa", &files[0]["part"]);
+    assert!(answer["preview"].is_string(), "{answer}");
 }

@@ -993,10 +993,15 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some(kind) = openable(mime, title) else {
         return Ok(unsupported());
     };
-    if !attachment_ok(attachment) {
-        return Ok(gone());
-    }
-    let Some(bytes) = core.gmail.attachment(&auth, &message, attachment)? else {
+    // a small file can come in its own part, with no id to fetch it by
+    let bytes = if attachment.is_empty() {
+        gmail::part_bytes(&mail, &part)
+    } else if attachment_ok(attachment) {
+        core.gmail.attachment(&auth, &message, attachment)?
+    } else {
+        None
+    };
+    let Some(bytes) = bytes else {
         return Ok(gone());
     };
     let dir = start_part(core, &id)?;

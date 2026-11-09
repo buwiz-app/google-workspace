@@ -556,19 +556,33 @@ impl Gmail {
             let Some(id) = message.get("id").and_then(Value::as_str).map(str::to_owned) else {
                 continue;
             };
-            let bytes = |p: &Value| match p.pointer("/body/data").and_then(Value::as_str) {
-                Some(data) => base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(data.trim_end_matches('='))
-                    .ok(),
+            let bytes = |p: &Value| match data_of(p) {
+                Some(data) => Some(data),
                 None => {
                     let att = p.pointer("/body/attachmentId").and_then(Value::as_str)?;
                     self.attachment(auth, &id, att).ok().flatten()
                 }
             };
+            // the calendar part's bytes once, against each file that may be it
+            let mut read: Vec<(String, Option<Vec<u8>>)> = Vec::new();
             let same: Vec<String> = twin_pairs(message)
                 .into_iter()
                 .filter(|(cal, file)| {
-                    bytes(cal).is_some_and(|a| bytes(file).is_some_and(|b| a == b))
+                    let key = cal
+                        .get("partId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let at = match read.iter().position(|(k, _)| k == key) {
+                        Some(at) => at,
+                        None => {
+                            read.push((key.to_owned(), bytes(cal)));
+                            read.len() - 1
+                        }
+                    };
+                    read[at]
+                        .1
+                        .as_ref()
+                        .is_some_and(|a| bytes(file).is_some_and(|b| *a == b))
                 })
                 .filter_map(|(cal, _)| cal.get("partId").and_then(Value::as_str).map(str::to_owned))
                 .collect();
@@ -885,32 +899,68 @@ pub fn carried(message: &Value) -> Vec<Value> {
 }
 
 /// The pairs that may be one event twice: a text/calendar part under an
-/// alternative, and a file outside one with its name and its size. Their bytes
-/// decide. `(the calendar part, the file)`, by part id.
+/// alternative, and each application/ics file outside one with its name and
+/// its size. Their bytes decide. `(the calendar part, the file)`.
 fn twin_pairs(message: &Value) -> Vec<(&Value, &Value)> {
     let parts = named_parts(message);
-    let calendar = |p: &Value| {
+    let typed = |p: &Value, kind: &str| {
         p.get("mimeType")
             .and_then(Value::as_str)
-            .is_some_and(|m| m.eq_ignore_ascii_case("text/calendar"))
+            .is_some_and(|m| m.eq_ignore_ascii_case(kind))
     };
     let size = |p: &Value| p.pointer("/body/size").and_then(Value::as_u64);
     let mut pairs = Vec::new();
-    for (cal, _) in parts.iter().filter(|(p, alt)| *alt && calendar(p)) {
+    for (cal, _) in parts
+        .iter()
+        .filter(|(p, alt)| *alt && typed(p, "text/calendar"))
+    {
         let Some(n) = size(cal).filter(|n| *n <= TWIN_MAX) else {
             continue;
         };
-        let twin = parts
-            .iter()
-            .find(|(p, alt)| !*alt && file_name(p) == file_name(cal) && size(p) == Some(n));
-        if let Some((file, _)) = twin {
+        for (file, _) in parts.iter().filter(|(p, alt)| {
+            !*alt
+                && typed(p, "application/ics")
+                && file_name(p) == file_name(cal)
+                && size(p) == Some(n)
+        }) {
+            if pairs.len() == TWINS_MAX {
+                return pairs;
+            }
             pairs.push((*cal, *file));
-        }
-        if pairs.len() == TWINS_MAX {
-            break;
         }
     }
     pairs
+}
+
+/// A part's own `body.data` as bytes: how Gmail can send a small file, with
+/// no attachment id to fetch it by.
+pub fn data_of(part: &Value) -> Option<Vec<u8>> {
+    let data = part.pointer("/body/data").and_then(Value::as_str)?;
+    let clean: String = data
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '=')
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            c => c,
+        })
+        .collect();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(clean)
+        .ok()
+}
+
+/// The bytes a part holds in the message itself, by the id
+/// [`attachments`] and [`carried`] give it (`root` for the whole message).
+pub fn part_bytes(message: &Value, part: &str) -> Option<Vec<u8>> {
+    let id = if part == "root" { "" } else { part };
+    fn find<'a>(p: &'a Value, id: &str) -> Option<&'a Value> {
+        if p.get("partId").and_then(Value::as_str) == Some(id) {
+            return Some(p);
+        }
+        p.get("parts")?.as_array()?.iter().find_map(|q| find(q, id))
+    }
+    data_of(find(message.get("payload")?, id)?)
 }
 
 fn part_mut<'a>(part: &'a mut Value, id: &str) -> Option<&'a mut Value> {
@@ -1208,6 +1258,30 @@ mod tests {
         assert_eq!(twins(&invite(640, false)), [pair("0.1", "1")]);
         // a rescheduled invite of another size is another event
         assert_eq!(twins(&invite(651, false)), []);
+    }
+
+    #[test]
+    fn only_an_ics_file_can_be_the_twin_and_every_one_is_compared() {
+        let mut two = invite(640, false);
+        let second = json!({"partId": "2", "mimeType": "application/ics", "filename": "invite.ics", "body": {"attachmentId": "z", "size": 640}});
+        two["payload"]["parts"].as_array_mut().unwrap().push(second);
+        assert_eq!(twins(&two), [pair("0.1", "1"), pair("0.1", "2")]);
+        // a file of the same name and size that isn't an event is no twin
+        let mut other = invite(640, false);
+        other["payload"]["parts"][1]["mimeType"] = json!("application/octet-stream");
+        assert_eq!(twins(&other), []);
+    }
+
+    #[test]
+    fn a_small_file_is_read_from_its_own_part() {
+        let mail = json!({"payload": {"partId": "", "mimeType": "multipart/mixed", "parts": [
+            {"partId": "0", "mimeType": "text/plain", "body": {"data": b64("Hi")}},
+            {"partId": "1", "mimeType": "text/csv", "filename": "a.csv", "body": {"data": b64("a,b"), "size": 3}},
+        ]}});
+        assert_eq!(part_bytes(&mail, "1"), Some(b"a,b".to_vec()));
+        assert_eq!(part_bytes(&mail, "2"), None);
+        let alone = json!({"payload": {"partId": "", "mimeType": "text/csv", "filename": "a.csv", "body": {"data": b64("x")}}});
+        assert_eq!(part_bytes(&alone, "root"), Some(b"x".to_vec()));
     }
 
     #[test]

@@ -452,10 +452,14 @@ fn lit(app: &Headless) -> bool {
 #[test]
 fn not_in_calendar_yet_is_the_mails_words_and_can_check_again() {
     let (mut app, _, fake) = opened(not_yet());
-    assert!(app.screen().shows("From the mail, not checked with Calendar."));
+    assert!(
+        app.screen()
+            .shows("From the mail, not checked with Calendar.")
+    );
     assert!(!lit(&app));
     *fake.invite.lock().unwrap() = in_calendar("needsAction");
-    app.press("label:Look in Calendar again").expect("it presses");
+    app.press("label:Look in Calendar again")
+        .expect("it presses");
     settle(&mut app);
     assert!(lit(&app), "Calendar has it now");
     assert!(!app.screen().shows("Not in your Calendar yet."));
@@ -494,7 +498,8 @@ fn a_try_again_pressed_twice_while_it_looks_asks_once() {
     *fake.look_fails.lock().unwrap() = None;
     *fake.hold_looks.lock().unwrap() = true;
     let before = fake.called("gws_mail_invite").len();
-    app.press("label:Read this invite again").expect("it presses");
+    app.press("label:Read this invite again")
+        .expect("it presses");
     settle(&mut app);
     let _ = app.press("label:Read this invite again");
     settle(&mut app);
@@ -562,14 +567,21 @@ fn calendar_not_answering_keeps_the_invite_with_the_reason_and_no_answer() {
         json!({"invite": invite("request"), "calendar": {"error": "Calendar is busy right now. Try again in a moment."}}),
     );
     assert!(app.screen().shows("Roof inspection"));
-    assert!(app.screen().shows("Calendar is busy right now. Try again in a moment."));
+    assert!(
+        app.screen()
+            .shows("Calendar is busy right now. Try again in a moment.")
+    );
     assert!(!lit(&app));
 }
 
 #[test]
 fn an_invite_gmail_couldnt_vouch_for_answers_nothing() {
-    let (app, _, _) = opened(json!({"invite": invite("request"), "calendar": {"unverified": true}}));
-    assert!(app.screen().shows("Gmail couldn't confirm this invite came from its organiser."));
+    let (app, _, _) =
+        opened(json!({"invite": invite("request"), "calendar": {"unverified": true}}));
+    assert!(
+        app.screen()
+            .shows("Gmail couldn't confirm this invite came from its organiser.")
+    );
     assert!(!lit(&app));
 }
 
@@ -577,7 +589,10 @@ fn an_invite_gmail_couldnt_vouch_for_answers_nothing() {
 fn a_damaged_invite_says_so_for_good() {
     let (app, _, _) = opened(json!({"invite": {"damaged": true}, "calendar": null}));
     assert!(app.screen().shows("Can't read this invite."));
-    assert_eq!(app.screen().count("label:Read this invite again").unwrap(), 0);
+    assert_eq!(
+        app.screen().count("label:Read this invite again").unwrap(),
+        0
+    );
 }
 
 #[test]

@@ -825,7 +825,12 @@ impl Calendars {
             return Reply::json(200, json!({}));
         }
         if self.patch_answers_junk {
-            return Reply(200, "application/json", b"{\"kind\": \"calendar#ev".to_vec(), Vec::new());
+            return Reply(
+                200,
+                "application/json",
+                b"{\"kind\": \"calendar#ev".to_vec(),
+                Vec::new(),
+            );
         }
         match self.list[at].event(id) {
             Some(event) => Reply::json(200, event),

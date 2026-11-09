@@ -260,7 +260,12 @@ fn words(card: &Card) -> Words {
         invite.title.clone()
     };
     let when = invite.when.as_ref().map(|w| when_line(w, &Local));
-    let event = Some((title, when, invite.place.clone(), about(invite, &card.calendar)));
+    let event = Some((
+        title,
+        when,
+        invite.place.clone(),
+        about(invite, &card.calendar),
+    ));
     let (mut notes, mut why, mut look_again) = (Vec::new(), None, false);
     if request {
         match &card.calendar {
@@ -578,7 +583,8 @@ pub(super) fn opened(b: &Bridge, m: Mail, thread: &str) {
     if m.chosen.with_untracked(|c| c.as_deref() != Some(thread)) {
         return;
     }
-    m.invite.update(|cards| cards.retain(|t, h| t == thread || h.looking || h.busy()));
+    m.invite
+        .update(|cards| cards.retain(|t, h| t == thread || h.looking || h.busy()));
     start(b, m, thread);
 }
 
@@ -587,7 +593,8 @@ pub(super) fn opened(b: &Bridge, m: Mail, thread: &str) {
 /// shows for a mail with none.
 pub(super) fn card(b: Bridge, m: Mail) -> impl IntoElement {
     if let Some(thread) = m.chosen.get_untracked()
-        && m.invite.with_untracked(|cards| !cards.contains_key(&thread))
+        && m.invite
+            .with_untracked(|cards| !cards.contains_key(&thread))
     {
         start(&b, m, &thread);
     }
@@ -730,7 +737,9 @@ mod tests {
             shows_of(Err(
                 "Gmail didn't send this invite just now. Try again in a moment.".to_owned()
             )),
-            Shows::Line("Gmail didn't send this invite just now. Try again in a moment.".to_owned())
+            Shows::Line(
+                "Gmail didn't send this invite just now. Try again in a moment.".to_owned()
+            )
         );
         assert_eq!(
             shows_of(Ok(
@@ -775,7 +784,11 @@ mod tests {
         assert_eq!(missing.notes, [UNCHECKED, NOT_YET]);
         assert!(missing.look_again, "it can check again");
         let down = words(&card(Calendar::Unanswered("Calendar is busy.".to_owned())));
-        assert_eq!(down.event.unwrap().0, "Roof inspection", "kept, not replaced");
+        assert_eq!(
+            down.event.unwrap().0,
+            "Roof inspection",
+            "kept, not replaced"
+        );
         assert_eq!(down.notes, [UNCHECKED]);
         assert_eq!(down.why.as_deref(), Some("Calendar is busy."));
         let unverified = words(&card(Calendar::Unverified));
@@ -812,7 +825,11 @@ mod tests {
         let mut cards = Cards::new();
         assert!(begin(&mut cards, "a"));
         assert!(!begin(&mut cards, "a"), "a second press while it looks");
-        landed(&mut cards, "a", Shows::Card(Box::new(card(Calendar::Missing))));
+        landed(
+            &mut cards,
+            "a",
+            Shows::Card(Box::new(card(Calendar::Missing))),
+        );
         assert!(begin(&mut cards, "a"), "opened again, it looks again");
         landed(
             &mut cards,
@@ -839,9 +856,13 @@ mod tests {
         assert!(!confirms(&fresh("needsAction"), "accepted"));
         assert!(!confirms(&Shows::Line("x".to_owned()), "accepted"));
         // a look that failed after a reply that went keeps it answered
-        let Shows::Card(after) =
-            after_answer(&asked, Shows::Line("x".to_owned()), "accepted", SENT.to_owned(), true)
-        else {
+        let Shows::Card(after) = after_answer(
+            &asked,
+            Shows::Line("x".to_owned()),
+            "accepted",
+            SENT.to_owned(),
+            true,
+        ) else {
             panic!("a card");
         };
         assert_eq!(after.calendar, Calendar::Guest("accepted".to_owned()));

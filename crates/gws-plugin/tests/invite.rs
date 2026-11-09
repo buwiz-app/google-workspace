@@ -57,7 +57,11 @@ fn the_card_reads_the_ics_and_the_thread_view_keeps_it() {
     let google = FakeGoogle::start(rich());
     let core = signed_in(&google, "view");
     let view = data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
-    assert_eq!(view["invite"], json!({"pending": true}), "the card fetches it");
+    assert_eq!(
+        view["invite"],
+        json!({"pending": true}),
+        "the card fetches it"
+    );
     data(core.run("gws_mail_invite", &json!({"thread": INVITE})));
     let view = data(core.run("gws_mail_thread", &json!({"thread": INVITE})));
     assert_eq!(
@@ -593,7 +597,10 @@ fn a_slow_ics_never_holds_up_the_thread_opening() {
         let answer = heard.recv_timeout(std::time::Duration::from_secs(10));
         google.release();
         let answer = answer.expect("the thread opens without the .ics");
-        assert_eq!(answer["structuredContent"]["invite"], json!({"pending": true}));
+        assert_eq!(
+            answer["structuredContent"]["invite"],
+            json!({"pending": true})
+        );
     });
 }
 
@@ -618,7 +625,12 @@ fn an_invite_gmail_cant_vouch_for_lights_no_answer() {
     for mail in [&forged, &stranger] {
         let got = data(core.run("gws_mail_invite", &json!({"message": mail.id})));
         assert_eq!(got["invite"]["sender_ok"], false, "{}", mail.from);
-        assert_eq!(got["calendar"], json!({"unverified": true}), "{}", mail.from);
+        assert_eq!(
+            got["calendar"],
+            json!({"unverified": true}),
+            "{}",
+            mail.from
+        );
         let refused = data(core.run(
             "gws_mail_invite_reply",
             &json!({"message": mail.id, "response": "accepted"}),

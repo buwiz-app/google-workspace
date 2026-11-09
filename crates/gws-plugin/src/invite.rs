@@ -1734,13 +1734,22 @@ mod tests {
 
     #[test]
     fn only_a_vouched_for_sender_of_the_organisers_domain_or_google_calendar_sends_an_invite() {
-        let pass = |d: &str| format!("mx.google.com; dkim=pass header.i=@{d}; dmarc=pass header.from={d}");
+        let pass =
+            |d: &str| format!("mx.google.com; dkim=pass header.i=@{d}; dmarc=pass header.from={d}");
         let fail = "mx.google.com; spf=softfail smtp.mailfrom=x; dmarc=fail header.from=google.com";
         let cases = [
-            ("Ana <calendar-notification@google.com>", pass("google.com"), true),
+            (
+                "Ana <calendar-notification@google.com>",
+                pass("google.com"),
+                true,
+            ),
             ("Ana <ana@example.com>", pass("example.com"), true),
             ("Ana <ana@mail.example.com>", pass("mail.example.com"), true),
-            ("Ana <calendar-notification@google.com>", fail.to_owned(), false),
+            (
+                "Ana <calendar-notification@google.com>",
+                fail.to_owned(),
+                false,
+            ),
             ("Mallory <m@evil.example>", pass("evil.example"), false),
             ("Mallory <m@notexample.com>", pass("notexample.com"), false),
         ];
@@ -1755,7 +1764,10 @@ mod tests {
         let planted = json!({"id": "m1", "payload": {"headers": [{"name": "Authentication-Results", "value": fail}, {"name": "Authentication-Results", "value": pass("google.com")}, {"name": "From", "value": "calendar-notification@google.com"}]}});
         assert!(!sent_by_organizer(&planted, "ana@example.com"));
         // no organiser to align with
-        assert!(!sent_by_organizer(&signed("ana@example.com", &pass("example.com")), ""));
+        assert!(!sent_by_organizer(
+            &signed("ana@example.com", &pass("example.com")),
+            ""
+        ));
     }
 
     #[test]

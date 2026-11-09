@@ -136,11 +136,7 @@ impl CalendarApi {
             ))
         })?;
         let status = res.status().as_u16();
-        let body = res
-            .body_mut()
-            .with_config()
-            .limit(PAGE_MAX)
-            .read_to_vec();
+        let body = res.body_mut().with_config().limit(PAGE_MAX).read_to_vec();
         let body = match body {
             Ok(body) => body,
             Err(_) if write && status == 200 => return Ok(Answer::Done(Value::Null)),
@@ -1788,7 +1784,10 @@ mod tests {
         let v = answered(&core, ME, ME, &written);
         assert_ne!(v["isError"], true, "{v}");
         assert_eq!(v["structuredContent"]["stored"], false, "{v}");
-        assert_eq!(v["structuredContent"]["event"]["response"], "accepted", "{v}");
+        assert_eq!(
+            v["structuredContent"]["event"]["response"], "accepted",
+            "{v}"
+        );
     }
 
     #[test]

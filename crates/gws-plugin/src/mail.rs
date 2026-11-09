@@ -362,18 +362,20 @@ pub enum Woken {
     Other,
 }
 
+/// The wake waiting, when a screen last asked, the next time set to look, and
+/// when the timer last had its turn.
+type Wakes = (
+    Option<Woken>,
+    Option<Instant>,
+    Option<Instant>,
+    Option<Instant>,
+);
+
 /// Wakes the sync, remembers when a screen last asked for something, and when
 /// it next has to look whatever else happens.
 #[derive(Default)]
 pub struct Waker {
-    /// The wake waiting, when a screen last asked, the next time set to look,
-    /// and when the timer last had its turn.
-    state: Mutex<(
-        Option<Woken>,
-        Option<Instant>,
-        Option<Instant>,
-        Option<Instant>,
-    )>,
+    state: Mutex<Wakes>,
     bell: Condvar,
     stop: AtomicBool,
 }

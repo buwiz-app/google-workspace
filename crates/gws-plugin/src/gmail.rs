@@ -62,19 +62,34 @@ pub enum Whole {
     TooSlow(Failure),
 }
 
-/// What one whole read may take: its bytes and its time.
+/// What one whole read may take: its bytes and its time, and the time of a
+/// file's download.
 #[derive(Debug, Clone, Copy)]
 pub struct Limit {
     pub bytes: u64,
     pub time: Duration,
+    pub file_time: Duration,
 }
 
 impl Limit {
-    /// What an open's read of a thread takes.
+    /// What an open's read of a thread takes, and a press's download.
     pub const FULL: Self = Self {
         bytes: FULL_MAX,
         time: TIMEOUT,
+        file_time: UPLOAD_TIMEOUT,
     };
+}
+
+/// What a download of an attachment came to.
+#[derive(Debug)]
+pub enum File {
+    Bytes(Vec<u8>),
+    /// Gone at Google, or its id gone stale.
+    Gone,
+    /// Begun, and too big or too long coming for the download: the next one
+    /// comes to the same.
+    TooBig(Failure),
+    TooSlow(Failure),
 }
 
 /// Why an answer gave nothing: past its cap, out of time once it had begun,
@@ -662,6 +677,37 @@ impl Gmail {
         id: &str,
         within: Duration,
     ) -> Result<Option<Vec<u8>>, Failure> {
+        match self.attachment_sized(auth, message, id, within) {
+            Ok(bytes) => Ok(bytes),
+            Err(refused) => Err(refused.into()),
+        }
+    }
+
+    /// [`Self::attachment_within`], saying apart a download that began and
+    /// was too big or too long coming.
+    pub fn attachment_whole(
+        &self,
+        auth: &Bearer,
+        message: &str,
+        id: &str,
+        within: Duration,
+    ) -> Result<File, Failure> {
+        match self.attachment_sized(auth, message, id, within) {
+            Ok(Some(bytes)) => Ok(File::Bytes(bytes)),
+            Ok(None) => Ok(File::Gone),
+            Err(Refused::TooBig(f)) => Ok(File::TooBig(f)),
+            Err(Refused::TooSlow(f)) => Ok(File::TooSlow(f)),
+            Err(Refused::Other(f)) => Err(f),
+        }
+    }
+
+    fn attachment_sized(
+        &self,
+        auth: &Bearer,
+        message: &str,
+        id: &str,
+        within: Duration,
+    ) -> Result<Option<Vec<u8>>, Refused> {
         let url = format!("{}/messages/{message}/attachments/{id}", self.base);
         let req = self
             .slow
@@ -671,13 +717,17 @@ impl Gmail {
             .build()
             .header("authorization", auth.header())
             .header("accept", "application/json");
-        let Some(v) = Self::answer(req.call(), ATTACHMENT_MAX)? else {
+        let Some(v) = Self::answer_sized(req.call(), ATTACHMENT_MAX)? else {
             return Ok(None);
         };
         let data = v.get("data").and_then(Value::as_str).unwrap_or_default();
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(data.trim_end_matches('='))
-            .map_err(|_| Failure::Plain("That attachment came back damaged.".to_owned()))?;
+            .map_err(|_| {
+                Refused::Other(Failure::Plain(
+                    "That attachment came back damaged.".to_owned(),
+                ))
+            })?;
         Ok(Some(bytes))
     }
 

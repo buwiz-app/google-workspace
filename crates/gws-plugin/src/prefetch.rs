@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::Core;
 use crate::accounts::Bearer;
-use crate::gmail::{self, Failure, Limit, Whole};
+use crate::gmail::{self, Failure, File, Limit, Whole};
 use crate::mail::{Viewed, now_ms, read_view, row_of, signed_in, with_own_store, with_store};
 use crate::pictures;
 
@@ -350,9 +350,22 @@ fn attachments(
                 return Ok(());
             }
             let auth = still(core, account)?;
-            let Some(bytes) = core.gmail.attachment(&auth, &message, id)? else {
-                whole = false;
-                continue;
+            let bytes = match core
+                .gmail
+                .attachment_whole(&auth, &message, id, limit.file_time)?
+            {
+                File::Bytes(bytes) => bytes,
+                File::Gone => {
+                    whole = false;
+                    continue;
+                }
+                // begun, and too much for this link: left to the press, and
+                // not tried again until the thread changes
+                File::TooBig(_) => {
+                    *spent += encoded(size);
+                    continue;
+                }
+                File::TooSlow(_) => continue,
             };
             *spent += encoded(bytes.len() as i64);
             // the size was Google's word; what counts is what came
@@ -614,8 +627,8 @@ mod tests {
 
     /// What a read takes on a link too slow for a thread of this size.
     const SLOW: Limit = Limit {
-        bytes: Limit::FULL.bytes,
         time: std::time::Duration::from_secs(1),
+        ..Limit::FULL
     };
 
     #[test]
@@ -705,6 +718,60 @@ mod tests {
             has_file(&core, 2),
             "older mail's files aren't held up by it"
         );
+    }
+
+    #[test]
+    fn a_file_too_slow_to_come_is_left_to_the_press_and_older_files_come() {
+        let mut slow = with_file(1, 1, 1024);
+        slow.attachments[0].2 = b"%PDF slow".repeat(8 * 1024);
+        let google = FakeGoogle::start(Seed {
+            mails: vec![slow, with_file(2, 2, 1024)],
+            ..Seed::default()
+        });
+        let core = synced(&google, "slow-file");
+        let opened = core.run(crate::tools::MAIL_THREAD, &json!({"thread": id(1)}));
+        assert_ne!(opened["isError"], true, "{opened}");
+        // a KiB each 50 ms: some 5 s for the file, its head at once
+        let path = format!("/attachments/att-{}-0-0", id(1));
+        google.trickle(Some((&path, 50)));
+        let slow_files = Limit {
+            file_time: std::time::Duration::from_secs(1),
+            ..Limit::FULL
+        };
+        round_within(&core, NOW, ROUND_MAX, slow_files).expect("no failure to back off from");
+        assert!(!has_file(&core, 1));
+        assert!(
+            has_file(&core, 2),
+            "older mail's files aren't held up by it"
+        );
+        round_within(&core, NOW, ROUND_MAX, slow_files).unwrap();
+        let asked = google
+            .log()
+            .iter()
+            .filter(|s| s.target.ends_with(&path))
+            .count();
+        assert_eq!(asked, 1, "left to the press, not asked for each round");
+    }
+
+    #[test]
+    fn a_file_with_no_answer_still_backs_off() {
+        let google = FakeGoogle::start(Seed {
+            mails: vec![with_file(1, 1, 1024)],
+            ..Seed::default()
+        });
+        let core = synced(&google, "file-no-answer");
+        let opened = core.run(crate::tools::MAIL_THREAD, &json!({"thread": id(1)}));
+        assert_ne!(opened["isError"], true, "{opened}");
+        google.hold("GET", &format!("/attachments/att-{}-0-0", id(1)));
+        let slow_files = Limit {
+            file_time: std::time::Duration::from_secs(1),
+            ..Limit::FULL
+        };
+        let round = round_within(&core, NOW, ROUND_MAX, slow_files);
+        google.release();
+        assert!(round.is_err(), "no answer at all is a failure");
+        round_within(&core, NOW, ROUND_MAX, Limit::FULL).unwrap();
+        assert!(has_file(&core, 1), "not left to the press");
     }
 
     #[test]

@@ -69,6 +69,9 @@ pub(crate) struct Kind {
     /// Whether the computer's own app may have it: what opens it is then
     /// Pages, Numbers, Keynote, TextEdit, Calendar or Archive Utility.
     system: bool,
+    /// Whether it's text the Bot's view reads only as UTF-8. Any other
+    /// encoding would show wrong there, and a save from it lose characters.
+    utf8: bool,
     /// Whether the Bot's view can edit it, and the edit go to Drive: what the
     /// Word and Spreadsheet views take, as their own check does. Drive opens
     /// these alone.
@@ -92,6 +95,7 @@ const fn kind(
         exts,
         view,
         system: true,
+        utf8: false,
         editable: false,
         magic: None,
         fits: zip,
@@ -204,7 +208,10 @@ pub(crate) const KINDS: [Kind; 19] = [
         system: false,
         ..edited("application/vnd.ms-excel", &["xls"], SHEET, ole)
     },
-    edited("text/csv", &["csv"], SHEET, text),
+    Kind {
+        utf8: true,
+        ..edited("text/csv", &["csv"], SHEET, text)
+    },
     sniffed_kind("image/png", &["png"], IMAGE, png),
     Kind {
         aliases: &["image/jpg", "image/pjpeg"],
@@ -222,6 +229,7 @@ pub(crate) const KINDS: [Kind; 19] = [
     },
     Kind {
         fits: text,
+        utf8: true,
         ..kind("text/plain", &["txt"], None)
     },
     kind(super::files::PPTX, &["pptx"], None),
@@ -319,6 +327,28 @@ pub(crate) fn way(docs: &Documents, kind: &Kind) -> Way {
         Way::System
     } else if kind.system {
         Way::Update
+    } else {
+        Way::SaveOnly
+    }
+}
+
+impl Kind {
+    /// Whether the way this kind goes can turn on its bytes: only text the
+    /// Bot's view reads as UTF-8 does.
+    pub(crate) fn by_bytes(&self) -> bool {
+        self.utf8 && self.view.is_some()
+    }
+}
+
+/// [`way`] for these bytes. Text that isn't UTF-8, as Latin-1 or UTF-16 from
+/// Excel often is, never goes to the Bot's view: it goes to the Mac's app,
+/// which reads either, or is only saved. A UTF-8 mark is still UTF-8.
+pub(crate) fn way_of(docs: &Documents, kind: &Kind, bytes: &[u8]) -> Way {
+    let way = way(docs, kind);
+    if way != Way::Viewer || !kind.utf8 || std::str::from_utf8(bytes).is_ok() {
+        way
+    } else if kind.system && docs.can(OPEN_WITH) {
+        Way::System
     } else {
         Way::SaveOnly
     }
@@ -450,6 +480,37 @@ mod tests {
             assert!(checked(csv, bytes).is_none(), "{bytes:?}");
             assert!(checked(txt, bytes).is_none(), "{bytes:?}");
         }
+    }
+
+    #[test]
+    fn text_that_isnt_utf8_never_goes_to_the_bots_view() {
+        let all = told(json!(["sheet", "open_with", "save"]));
+        let viewer_only = told(json!(["sheet", "save"]));
+        let csv = by_mime("text/csv").unwrap();
+        for bytes in [
+            &b"a,b\n"[..],
+            "Pe\u{f1}a,1\n".as_bytes(),
+            b"\xef\xbb\xbfa,b\n",
+            b"",
+        ] {
+            assert_eq!(way_of(&all, csv, bytes), Way::Viewer, "{bytes:?}");
+            assert_eq!(way_of(&viewer_only, csv, bytes), Way::Viewer, "{bytes:?}");
+        }
+        for bytes in [
+            &b"Pe\xf1a,1\n"[..],
+            b"\xff\xfea\0,\0b\0",
+            b"\xfe\xff\0a\0,\0b",
+        ] {
+            assert_eq!(way_of(&all, csv, bytes), Way::System, "{bytes:?}");
+            assert_eq!(way_of(&viewer_only, csv, bytes), Way::SaveOnly, "{bytes:?}");
+        }
+        let txt = by_mime("text/plain").unwrap();
+        assert_eq!(way_of(&all, txt, b"Pe\xf1a"), Way::System);
+        let png = by_mime("image/png").unwrap();
+        assert_eq!(
+            way_of(&told(json!(["image"])), png, b"\x89PNG\r\n\x1a\n\xff"),
+            Way::Viewer
+        );
     }
 
     #[test]

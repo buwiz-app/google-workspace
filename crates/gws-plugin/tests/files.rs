@@ -2472,10 +2472,49 @@ fn an_old_office_or_text_kind_its_bytes_dont_bear_out_is_only_saved() {
     assert_eq!(handed(&open_attachment(&home, 5)).0, "buwiz/document");
     assert_eq!(handed(&open_attachment(&home, 6)).0, "buwiz/document");
     assert_eq!(handed(&open_attachment(&home, 7)).0, "buwiz/open_with");
-    // text that isn't UTF-8 is still text
-    assert_eq!(handed(&open_attachment(&home, 8)).0, "buwiz/document");
-    assert_eq!(handed(&open_attachment(&home, 9)).0, "buwiz/document");
+    // text that isn't UTF-8 is still text, for the Mac's app
+    assert_eq!(handed(&open_attachment(&home, 8)).0, "buwiz/open_with");
+    assert_eq!(handed(&open_attachment(&home, 9)).0, "buwiz/open_with");
     assert_eq!(handed(&open_attachment(&home, 10)).0, "buwiz/open_with");
+}
+
+#[test]
+fn a_csv_that_isnt_utf8_goes_to_the_macs_app_or_is_saved_and_never_to_the_bots_view() {
+    let google = FakeGoogle::start(Seed::default());
+    google.deliver(mail_with(vec![
+        ("latin.csv", "text/csv", b"Pe\xf1a,1\r\n"),
+        ("wide.csv", "text/csv", b"\xff\xfeP\0e\0\xf1\0a\0"),
+        ("plain.csv", "text/csv", "Pe\u{f1}a,1\n".as_bytes()),
+        ("marked.csv", "text/csv", b"\xef\xbb\xbfPe\xc3\xb1a,1\n"),
+    ]));
+    let home = Home::new(&google.base(), "notutf8");
+    bot_can(&home, &EVERYTHING);
+    for n in 0..2 {
+        let answer = open_attachment(&home, n);
+        assert_eq!(handed(&answer).0, "buwiz/open_with", "{n}: {answer}");
+        // and again, from the copy already here
+        let again = open_attachment(&home, n);
+        assert_eq!(handed(&again).0, "buwiz/open_with", "{n} again: {again}");
+    }
+    for n in 2..4 {
+        let answer = open_attachment(&home, n);
+        assert_eq!(handed(&answer).0, "buwiz/document", "{n}: {answer}");
+    }
+
+    let home = Home::new(&google.base(), "notutf8noapp");
+    bot_can(&home, &["word", "sheet", "save"]);
+    for n in 0..2 {
+        let answer = open_attachment(&home, n);
+        assert_eq!(refusal(&answer), "unsupported", "{n}: {answer}");
+        assert_eq!(
+            says(&answer),
+            "This kind of file can't open here. Save it instead."
+        );
+        assert_eq!(answer.get("_meta"), None, "{n}: {answer}");
+    }
+    assert!(!home.open_dir().exists(), "nothing stays");
+    assert_eq!(handed(&open_attachment(&home, 2)).0, "buwiz/document");
+    assert_eq!(handed(&save_attachment(&home, 0)).0, "buwiz/save");
 }
 
 #[test]

@@ -1099,7 +1099,7 @@ fn handed(core: &Core, path: &Path, row: &Opened) -> Value {
     let Some(kind) = handoff::by_mime(&row.mime) else {
         return save_instead(core);
     };
-    match handoff::way(&core.documents, kind) {
+    match way_here(core, path, kind) {
         Way::Viewer => opened(path, &row.name, &row.mime),
         Way::System => {
             let mut answer =
@@ -1110,6 +1110,22 @@ fn handed(core: &Core, path: &Path, row: &Opened) -> Value {
         Way::Update => needs_update("open"),
         Way::SaveOnly => save_instead(core),
     }
+}
+
+/// The way the file at `path` goes to this Bot. Only text is read for it, to
+/// see that it's UTF-8; one that can't be read isn't.
+fn way_here(core: &Core, path: &Path, kind: &handoff::Kind) -> Way {
+    if !kind.by_bytes() {
+        return handoff::way(&core.documents, kind);
+    }
+    let mut bytes = Vec::new();
+    if open_regular(path)
+        .and_then(|mut file| file.read_to_end(&mut bytes))
+        .is_err()
+    {
+        bytes = vec![0xff];
+    }
+    handoff::way_of(&core.documents, kind, &bytes)
 }
 
 /// The attachment `part` of `message`, as a fresh read of it says: its name, its
@@ -1280,7 +1296,8 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
         _ => None,
     };
     if let Some(row) = &here {
-        let now = handoff::by_mime(&row.mime).map(|kind| handoff::way(&core.documents, kind));
+        let path = path_of(core, row)?;
+        let now = handoff::by_mime(&row.mime).map(|kind| way_here(core, &path, kind));
         if row.account == account && now == Some(handed_way(row)) {
             return reopen(core, row);
         }
@@ -1329,7 +1346,12 @@ fn open_attachment(core: &Core, args: &Value) -> Result<Value, Failure> {
     let Some(kind) = handoff::checked(kind, &bytes) else {
         return Ok(save_instead(core));
     };
-    let by_app = handoff::way(&core.documents, kind) == Way::System;
+    let by_app = match handoff::way_of(&core.documents, kind, &bytes) {
+        Way::System => true,
+        Way::Viewer => false,
+        Way::Update => return Ok(needs_update("open")),
+        Way::SaveOnly => return Ok(save_instead(core)),
+    };
     let dir = start_part(core, &id)?;
     write_part(&dir, &bytes)?;
     let row = Opened {

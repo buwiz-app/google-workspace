@@ -598,6 +598,7 @@ fn keys(b: Bridge, m: Drive) {
     let options = KeyOptions {
         when: When::NotEditing,
         repeat: true,
+        ..Default::default()
     };
     let free = move || {
         matches!(
@@ -653,6 +654,7 @@ fn keys(b: Bridge, m: Drive) {
     let once = KeyOptions {
         when: When::NotEditing,
         repeat: false,
+        ..Default::default()
     };
     on_key_with("f2", once, move |_| {
         if free() {

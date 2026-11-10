@@ -18,10 +18,11 @@ use crate::accounts::Bearer;
 use crate::gmail::{self, Failure, Limit, Whole};
 use crate::pictures::{self, Made};
 use crate::tools::{
-    MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_DRAFT_DELETE, MAIL_DRAFT_OF, MAIL_DRAFT_READ,
-    MAIL_DRAFT_SAVE, MAIL_JOB, MAIL_JOB_START, MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK,
-    MAIL_REPLY_START, MAIL_SEND, MAIL_SEND_ARM, MAIL_SEND_DISARM, MAIL_THREAD, MAIL_TRASH,
-    MAIL_UNDO, PEOPLE_SUGGEST, SEARCH_MAIL, UPLOAD_CHUNK, UPLOAD_DROP, fail, failed, ok,
+    CARD_TEXT, MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_DRAFT_DELETE, MAIL_DRAFT_OF,
+    MAIL_DRAFT_READ, MAIL_DRAFT_SAVE, MAIL_JOB, MAIL_JOB_START, MAIL_LABEL, MAIL_LABELS, MAIL_LIST,
+    MAIL_MARK, MAIL_REPLY_START, MAIL_SEND, MAIL_SEND_ARM, MAIL_SEND_DISARM, MAIL_THREAD,
+    MAIL_TRASH, MAIL_UNDO, PEOPLE_SUGGEST, SEARCH_MAIL, UPLOAD_CHUNK, UPLOAD_DROP, fail, failed,
+    ok,
 };
 use crate::{Core, clean, compose, fold, js};
 
@@ -616,38 +617,165 @@ fn card_search(core: &Core, args: &Value) -> Option<String> {
     }
 }
 
-/// A card's rows, each with a ticket to open it by.
+/// Where what a card last showed is kept, with the account's other state.
+fn shown_key(ticket: &str) -> String {
+    format!("card:{ticket}")
+}
+
+/// Remembers what a card showed when Google last answered it: the ids, and
+/// when. It's what the card shows while Google can't be asked. Not kept is
+/// only that: the card still showed.
+pub(crate) fn note_shown(core: &Core, account: &str, ticket: &str, ids: &[&str]) {
+    let shown = json!({"at": now_ms(), "ids": ids}).to_string();
+    let _ = with_own_store(core, account, |store| {
+        store.set_state(account, &shown_key(ticket), &shown)
+    });
+}
+
+/// What a card last showed, and when: [`note_shown`]'s.
+pub(crate) fn last_shown(core: &Core, account: &str, ticket: &str) -> Option<(i64, Vec<String>)> {
+    let kept = with_store(core, |store| store.state(account, &shown_key(ticket))).ok()??;
+    let kept: Value = serde_json::from_str(&kept).ok()?;
+    let ids = kept.get("ids")?.as_array()?;
+    Some((
+        kept.get("at")?.as_i64()?,
+        ids.iter()
+            .filter_map(|id| id.as_str().map(str::to_owned))
+            .collect(),
+    ))
+}
+
+/// A card's answer: its rows, and when they're kept ones, from when and why.
+pub(crate) fn card_answer(
+    rows: Vec<Value>,
+    more: bool,
+    kept: Option<(Option<i64>, &str)>,
+) -> Value {
+    let mut answer = json!({"rows": rows, "more": more, "saved": kept.is_some()});
+    if let Some((at, why)) = kept {
+        answer["why"] = json!(why);
+        if let Some(at) = at {
+            answer["saved_at"] = json!(at);
+        }
+    }
+    ok(answer)
+}
+
+/// The mail a card shows while Google can't be asked: what it last showed, as
+/// it's kept now, and from when. A card that never showed any gets the kept
+/// mail its search's words are in.
+fn kept_card(
+    core: &Core,
+    account: &str,
+    ticket: &str,
+    query: &str,
+) -> Result<(Vec<Thread>, Option<i64>), Failure> {
+    if let Some((at, ids)) = last_shown(core, account, ticket) {
+        let rows = with_store(core, |store| {
+            let mut rows = Vec::with_capacity(ids.len());
+            for id in &ids {
+                rows.extend(store.thread(account, id)?);
+            }
+            Ok(rows)
+        })?;
+        return Ok((rows, Some(at)));
+    }
+    let rows = with_store(core, |store| {
+        store.search_threads(account, query, CARD_ROWS as i64)
+    })?;
+    Ok((rows, None))
+}
+
+/// A card's rows, each with a ticket to open it by. When Google can't be
+/// asked they're the ones it last showed, and the answer says from when and
+/// why: `offline`, or `signed_out` when Google no longer takes the sign-in.
 fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (auth, account) = reader(core)?;
     let Some(query) = card_search(core, args) else {
         return Ok(lost(core, &js::string_or_empty(args.get("ticket"))));
     };
+    let ticket = js::string_or_empty(args.get("ticket"));
     let found = match &auth {
         Some(auth) => search(core, auth, &account, &query),
         None => Err(unreached()),
     };
-    let (rows, saved) = match found {
-        Ok(rows) => (rows, false),
-        Err(Failure::Offline(_)) => (
-            with_store(core, |store| {
-                store.search_threads(&account, &query, CARD_ROWS as i64)
-            })?,
-            true,
-        ),
+    let (rows, kept) = match found {
+        Ok(rows) => (rows, None),
+        Err(Failure::Offline(_)) => {
+            let (rows, at) = kept_card(core, &account, &ticket, &query)?;
+            (rows, Some((at, "offline")))
+        }
+        Err(Failure::AccountRequired) => {
+            let (rows, at) = kept_card(core, &account, &ticket, &query)?;
+            // nothing kept is nothing to show: the card asks for the sign-in
+            if rows.is_empty() {
+                return Err(Failure::AccountRequired);
+            }
+            (rows, Some((at, "signed_out")))
+        }
         Err(e) => return Err(e),
     };
     let more = rows.len() > CARD_ROWS;
-    let shown: Vec<Subject> = rows
-        .iter()
-        .take(CARD_ROWS)
-        .map(|t| Subject::Thread(t.id.clone()))
-        .collect();
+    let rows = &rows[..rows.len().min(CARD_ROWS)];
+    if kept.is_none() {
+        let ids: Vec<&str> = rows.iter().map(|t| t.id.as_str()).collect();
+        note_shown(core, &account, &ticket, &ids);
+    }
+    let shown: Vec<Subject> = rows.iter().map(|t| Subject::Thread(t.id.clone())).collect();
     let rows: Vec<Value> = rows
         .iter()
         .zip(issue_rows(core, &shown))
         .map(|(t, ticket)| json!({"sender": t.sender, "subject": t.subject, "at": t.at, "unread": t.unread, "ticket": ticket}))
         .collect();
-    Ok(ok(json!({"rows": rows, "more": more, "saved": saved})))
+    Ok(card_answer(rows, more, kept))
+}
+
+/// `gws_card_text`: what a card last showed, as plain lines, from the store
+/// alone. It's for a Bot that can no longer draw the card: Google is never
+/// asked, and a card nothing is kept of is `not_found`.
+fn card_text(core: &Core, args: &Value) -> Result<Value, Failure> {
+    let none = || fail("not_found", "Nothing of this card is kept on this Mac.");
+    let ticket = js::string_or_empty(args.get("ticket"));
+    let (Some(subject), Some((account, _))) =
+        (subject_of(core, &ticket), core.accounts.signed_in())
+    else {
+        return Ok(none());
+    };
+    let apps = &crate::manifest::APPS;
+    let (title, lines, at) = match subject {
+        Subject::Search(_) => {
+            let Some((at, ids)) = last_shown(core, &account, &ticket) else {
+                return Ok(none());
+            };
+            let lines = with_store(core, |store| {
+                let mut lines = Vec::with_capacity(ids.len());
+                for id in &ids {
+                    if let Some(t) = store.thread(&account, id)? {
+                        lines.push(format!("{} — {}", t.sender, t.subject));
+                    }
+                }
+                Ok(lines)
+            })?;
+            (apps[0].title, lines, Some(at))
+        }
+        Subject::EventDraft(fields) => (
+            apps[1].title,
+            crate::calendar::draft_lines(&fields, &account),
+            None,
+        ),
+        Subject::DriveSearch(_) => {
+            let Some((at, lines)) = crate::drive::card_lines(core, &account, &ticket) else {
+                return Ok(none());
+            };
+            (apps[2].title, lines, Some(at))
+        }
+        // a draft is Google's alone, and a row is no card
+        Subject::Draft(_) | Subject::Thread(_) => return Ok(none()),
+    };
+    if lines.is_empty() {
+        return Ok(none());
+    }
+    Ok(ok(json!({"title": title, "lines": lines, "at": at})))
 }
 
 /// What a sync woke for. Mail is kept ahead only after the timer's or a
@@ -1686,6 +1814,7 @@ pub fn run(core: &Core, tool: &str, args: &Value) -> Option<Value> {
         MAIL_THREAD => thread(core, args),
         MAIL_CHANGES => changes(core, args),
         MAIL_CARD => card(core, args),
+        CARD_TEXT => card_text(core, args),
         MAIL_MARK | MAIL_LABEL | MAIL_ARCHIVE | MAIL_TRASH => act(core, tool, args),
         MAIL_UNDO => undo(core, args),
         MAIL_DRAFT_SAVE => compose::save(core, args),

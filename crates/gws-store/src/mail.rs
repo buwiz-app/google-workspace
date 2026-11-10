@@ -189,6 +189,18 @@ impl Store {
         Ok(())
     }
 
+    /// One thread's row, if it's kept.
+    pub fn thread(&self, account: &str, id: &str) -> Result<Option<Thread>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT * FROM threads WHERE account = ? AND id = ?",
+                params![account, id],
+                row,
+            )
+            .optional()?)
+    }
+
     /// A label's threads, newest first.
     pub fn threads(&self, account: &str, label: &str, skip: i64, take: i64) -> Result<Vec<Thread>> {
         let mut q = self.conn.prepare("SELECT t.* FROM threads t JOIN thread_labels l ON l.account = t.account AND l.thread = t.id WHERE t.account = ? AND l.label = ? ORDER BY t.at DESC, t.id LIMIT ? OFFSET ?")?;

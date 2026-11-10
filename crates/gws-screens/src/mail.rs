@@ -1450,7 +1450,10 @@ fn signed_out_view(b: Bridge) -> impl IntoElement {
 #[derive(Clone, PartialEq)]
 enum CardState {
     Loading,
-    Rows(Vec<(String, String, i64, String)>, bool),
+    Rows(
+        Vec<(String, String, i64, String)>,
+        Option<crate::shell::Kept>,
+    ),
     Line(String),
     /// Its ticket stands for nothing, and no search could be run in its place.
     Lost,
@@ -1473,7 +1476,7 @@ fn card_rows(v: &Value, key: &str, opens: &str) -> CardState {
             )
         })
         .collect();
-    CardState::Rows(rows, v.get("saved") == Some(&Value::Bool(true)))
+    CardState::Rows(rows, crate::shell::Kept::of(v))
 }
 
 /// How many rows a card shows.
@@ -1564,7 +1567,7 @@ fn card(b: Bridge) -> View {
                 text("No mail matches this now.")
                     .app_class(Some(format!("text-[12px] {MUTE}").into())),
             ),
-            State::Rows(rows, saved) => {
+            State::Rows(rows, kept) => {
                 let now = now_ms();
                 let list = rows
                     .into_iter()
@@ -1601,15 +1604,22 @@ fn card(b: Bridge) -> View {
                                 ),
                         )
                     });
-                if saved {
-                    list.child(
-                        view().app_class(Some("px-3 py-1".into())).child(
-                            text("Saved mail, offline")
-                                .app_class(Some(format!("text-[11px] {DIM}").into())),
-                        ),
-                    )
-                } else {
-                    list
+                match kept {
+                    Some(kept) => {
+                        // Mail's own screen is where a sign-in that went is put right
+                        let b = press.clone();
+                        list.child(crate::shell::kept_footer(
+                            &kept,
+                            "emails",
+                            now,
+                            load.clone(),
+                            move || {
+                                let open = b.open("mail", json!({}));
+                                b.spawn(async move { drop(open.await) });
+                            },
+                        ))
+                    }
+                    None => list,
                 }
             }
         }))

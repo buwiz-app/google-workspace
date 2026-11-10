@@ -331,3 +331,242 @@ fn with_no_store_tickets_last_as_long_as_the_process() {
         "a card's ticket isn't pushed out by rows"
     );
 }
+
+// --- What a card shows when Google can't be asked ------------------------------
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// A process over `dir` that reaches no Google at all.
+fn cut_off(dir: &std::path::Path) -> Core {
+    started("http://127.0.0.1:1", dir)
+}
+
+/// A process over `dir` whose token Google no longer takes.
+fn refused_by_google(base: &str, dir: &std::path::Path) -> Core {
+    let core = Core::new(&Apis::at(base), Ok(gws_store::Paths::in_dir(dir)));
+    core.unlock("seed");
+    let set = core.account("buwiz.account.set", &json!({"account": "google", "label": "default", "provider": "google", "subject": FAKE_EMAIL, "scopes": ["https://www.googleapis.com/auth/gmail.modify", "https://www.googleapis.com/auth/drive"], "access_token": "not-a-token-google-knows", "token_type": "Bearer", "expires_at": 4_000_000_000u64}));
+    assert_ne!(set["isError"], true, "{set}");
+    core
+}
+
+fn subjects(card: &Value, key: &str) -> Vec<String> {
+    card["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r[key].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn offline_a_mail_card_keeps_the_mail_it_last_showed_and_says_from_when() {
+    let google = FakeGoogle::start(Seed::demo(12));
+    let dir = folder("mail-offline");
+    let first = started(&google.base(), &dir);
+    // a search only Google can run: nothing kept has these words in it
+    let ticket = prop(
+        &first.run_for_chat("gws_search_mail", &json!({"query": "from:ana"})),
+        "search",
+    );
+    let before = now_ms();
+    let live = data(first.run("gws_mail_card", &json!({"ticket": ticket})));
+    let after = now_ms();
+    assert_eq!(live["saved"], false);
+    assert_eq!(live.get("why"), None, "{live}");
+    assert_eq!(live.get("saved_at"), None, "{live}");
+    drop(first);
+
+    let dead = cut_off(&dir);
+    let kept = data(dead.run("gws_mail_card", &json!({"ticket": ticket})));
+    assert_eq!(kept["saved"], true);
+    assert_eq!(kept["why"], "offline");
+    let at = kept["saved_at"].as_i64().unwrap();
+    assert!((before..=after).contains(&at), "{before} {at} {after}");
+    assert_eq!(subjects(&kept, "subject"), subjects(&live, "subject"));
+    assert!(!subjects(&kept, "subject").is_empty());
+    assert!(
+        matches!(
+            gws::mail::subject_of(&dead, kept["rows"][0]["ticket"].as_str().unwrap()),
+            Some(gws::mail::Subject::Thread(_))
+        ),
+        "a kept row has its ticket"
+    );
+}
+
+#[test]
+fn a_mail_card_google_refuses_keeps_its_mail_and_says_signed_out() {
+    let google = FakeGoogle::start(Seed::demo(12));
+    let dir = folder("mail-refused");
+    let first = started(&google.base(), &dir);
+    let ticket = prop(
+        &first.run_for_chat("gws_search_mail", &json!({"query": "from:ana"})),
+        "search",
+    );
+    let live = data(first.run("gws_mail_card", &json!({"ticket": ticket})));
+    drop(first);
+
+    let refused = refused_by_google(&google.base(), &dir);
+    let kept = data(refused.run("gws_mail_card", &json!({"ticket": ticket})));
+    assert_eq!(kept["saved"], true);
+    assert_eq!(kept["why"], "signed_out");
+    assert!(kept["saved_at"].is_i64());
+    assert_eq!(subjects(&kept, "subject"), subjects(&live, "subject"));
+
+    // with nothing kept there is nothing to show: the sign-in line, as before
+    let bare = refused_by_google(&google.base(), &folder("mail-refused-bare"));
+    let asked = bare.run(
+        "gws_mail_card",
+        &json!({"ticket": "tkt_0123456789ABCDEFGHJKMNPQRS", "query": "from:ana"}),
+    );
+    assert_eq!(
+        asked["structuredContent"]["code"], "account_required",
+        "{asked}"
+    );
+}
+
+#[test]
+fn offline_or_refused_a_files_card_keeps_the_files_it_last_showed() {
+    let google = FakeGoogle::start(Seed::demo(4).with_drive());
+    let dir = folder("drive-offline");
+    let first = started(&google.base(), &dir);
+    let ticket = prop(
+        &first.run_for_chat("gws_search_drive", &json!({"query": "meeting"})),
+        "search",
+    );
+    let before = now_ms();
+    let live = data(first.run("gws_drive_card", &json!({"ticket": ticket})));
+    let after = now_ms();
+    assert_eq!(live["saved"], false);
+    assert_eq!(live.get("why"), None, "{live}");
+    drop(first);
+
+    let dead = cut_off(&dir);
+    let kept = data(dead.run("gws_drive_card", &json!({"ticket": ticket})));
+    assert_eq!(
+        (&kept["saved"], &kept["why"]),
+        (&json!(true), &json!("offline"))
+    );
+    let at = kept["saved_at"].as_i64().unwrap();
+    assert!((before..=after).contains(&at), "{before} {at} {after}");
+    assert_eq!(subjects(&kept, "name"), subjects(&live, "name"));
+    assert!(!subjects(&kept, "name").is_empty());
+    drop(dead);
+
+    let refused = refused_by_google(&google.base(), &dir);
+    let kept = data(refused.run("gws_drive_card", &json!({"ticket": ticket})));
+    assert_eq!(
+        (&kept["saved"], &kept["why"]),
+        (&json!(true), &json!("signed_out"))
+    );
+    assert_eq!(subjects(&kept, "name"), subjects(&live, "name"));
+
+    let bare = refused_by_google(&google.base(), &folder("drive-refused-bare"));
+    let asked = bare.run(
+        "gws_drive_card",
+        &json!({"ticket": "tkt_0123456789ABCDEFGHJKMNPQRS", "query": "meeting"}),
+    );
+    assert_eq!(
+        asked["structuredContent"]["code"], "account_required",
+        "{asked}"
+    );
+}
+
+// --- A card as plain text, from the store alone -------------------------------
+
+#[test]
+fn a_cards_text_comes_from_whats_kept_and_asks_google_nothing() {
+    let google = FakeGoogle::start(Seed {
+        calendars: vec![FakeCalendar::new(
+            FAKE_EMAIL,
+            "Owner",
+            true,
+            "America/New_York",
+        )],
+        ..Seed::demo(12).with_drive()
+    });
+    let dir = folder("text");
+    let first = started(&google.base(), &dir);
+    let mail = prop(
+        &first.run_for_chat("gws_search_mail", &json!({"query": "from:ana"})),
+        "search",
+    );
+    let shown = data(first.run("gws_mail_card", &json!({"ticket": mail})));
+    let files = prop(
+        &first.run_for_chat("gws_search_drive", &json!({"query": "meeting"})),
+        "search",
+    );
+    let listed = data(first.run("gws_drive_card", &json!({"ticket": files})));
+    let event = prop(&first.run_for_chat("gws_event_draft", &event()), "draft");
+    let unread = prop(
+        &first.run_for_chat("gws_search_mail", &json!({"query": "from:ben"})),
+        "search",
+    );
+    drop(first);
+
+    // no Google to ask: whatever comes is the store's
+    let core = cut_off(&dir);
+    let text = data(core.run("gws_card_text", &json!({"ticket": mail})));
+    assert_eq!(text["title"], "Mail");
+    let lines: Vec<&str> = text["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap())
+        .collect();
+    assert_eq!(lines.len(), shown["rows"].as_array().unwrap().len());
+    for (line, row) in lines.iter().zip(shown["rows"].as_array().unwrap()) {
+        assert_eq!(
+            *line,
+            format!(
+                "{} — {}",
+                row["sender"].as_str().unwrap(),
+                row["subject"].as_str().unwrap()
+            )
+        );
+    }
+    assert!(text["at"].is_i64());
+
+    let text = data(core.run("gws_card_text", &json!({"ticket": files})));
+    assert_eq!(text["title"], "Drive");
+    let names = subjects(&listed, "name");
+    let lines = text["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), names.len());
+    assert!(lines[0].as_str().unwrap().starts_with(&names[0]), "{text}");
+
+    let text = data(core.run("gws_card_text", &json!({"ticket": event})));
+    assert_eq!(text["title"], "Calendar");
+    let said = text["lines"].to_string();
+    assert!(
+        said.contains("Lunch") && said.contains("Cafe") && said.contains("ana@example.com"),
+        "{said}"
+    );
+
+    // a card that never read live has nothing kept, and neither has a stranger's ticket
+    for ticket in [
+        unread.as_str(),
+        "tkt_0123456789ABCDEFGHJKMNPQRS",
+        "nonsense",
+    ] {
+        let none = core.run("gws_card_text", &json!({"ticket": ticket}));
+        assert_eq!(none["isError"], true, "{none}");
+        assert_eq!(none["structuredContent"]["code"], "not_found", "{none}");
+    }
+}
+
+#[test]
+fn only_a_screen_may_read_a_cards_text() {
+    let tools = gws::tools::defs();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == "gws_card_text")
+        .expect("the tool is listed");
+    assert_eq!(tool.audience, gws::tools::APP_ONLY);
+    assert!(tool.read_only);
+    assert!(!tool.open_world, "it never asks Google");
+}

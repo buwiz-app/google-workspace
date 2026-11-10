@@ -1562,16 +1562,27 @@ fn card(b: Bridge) -> View {
                     b.spawn(async move { drop(open.await) });
                 })
             }
-            // the card is read live, and what it found can have gone since
-            State::Rows(rows, _) if rows.is_empty() => view().app_class(Some("p-3".into())).child(
-                text("No mail matches this now.")
-                    .app_class(Some(format!("text-[12px] {MUTE}").into())),
-            ),
+            // the card is read live, and what it found can have gone since;
+            // kept rows say why they're kept, even when there are none
+            State::Rows(rows, None) if rows.is_empty() => {
+                view().app_class(Some("p-3".into())).child(
+                    text("No mail matches this now.")
+                        .app_class(Some(format!("text-[12px] {MUTE}").into())),
+                )
+            }
             State::Rows(rows, kept) => {
                 let now = now_ms();
+                let list = if rows.is_empty() {
+                    view().child(
+                        text(crate::shell::NOTHING_KEPT)
+                            .app_class(Some(format!("px-3 pt-3 text-[12px] {MUTE}").into())),
+                    )
+                } else {
+                    view()
+                };
                 let list = rows
                     .into_iter()
-                    .fold(view(), |list, (sender, subject, at, ticket)| {
+                    .fold(list, |list, (sender, subject, at, ticket)| {
                         let b = press.clone();
                         list.child(
                             view()

@@ -140,11 +140,17 @@ pub(super) fn files(b: Bridge) -> View {
                     b.spawn(async move { drop(open.await) });
                 })
             }
-            State::Rows(rows, _) if rows.is_empty() => plain("No files match.".to_owned()),
+            // kept rows say why they're kept, even when there are none
+            State::Rows(rows, None) if rows.is_empty() => plain("No files match.".to_owned()),
             State::Rows(rows, kept) => {
+                let list = if rows.is_empty() {
+                    view().child(plain(crate::shell::NOTHING_KEPT.to_owned()))
+                } else {
+                    view()
+                };
                 let list = rows
                     .iter()
-                    .fold(view(), |list, r| list.child(row(&press, &ticket, r)));
+                    .fold(list, |list, r| list.child(row(&press, &ticket, r)));
                 let list = match kept {
                     Some(kept) => {
                         // Drive's own screen is where a sign-in that went is put right

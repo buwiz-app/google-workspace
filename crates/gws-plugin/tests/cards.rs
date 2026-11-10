@@ -511,7 +511,7 @@ fn a_cards_text_comes_from_whats_kept_and_asks_google_nothing() {
 
     // no Google to ask: whatever comes is the store's
     let core = cut_off(&dir);
-    let text = data(core.run("gws_card_text", &json!({"ticket": mail})));
+    let text = data(core.run_as("gws_card_text", &json!({"ticket": mail}), Some("mail")));
     assert_eq!(text["title"], "Mail");
     let lines: Vec<&str> = text["lines"]
         .as_array()
@@ -532,14 +532,14 @@ fn a_cards_text_comes_from_whats_kept_and_asks_google_nothing() {
     }
     assert!(text["at"].is_i64());
 
-    let text = data(core.run("gws_card_text", &json!({"ticket": files})));
+    let text = data(core.run_as("gws_card_text", &json!({"ticket": files}), Some("drive")));
     assert_eq!(text["title"], "Drive");
     let names = subjects(&listed, "name");
     let lines = text["lines"].as_array().unwrap();
     assert_eq!(lines.len(), names.len());
     assert!(lines[0].as_str().unwrap().starts_with(&names[0]), "{text}");
 
-    let text = data(core.run("gws_card_text", &json!({"ticket": event})));
+    let text = data(core.run_as("gws_card_text", &json!({"ticket": event}), Some("calendar")));
     assert_eq!(text["title"], "Calendar");
     let said = text["lines"].to_string();
     assert!(
@@ -553,10 +553,48 @@ fn a_cards_text_comes_from_whats_kept_and_asks_google_nothing() {
         "tkt_0123456789ABCDEFGHJKMNPQRS",
         "nonsense",
     ] {
-        let none = core.run("gws_card_text", &json!({"ticket": ticket}));
+        let none = core.run_as("gws_card_text", &json!({"ticket": ticket}), Some("mail"));
         assert_eq!(none["isError"], true, "{none}");
         assert_eq!(none["structuredContent"]["code"], "not_found", "{none}");
     }
+
+    // each app reads only its own cards: Calendar and Drive never a Gmail
+    // card's senders and subjects, nor Mail an event's guests
+    for (ticket, app) in [
+        (mail.as_str(), "calendar"),
+        (mail.as_str(), "drive"),
+        (event.as_str(), "mail"),
+        (event.as_str(), "drive"),
+        (files.as_str(), "mail"),
+        (files.as_str(), "calendar"),
+    ] {
+        let none = core.run_as("gws_card_text", &json!({"ticket": ticket}), Some(app));
+        assert_eq!(
+            none["structuredContent"]["code"], "not_found",
+            "{app}: {none}"
+        );
+        assert!(!none.to_string().contains("—"), "{none}");
+    }
+    let none = core.run("gws_card_text", &json!({"ticket": mail}));
+    assert_eq!(
+        none["structuredContent"]["code"], "not_found",
+        "no app, nothing"
+    );
+    drop(core);
+
+    // with Google there to ask, it still asks nothing: for a card it has
+    // text of, nor for one with nothing kept
+    let live = started(&google.base(), &dir);
+    let before = google.log().len();
+    data(live.run_as("gws_card_text", &json!({"ticket": mail}), Some("mail")));
+    let none = live.run_as("gws_card_text", &json!({"ticket": unread}), Some("mail"));
+    assert_eq!(none["structuredContent"]["code"], "not_found", "{none}");
+    let asked: Vec<String> = google.log()[before..]
+        .iter()
+        .filter(|s| s.target.contains("ana") || s.target.contains("ben"))
+        .map(|s| s.target.clone())
+        .collect();
+    assert!(asked.is_empty(), "{asked:?}");
 }
 
 #[test]

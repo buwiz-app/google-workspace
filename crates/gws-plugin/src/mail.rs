@@ -18,11 +18,10 @@ use crate::accounts::Bearer;
 use crate::gmail::{self, Failure, Limit, Whole};
 use crate::pictures::{self, Made};
 use crate::tools::{
-    CARD_TEXT, MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_DRAFT_DELETE, MAIL_DRAFT_OF,
-    MAIL_DRAFT_READ, MAIL_DRAFT_SAVE, MAIL_JOB, MAIL_JOB_START, MAIL_LABEL, MAIL_LABELS, MAIL_LIST,
-    MAIL_MARK, MAIL_REPLY_START, MAIL_SEND, MAIL_SEND_ARM, MAIL_SEND_DISARM, MAIL_THREAD,
-    MAIL_TRASH, MAIL_UNDO, PEOPLE_SUGGEST, SEARCH_MAIL, UPLOAD_CHUNK, UPLOAD_DROP, fail, failed,
-    ok,
+    MAIL_ARCHIVE, MAIL_CARD, MAIL_CHANGES, MAIL_DRAFT_DELETE, MAIL_DRAFT_OF, MAIL_DRAFT_READ,
+    MAIL_DRAFT_SAVE, MAIL_JOB, MAIL_JOB_START, MAIL_LABEL, MAIL_LABELS, MAIL_LIST, MAIL_MARK,
+    MAIL_REPLY_START, MAIL_SEND, MAIL_SEND_ARM, MAIL_SEND_DISARM, MAIL_THREAD, MAIL_TRASH,
+    MAIL_UNDO, PEOPLE_SUGGEST, SEARCH_MAIL, UPLOAD_CHUNK, UPLOAD_DROP, fail, failed, ok,
 };
 use crate::{Core, clean, compose, fold, js};
 
@@ -627,14 +626,22 @@ fn shown_key(ticket: &str) -> String {
 /// only that: the card still showed.
 pub(crate) fn note_shown(core: &Core, account: &str, ticket: &str, ids: &[&str]) {
     let shown = json!({"at": now_ms(), "ids": ids}).to_string();
-    let _ = with_own_store(core, account, |store| {
+    if let Err(e) = with_own_store(core, account, |store| {
         store.set_state(account, &shown_key(ticket), &shown)
-    });
+    }) {
+        eprintln!("buwiz-gws: what a card showed wasn't kept: {e:?}");
+    }
 }
 
 /// What a card last showed, and when: [`note_shown`]'s.
 pub(crate) fn last_shown(core: &Core, account: &str, ticket: &str) -> Option<(i64, Vec<String>)> {
-    let kept = with_store(core, |store| store.state(account, &shown_key(ticket))).ok()??;
+    let kept = match with_store(core, |store| store.state(account, &shown_key(ticket))) {
+        Ok(kept) => kept?,
+        Err(e) => {
+            eprintln!("buwiz-gws: what a card showed couldn't be read: {e:?}");
+            return None;
+        }
+    };
     let kept: Value = serde_json::from_str(&kept).ok()?;
     let ids = kept.get("ids")?.as_array()?;
     Some((
@@ -730,10 +737,21 @@ fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
     Ok(card_answer(rows, more, kept))
 }
 
+/// `gws_card_text` for the screen of `app` (the caller's, as the host says):
+/// [`card_text`], and nothing for a call no app made.
+pub fn card_text_for(core: &Core, args: &Value, app: Option<&str>) -> Value {
+    let Some(app) = app else {
+        return fail("not_found", "Only a card's own app reads what it showed.");
+    };
+    card_text(core, args, app).unwrap_or_else(failed)
+}
+
 /// `gws_card_text`: what a card last showed, as plain lines, from the store
 /// alone. It's for a Bot that can no longer draw the card: Google is never
-/// asked, and a card nothing is kept of is `not_found`.
-fn card_text(core: &Core, args: &Value) -> Result<Value, Failure> {
+/// asked, and a card nothing is kept of is `not_found`. Each app reads only
+/// its own cards (`app`, the caller's): approving Calendar never grants a
+/// read of Gmail.
+fn card_text(core: &Core, args: &Value, app: &str) -> Result<Value, Failure> {
     let none = || fail("not_found", "Nothing of this card is kept on this Mac.");
     let ticket = js::string_or_empty(args.get("ticket"));
     let (Some(subject), Some((account, _))) =
@@ -742,6 +760,15 @@ fn card_text(core: &Core, args: &Value) -> Result<Value, Failure> {
         return Ok(none());
     };
     let apps = &crate::manifest::APPS;
+    let owner = match &subject {
+        Subject::Search(_) => apps[0].id,
+        Subject::EventDraft(_) => apps[1].id,
+        Subject::DriveSearch(_) => apps[2].id,
+        Subject::Draft(_) | Subject::Thread(_) => return Ok(none()),
+    };
+    if owner != app {
+        return Ok(none());
+    }
     let (title, lines, at) = match subject {
         Subject::Search(_) => {
             let Some((at, ids)) = last_shown(core, &account, &ticket) else {
@@ -1814,7 +1841,6 @@ pub fn run(core: &Core, tool: &str, args: &Value) -> Option<Value> {
         MAIL_THREAD => thread(core, args),
         MAIL_CHANGES => changes(core, args),
         MAIL_CARD => card(core, args),
-        CARD_TEXT => card_text(core, args),
         MAIL_MARK | MAIL_LABEL | MAIL_ARCHIVE | MAIL_TRASH => act(core, tool, args),
         MAIL_UNDO => undo(core, args),
         MAIL_DRAFT_SAVE => compose::save(core, args),

@@ -912,6 +912,7 @@ pub(crate) fn card_lines(core: &Core, account: &str, ticket: &str) -> Option<(i6
         }
         Ok(lines)
     })
+    .inspect_err(|e| eprintln!("buwiz-gws: a files card's rows couldn't be read: {e:?}"))
     .ok()?;
     Some((at, lines))
 }

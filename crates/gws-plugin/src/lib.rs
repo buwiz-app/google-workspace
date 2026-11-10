@@ -162,8 +162,17 @@ impl Core {
 
     /// Runs one of the plugin's tools. `args` were checked as an object.
     pub fn run(&self, tool: &str, args: &Value) -> Value {
+        self.run_as(tool, args, None)
+    }
+
+    /// [`Core::run`] for a call from `app`'s screen (the host says which;
+    /// `None` for any other caller): the tools that answer by app.
+    pub fn run_as(&self, tool: &str, args: &Value, app: Option<&str>) -> Value {
         if let Some(refused) = accounts::stale(self, args) {
             return refused;
+        }
+        if tool == tools::CARD_TEXT {
+            return mail::card_text_for(self, args, app);
         }
         let result = accounts::run(self, tool, args)
             .or_else(|| mail::run(self, tool, args))
@@ -313,8 +322,9 @@ impl Plugin for Gws {
         tools::list()
     }
 
-    fn call(&mut self, tool: &str, args: &Args, _caller: &Caller) -> Value {
-        self.core.run(tool, &Value::Object(args.clone()))
+    fn call(&mut self, tool: &str, args: &Args, caller: &Caller) -> Value {
+        self.core
+            .run_as(tool, &Value::Object(args.clone()), caller.app.as_deref())
     }
 
     fn ticket_title(&mut self, ticket: &str) -> Option<String> {

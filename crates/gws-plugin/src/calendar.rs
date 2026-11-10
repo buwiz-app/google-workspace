@@ -1766,25 +1766,35 @@ fn draft(core: &Core, args: &Value) -> Value {
     ok(json!({"ticket": ticket}))
 }
 
+/// How many of a draft's guests its plain lines name.
+const GUESTS_SHOWN: usize = 10;
+
 /// A draft's fields as plain lines, for the account it was drafted on: what
 /// it's called, when, where, who's invited, and its notes. Nobody else's.
 pub(crate) fn draft_lines(fields: &str, account: &str) -> Vec<String> {
     let Ok(fields) = serde_json::from_str::<Value>(fields) else {
         return Vec::new();
     };
-    if fields["as_account"]
-        .as_str()
-        .is_some_and(|who| who != account)
-    {
+    // a draft that says no account is nobody's to read
+    if fields["as_account"].as_str() != Some(account) {
         return Vec::new();
     }
     let text = |key: &str| fields[key].as_str().unwrap_or_default().to_owned();
-    let guests: Vec<&str> = fields["guests"]
+    let all: Vec<&str> = fields["guests"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
         .collect();
+    // a line, not a list: the first few, then how many more
+    let mut guests: Vec<String> = all
+        .iter()
+        .take(GUESTS_SHOWN)
+        .map(|g| (*g).to_owned())
+        .collect();
+    if all.len() > GUESTS_SHOWN {
+        guests.push(format!("{} more", all.len() - GUESTS_SHOWN));
+    }
     let when = match (text("start"), text("end")) {
         (start, end) if start.is_empty() || end.is_empty() => start + &end,
         (start, end) => format!("{start} to {end}"),

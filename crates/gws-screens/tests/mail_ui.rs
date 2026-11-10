@@ -2356,6 +2356,81 @@ fn a_draft_card_whose_ticket_is_lost_says_so_and_opens_drafts() {
     assert_eq!(opened[0]["props"], json!({"view": "DRAFT"}));
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// A card's answer when its rows are kept ones.
+fn kept_card(why: Option<&str>, at: Option<i64>) -> Value {
+    let mut card = some_card();
+    card["saved"] = json!(true);
+    if let Some(why) = why {
+        card["why"] = json!(why);
+    }
+    if let Some(at) = at {
+        card["saved_at"] = json!(at);
+    }
+    card
+}
+
+#[test]
+fn offline_a_card_keeps_its_mail_says_from_when_and_retry_reads_again() {
+    use chrono::TimeZone as _;
+    let at = now_ms();
+    let clock = chrono::Local
+        .timestamp_millis_opt(at)
+        .unwrap()
+        .format("%H:%M")
+        .to_string();
+    let fake = Arc::new(Fake::default());
+    *fake.card.lock().unwrap() = kept_card(Some("offline"), Some(at));
+    let (mut app, _) = card_of(fake.clone());
+    app.wait_for_within("text:Roof quote", WAIT)
+        .expect("the kept mail shows");
+    let line = format!("Offline · emails from {clock} ·");
+    assert!(app.screen().shows(&line), "{:?}", app.screen().texts());
+    assert!(!app.screen().matches("label:Sign in to refresh").unwrap());
+    // back on line
+    *fake.card.lock().unwrap() = some_card();
+    app.press("label:Retry").expect("Retry presses");
+    settle(&mut app);
+    assert_eq!(fake.called("gws_mail_card").len(), 2);
+    assert!(app.screen().shows("Roof quote"));
+    assert!(!app.screen().shows(&line), "live again");
+    assert!(!app.screen().matches("label:Retry").unwrap());
+}
+
+#[test]
+fn signed_out_a_card_keeps_its_mail_and_shows_the_way_to_sign_in() {
+    let fake = Arc::new(Fake::default());
+    *fake.card.lock().unwrap() = kept_card(Some("signed_out"), Some(now_ms()));
+    let (mut app, _) = card_of(fake.clone());
+    app.wait_for_within("text:Roof quote", WAIT)
+        .expect("the kept mail shows");
+    assert!(app.screen().shows("Signed out ·"));
+    assert!(!app.screen().matches("label:Retry").unwrap());
+    app.press("label:Sign in to refresh").expect("it presses");
+    settle(&mut app);
+    let opened = fake.opened.lock().unwrap().clone();
+    assert_eq!(
+        (&opened[0]["app"], &opened[0]["props"]),
+        (&json!("mail"), &json!({}))
+    );
+}
+
+#[test]
+fn a_kept_card_from_a_plugin_that_says_no_more_still_says_offline() {
+    let fake = Arc::new(Fake::default());
+    *fake.card.lock().unwrap() = kept_card(None, None);
+    let (mut app, _) = card_of(fake);
+    app.wait_for_within("text:Offline · saved emails ·", WAIT)
+        .expect("it says so");
+    assert!(app.screen().matches("label:Retry").unwrap());
+}
+
 fn card_of(fake: Arc<Fake>) -> (Headless, Filter) {
     *fake.inline.lock().unwrap() = true;
     *fake.props.lock().unwrap() = json!({"search": "tk1"});
@@ -2401,7 +2476,9 @@ fn the_empty_lines_stay_in_their_columns_as_the_reader_narrows() {
 /// What the Bot's filter names on any Mail screen, and why each is safe. Everything
 /// else, and every field, stays unnamed: a new control has to be added here, and
 /// so has to say why.
-const MAY_REACH: [&str; 5] = [
+const MAY_REACH: [&str; 6] = [
+    // reads a card's rows again and changes nothing
+    "Retry",
     // the first thing it does is `gws_mail_send_arm`, which the Bot refuses the AI
     "Send",
     "Send it",

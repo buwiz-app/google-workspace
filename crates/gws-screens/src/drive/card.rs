@@ -8,7 +8,15 @@ use serde_json::{Value, json};
 use super::file::{Row, rows_in};
 use super::{refused, value};
 use crate::compose::press_text;
-use crate::shell::{DIM, INK, LINE, MUTE, PANEL, RUN_AGAIN, link_lost, lost_card, origin, read};
+use crate::shell::{
+    INK, Kept, LINE, MUTE, PANEL, RUN_AGAIN, kept_footer, link_lost, lost_card, origin, read,
+};
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
 
 /// The most files a card shows, however many the answer holds.
 const ROWS: usize = 5;
@@ -57,7 +65,7 @@ fn row(b: &Bridge, ticket: &str, r: &Row) -> View {
 #[derive(Clone, PartialEq)]
 enum State {
     Loading,
-    Rows(Vec<Row>, bool),
+    Rows(Vec<Row>, Option<Kept>),
     Line(String),
     /// Its ticket stands for nothing.
     Lost,
@@ -78,7 +86,7 @@ async fn read_card(b: &Bridge, ticket: &str, query: Option<&str>) -> State {
             None => {
                 let mut rows = rows_in(&v, "rows");
                 rows.truncate(ROWS);
-                State::Rows(rows, v.get("saved") == Some(&Value::Bool(true)))
+                State::Rows(rows, Kept::of(&v))
             }
         },
         Err(e) if e == "sign-in" => State::Line("Sign in to Google first.".to_owned()),
@@ -133,19 +141,26 @@ pub(super) fn files(b: Bridge) -> View {
                 })
             }
             State::Rows(rows, _) if rows.is_empty() => plain("No files match.".to_owned()),
-            State::Rows(rows, saved) => {
+            State::Rows(rows, kept) => {
                 let list = rows
                     .iter()
                     .fold(view(), |list, r| list.child(row(&press, &ticket, r)));
-                let list = if saved {
-                    list.child(
-                        view().app_class(Some("px-3 py-1".into())).child(
-                            text("Saved files, offline")
-                                .app_class(Some(format!("text-[11px] {DIM}").into())),
-                        ),
-                    )
-                } else {
-                    list
+                let list = match kept {
+                    Some(kept) => {
+                        // Drive's own screen is where a sign-in that went is put right
+                        let b = press.clone();
+                        list.child(kept_footer(
+                            &kept,
+                            "files",
+                            now_ms(),
+                            load.clone(),
+                            move || {
+                                let open = b.open("drive", json!({}));
+                                b.spawn(async move { drop(open.await) });
+                            },
+                        ))
+                    }
+                    None => list,
                 };
                 let (b, ticket) = (press.clone(), ticket.clone());
                 // straight in the column, where it can wrap: in a row it runs off

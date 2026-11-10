@@ -128,6 +128,65 @@ pub(crate) fn lost_card(
         )
 }
 
+/// Why a card's rows are kept ones and not Google's answer just now.
+#[derive(Clone, PartialEq)]
+pub(crate) struct Kept {
+    /// When the card last showed them live, in Unix milliseconds. A plugin
+    /// from before this said nothing.
+    at: Option<i64>,
+    /// Google no longer takes the sign-in; otherwise it just can't be reached.
+    signed_out: bool,
+}
+
+impl Kept {
+    /// From a card's answer: `saved`, with `saved_at` and `why`.
+    pub(crate) fn of(v: &Value) -> Option<Self> {
+        (v.get("saved") == Some(&Value::Bool(true))).then(|| Self {
+            at: v.get("saved_at").and_then(Value::as_i64),
+            signed_out: v.get("why").and_then(Value::as_str) == Some("signed_out"),
+        })
+    }
+
+    /// What the footer says before its press. `what` is "emails" or "files".
+    fn line(&self, what: &str, now: i64) -> String {
+        match (self.signed_out, self.at) {
+            (true, _) => "Signed out ·".to_owned(),
+            (false, Some(at)) => format!(
+                "Offline · {what} from {} ·",
+                crate::mail::short_time(at, now)
+            ),
+            (false, None) => format!("Offline · saved {what} ·"),
+        }
+    }
+}
+
+/// Under a card's kept rows: why they're kept, from when, and the press that
+/// helps. Offline that's Retry; signed out it's the way to the sign-in.
+pub(crate) fn kept_footer(
+    kept: &Kept,
+    what: &str,
+    now: i64,
+    retry: impl Fn() + 'static,
+    sign_in: impl Fn() + 'static,
+) -> nsh_core::element::View {
+    let line = view()
+        .app_class(Some(
+            "flex-row flex-wrap items-center gap-x-1 px-3 py-1".into(),
+        ))
+        .child(text(kept.line(what, now)).app_class(Some(format!("text-[11px] {DIM}").into())));
+    let press = |label: &'static str, press: Box<dyn Fn()>| {
+        view()
+            .label(label)
+            .on_press(press)
+            .child(text(label).app_class(Some(format!("text-[11px] underline {MUTE}").into())))
+    };
+    if kept.signed_out {
+        line.child(press("Sign in to refresh", Box::new(sign_in)))
+    } else {
+        line.child(press("Retry", Box::new(retry)))
+    }
+}
+
 /// What a lost card's press reads when it can run the chat's search again.
 pub(crate) const RUN_AGAIN: &str = "Run the search again";
 

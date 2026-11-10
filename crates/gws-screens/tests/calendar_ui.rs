@@ -412,6 +412,31 @@ fn start_with(events: Vec<Value>) -> (Headless, Arc<Fake>) {
     (app, fake)
 }
 
+/// The now-line is drawn over the events, and takes no press: an event
+/// starting this minute opens from its title, which the line lies on. The
+/// grid shows 07:00 to past 16:00 as it opens, so outside those hours the
+/// event is out of view and there's nothing to press.
+#[test]
+fn an_event_under_the_now_line_still_opens() {
+    use chrono::Timelike as _;
+    let now = Local::now();
+    if !(7..16).contains(&now.hour()) {
+        eprintln!(
+            "the now-line is out of view at {}: nothing to press",
+            now.format("%H:%M")
+        );
+        return;
+    }
+    let start = at(0, now.hour(), now.minute());
+    let end = at(0, now.hour() + 1, now.minute());
+    let (mut app, _) = start_with(vec![event("n1", "mine", "Right now", start, end)]);
+    assert!(
+        app.screen().matches("id:now-line").unwrap(),
+        "the line shows today"
+    );
+    open(&mut app, "Right now");
+}
+
 fn start() -> (Headless, Arc<Fake>) {
     let (app, fake) = start_with(a_day());
     assert!(

@@ -107,7 +107,8 @@ fn column(b: &Bridge, m: Cal, day: NaiveDate, rows: &[Event], calendars: &[Calen
     for hour in 1..24 {
         let top = hour as f32 * HOUR;
         col = col.child(view().app_class(Some(
-            format!("absolute left-0 right-0 top-[{top}px] h-[1px] border-t {LINE}").into(),
+            // a line to read by, never a press's target
+            format!("absolute left-0 right-0 top-[{top}px] h-[1px] border-t pointer-events-none {LINE}").into(),
         )));
     }
     for ((e, (from, to)), (lane, of)) in events.iter().zip(lanes) {
@@ -149,7 +150,8 @@ fn column(b: &Bridge, m: Cal, day: NaiveDate, rows: &[Event], calendars: &[Calen
                 .map_or(0.0, |(from, _)| from as f32 / 60.0 * HOUR);
             view().test_id("now-line").app_class(Some(
                 format!(
-                    "absolute left-0 right-0 top-[{top}px] h-[2px] bg-[#c2410c] dark:bg-[#fb923c]"
+                    // drawn over the events, so a press on one under it goes through
+                    "absolute left-0 right-0 top-[{top}px] h-[2px] pointer-events-none bg-[#c2410c] dark:bg-[#fb923c]"
                 )
                 .into(),
             ))

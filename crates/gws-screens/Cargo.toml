@@ -8,8 +8,8 @@ publish.workspace = true
 
 [dependencies]
 # the Bot pins these two: move them together, or `ScreenDef` is two types
-buwiz-app = { git = "https://github.com/buwiz-app/buwiz-sdk", rev = "79883a820597c623c9259cc0fac0c4166bdde093" }
-nsh-core = { git = "https://github.com/hexuria/nsh", rev = "f1461478d3768fb5da872cb697f0b0a48564ee91" }
+buwiz-app = { git = "https://github.com/buwiz-app/buwiz-sdk", rev = "369935a8406808786b642c3b4893fbed9c106859" }
+nsh-core = { git = "https://github.com/hexuria/nsh", rev = "c66f78cb4fa67825c51db55909ef5e1ea24f1658" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # a time typed for another zone means that zone
 chrono-tz = { version = "0.10", default-features = false }
@@ -20,9 +20,9 @@ tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 # the same nsh as above: the Mail screen driven with no window
-nsh-engine = { git = "https://github.com/hexuria/nsh", rev = "f1461478d3768fb5da872cb697f0b0a48564ee91" }
+nsh-engine = { git = "https://github.com/hexuria/nsh", rev = "c66f78cb4fa67825c51db55909ef5e1ea24f1658" }
 # `agent`: the semantic tree, as the Bot's filter reads it
-nsh-testing = { git = "https://github.com/hexuria/nsh", rev = "f1461478d3768fb5da872cb697f0b0a48564ee91", features = ["agent"] }
+nsh-testing = { git = "https://github.com/hexuria/nsh", rev = "c66f78cb4fa67825c51db55909ef5e1ea24f1658", features = ["agent"] }
 # the Drive screen on the real plugin and the stub, so the two can't drift
 buwiz-gws = { path = "../gws-plugin" }
 gws-fake-google = { path = "../gws-fake-google" }

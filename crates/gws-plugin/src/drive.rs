@@ -463,6 +463,11 @@ fn gone() -> Value {
     refusal("not_found", "That's gone from Google Drive.")
 }
 
+/// A card's or its search's ticket that stands for nothing.
+fn lost() -> Value {
+    refusal("ticket_lost", crate::mail::TICKET_LOST)
+}
+
 fn no_access() -> Value {
     refusal("no_access", "This account can't read that in Google Drive.")
 }
@@ -815,13 +820,8 @@ fn list(core: &Core, args: &Value) -> Result<Value, Failure> {
 }
 
 fn searched(core: &Core, ticket: &str) -> Option<String> {
-    match core
-        .tickets
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .subject(ticket)
-    {
-        Some(Subject::DriveSearch(words)) => Some(words.clone()),
+    match crate::mail::subject_of(core, ticket) {
+        Some(Subject::DriveSearch(words)) => Some(words),
         _ => None,
     }
 }
@@ -862,7 +862,7 @@ fn list_search(
     skip: i64,
 ) -> Result<Value, Failure> {
     let Some(words) = searched(core, ticket) else {
-        return Ok(refusal("not_found", "This search is out of date."));
+        return Ok(lost());
     };
     let (files, saved) = find(core, auth, account, &words, PAGE)?;
     let page = files.get(skip as usize..).unwrap_or_default();
@@ -874,8 +874,17 @@ fn list_search(
 /// A card's rows, by its ticket.
 fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (auth, account) = signed_in(core)?;
-    let Some(words) = searched(core, &js::string_or_empty(args.get("ticket"))) else {
-        return Ok(refusal("not_found", "This card is out of date."));
+    let ticket = js::string_or_empty(args.get("ticket"));
+    // a card from before tickets were kept comes with the search that made it
+    let words = searched(core, &ticket).or_else(|| {
+        let words = js::trim(&js::string_or_empty(args.get("query"))).to_owned();
+        let bound = !words.is_empty()
+            && crate::mail::subject_of(core, &ticket).is_none()
+            && crate::mail::bind(core, &ticket, &Subject::DriveSearch(words.clone()));
+        bound.then_some(words)
+    });
+    let Some(words) = words else {
+        return Ok(lost());
     };
     let (files, saved) = find(core, &auth, &account, &words, CARD_ROWS as i64 + 1)?;
     let shown = &files[..files.len().min(CARD_ROWS)];
@@ -1168,11 +1177,7 @@ pub fn offer_card(core: &Core, tool: &str, args: &Value, result: &mut Value) {
         return;
     }
     let words = js::trim(&js::string_or_empty(args.get("query"))).to_owned();
-    let ticket = core
-        .tickets
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .issue(&Subject::DriveSearch(words));
+    let ticket = crate::mail::issue_card(core, &Subject::DriveSearch(words));
     result["_meta"] = json!({"buwiz/open": {"app": "drive", "props": {"search": ticket}, "title": "Drive", "placement": "inline"}});
 }
 
@@ -1192,10 +1197,14 @@ fn resolve_file(core: &Core, args: &Value) -> Value {
                 with_store(core, |s| s.search_files(&account, &value, CHOICES_MAX)).ok()
             })
             .unwrap_or_default();
-        let mut tickets = core.tickets.lock().unwrap_or_else(|e| e.into_inner());
+        let names: Vec<Subject> = found
+            .iter()
+            .map(|f| Subject::DriveSearch(f.name.clone()))
+            .collect();
         let choices: Vec<Value> = found
             .iter()
-            .map(|f| json!({"label": "Drive file", "detail": f.name, "value": tickets.issue(&Subject::DriveSearch(f.name.clone()))}))
+            .zip(crate::mail::issue_rows(core, &names))
+            .map(|(f, ticket)| json!({"label": "Drive file", "detail": f.name, "value": ticket}))
             .collect();
         return ok(json!({"result": "choices", "choices": choices}));
     }
@@ -1204,11 +1213,10 @@ fn resolve_file(core: &Core, args: &Value) -> Value {
             json!({"result": "open", "app": "drive", "title": "Drive", "placement": "full", "props": {"view": "my"}}),
         );
     }
-    let mut tickets = core.tickets.lock().unwrap_or_else(|e| e.into_inner());
     // a choice comes back as its ticket
-    let ticket = match tickets.subject(&value) {
+    let ticket = match crate::mail::subject_of(core, &value) {
         Some(Subject::DriveSearch(_)) => value,
-        _ => tickets.issue(&Subject::DriveSearch(value)),
+        _ => crate::mail::issue_row(core, &Subject::DriveSearch(value)),
     };
     ok(
         json!({"result": "open", "app": "drive", "title": "Drive", "placement": "full", "props": {"search": ticket}}),

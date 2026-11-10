@@ -119,6 +119,8 @@ struct Fake {
     /// In place of each file's usual preview, by id.
     previews: Mutex<HashMap<String, Value>>,
     card: Mutex<Option<Value>>,
+    /// A card's ticket stands for nothing, until a query comes with it.
+    card_lost: Mutex<bool>,
     /// Lists read from the store.
     saved: Mutex<bool>,
     seq: Mutex<i64>,
@@ -529,6 +531,11 @@ impl Host for Fake {
                     json!({"items": items, "untrusted": "File names are other people's words."}),
                 )
             }
+            // a plugin that binds a lost ticket again to the query sent along
+            "gws_drive_card" if *self.card_lost.lock().unwrap() && !args["query"].is_string() => (
+                String::new(),
+                json!({"refused": "ticket_lost", "message": LINK_LOST}),
+            ),
             "gws_drive_card" => (
                 String::new(),
                 self.card.lock().unwrap().clone().unwrap_or_else(a_card),
@@ -2530,16 +2537,80 @@ fn a_card_with_no_files_says_so() {
         .expect("it says so");
 }
 
+const LINK_LOST: &str = "This card lost its link when the plugin restarted.";
+
 #[test]
-fn an_old_cards_ticket_says_so() {
+fn a_lost_card_with_nothing_to_go_on_says_so_and_opens_drive() {
+    for answer in [
+        json!({"refused": "ticket_lost", "message": LINK_LOST}),
+        // a plugin from before tickets were kept
+        json!({"refused": "not_found", "message": "This card is out of date."}),
+    ] {
+        let fake = Arc::new(Fake::default());
+        *fake.inline.lock().unwrap() = true;
+        *fake.props.lock().unwrap() = json!({"search": "tkt1"});
+        *fake.card.lock().unwrap() = Some(answer);
+        let (mut app, _) = open_app(fake.clone(), 420.0, 300.0);
+        app.wait_for_within(&format!("text:{LINK_LOST}"), WAIT)
+            .expect("it says what happened");
+        assert!(!app.screen().shows("This card is out of date."));
+        assert!(!app.screen().matches("label:Open full screen").unwrap());
+        assert!(!app.screen().matches("label:Run the search again").unwrap());
+        assert_eq!(last_of(&fake, "gws_drive_card"), json!({"ticket": "tkt1"}));
+        press(&mut app, "label:Open Drive");
+        let opened = fake.host.lock().unwrap().clone();
+        let (_, data) = opened
+            .iter()
+            .find(|(m, _)| m == "buwiz.open")
+            .expect("it opens");
+        assert_eq!(
+            (&data["app"], &data["props"]),
+            (&json!("drive"), &json!({}))
+        );
+    }
+}
+
+#[test]
+fn a_card_sends_the_chats_search_with_its_ticket_so_a_lost_one_is_bound_again() {
     let fake = Arc::new(Fake::default());
     *fake.inline.lock().unwrap() = true;
+    *fake.card_lost.lock().unwrap() = true;
+    *fake.props.lock().unwrap() = json!({"search": "tkt1", "origin": {"tool": "gws_search_drive", "args": {"query": "meeting"}}});
+    let (mut app, _) = open_app(fake.clone(), 420.0, 500.0);
+    app.wait_for_within("text:Card file 0", WAIT)
+        .expect("its files show");
+    assert_eq!(
+        last_of(&fake, "gws_drive_card"),
+        json!({"ticket": "tkt1", "query": "meeting"})
+    );
+    assert!(!app.screen().shows(LINK_LOST));
+}
+
+#[test]
+fn a_lost_card_that_knows_its_search_can_run_it_again_and_another_tools_is_not_its_own() {
+    let fake = Arc::new(Fake::default());
+    *fake.inline.lock().unwrap() = true;
+    *fake.props.lock().unwrap() = json!({"search": "tkt1", "origin": {"tool": "gws_search_drive", "args": {"query": "meeting"}}});
+    // a plugin from before tickets were kept takes no query
     *fake.card.lock().unwrap() =
         Some(json!({"refused": "not_found", "message": "This card is out of date."}));
-    let (mut app, _) = open_app(fake, 420.0, 300.0);
-    app.wait_for_within("text:This card is out of date.", WAIT)
-        .expect("it says so");
-    assert!(!app.screen().matches("label:Open full screen").unwrap());
+    let (mut app, _) = open_app(fake.clone(), 420.0, 500.0);
+    app.wait_for_within(&format!("text:{LINK_LOST}"), WAIT)
+        .expect("it says what happened");
+    // updated since
+    *fake.card.lock().unwrap() = None;
+    press(&mut app, "label:Run the search again");
+    app.wait_for_within("text:Card file 0", WAIT)
+        .expect("its files show");
+
+    let fake = Arc::new(Fake::default());
+    *fake.inline.lock().unwrap() = true;
+    *fake.card_lost.lock().unwrap() = true;
+    *fake.props.lock().unwrap() = json!({"search": "tkt1", "origin": {"tool": "gws_search_mail", "args": {"query": "meeting"}}});
+    let (mut app, _) = open_app(fake.clone(), 420.0, 500.0);
+    app.wait_for_within(&format!("text:{LINK_LOST}"), WAIT)
+        .expect("it says what happened");
+    assert_eq!(last_of(&fake, "gws_drive_card"), json!({"ticket": "tkt1"}));
 }
 
 #[test]

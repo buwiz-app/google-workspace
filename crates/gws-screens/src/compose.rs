@@ -1341,11 +1341,15 @@ pub fn card(b: Bridge, ticket: String) -> View {
     let (c, waiting) = Compose::new();
     let review = signal(None::<Review>);
     let kept = signal(false);
+    // its ticket stands for nothing, and nothing in the chat names the draft
+    let lost = signal(false);
     b.spawn(work(waiting));
     let (loading, name) = (b.clone(), ticket.clone());
     c.run(async move {
-        if let Err(why) = read_card(&loading, c, &name, review).await {
-            c.said.set(Some(why));
+        match read_card(&loading, c, &name, review).await {
+            Ok(()) => {}
+            Err(why) if crate::shell::link_lost(&why) => lost.set(true),
+            Err(why) => c.said.set(Some(why)),
         }
         loading.ready();
     });
@@ -1367,6 +1371,14 @@ pub fn card(b: Bridge, ticket: String) -> View {
                 return view().app_class(Some("p-3".into())).child(
                     text("Kept in Drafts.").app_class(Some(format!("text-[12px] {MUTE}").into())),
                 );
+            }
+            if lost.get() {
+                let b = b.clone();
+                // the draft is still in Drafts: Mail is where to find it
+                return crate::shell::lost_card("Open Mail", move || {
+                    let open = b.open("mail", json!({"view": "DRAFT"}));
+                    b.spawn(async move { drop(open.await) });
+                });
             }
             let Some(shown) = shown else {
                 let line = c

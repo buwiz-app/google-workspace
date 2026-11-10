@@ -87,6 +87,50 @@ pub(crate) async fn once(b: &Bridge, tool: &str, args: Value) -> Result<Value, S
     })
 }
 
+/// What a card says when its ticket stands for nothing: it was issued by a
+/// plugin that kept none past a restart, and nothing came to bind it again.
+pub(crate) const LINK_LOST: &str = "This card lost its link when the plugin restarted.";
+
+/// Whether a card's read was refused for its ticket. A plugin from before
+/// tickets were kept said the second.
+pub(crate) fn link_lost(why: &str) -> bool {
+    why == LINK_LOST || why == "This card is out of date."
+}
+
+/// What the chat made this card with: the arguments of the tool call the Bot
+/// hands over as `origin`, when that call was `tool`. A card whose ticket is
+/// lost has only this to go on.
+pub(crate) fn origin(b: &Bridge, tool: &str) -> Option<Value> {
+    let props = b.props();
+    let origin = props.get("origin")?;
+    if origin.get("tool").and_then(Value::as_str) != Some(tool) {
+        return None;
+    }
+    origin.get("args").filter(|a| a.is_object()).cloned()
+}
+
+/// A card whose ticket is lost: why, and the one press that helps.
+pub(crate) fn lost_card(
+    label: &'static str,
+    press: impl Fn() + 'static,
+) -> nsh_core::element::View {
+    view()
+        .app_class(Some("p-3 gap-2 items-start".into()))
+        .child(text(LINK_LOST).app_class(Some(format!("text-[12px] {MUTE}").into())))
+        .child(
+            view()
+                .app_class(Some(
+                    "px-3 py-1 rounded-md bg-[#e9e9e6] dark:bg-[#2d2d2d]".into(),
+                ))
+                .label(label)
+                .on_press(press)
+                .child(text(label).app_class(Some(format!("text-[12px] {INK}").into()))),
+        )
+}
+
+/// What a lost card's press reads when it can run the chat's search again.
+pub(crate) const RUN_AGAIN: &str = "Run the search again";
+
 /// A read through the bridge, tried again while the answer is only busy.
 pub(crate) async fn read(b: &Bridge, tool: &str, args: Value) -> Result<Value, String> {
     for attempt in 0.. {

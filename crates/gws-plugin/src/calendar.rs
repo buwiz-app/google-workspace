@@ -1730,14 +1730,10 @@ fn answered(core: &Core, account: &str, calendar: &str, written: &Value) -> Valu
     ok(json!({"event": event.as_ref().map(row_json), "stored": stored.is_ok()}))
 }
 
-/// `gws_event_draft`: a ticket and nothing else. No Google, no store: the
-/// fields live behind the ticket until the person presses Save on the card.
-fn draft(core: &Core, args: &Value) -> Value {
-    let form = match Form::of(args) {
-        Ok(form) => form,
-        Err(why) => return fail("invalid_args", why),
-    };
-    let fields = json!({
+/// A draft's fields as they're held behind its ticket, or why `args` make no event.
+fn draft_fields(core: &Core, args: &Value) -> Result<Value, &'static str> {
+    let form = Form::of(args)?;
+    Ok(json!({
         "title": form.title.unwrap_or_default(),
         "start": form.start,
         "end": form.end,
@@ -1751,38 +1747,69 @@ fn draft(core: &Core, args: &Value) -> Value {
         "meet": form.meet,
         // a card saves to the account it was drafted on, or not at all
         "as_account": core.accounts.signed_in().map(|(who, _)| who),
-    });
-    let ticket = core
-        .tickets
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .issue(&Subject::EventDraft(fields.to_string()));
+    }))
+}
+
+/// `gws_event_draft`: a ticket and nothing else. No Google: the fields live
+/// behind the ticket until the person presses Save on the card.
+fn draft(core: &Core, args: &Value) -> Value {
+    let fields = match draft_fields(core, args) {
+        Ok(fields) => fields,
+        Err(why) => return fail("invalid_args", why),
+    };
+    let ticket = crate::mail::issue_row(core, &Subject::EventDraft(fields.to_string()));
     ok(json!({"ticket": ticket}))
 }
 
+/// A draft card's ticket that stands for nothing.
+fn lost() -> Value {
+    refusal("ticket_lost", crate::mail::TICKET_LOST)
+}
+
+/// `gws_event_draft_read`. A ticket that stands for nothing is bound to
+/// `fields`, what the chat drafted the event with, when those came too: a card
+/// from before tickets were kept has only that to go on.
 fn draft_read(core: &Core, args: &Value) -> Value {
-    let tickets = core.tickets.lock().unwrap_or_else(|e| e.into_inner());
-    let held = tickets.subject(&js::string_or_empty(args.get("ticket")));
-    let fields = match held {
-        Some(Subject::EventDraft(fields)) => serde_json::from_str::<Value>(fields).ok(),
-        _ => None,
+    let ticket = js::string_or_empty(args.get("ticket"));
+    let held = match crate::mail::subject_of(core, &ticket) {
+        Some(Subject::EventDraft(fields)) => Some(fields),
+        Some(_) => None,
+        None => args
+            .get("fields")
+            .filter(|f| f.is_object())
+            .and_then(|f| draft_fields(core, f).ok())
+            .map(|f| f.to_string())
+            .filter(|f| crate::mail::bind(core, &ticket, &Subject::EventDraft(f.clone()))),
+    };
+    let Some(fields) = held.and_then(|fields| serde_json::from_str::<Value>(&fields).ok()) else {
+        return lost();
     };
     let now = core.accounts.signed_in().map(|(who, _)| who);
-    let fields = fields.filter(|f| {
-        let drafted = f["as_account"].as_str();
-        drafted.is_none() || drafted == now.as_deref()
-    });
-    fields.map_or_else(|| refusal("not_found", "This card is out of date."), ok)
+    let drafted = fields["as_account"].as_str();
+    if drafted.is_some() && drafted != now.as_deref() {
+        return refusal(
+            "not_found",
+            "This event was drafted on another account. Switch back to it to go on.",
+        );
+    }
+    ok(fields)
 }
 
 /// Offers the `decide` card with a chat's event draft. Nothing of the event
-/// goes in it: props hold a ticket, and the card reads the fields itself.
-pub fn offer_card(tool: &str, result: &mut Value) {
+/// goes in it: props hold a ticket, and the card reads the fields itself. The
+/// chat keeps the card, so from here the ticket is kept for good.
+pub fn offer_card(core: &Core, tool: &str, result: &mut Value) {
     if tool != EVENT_DRAFT {
         return;
     }
     let ticket = result.pointer("/structuredContent/ticket").cloned();
     if let Some(ticket) = ticket {
+        if let Some(subject) = ticket
+            .as_str()
+            .and_then(|t| crate::mail::subject_of(core, t))
+        {
+            crate::mail::issue_card(core, &subject);
+        }
         result["_meta"] = json!({"buwiz/open": {"app": "calendar", "props": {"draft": ticket}, "title": "Calendar", "placement": "inline"}});
     }
 }

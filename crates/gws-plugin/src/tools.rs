@@ -215,8 +215,8 @@ pub fn defs() -> Vec<Def> {
         },
         Def {
             name: MAIL_CARD,
-            description: "The rows of a mail card, by its ticket.",
-            input_schema: json!({"type": "object", "properties": {"ticket": {"type": "string"}}, "required": ["ticket"]}),
+            description: "The rows of a mail card, by its ticket. A ticket that stands for nothing is bound to query, the search that made the card.",
+            input_schema: json!({"type": "object", "properties": {"ticket": {"type": "string"}, "query": {"type": "string"}}, "required": ["ticket"]}),
             read_only: true,
             audience: APP_ONLY,
             open_world: true,
@@ -356,8 +356,8 @@ pub fn defs() -> Vec<Def> {
         },
         Def {
             name: EVENT_DRAFT_READ,
-            description: "An event draft's fields, by its ticket.",
-            input_schema: json!({"type": "object", "properties": {"ticket": {"type": "string"}}, "required": ["ticket"]}),
+            description: "An event draft's fields, by its ticket. A ticket that stands for nothing is bound to fields, what the event was drafted with.",
+            input_schema: json!({"type": "object", "properties": {"ticket": {"type": "string"}, "fields": {"type": "object"}}, "required": ["ticket"]}),
             read_only: true,
             audience: APP_ONLY,
             open_world: false,
@@ -496,8 +496,8 @@ pub fn defs() -> Vec<Def> {
         },
         Def {
             name: DRIVE_CARD,
-            description: "The rows of a files card, by its ticket.",
-            input_schema: json!({"type": "object", "properties": {"ticket": {"type": "string"}}, "required": ["ticket"]}),
+            description: "The rows of a files card, by its ticket. A ticket that stands for nothing is bound to query, the search that made the card.",
+            input_schema: json!({"type": "object", "properties": {"ticket": {"type": "string"}, "query": {"type": "string"}}, "required": ["ticket"]}),
             read_only: true,
             audience: APP_ONLY,
             open_world: true,

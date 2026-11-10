@@ -1446,15 +1446,67 @@ fn signed_out_view(b: Bridge) -> impl IntoElement {
     )
 }
 
+/// What a mail card shows.
+#[derive(Clone, PartialEq)]
+enum CardState {
+    Loading,
+    Rows(Vec<(String, String, i64, String)>, bool),
+    Line(String),
+    /// Its ticket stands for nothing, and no search could be run in its place.
+    Lost,
+}
+
+/// A card's rows out of `v[key]`, each with what opens it.
+fn card_rows(v: &Value, key: &str, opens: &str) -> CardState {
+    let rows = v
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(CARD_ROWS)
+        .map(|r| {
+            (
+                r["sender"].as_str().unwrap_or_default().to_owned(),
+                r["subject"].as_str().unwrap_or_default().to_owned(),
+                r["at"].as_i64().unwrap_or(0),
+                r[opens].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    CardState::Rows(rows, v.get("saved") == Some(&Value::Bool(true)))
+}
+
+/// How many rows a card shows.
+const CARD_ROWS: usize = 5;
+
+/// Reads a card by its ticket. `query` is the search the chat made it with:
+/// it goes along, so a plugin that kept no tickets past a restart binds the
+/// ticket again, and with a plugin too old for that the search is run itself.
+async fn read_card(b: &Bridge, ticket: &str, query: Option<&str>) -> CardState {
+    let mut args = json!({"ticket": ticket});
+    if let Some(query) = query {
+        args["query"] = json!(query);
+    }
+    match read(b, "gws_mail_card", args).await {
+        Ok(v) => card_rows(&v, "rows", "ticket"),
+        Err(e) if e == "sign-in" => CardState::Line("Sign in to Google first.".to_owned()),
+        Err(e) if crate::shell::link_lost(&e) => {
+            let Some(query) = query else {
+                return CardState::Lost;
+            };
+            match read(b, "gws_mail_list", json!({"query": query})).await {
+                Ok(v) => card_rows(&v, "threads", "id"),
+                Err(_) => CardState::Lost,
+            }
+        }
+        Err(e) => CardState::Line(e),
+    }
+}
+
 /// Mail as a card in a chat: its own rows, read live, so no mail sits in the
 /// chat's record. A row or the card's maximize opens Mail.
 fn card(b: Bridge) -> View {
-    #[derive(Clone, PartialEq)]
-    enum State {
-        Loading,
-        Rows(Vec<(String, String, i64, String)>, bool),
-        Line(String),
-    }
+    use CardState as State;
     let state = signal(State::Loading);
     let ticket = b
         .props()
@@ -1462,36 +1514,24 @@ fn card(b: Bridge) -> View {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let reader = b.clone();
-    b.spawn(async move {
-        match read(&reader, "gws_mail_card", json!({"ticket": ticket})).await {
-            Ok(v) => {
-                let rows = v
-                    .get("rows")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .map(|r| {
-                        (
-                            r["sender"].as_str().unwrap_or_default().to_owned(),
-                            r["subject"].as_str().unwrap_or_default().to_owned(),
-                            r["at"].as_i64().unwrap_or(0),
-                            r["ticket"].as_str().unwrap_or_default().to_owned(),
-                        )
-                    })
-                    .collect();
-                state.set(State::Rows(
-                    rows,
-                    v.get("saved") == Some(&Value::Bool(true)),
-                ));
-            }
-            Err(e) if e == "sign-in" => {
-                state.set(State::Line("Sign in to Google first.".to_owned()))
-            }
-            Err(e) => state.set(State::Line(e)),
+    let query = crate::shell::origin(&b, "gws_search_mail")
+        .and_then(|args| Some(args.get("query")?.as_str()?.trim().to_owned()))
+        .filter(|q| !q.is_empty());
+    // a read asked for by a press outlives the press's own part of the card
+    let (reads, waiting) = tokio::sync::mpsc::unbounded_channel::<crate::shell::Job>();
+    b.spawn(compose::work(waiting));
+    let load = {
+        let (b, ticket, query) = (b.clone(), ticket.clone(), query.clone());
+        move || {
+            let (reader, ticket, query) = (b.clone(), ticket.clone(), query.clone());
+            state.set(State::Loading);
+            drop(reads.send(Box::pin(async move {
+                state.set(read_card(&reader, &ticket, query.as_deref()).await);
+                reader.ready();
+            })));
         }
-        reader.ready();
-    });
+    };
+    load();
     let fit = b.clone();
     let press = b;
     view()
@@ -1508,6 +1548,17 @@ fn card(b: Bridge) -> View {
             State::Line(line) => view()
                 .app_class(Some("p-3".into()))
                 .child(text(line).app_class(Some(format!("text-[12px] {MUTE}").into()))),
+            State::Lost if query.is_some() => {
+                crate::shell::lost_card(crate::shell::RUN_AGAIN, load.clone())
+            }
+            // nothing says what the search was: Mail is where to make it again
+            State::Lost => {
+                let b = press.clone();
+                crate::shell::lost_card("Open Mail", move || {
+                    let open = b.open("mail", json!({}));
+                    b.spawn(async move { drop(open.await) });
+                })
+            }
             // the card is read live, and what it found can have gone since
             State::Rows(rows, _) if rows.is_empty() => view().app_class(Some("p-3".into())).child(
                 text("No mail matches this now.")

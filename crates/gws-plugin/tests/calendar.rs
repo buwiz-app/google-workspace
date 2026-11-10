@@ -347,7 +347,7 @@ mod attendee_changes {
         assert_eq!(google.log(), [], "nor does reading one");
         assert_eq!(
             refusal(&core.run("gws_event_draft_read", &json!({"ticket": "tkt_nope"}))),
-            "not_found"
+            "ticket_lost"
         );
 
         // the card's Save: only now does anyone hear

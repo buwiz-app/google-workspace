@@ -13,7 +13,7 @@ use super::event::{Calendar, Event, Form, calendars_in, repeat_line, rows_in, sa
 use super::time::{self, When};
 use super::{outcome, refused_read, value};
 use crate::compose::{self, press_send_button, press_text, review_line};
-use crate::shell::{INK, Job, LINE, MUTE, PANEL, RAIL, read};
+use crate::shell::{INK, Job, LINE, MUTE, PANEL, RAIL, link_lost, lost_card, origin, read};
 
 /// How many invites a card sends without asking once more, as Mail's does.
 const FEW: usize = 5;
@@ -166,6 +166,8 @@ fn review(form: &Form, calendars: &[Calendar]) -> View {
 #[derive(Clone, PartialEq)]
 enum Stage {
     Reading,
+    /// Its ticket stands for nothing.
+    Lost,
     Showing,
     Kept,
     Saved(String),
@@ -193,23 +195,43 @@ pub(super) fn decide(b: Bridge, ticket: String) -> View {
     let (jobs, waiting) = unbounded_channel::<Job>();
     let jobs = signal_with(jobs, SignalEquals::Never);
     b.spawn(compose::work(waiting));
-    let (loading, name) = (b.clone(), ticket.clone());
-    b.spawn(async move {
-        let list = read(&loading, "gws_cal_list", json!({})).await;
-        let list = list.map(|v| calendars_in(&v)).unwrap_or_default();
-        match read(&loading, "gws_event_draft_read", json!({"ticket": name})).await {
-            Ok(v) => match refused_read(&v) {
-                Some(why) => said.set(Some(why)),
-                None => {
-                    form.set(Some(Form::of_draft(&v, blank_for_card(&list), &Local)));
-                    stage.set(Stage::Showing);
+    // what the chat drafted the event with: it goes along, so a plugin that
+    // kept no tickets past a restart binds the ticket again
+    let fields = origin(&b, "gws_event_draft");
+    let retries = fields.is_some();
+    let load = {
+        let (b, name) = (b.clone(), ticket.clone());
+        move || {
+            let (loading, name, fields) = (b.clone(), name.clone(), fields.clone());
+            stage.set(Stage::Reading);
+            said.set(None);
+            let read_it = async move {
+                let list = read(&loading, "gws_cal_list", json!({})).await;
+                let list = list.map(|v| calendars_in(&v)).unwrap_or_default();
+                let mut args = json!({"ticket": name});
+                if let Some(fields) = fields {
+                    args["fields"] = fields;
                 }
-            },
-            Err(why) => said.set(Some(trouble(why))),
+                match read(&loading, "gws_event_draft_read", args).await {
+                    Ok(v) => match refused_read(&v) {
+                        Some(why) if link_lost(&why) => stage.set(Stage::Lost),
+                        Some(why) => said.set(Some(why)),
+                        None => {
+                            form.set(Some(Form::of_draft(&v, blank_for_card(&list), &Local)));
+                            stage.set(Stage::Showing);
+                        }
+                    },
+                    Err(why) => said.set(Some(trouble(why))),
+                }
+                calendars.set(list);
+                loading.ready();
+            };
+            // with the saves: a read a press asked for outlives the press's
+            // own part of the card
+            jobs.with_untracked(|jobs| drop(jobs.send(Box::pin(read_it))));
         }
-        calendars.set(list);
-        loading.ready();
-    });
+    };
+    load();
     // the call is made in the press, as on the screen: see the top of `calendar.rs`
     let save = {
         let b = b.clone();
@@ -250,6 +272,15 @@ pub(super) fn decide(b: Bridge, ticket: String) -> View {
         let (shown, list) = (form.get(), calendars.get());
         match stage.get() {
             Stage::Reading => plain(said.get().unwrap_or_else(|| "Reading the draft…".to_owned())),
+            Stage::Lost if retries => lost_card("Try again", load.clone()),
+            // nothing says what the event was: Calendar is where to make it again
+            Stage::Lost => {
+                let b = opening.clone();
+                lost_card("Open Calendar", move || {
+                    let go = b.open("calendar", json!({}));
+                    b.spawn(async move { drop(go.await) });
+                })
+            }
             Stage::Kept => plain("Kept. Nothing was saved.".to_owned()),
             Stage::Saved(line) => plain(line),
             Stage::Showing => {

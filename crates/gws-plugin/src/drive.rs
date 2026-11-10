@@ -463,9 +463,9 @@ fn gone() -> Value {
     refusal("not_found", "That's gone from Google Drive.")
 }
 
-/// A card's or its search's ticket that stands for nothing.
-fn lost() -> Value {
-    refusal("ticket_lost", crate::mail::TICKET_LOST)
+/// A card's or its search's ticket that stands for nothing here, and why.
+fn lost(core: &Core, ticket: &str) -> Value {
+    refusal("ticket_lost", crate::mail::lost_words(core, ticket))
 }
 
 fn no_access() -> Value {
@@ -862,7 +862,7 @@ fn list_search(
     skip: i64,
 ) -> Result<Value, Failure> {
     let Some(words) = searched(core, ticket) else {
-        return Ok(lost());
+        return Ok(lost(core, ticket));
     };
     let (files, saved) = find(core, auth, account, &words, PAGE)?;
     let page = files.get(skip as usize..).unwrap_or_default();
@@ -879,12 +879,11 @@ fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
     let words = searched(core, &ticket).or_else(|| {
         let words = js::trim(&js::string_or_empty(args.get("query"))).to_owned();
         let bound = !words.is_empty()
-            && crate::mail::subject_of(core, &ticket).is_none()
             && crate::mail::bind(core, &ticket, &Subject::DriveSearch(words.clone()));
         bound.then_some(words)
     });
     let Some(words) = words else {
-        return Ok(lost());
+        return Ok(lost(core, &ticket));
     };
     let (files, saved) = find(core, &auth, &account, &words, CARD_ROWS as i64 + 1)?;
     let shown = &files[..files.len().min(CARD_ROWS)];

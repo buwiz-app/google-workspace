@@ -693,16 +693,8 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
         )["structuredContent"],
         json!({"ok": true})
     );
-    assert_eq!(
-        call(
-            &mut ask,
-            "buwiz.account.clear",
-            json!({"account": "google", "label": "default"})
-        )["structuredContent"],
-        json!({"ok": true})
-    );
     // through the real server: a tool that never leaves this Mac goes a short
-    // way, and a card has to survive it
+    // way, and a card has to survive it (a draft is made on the account signed in)
     let draft = call(
         &mut ask,
         "gws_event_draft",
@@ -712,6 +704,14 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
     assert_eq!(
         draft["_meta"]["buwiz/open"]["props"]["draft"],
         draft["structuredContent"]["ticket"]
+    );
+    assert_eq!(
+        call(
+            &mut ask,
+            "buwiz.account.clear",
+            json!({"account": "google", "label": "default"})
+        )["structuredContent"],
+        json!({"ok": true})
     );
 
     let r = call(&mut ask, "gws_search_mail", json!({"query": "x"}));

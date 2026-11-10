@@ -35,6 +35,9 @@ const ACT_MAX: usize = 100;
 const UNDOS_MAX: usize = 20;
 /// A generation of [`Tickets`].
 const TICKETS_MAX: usize = 512;
+
+/// How many cards' tickets each of the two generations held here takes.
+const CARDS_HELD: usize = gws_store::tickets::CARDS_MAX as usize;
 const TOO_LONG: &str = "<p>This message is too long to show here.</p>";
 /// How often the sync runs with a screen open, and with none.
 const ACTIVE: Duration = Duration::from_secs(30);
@@ -287,9 +290,24 @@ fn undo(core: &Core, args: &Value) -> Result<Value, Failure> {
 /// came with it to bind it again.
 pub const TICKET_LOST: &str = "This card lost its link when the plugin restarted.";
 
-/// A card's own read, refused for a ticket nobody can place.
-pub(crate) fn ticket_lost() -> Value {
-    fail("ticket_lost", TICKET_LOST)
+/// What a card says when its ticket is another account's.
+pub const TICKET_ELSEWHERE: &str = "This card is from another account.";
+
+/// What a card says when its ticket aged out of what's kept.
+pub const TICKET_GONE: &str = "This card is out of date.";
+
+/// Why a card's `ticket` stands for nothing here, in words.
+pub(crate) fn lost_words(core: &Core, ticket: &str) -> &'static str {
+    match place(core, ticket) {
+        Place::Elsewhere => TICKET_ELSEWHERE,
+        Place::Gone => TICKET_GONE,
+        Place::Here(_) | Place::Nowhere => TICKET_LOST,
+    }
+}
+
+/// [`ticket_lost`], saying why for `ticket`.
+pub(crate) fn lost(core: &Core, ticket: &str) -> Value {
+    fail("ticket_lost", lost_words(core, ticket))
 }
 
 impl Subject {
@@ -325,17 +343,22 @@ impl Subject {
     }
 }
 
-/// Tickets and their subjects, both ways.
+/// Whose a ticket is: the account signed in when it was issued, if any.
+type Whose = Option<String>;
+
+/// Tickets and their subjects, both ways, each with whose it is.
 #[derive(Default)]
 struct Held {
-    by_subject: HashMap<Subject, String>,
-    by_ticket: HashMap<String, Subject>,
+    by_subject: HashMap<(Whose, Subject), String>,
+    by_ticket: HashMap<String, (Subject, Whose)>,
 }
 
 impl Held {
-    fn put(&mut self, ticket: &str, subject: &Subject) {
-        self.by_subject.insert(subject.clone(), ticket.to_owned());
-        self.by_ticket.insert(ticket.to_owned(), subject.clone());
+    fn put(&mut self, ticket: &str, subject: &Subject, whose: &Whose) {
+        self.by_subject
+            .insert((whose.clone(), subject.clone()), ticket.to_owned());
+        self.by_ticket
+            .insert(ticket.to_owned(), (subject.clone(), whose.clone()));
     }
 }
 
@@ -343,40 +366,58 @@ impl Held {
 /// ([`issue_card`], [`issue_rows`], [`subject_of`]); this is what's been read
 /// from there or issued here, and all there is while the store can't open.
 ///
-/// A card's own ticket stays for the life of the process. Rows come in two
-/// generations, so they can't grow without end: when the newer fills, the
-/// older goes, and the card that issued one issues it again when it next reads.
+/// Cards and rows each come in two generations, so neither grows without
+/// end: when the newer fills, the older goes. A row's card issues it again
+/// when it next reads; a card's is read from the store again.
 #[derive(Default)]
 pub struct Tickets {
     cards: Held,
+    older_cards: Held,
+    cards_issued: usize,
     newer: Held,
     older: Held,
     issued: usize,
 }
 
 impl Tickets {
-    fn ticket(&self, subject: &Subject) -> Option<&String> {
-        [&self.cards, &self.newer, &self.older]
-            .into_iter()
-            .find_map(|held| held.by_subject.get(subject))
+    fn all(&self) -> [&Held; 4] {
+        [&self.cards, &self.older_cards, &self.newer, &self.older]
     }
 
-    fn subject(&self, ticket: &str) -> Option<&Subject> {
-        [&self.cards, &self.newer, &self.older]
+    fn ticket(&self, whose: &Whose, subject: &Subject) -> Option<&String> {
+        let key = (whose.clone(), subject.clone());
+        self.all()
+            .into_iter()
+            .find_map(|held| held.by_subject.get(&key))
+    }
+
+    fn entry(&self, ticket: &str) -> Option<&(Subject, Whose)> {
+        self.all()
             .into_iter()
             .find_map(|held| held.by_ticket.get(ticket))
     }
 
-    fn put(&mut self, ticket: &str, subject: &Subject, card: bool) {
-        if card || self.cards.by_ticket.contains_key(ticket) {
-            return self.cards.put(ticket, subject);
+    #[cfg(test)]
+    fn subject(&self, ticket: &str) -> Option<&Subject> {
+        self.entry(ticket).map(|(subject, _)| subject)
+    }
+
+    fn put(&mut self, ticket: &str, subject: &Subject, whose: &Whose, card: bool) {
+        let a_card = |held: &Held| held.by_ticket.contains_key(ticket);
+        if card || a_card(&self.cards) || a_card(&self.older_cards) {
+            if self.cards_issued >= CARDS_HELD {
+                self.older_cards = std::mem::take(&mut self.cards);
+                self.cards_issued = 0;
+            }
+            self.cards_issued += 1;
+            return self.cards.put(ticket, subject, whose);
         }
         if self.issued >= TICKETS_MAX {
             self.older = std::mem::take(&mut self.newer);
             self.issued = 0;
         }
         self.issued += 1;
-        self.newer.put(ticket, subject);
+        self.newer.put(ticket, subject, whose);
     }
 
     /// Forgets every ticket held here. The store's are its own to forget.
@@ -395,11 +436,14 @@ fn keeper(core: &Core) -> Option<String> {
 /// one. All are kept in the store as the newest, a `card`'s for good. With no
 /// store they live as long as this process, as they always did.
 fn issue(core: &Core, subjects: &[Subject], card: bool) -> Vec<String> {
+    let account = keeper(core);
     let known: Vec<Option<String>> = {
         let held = core.tickets.lock().unwrap_or_else(|e| e.into_inner());
-        subjects.iter().map(|s| held.ticket(s).cloned()).collect()
+        subjects
+            .iter()
+            .map(|s| held.ticket(&account, s).cloned())
+            .collect()
     };
-    let account = keeper(core);
     let kept = account.as_ref().and_then(|account| {
         with_own_store(core, account, |store| {
             let mut tickets = Vec::with_capacity(subjects.len());
@@ -420,6 +464,7 @@ fn issue(core: &Core, subjects: &[Subject], card: bool) -> Vec<String> {
             store.keep_tickets(account, &rows, card)?;
             Ok(tickets)
         })
+        .inspect_err(|e| eprintln!("buwiz-gws: tickets weren't kept: {e:?}"))
         .ok()
     });
     let tickets = kept.unwrap_or_else(|| {
@@ -430,7 +475,7 @@ fn issue(core: &Core, subjects: &[Subject], card: bool) -> Vec<String> {
     });
     let mut held = core.tickets.lock().unwrap_or_else(|e| e.into_inner());
     for (subject, ticket) in subjects.iter().zip(&tickets) {
-        held.put(ticket, subject, card);
+        held.put(ticket, subject, &account, card);
     }
     tickets
 }
@@ -453,46 +498,97 @@ pub fn issue_row(core: &Core, subject: &Subject) -> String {
     issue_rows(core, std::slice::from_ref(subject)).remove(0)
 }
 
-/// What a ticket stands for: as this process knows it, else as the store kept it.
-pub fn subject_of(core: &Core, ticket: &str) -> Option<Subject> {
+/// What a ticket is to whoever is signed in now.
+pub(crate) enum Place {
+    /// Theirs, standing for this.
+    Here(Subject),
+    /// Another account's.
+    Elsewhere,
+    /// Theirs, but it aged out of what's kept: it stands for nothing.
+    Gone,
+    /// Nobody's that this process or the store knows.
+    Nowhere,
+}
+
+/// Where `ticket` stands: as this process knows it, else as the store kept it.
+/// A ticket stands for its subject only under the account it was issued to.
+pub(crate) fn place(core: &Core, ticket: &str) -> Place {
+    let whose = keeper(core);
     let held = core
         .tickets
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .subject(ticket)
+        .entry(ticket)
         .cloned();
-    if held.is_some() || !buwiz_plugin::is_ticket(ticket) {
-        return held;
+    if let Some((subject, of)) = held {
+        return if of == whose {
+            Place::Here(subject)
+        } else {
+            Place::Elsewhere
+        };
     }
-    let (kept, card) = with_store(core, |store| store.ticket(ticket)).ok()??;
-    let subject = Subject::of_kept(&kept.kind, kept.subject)?;
+    if !buwiz_plugin::is_ticket(ticket) {
+        return Place::Nowhere;
+    }
+    let kept = match with_store(core, |store| store.ticket(ticket)) {
+        Ok(Some(kept)) => kept,
+        Ok(None) => return Place::Nowhere,
+        Err(e) => {
+            eprintln!("buwiz-gws: a card's link couldn't be read: {e:?}");
+            return Place::Nowhere;
+        }
+    };
+    if whose.as_deref() != Some(kept.account.as_str()) {
+        return Place::Elsewhere;
+    }
+    if kept.ticket.kind == gws_store::tickets::GONE {
+        return Place::Gone;
+    }
+    let Some(subject) = Subject::of_kept(&kept.ticket.kind, kept.ticket.subject) else {
+        return Place::Gone;
+    };
     core.tickets
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .put(ticket, &subject, card);
-    Some(subject)
+        .put(ticket, &subject, &whose, kept.card);
+    Place::Here(subject)
+}
+
+/// What a ticket stands for under the account signed in now.
+pub fn subject_of(core: &Core, ticket: &str) -> Option<Subject> {
+    match place(core, ticket) {
+        Place::Here(subject) => Some(subject),
+        _ => None,
+    }
 }
 
 /// Gives a card's ticket that stands for nothing its subject back: the chat
 /// still has the card and what made it, though the ticket was issued by a
-/// process that kept none. False for anything that isn't a ticket, or one that
-/// stands for something already.
+/// process that kept none. False for anything that isn't a ticket, one that
+/// stands for something already, another account's, or one aged out. Two
+/// binds at once: the first kept wins, and the other is false unless it said
+/// the same.
 pub(crate) fn bind(core: &Core, ticket: &str, subject: &Subject) -> bool {
-    if !buwiz_plugin::is_ticket(ticket) || subject_of(core, ticket).is_some() {
+    if !buwiz_plugin::is_ticket(ticket) || !matches!(place(core, ticket), Place::Nowhere) {
         return false;
     }
-    if let Some(account) = keeper(core) {
+    let whose = keeper(core);
+    if let Some(account) = &whose {
         let kept = subject.to_kept(ticket);
         // unkept, it still works until this process ends
-        let _ = with_own_store(core, &account, |store| {
-            store.keep_tickets(&account, std::slice::from_ref(&kept), true)
-        });
+        if let Err(e) = with_own_store(core, account, |store| {
+            store.keep_tickets(account, std::slice::from_ref(&kept), true)
+        }) {
+            eprintln!("buwiz-gws: a card's link wasn't kept: {e:?}");
+        }
     }
-    core.tickets
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .put(ticket, subject, true);
-    true
+    {
+        let mut held = core.tickets.lock().unwrap_or_else(|e| e.into_inner());
+        if held.entry(ticket).is_none() {
+            held.put(ticket, subject, &whose, true);
+        }
+    }
+    matches!(place(core, ticket), Place::Here(now) if now == *subject)
 }
 
 /// Forgets the tickets this process holds, after an account's went from the
@@ -524,7 +620,7 @@ fn card_search(core: &Core, args: &Value) -> Option<String> {
 fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
     let (auth, account) = reader(core)?;
     let Some(query) = card_search(core, args) else {
-        return Ok(ticket_lost());
+        return Ok(lost(core, &js::string_or_empty(args.get("ticket"))));
     };
     let found = match &auth {
         Some(auth) => search(core, auth, &account, &query),
@@ -752,6 +848,9 @@ pub(crate) fn filed_subject(core: &Core, args: &Value) -> Option<String> {
 /// this process ever saw it signed in. False if it couldn't, and then a marker
 /// on disk has the next sync try again, even after a restart.
 pub fn reconcile(core: &Core) -> bool {
+    // the tickets held here go under the same lock as the store's, so no read
+    // in between finds one the store no longer has
+    let mut held = core.tickets.lock().unwrap_or_else(|e| e.into_inner());
     let cleared = with_store(core, |store| {
         let listed = file_sign_ins(core, store)?;
         for account in store.accounts()? {
@@ -764,8 +863,9 @@ pub fn reconcile(core: &Core) -> bool {
     })
     .is_ok();
     if cleared {
-        forget_tickets(core);
+        held.clear();
     }
+    drop(held);
     if let Ok(paths) = &core.paths {
         let marker = paths.wipe_pending();
         let marked = if cleared {
@@ -787,6 +887,7 @@ pub fn reconcile(core: &Core) -> bool {
 /// and no one else's, as the Bot may have pushes still to come. False if it
 /// couldn't, and then the marker has it cleared with the rest.
 pub(crate) fn forget(core: &Core, account: &str) -> bool {
+    let mut held = core.tickets.lock().unwrap_or_else(|e| e.into_inner());
     let cleared = with_store(core, |store| {
         let listed = file_sign_ins(core, store)?;
         if !core.accounts.holds(account) && !listed.contains(account) {
@@ -797,8 +898,9 @@ pub(crate) fn forget(core: &Core, account: &str) -> bool {
     })
     .is_ok();
     if cleared {
-        forget_tickets(core);
+        held.clear();
     }
+    drop(held);
     if !cleared
         && let Ok(paths) = &core.paths
         && std::fs::write(paths.wipe_pending(), b"").is_err()
@@ -2217,6 +2319,67 @@ mod tests {
             assert_eq!(answer(&read(&ticket))["refused"], "not_found");
             switch(&core, B, A);
             assert_eq!(answer(&read(&ticket))["title"], "Lunch");
+
+            // a card whose ticket stands for nothing, read with the chat's
+            // fields after a switch: never bound to the account signed in now
+            switch(&core, A, B);
+            let with = |ticket: &str, fields: Value| {
+                answer(&core.run(
+                    crate::tools::EVENT_DRAFT_READ,
+                    &json!({"ticket": ticket, "fields": fields}),
+                ))
+                .clone()
+            };
+            let old = buwiz_plugin::new_ticket();
+            let said = with(&old, args.clone());
+            assert_eq!(
+                (said["refused"].clone(), said["message"].clone()),
+                (json!("ticket_lost"), json!(TICKET_GONE)),
+                "no account recorded: out of date"
+            );
+            let mut drafted_on_a = args.clone();
+            drafted_on_a["as_account"] = json!(A);
+            assert_eq!(with(&old, drafted_on_a.clone())["refused"], "not_found");
+            assert_eq!(subject_of(&core, &old), None, "nothing was bound");
+            // the old card's own ticket, fields or not, stays A's
+            assert_eq!(
+                with(ticket.as_str().unwrap(), drafted_on_a.clone())["refused"],
+                "not_found"
+            );
+            switch(&core, B, A);
+            assert_eq!(
+                with(&old, drafted_on_a)["title"],
+                "Lunch",
+                "back on A it binds to A"
+            );
+        }
+
+        #[test]
+        fn a_card_ticket_reads_only_under_its_own_account() {
+            let google = FakeGoogle::start(Seed::demo(1));
+            let (core, _) = two_accounts(&google, "two-card");
+            let ticket = issue_card(&core, &Subject::Search("from:ana".to_owned()));
+            assert_eq!(
+                subject_of(&core, &ticket),
+                Some(Subject::Search("from:ana".to_owned()))
+            );
+            switch(&core, A, B);
+            assert_eq!(subject_of(&core, &ticket), None);
+            assert_eq!(lost_words(&core, &ticket), TICKET_ELSEWHERE);
+            assert!(
+                !bind(&core, &ticket, &Subject::Search("from:bo".to_owned())),
+                "another account's ticket is never bound again"
+            );
+            let card = core.run(
+                crate::tools::MAIL_CARD,
+                &json!({"ticket": ticket, "query": "from:bo"}),
+            );
+            assert_eq!(answer(&card)["message"], TICKET_ELSEWHERE);
+            switch(&core, B, A);
+            assert_eq!(
+                subject_of(&core, &ticket),
+                Some(Subject::Search("from:ana".to_owned()))
+            );
         }
 
         #[test]
@@ -2346,26 +2509,54 @@ mod tests {
     #[test]
     fn tickets_stay_bounded_and_the_recent_ones_work() {
         let mut tickets = Tickets::default();
-        tickets.put("card", &Subject::Search("a card's".to_owned()), true);
-        tickets.put("first", &Subject::Thread("first".to_owned()), false);
+        let me = Some("me".to_owned());
+        tickets.put("card", &Subject::Search("a card's".to_owned()), &me, true);
+        tickets.put("first", &Subject::Thread("first".to_owned()), &me, false);
         for n in 0..TICKETS_MAX * 3 {
-            tickets.put(&format!("row-{n}"), &Subject::Thread(n.to_string()), false);
+            tickets.put(
+                &format!("row-{n}"),
+                &Subject::Thread(n.to_string()),
+                &me,
+                false,
+            );
         }
         assert_eq!(tickets.subject("first"), None, "the oldest row went");
         let last = format!("row-{}", TICKETS_MAX * 3 - 1);
         assert!(tickets.subject(&last).is_some());
         assert!(tickets.subject("card").is_some(), "a card's never does");
         // a row a card then takes for its own stays one
-        tickets.put(&last, &Subject::Thread("x".to_owned()), true);
-        tickets.put(&last, &Subject::Thread("x".to_owned()), false);
+        tickets.put(&last, &Subject::Thread("x".to_owned()), &me, true);
+        tickets.put(&last, &Subject::Thread("x".to_owned()), &me, false);
         for n in 0..TICKETS_MAX * 3 {
             tickets.put(
                 &format!("more-{n}"),
                 &Subject::Thread(format!("m{n}")),
+                &me,
                 false,
             );
         }
         assert!(tickets.subject(&last).is_some());
+        // cards come in generations too
+        for n in 0..CARDS_HELD * 2 {
+            tickets.put(
+                &format!("card-{n}"),
+                &Subject::Search(n.to_string()),
+                &me,
+                true,
+            );
+        }
+        assert!(
+            tickets.subject("card").is_none(),
+            "the oldest card here went; the store still has it"
+        );
+        assert!(
+            tickets
+                .subject(&format!("card-{}", CARDS_HELD * 2 - 1))
+                .is_some()
+        );
+        // a subject's ticket is whoever's it was issued to
+        let you = Some("you".to_owned());
+        assert_eq!(tickets.ticket(&you, &Subject::Search("0".to_owned())), None);
     }
 
     #[test]

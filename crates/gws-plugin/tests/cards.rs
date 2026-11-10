@@ -212,9 +212,21 @@ fn a_ticket_lost_before_this_is_bound_again_by_the_search_that_made_the_card() {
     let draft = "tkt_YYYYYYYYYYYYYYYYYYYYYYYYYY";
     let gone = core.run("gws_event_draft_read", &json!({"ticket": draft}));
     assert_eq!(gone["structuredContent"]["refused"], "ticket_lost");
-    let read = data(core.run(
+    // the chat's fields bind it only when they say the account it was drafted
+    // on: without one it could be saved to whoever is signed in now
+    let unowned = core.run(
         "gws_event_draft_read",
         &json!({"ticket": draft, "fields": event()}),
+    );
+    assert_eq!(
+        unowned["structuredContent"]["message"],
+        "This card is out of date."
+    );
+    let mut fields = event();
+    fields["as_account"] = json!(FAKE_EMAIL);
+    let read = data(core.run(
+        "gws_event_draft_read",
+        &json!({"ticket": draft, "fields": fields}),
     ));
     assert_eq!(read["title"], "Lunch");
     assert_eq!(
@@ -224,7 +236,7 @@ fn a_ticket_lost_before_this_is_bound_again_by_the_search_that_made_the_card() {
     // fields that make no event bind nothing
     let bad = core.run(
         "gws_event_draft_read",
-        &json!({"ticket": "tkt_XXXXXXXXXXXXXXXXXXXXXXXXXX", "fields": {"title": "x", "start": "soon", "end": "later"}}),
+        &json!({"ticket": "tkt_XXXXXXXXXXXXXXXXXXXXXXXXXX", "fields": {"title": "x", "start": "soon", "end": "later", "as_account": FAKE_EMAIL}}),
     );
     assert_eq!(bad["structuredContent"]["refused"], "ticket_lost");
 

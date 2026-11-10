@@ -1730,8 +1730,9 @@ fn answered(core: &Core, account: &str, calendar: &str, written: &Value) -> Valu
     ok(json!({"event": event.as_ref().map(row_json), "stored": stored.is_ok()}))
 }
 
-/// A draft's fields as they're held behind its ticket, or why `args` make no event.
-fn draft_fields(core: &Core, args: &Value) -> Result<Value, &'static str> {
+/// A draft's fields as they're held behind its ticket, made on `account`, or
+/// why `args` make no event.
+fn draft_fields(account: &str, args: &Value) -> Result<Value, &'static str> {
     let form = Form::of(args)?;
     Ok(json!({
         "title": form.title.unwrap_or_default(),
@@ -1746,14 +1747,18 @@ fn draft_fields(core: &Core, args: &Value) -> Result<Value, &'static str> {
         "repeat": form.repeat,
         "meet": form.meet,
         // a card saves to the account it was drafted on, or not at all
-        "as_account": core.accounts.signed_in().map(|(who, _)| who),
+        "as_account": account,
     }))
 }
 
 /// `gws_event_draft`: a ticket and nothing else. No Google: the fields live
 /// behind the ticket until the person presses Save on the card.
 fn draft(core: &Core, args: &Value) -> Value {
-    let fields = match draft_fields(core, args) {
+    // a draft is made on an account: with nobody signed in, nobody's would do
+    let Some((account, _)) = core.accounts.signed_in() else {
+        return failed(Failure::AccountRequired);
+    };
+    let fields = match draft_fields(&account, args) {
         Ok(fields) => fields,
         Err(why) => return fail("invalid_args", why),
     };
@@ -1796,38 +1801,59 @@ pub(crate) fn draft_lines(fields: &str, account: &str) -> Vec<String> {
     .collect()
 }
 
-/// A draft card's ticket that stands for nothing.
-fn lost() -> Value {
-    refusal("ticket_lost", crate::mail::TICKET_LOST)
+/// A draft card's ticket that stands for nothing here, and why.
+fn lost(core: &Core, ticket: &str) -> Value {
+    refusal("ticket_lost", crate::mail::lost_words(core, ticket))
+}
+
+/// What a draft drafted on another account than `now`'s says.
+fn elsewhere() -> Value {
+    refusal(
+        "not_found",
+        "This event was drafted on another account. Switch back to it to go on.",
+    )
 }
 
 /// `gws_event_draft_read`. A ticket that stands for nothing is bound to
-/// `fields`, what the chat drafted the event with, when those came too: a card
-/// from before tickets were kept has only that to go on.
+/// `fields`, what the chat drafted the event with, when those came too and say
+/// the account they were drafted on: that is the only account it may save to,
+/// so one that says none (a card from before) is out of date.
 fn draft_read(core: &Core, args: &Value) -> Value {
     let ticket = js::string_or_empty(args.get("ticket"));
-    let held = match crate::mail::subject_of(core, &ticket) {
-        Some(Subject::EventDraft(fields)) => Some(fields),
-        Some(_) => None,
-        None => args
-            .get("fields")
-            .filter(|f| f.is_object())
-            .and_then(|f| draft_fields(core, f).ok())
-            .map(|f| f.to_string())
-            .filter(|f| crate::mail::bind(core, &ticket, &Subject::EventDraft(f.clone()))),
-    };
-    let Some(fields) = held.and_then(|fields| serde_json::from_str::<Value>(&fields).ok()) else {
-        return lost();
-    };
     let now = core.accounts.signed_in().map(|(who, _)| who);
-    let drafted = fields["as_account"].as_str();
-    if drafted.is_some() && drafted != now.as_deref() {
-        return refusal(
-            "not_found",
-            "This event was drafted on another account. Switch back to it to go on.",
-        );
+    let held = match crate::mail::place(core, &ticket) {
+        crate::mail::Place::Here(Subject::EventDraft(fields)) => fields,
+        crate::mail::Place::Nowhere => {
+            let Some(given) = args.get("fields").filter(|f| f.is_object()) else {
+                return lost(core, &ticket);
+            };
+            // never the account signed in now: only the one it was drafted on
+            let Some(drafted) = given["as_account"].as_str().filter(|a| !a.is_empty()) else {
+                return refusal("ticket_lost", crate::mail::TICKET_GONE);
+            };
+            if Some(drafted) != now.as_deref() {
+                return elsewhere();
+            }
+            let Ok(fields) = draft_fields(drafted, given).map(|f| f.to_string()) else {
+                return lost(core, &ticket);
+            };
+            if !crate::mail::bind(core, &ticket, &Subject::EventDraft(fields.clone())) {
+                return lost(core, &ticket);
+            }
+            fields
+        }
+        crate::mail::Place::Elsewhere => return elsewhere(),
+        _ => return lost(core, &ticket),
+    };
+    let Ok(fields) = serde_json::from_str::<Value>(&held) else {
+        return lost(core, &ticket);
+    };
+    // a draft says whose it is, and only they may see it and save it
+    match fields["as_account"].as_str() {
+        Some(drafted) if Some(drafted) == now.as_deref() => ok(fields),
+        Some(_) => elsewhere(),
+        None => refusal("ticket_lost", crate::mail::TICKET_GONE),
     }
-    ok(fields)
 }
 
 /// Offers the `decide` card with a chat's event draft. Nothing of the event

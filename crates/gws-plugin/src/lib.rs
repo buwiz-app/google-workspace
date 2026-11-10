@@ -266,6 +266,7 @@ impl Core {
     /// install's files. An error says what stayed on disk.
     pub fn uninstall(&self) -> Result<(), gws_store::Error> {
         self.accounts.forget();
+        crate::mail::forget_tickets(self);
         *self.store.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let paths = self.paths.as_ref().map_err(Clone::clone)?;
         match self

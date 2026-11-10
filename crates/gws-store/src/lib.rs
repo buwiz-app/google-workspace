@@ -106,7 +106,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
         13,
         "CREATE TABLE tickets(ticket TEXT PRIMARY KEY, account TEXT NOT NULL, kind TEXT NOT NULL, subject TEXT NOT NULL, card INTEGER NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID;
          CREATE INDEX tickets_of_subject ON tickets(account, kind, subject);
-         CREATE INDEX tickets_by_age ON tickets(card, seq);",
+         CREATE INDEX tickets_by_age ON tickets(card, seq);
+         CREATE INDEX tickets_of_account ON tickets(account, card, seq);",
     ),
 ];
 
@@ -360,7 +361,15 @@ impl Store {
             ));
         }
         for (version, sql) in MIGRATIONS.iter().filter(|m| m.0 > current) {
-            let tx = self.conn.transaction()?;
+            // another process may have run it since `current` was read: the
+            // version is read again under the write lock
+            let tx = self
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let now: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if now >= *version {
+                continue;
+            }
             tx.execute_batch(sql)?;
             tx.execute_batch(&format!("PRAGMA user_version = {version};"))?;
             tx.commit()?;

@@ -821,7 +821,7 @@ pub fn read(core: &Core, args: &Value) -> Result<Value, Failure> {
         match crate::mail::subject_of(core, &ticket) {
             Some(Subject::Draft(id)) => id,
             // nothing in the chat names the draft, so nothing can bind it again
-            _ => return Ok(crate::mail::ticket_lost()),
+            _ => return Ok(crate::mail::lost(core, &ticket)),
         }
     } else {
         js::string_or_empty(args.get("draft"))

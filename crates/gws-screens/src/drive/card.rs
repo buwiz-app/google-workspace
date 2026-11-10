@@ -73,7 +73,9 @@ enum State {
 
 /// Reads the card by its ticket. `query` is the search the chat made it with:
 /// it goes along, so a plugin that kept no tickets past a restart binds the
-/// ticket again.
+/// ticket again, and when the ticket can't be bound (out of date, say) the
+/// search is run itself, as Mail's card does: Run the search again never
+/// asks for the same ticket that just failed.
 async fn read_card(b: &Bridge, ticket: &str, query: Option<&str>) -> State {
     let mut args = json!({"ticket": ticket});
     if let Some(query) = query {
@@ -81,7 +83,17 @@ async fn read_card(b: &Bridge, ticket: &str, query: Option<&str>) -> State {
     }
     match read(b, "gws_drive_card", args).await {
         Ok(v) => match refused(&v) {
-            Some(why) if link_lost(&why) => State::Lost,
+            Some(why) if link_lost(&why) => match query {
+                Some(query) => match read(b, "gws_search_drive", json!({"query": query})).await {
+                    Ok(v) if refused(&v).is_none() => {
+                        let mut rows = rows_in(&v, "items");
+                        rows.truncate(ROWS);
+                        State::Rows(rows, None)
+                    }
+                    _ => State::Lost,
+                },
+                None => State::Lost,
+            },
             Some(why) => State::Line(why),
             None => {
                 let mut rows = rows_in(&v, "rows");

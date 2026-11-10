@@ -1762,7 +1762,9 @@ fn draft(core: &Core, args: &Value) -> Value {
         Ok(fields) => fields,
         Err(why) => return fail("invalid_args", why),
     };
-    let ticket = crate::mail::issue_row(core, &Subject::EventDraft(fields.to_string()));
+    // the account read above, not again: the draft and its ticket are one account's
+    let ticket =
+        crate::mail::issue_row_as(core, &Subject::EventDraft(fields.to_string()), &account);
     ok(json!({"ticket": ticket}))
 }
 
@@ -1830,7 +1832,11 @@ fn elsewhere() -> Value {
 /// so one that says none (a card from before) is out of date.
 fn draft_read(core: &Core, args: &Value) -> Value {
     let ticket = js::string_or_empty(args.get("ticket"));
-    let now = core.accounts.signed_in().map(|(who, _)| who);
+    // signed out, a draft is nobody's to show: that's a sign-in, not another account
+    let Some((now, _)) = core.accounts.signed_in() else {
+        return failed(Failure::AccountRequired);
+    };
+    let now = Some(now);
     let held = match crate::mail::place(core, &ticket) {
         crate::mail::Place::Here(Subject::EventDraft(fields)) => fields,
         crate::mail::Place::Nowhere => {
@@ -1924,6 +1930,31 @@ mod tests {
     use super::*;
 
     const ME: &str = "owner@example.com";
+
+    #[test]
+    fn a_drafts_lines_name_its_first_guests_then_how_many_more() {
+        let guests: Vec<String> = (0..GUESTS_SHOWN + 3)
+            .map(|n| format!("g{n}@example.com"))
+            .collect();
+        let fields = json!({"title": "All hands", "guests": guests, "as_account": ME}).to_string();
+        let lines = draft_lines(&fields, ME);
+        let said = lines
+            .iter()
+            .find(|l| l.contains("g0@example.com"))
+            .expect("a guests line");
+        assert!(
+            said.contains("g9@example.com") && !said.contains("g10@example.com"),
+            "{said}"
+        );
+        assert!(said.ends_with("3 more"), "{said}");
+        // a few guests are all named
+        let few =
+            json!({"title": "Lunch", "guests": ["ana@example.com"], "as_account": ME}).to_string();
+        assert!(draft_lines(&few, ME).iter().any(|l| l == "ana@example.com"));
+        // nobody else's, and nobody's with no account
+        assert!(draft_lines(&fields, "else@example.com").is_empty());
+        assert!(draft_lines(&json!({"title": "x"}).to_string(), ME).is_empty());
+    }
 
     #[test]
     fn an_answer_the_store_wont_take_is_still_sent_and_says_so() {

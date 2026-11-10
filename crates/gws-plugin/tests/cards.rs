@@ -615,10 +615,9 @@ fn a_cards_text_comes_from_whats_kept_and_asks_google_nothing() {
     assert_eq!(none["structuredContent"]["code"], "not_found", "{none}");
     let asked: Vec<String> = google.log()[before..]
         .iter()
-        .filter(|s| s.target.contains("ana") || s.target.contains("ben"))
-        .map(|s| s.target.clone())
+        .map(|s| format!("{} {}", s.method, s.target))
         .collect();
-    assert!(asked.is_empty(), "{asked:?}");
+    assert!(asked.is_empty(), "no request at all: {asked:?}");
 }
 
 #[test]

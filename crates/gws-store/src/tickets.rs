@@ -63,8 +63,14 @@ impl Store {
     /// Keeps each ticket for `account`, as the newest. One already a card's
     /// stays one, and a ticket kept before keeps what it stood for and whose
     /// it is. Rows past [`ROWS_MAX`] go, oldest first; `account`'s cards past
-    /// [`CARDS_MAX`] stand for nothing from then on ([`GONE`]).
-    pub fn keep_tickets(&self, account: &str, tickets: &[Ticket], card: bool) -> Result<()> {
+    /// [`CARDS_MAX`] stand for nothing from then on ([`GONE`]). → the tickets
+    /// that went so now, for whoever holds them elsewhere to drop.
+    pub fn keep_tickets(
+        &self,
+        account: &str,
+        tickets: &[Ticket],
+        card: bool,
+    ) -> Result<Vec<String>> {
         let tx = self.conn.unchecked_transaction()?;
         let mut seq: i64 = tx.query_row("SELECT coalesce(max(seq), 0) FROM tickets", [], |r| {
             r.get(0)
@@ -84,17 +90,20 @@ impl Store {
         )?;
         // an old card's event, search or draft is no longer kept: its ticket is
         // known as gone, so its card says it's out of date
-        tx.execute(
-            "UPDATE tickets SET kind = 'gone', subject = '' WHERE account = ?1 AND card = 1 AND kind != 'gone' AND seq <= \
-             (SELECT seq FROM tickets WHERE account = ?1 AND card = 1 AND kind != 'gone' ORDER BY seq DESC LIMIT 1 OFFSET ?2)",
-            params![account, CARDS_MAX],
-        )?;
+        let gone: Vec<String> = tx
+            .prepare(
+                "UPDATE tickets SET kind = 'gone', subject = '' WHERE account = ?1 AND card = 1 AND kind != 'gone' AND seq <= \
+                 (SELECT seq FROM tickets WHERE account = ?1 AND card = 1 AND kind != 'gone' ORDER BY seq DESC LIMIT 1 OFFSET ?2) \
+                 RETURNING ticket",
+            )?
+            .query_map(params![account, CARDS_MAX], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
         tx.execute(
             "DELETE FROM tickets WHERE kind = 'gone' AND seq <= (SELECT seq FROM tickets WHERE kind = 'gone' ORDER BY seq DESC LIMIT 1 OFFSET ?)",
             [GONE_MAX],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(gone)
     }
 
     /// What the store knows of `ticket`, whoever's it is.
@@ -277,6 +286,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(live, CARDS_MAX);
+        // a keep says which cards went with it
+        let gone = s
+            .keep_tickets("me", &[ticket(9000, "event_draft")], true)
+            .unwrap();
+        assert_eq!(gone, ["tkt_6"]);
     }
 
     #[test]

@@ -420,6 +420,20 @@ impl Tickets {
         self.newer.put(ticket, subject, whose);
     }
 
+    /// Forgets `ticket`, wherever it's held.
+    fn forget(&mut self, ticket: &str) {
+        for held in [
+            &mut self.cards,
+            &mut self.older_cards,
+            &mut self.newer,
+            &mut self.older,
+        ] {
+            if let Some((subject, whose)) = held.by_ticket.remove(ticket) {
+                held.by_subject.remove(&(whose, subject));
+            }
+        }
+    }
+
     /// Forgets every ticket held here. The store's are its own to forget.
     fn clear(&mut self) {
         *self = Self::default();
@@ -436,7 +450,11 @@ fn keeper(core: &Core) -> Option<String> {
 /// one. All are kept in the store as the newest, a `card`'s for good. With no
 /// store they live as long as this process, as they always did.
 fn issue(core: &Core, subjects: &[Subject], card: bool) -> Vec<String> {
-    let account = keeper(core);
+    issue_as(core, subjects, card, keeper(core))
+}
+
+/// [`issue`] for `account`, read once by the caller.
+fn issue_as(core: &Core, subjects: &[Subject], card: bool, account: Option<String>) -> Vec<String> {
     let known: Vec<Option<String>> = {
         let held = core.tickets.lock().unwrap_or_else(|e| e.into_inner());
         subjects
@@ -444,13 +462,29 @@ fn issue(core: &Core, subjects: &[Subject], card: bool) -> Vec<String> {
             .map(|s| held.ticket(&account, s).cloned())
             .collect()
     };
+    // what the store has aged out or no longer has as this account's goes
+    // from here too: a ticket it won't take again is never handed out
+    let mut stale: Vec<String> = Vec::new();
     let kept = account.as_ref().and_then(|account| {
         with_own_store(core, account, |store| {
             let mut tickets = Vec::with_capacity(subjects.len());
             for (subject, known) in subjects.iter().zip(&known) {
                 let (kind, words) = subject.kept();
-                tickets.push(match known {
-                    Some(ticket) => ticket.clone(),
+                let held = match known {
+                    Some(ticket) => match store.ticket(ticket)? {
+                        Some(k)
+                            if k.account != *account
+                                || k.ticket.kind == gws_store::tickets::GONE =>
+                        {
+                            stale.push(ticket.clone());
+                            None
+                        }
+                        _ => Some(ticket.clone()),
+                    },
+                    None => None,
+                };
+                tickets.push(match held {
+                    Some(ticket) => ticket,
                     None => store
                         .ticket_for(account, kind, words)?
                         .unwrap_or_else(buwiz_plugin::new_ticket),
@@ -461,7 +495,7 @@ fn issue(core: &Core, subjects: &[Subject], card: bool) -> Vec<String> {
                 .zip(&tickets)
                 .map(|(subject, ticket)| subject.to_kept(ticket))
                 .collect();
-            store.keep_tickets(account, &rows, card)?;
+            stale.extend(store.keep_tickets(account, &rows, card)?);
             Ok(tickets)
         })
         .inspect_err(|e| eprintln!("buwiz-gws: tickets weren't kept: {e:?}"))
@@ -474,6 +508,9 @@ fn issue(core: &Core, subjects: &[Subject], card: bool) -> Vec<String> {
             .collect()
     });
     let mut held = core.tickets.lock().unwrap_or_else(|e| e.into_inner());
+    for ticket in &stale {
+        held.forget(ticket);
+    }
     for (subject, ticket) in subjects.iter().zip(&tickets) {
         held.put(ticket, subject, &account, card);
     }
@@ -496,6 +533,17 @@ pub fn issue_rows(core: &Core, subjects: &[Subject]) -> Vec<String> {
 /// [`issue_rows`] for one.
 pub fn issue_row(core: &Core, subject: &Subject) -> String {
     issue_rows(core, std::slice::from_ref(subject)).remove(0)
+}
+
+/// [`issue_row`] for `account`, which the caller read once.
+pub(crate) fn issue_row_as(core: &Core, subject: &Subject, account: &str) -> String {
+    issue_as(
+        core,
+        std::slice::from_ref(subject),
+        false,
+        Some(account.to_owned()),
+    )
+    .remove(0)
 }
 
 /// What a ticket is to whoever is signed in now.
@@ -577,7 +625,9 @@ pub(crate) fn bind(core: &Core, ticket: &str, subject: &Subject) -> bool {
         let kept = subject.to_kept(ticket);
         // unkept, it still works until this process ends
         if let Err(e) = with_own_store(core, account, |store| {
-            store.keep_tickets(account, std::slice::from_ref(&kept), true)
+            store
+                .keep_tickets(account, std::slice::from_ref(&kept), true)
+                .map(|_| ())
         }) {
             eprintln!("buwiz-gws: a card's link wasn't kept: {e:?}");
         }
@@ -1014,12 +1064,10 @@ pub fn reconcile(core: &Core) -> bool {
                 store.forget_account(&account)?;
             }
         }
+        held.clear();
         Ok(())
     })
     .is_ok();
-    if cleared {
-        held.clear();
-    }
     drop(held);
     if let Ok(paths) = &core.paths {
         let marker = paths.wipe_pending();
@@ -1049,12 +1097,10 @@ pub(crate) fn forget(core: &Core, account: &str) -> bool {
             crate::files::forget_account(core, store, account)?;
             store.forget_account(account)?;
         }
+        held.clear();
         Ok(())
     })
     .is_ok();
-    if cleared {
-        held.clear();
-    }
     drop(held);
     if !cleared
         && let Ok(paths) = &core.paths

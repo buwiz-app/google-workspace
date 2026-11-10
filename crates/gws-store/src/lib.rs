@@ -106,8 +106,13 @@ const MIGRATIONS: &[(i64, &str)] = &[
         13,
         "CREATE TABLE tickets(ticket TEXT PRIMARY KEY, account TEXT NOT NULL, kind TEXT NOT NULL, subject TEXT NOT NULL, card INTEGER NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID;
          CREATE INDEX tickets_of_subject ON tickets(account, kind, subject);
-         CREATE INDEX tickets_by_age ON tickets(card, seq);
-         CREATE INDEX tickets_of_account ON tickets(account, card, seq);",
+         CREATE INDEX tickets_by_age ON tickets(card, seq);",
+    ),
+    // an account's cards by age, for the ones past its limit (a store that
+    // ran 13 while it carried this has it already)
+    (
+        14,
+        "CREATE INDEX IF NOT EXISTS tickets_of_account ON tickets(account, card, seq);",
     ),
 ];
 

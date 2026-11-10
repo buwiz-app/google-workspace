@@ -1112,20 +1112,14 @@ fn handed(core: &Core, path: &Path, row: &Opened) -> Value {
     }
 }
 
-/// The way the file at `path` goes to this Bot. Only text is read for it, to
-/// see that it's UTF-8; one that can't be read isn't.
+/// The way the file at `path` goes to this Bot. Only text is read for it, a
+/// chunk at a time, to see that it's UTF-8; one that can't be read isn't.
 fn way_here(core: &Core, path: &Path, kind: &handoff::Kind) -> Way {
     if !kind.by_bytes() {
         return handoff::way(&core.documents, kind);
     }
-    let mut bytes = Vec::new();
-    if open_regular(path)
-        .and_then(|mut file| file.read_to_end(&mut bytes))
-        .is_err()
-    {
-        bytes = vec![0xff];
-    }
-    handoff::way_of(&core.documents, kind, &bytes)
+    let utf8 = open_regular(path).is_ok_and(handoff::reads_as_utf8);
+    handoff::way_for(&core.documents, kind, utf8)
 }
 
 /// The attachment `part` of `message`, as a fresh read of it says: its name, its
@@ -1376,6 +1370,18 @@ pub(crate) fn attachment_opens(core: &Core, mime: &str, name: &str) -> bool {
     handoff::declared(mime, extension(name)).is_some_and(|kind| {
         matches!(
             handoff::way(&core.documents, kind),
+            Way::Viewer | Way::System
+        )
+    })
+}
+
+/// Whether these bytes of an attachment open on this Bot, as an open of them
+/// would go: text that isn't UTF-8 may only be saved, and a read ahead keeps
+/// no copy of that.
+pub(crate) fn attachment_bytes_open(core: &Core, mime: &str, name: &str, bytes: &[u8]) -> bool {
+    handoff::declared(mime, extension(name)).is_some_and(|kind| {
+        matches!(
+            handoff::way_of(&core.documents, kind, bytes),
             Way::Viewer | Way::System
         )
     })

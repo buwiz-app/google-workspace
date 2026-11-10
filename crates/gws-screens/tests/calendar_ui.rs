@@ -412,6 +412,31 @@ fn start_with(events: Vec<Value>) -> (Headless, Arc<Fake>) {
     (app, fake)
 }
 
+/// The now-line is drawn over the events, and takes no press: an event
+/// starting this minute opens from its title, which the line lies on. The
+/// grid shows 07:00 to past 16:00 as it opens, so outside those hours the
+/// event is out of view and there's nothing to press.
+#[test]
+fn an_event_under_the_now_line_still_opens() {
+    use chrono::Timelike as _;
+    let now = Local::now();
+    if !(7..16).contains(&now.hour()) {
+        eprintln!(
+            "the now-line is out of view at {}: nothing to press",
+            now.format("%H:%M")
+        );
+        return;
+    }
+    let start = at(0, now.hour(), now.minute());
+    let end = at(0, now.hour() + 1, now.minute());
+    let (mut app, _) = start_with(vec![event("n1", "mine", "Right now", start, end)]);
+    assert!(
+        app.screen().matches("id:now-line").unwrap(),
+        "the line shows today"
+    );
+    open(&mut app, "Right now");
+}
+
 fn start() -> (Headless, Arc<Fake>) {
     let (app, fake) = start_with(a_day());
     assert!(
@@ -1756,6 +1781,30 @@ fn a_draft_card_sends_what_the_chat_drafted_so_a_lost_ticket_is_bound_again() {
     );
     assert!(app.screen().shows("Quarterly plan"));
     assert!(!app.screen().shows(LINK_LOST));
+}
+
+/// The card says the account it was drafted on: the fields go with it, so
+/// the plugin binds the ticket to that account and no other.
+#[test]
+fn a_draft_card_sends_the_account_it_was_drafted_on_with_the_chats_fields() {
+    let drafted = json!({"title": "Quarterly plan", "start": at(2, 10, 0), "end": at(2, 11, 0)});
+    let (mut app, fake) = card(
+        json!({"draft": "tk1", "account": "me@example.com", "origin": {"tool": "gws_event_draft", "args": drafted}}),
+        |f| {
+            *f.draft_lost.lock().unwrap() = true;
+            *f.draft.lock().unwrap() = a_draft(0);
+        },
+        420.0,
+        420.0,
+    );
+    app.wait_for_within("label:Keep draft", WAIT)
+        .expect("the card shows");
+    let mut sent = drafted.clone();
+    sent["as_account"] = json!("me@example.com");
+    assert_eq!(
+        last(&fake, "gws_event_draft_read"),
+        json!({"ticket": "tk1", "fields": sent})
+    );
 }
 
 #[test]

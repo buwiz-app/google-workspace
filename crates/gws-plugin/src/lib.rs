@@ -345,3 +345,39 @@ impl Plugin for Gws {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// The host's word for whose screen calls: `gws_card_text` hears it, so
+    /// a call no app made is refused before anything is looked up.
+    #[test]
+    fn a_calls_app_is_the_hosts_caller_app() {
+        let mut gws = Gws {
+            core: Arc::new(Core::new(
+                &Apis::at("http://127.0.0.1:9"),
+                Err(gws_store::Error {
+                    code: "none",
+                    message: "no store".to_owned(),
+                }),
+            )),
+        };
+        let args: Args =
+            serde_json::from_value(json!({"ticket": "tkt_0123456789ABCDEFGHJKMNPQRS"})).unwrap();
+        let said = |caller: Value, gws: &mut Gws| {
+            let caller = Caller::of(&json!({"_meta": {"buwiz/caller": caller}}));
+            gws.call(tools::CARD_TEXT, &args, &caller)["structuredContent"]["message"].clone()
+        };
+        assert_eq!(
+            said(json!({"origin": "app", "app": "mail"}), &mut gws),
+            "Nothing of this card is kept on this Mac."
+        );
+        assert_eq!(
+            said(json!({"origin": "agent"}), &mut gws),
+            "Only a card's own app reads what it showed."
+        );
+    }
+}

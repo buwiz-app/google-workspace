@@ -278,6 +278,30 @@ fn only_a_ticket_is_ever_bound_and_no_card_says_out_of_date() {
     assert!(!said.contains("out of date"), "{said}");
 }
 
+/// A decide card says the account it was drafted on, so a process that kept
+/// none of its tickets binds it again from the chat's call, to that account.
+#[test]
+fn a_lost_draft_card_binds_again_to_the_account_its_card_says() {
+    let google = FakeGoogle::start(Seed::demo(4));
+    let first = started(&google.base(), &folder("draft-made"));
+    let made = first.run_for_chat("gws_event_draft", &event());
+    let props = made["_meta"]["buwiz/open"]["props"].clone();
+    assert_eq!(props["account"], FAKE_EMAIL, "{made}");
+    drop(first);
+    // another store: nothing of the ticket is kept there
+    let core = started(&google.base(), &folder("draft-lost"));
+    let mut fields = event();
+    fields["as_account"] = props["account"].clone();
+    let read = data(core.run(
+        "gws_event_draft_read",
+        &json!({"ticket": props["draft"], "fields": fields}),
+    ));
+    assert_eq!(
+        (read["title"].clone(), read["as_account"].clone()),
+        (json!("Lunch"), json!(FAKE_EMAIL))
+    );
+}
+
 #[test]
 fn signing_out_takes_the_accounts_tickets_with_its_mail() {
     let google = FakeGoogle::start(Seed {
@@ -591,10 +615,9 @@ fn a_cards_text_comes_from_whats_kept_and_asks_google_nothing() {
     assert_eq!(none["structuredContent"]["code"], "not_found", "{none}");
     let asked: Vec<String> = google.log()[before..]
         .iter()
-        .filter(|s| s.target.contains("ana") || s.target.contains("ben"))
-        .map(|s| s.target.clone())
+        .map(|s| format!("{} {}", s.method, s.target))
         .collect();
-    assert!(asked.is_empty(), "{asked:?}");
+    assert!(asked.is_empty(), "no request at all: {asked:?}");
 }
 
 #[test]

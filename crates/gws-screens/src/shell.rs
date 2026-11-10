@@ -92,7 +92,9 @@ pub(crate) async fn once(b: &Bridge, tool: &str, args: Value) -> Result<Value, S
 pub(crate) const LINK_LOST: &str = "This card lost its link when the plugin restarted.";
 
 /// Whether a card's read was refused for its ticket. A plugin from before
-/// tickets were kept said the second.
+/// tickets were kept said the second. A ticket of another account's isn't
+/// one: "This card is from another account." is shown as it's said, with no
+/// press, as running the card again would read the account signed in now.
 pub(crate) fn link_lost(why: &str) -> bool {
     why == LINK_LOST || why == "This card is out of date."
 }

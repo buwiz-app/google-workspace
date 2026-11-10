@@ -159,7 +159,7 @@ fn app(a: &App) -> Value {
     if a.card {
         entry["placement"] = json!(["full", "inline"]);
         entry["inline"] = json!({ "width": 420, "height": 96, "min_height": 96, "max_height": 480, "resizable": false, "wait_ready": true });
-        entry["props"] = json!({ "type": "object", "properties": { "search": { "type": "string", "maxLength": 30 }, "thread": { "type": "string", "maxLength": 30 }, "draft": { "type": "string", "maxLength": 30 }, "view": { "type": "string", "maxLength": 30 }, "folder": { "type": "string", "maxLength": 256 }, "event": { "type": "object", "properties": { "calendar": { "type": "string", "maxLength": 512 }, "id": { "type": "string", "maxLength": 512 } } } } });
+        entry["props"] = json!({ "type": "object", "properties": { "search": { "type": "string", "maxLength": 30 }, "thread": { "type": "string", "maxLength": 30 }, "draft": { "type": "string", "maxLength": 30 }, "account": { "type": "string", "maxLength": 320 }, "view": { "type": "string", "maxLength": 30 }, "folder": { "type": "string", "maxLength": 256 }, "event": { "type": "object", "properties": { "calendar": { "type": "string", "maxLength": 512 }, "id": { "type": "string", "maxLength": 512 } } } } });
     }
     if a.files {
         permissions["pick_file"] =

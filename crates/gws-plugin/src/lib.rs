@@ -64,8 +64,9 @@ pub struct Core {
     store: Mutex<Option<Store>>,
     /// Wakes the background sync.
     pub sync: mail::Waker,
-    /// What a card's tickets stand for: a search, or a thread.
-    pub tickets: Mutex<mail::Tickets>,
+    /// What tickets stand for, as this process knows: the store keeps them
+    /// past it ([`mail::subject_of`]).
+    pub(crate) tickets: Mutex<mail::Tickets>,
     /// The Bot has told this process who is signed in.
     pub pushed: std::sync::atomic::AtomicBool,
     /// Whether it has finished telling.
@@ -236,7 +237,7 @@ impl Core {
     pub fn run_for_chat(&self, tool: &str, args: &Value) -> Value {
         let mut result = self.run_for_model(tool, args);
         mail::offer_card(self, tool, args, &mut result);
-        calendar::offer_card(tool, &mut result);
+        calendar::offer_card(self, tool, &mut result);
         drive::offer_card(self, tool, args, &mut result);
         result
     }
@@ -317,16 +318,11 @@ impl Plugin for Gws {
 
     fn ticket_title(&mut self, ticket: &str) -> Option<String> {
         // a title says what it is, never what it stands for
-        self.core
-            .tickets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .subject(ticket)
-            .map(|subject| match subject {
-                mail::Subject::EventDraft(_) => manifest::APPS[1].title.to_owned(),
-                mail::Subject::DriveSearch(_) => manifest::APPS[2].title.to_owned(),
-                _ => manifest::APPS[0].title.to_owned(),
-            })
+        mail::subject_of(&self.core, ticket).map(|subject| match subject {
+            mail::Subject::EventDraft(_) => manifest::APPS[1].title.to_owned(),
+            mail::Subject::DriveSearch(_) => manifest::APPS[2].title.to_owned(),
+            _ => manifest::APPS[0].title.to_owned(),
+        })
     }
 
     fn uninstall(&mut self) {

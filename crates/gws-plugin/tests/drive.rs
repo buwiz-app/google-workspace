@@ -1030,7 +1030,7 @@ fn a_chats_search_offers_a_card_and_the_ticket_reads_it_back() {
         ("gws_drive_card", json!({"ticket": "tkt_nothing"})),
         ("gws_drive_list", json!({"search": "tkt_nothing"})),
     ] {
-        assert_eq!(refusal(&core.run(tool, &args)), "not_found", "{tool}");
+        assert_eq!(refusal(&core.run(tool, &args)), "ticket_lost", "{tool}");
     }
 }
 
@@ -1042,12 +1042,12 @@ fn a_mail_ticket_opens_no_drive_search_and_a_drive_one_no_mail_search() {
     let ticket = open_of(&mail)["props"]["search"].as_str().unwrap();
     assert_eq!(
         refusal(&core.run("gws_drive_card", &json!({"ticket": ticket}))),
-        "not_found"
+        "ticket_lost"
     );
     let drive = core.run_for_chat("gws_search_drive", &json!({"query": "meeting"}));
     let ticket = open_of(&drive)["props"]["search"].as_str().unwrap();
     let card = core.run("gws_mail_card", &json!({"ticket": ticket}));
-    assert_eq!(card["structuredContent"]["code"], "not_found", "{card}");
+    assert_eq!(card["structuredContent"]["code"], "ticket_lost", "{card}");
 }
 
 fn resolved(core: &Core, args: Value) -> Value {

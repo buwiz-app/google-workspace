@@ -818,10 +818,10 @@ pub fn read(core: &Core, args: &Value) -> Result<Value, Failure> {
     let ticket = js::string_or_empty(args.get("ticket"));
     let review = !ticket.is_empty() || args.get("review") == Some(&Value::Bool(true));
     let id = if !ticket.is_empty() {
-        let tickets = core.tickets.lock().unwrap_or_else(|e| e.into_inner());
-        match tickets.subject(&ticket) {
-            Some(Subject::Draft(id)) => id.clone(),
-            _ => return Ok(fail("not_found", "This card is out of date.")),
+        match crate::mail::subject_of(core, &ticket) {
+            Some(Subject::Draft(id)) => id,
+            // nothing in the chat names the draft, so nothing can bind it again
+            _ => return Ok(crate::mail::ticket_lost()),
         }
     } else {
         js::string_or_empty(args.get("draft"))

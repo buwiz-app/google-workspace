@@ -114,7 +114,8 @@ impl Store {
              UNION SELECT account FROM calendars UNION SELECT account FROM events \
              UNION SELECT account FROM drive_files UNION SELECT account FROM drive_views \
              UNION SELECT account FROM opened UNION SELECT account FROM picture_senders \
-             UNION SELECT account FROM attachment_bytes UNION SELECT account FROM ahead_passed",
+             UNION SELECT account FROM attachment_bytes UNION SELECT account FROM ahead_passed \
+             UNION SELECT account FROM tickets",
         )?;
         let accounts = q
             .query_map([], |r| r.get(0))?
@@ -164,6 +165,7 @@ impl Store {
             "drive_views",
             "drive_files",
             "picture_senders",
+            "tickets",
             "state",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE account = ?"), [account])?;

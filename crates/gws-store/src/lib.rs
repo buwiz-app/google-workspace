@@ -23,6 +23,7 @@ pub mod mail;
 pub mod open;
 pub mod pictures;
 pub mod prefetch;
+pub mod tickets;
 
 pub const DATA_DIR_ENV: &str = "GWS_DATA_DIR";
 /// How long a locked store is waited for.
@@ -98,6 +99,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
          CREATE TABLE ahead_passed(account TEXT NOT NULL, thread TEXT NOT NULL, at INTEGER NOT NULL, messages INTEGER NOT NULL, misses INTEGER NOT NULL, PRIMARY KEY(account, thread)) WITHOUT ROWID;
          ALTER TABLE bodies ADD COLUMN fetched INTEGER NOT NULL DEFAULT 0;
          ALTER TABLE bodies ADD COLUMN tries INTEGER NOT NULL DEFAULT 0;",
+    ),
+    // what a card's ticket stands for, so a card outlives the process that
+    // issued it; `seq` is how new one is, for the rows that age out
+    (
+        13,
+        "CREATE TABLE tickets(ticket TEXT PRIMARY KEY, account TEXT NOT NULL, kind TEXT NOT NULL, subject TEXT NOT NULL, card INTEGER NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID;
+         CREATE INDEX tickets_of_subject ON tickets(account, kind, subject);
+         CREATE INDEX tickets_by_age ON tickets(card, seq);",
     ),
 ];
 
@@ -666,6 +675,7 @@ mod tests {
                  DROP TABLE picture_senders;
                  DROP TABLE attachment_bytes;
                  DROP TABLE ahead_passed;
+                 DROP TABLE tickets;
                  ALTER TABLE bodies DROP COLUMN fetched;
                  ALTER TABLE bodies DROP COLUMN tries;
                  ALTER TABLE drive_files DROP COLUMN can;
@@ -690,6 +700,7 @@ mod tests {
                  DROP TABLE picture_senders;
                  DROP TABLE attachment_bytes;
                  DROP TABLE ahead_passed;
+                 DROP TABLE tickets;
                  ALTER TABLE bodies DROP COLUMN fetched;
                  ALTER TABLE bodies DROP COLUMN tries;
                  PRAGMA user_version = 9;",

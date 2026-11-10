@@ -751,7 +751,7 @@ mod mail {
                 "gws_mail_card",
                 &json!({"ticket": "tkt_00000000000000000000000000"})
             )["structuredContent"]["code"],
-            "not_found"
+            "ticket_lost"
         );
     }
 

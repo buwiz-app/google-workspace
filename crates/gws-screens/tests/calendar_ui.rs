@@ -122,6 +122,8 @@ struct Fake {
     signed_out: Mutex<bool>,
     /// A draft read is refused, as an old ticket is.
     draft_gone: Mutex<bool>,
+    /// A draft card's ticket stands for nothing, until its fields come with it.
+    draft_lost: Mutex<bool>,
     /// A save is refused: someone else's version of the event, which goes in.
     changed: Mutex<Option<Value>>,
     calls: Mutex<Vec<(String, Value)>>,
@@ -347,6 +349,15 @@ impl Host for Fake {
                 let back = event("e2", "work", "Dentist", at(0, 9, 30), at(0, 10, 30));
                 self.events.lock().unwrap().push(back.clone());
                 (tool.to_owned(), json!({"event": back}))
+            }
+            // a plugin that binds a lost ticket again to the fields sent along
+            "gws_event_draft_read"
+                if *self.draft_lost.lock().unwrap() && !args["fields"].is_object() =>
+            {
+                (
+                    tool.to_owned(),
+                    json!({"refused": "ticket_lost", "message": LINK_LOST}),
+                )
             }
             "gws_event_draft_read" if *self.draft_gone.lock().unwrap() => (
                 tool.to_owned(),
@@ -1699,6 +1710,88 @@ fn draft_card(draft: Value, width: f32) -> (Headless, Arc<Fake>) {
     app.wait_for_within("label:Keep draft", WAIT)
         .expect("the card shows");
     (app, fake)
+}
+
+const LINK_LOST: &str = "This card lost its link when the plugin restarted.";
+
+#[test]
+fn a_draft_card_whose_ticket_is_lost_says_so_and_opens_calendar() {
+    let (mut app, fake) = card(
+        json!({"draft": "tk1"}),
+        |f| *f.draft_lost.lock().unwrap() = true,
+        420.0,
+        420.0,
+    );
+    app.wait_for_within(&format!("text:{LINK_LOST}"), WAIT)
+        .expect("it says what happened");
+    assert!(!app.screen().matches("label:Save this event").unwrap());
+    assert!(!app.screen().matches("label:Try again").unwrap());
+    assert_eq!(
+        last(&fake, "gws_event_draft_read"),
+        json!({"ticket": "tk1"})
+    );
+    press(&mut app, "label:Open Calendar");
+    let opened = fake.host.lock().unwrap().clone();
+    assert_eq!(opened[0].1["app"], "calendar");
+    assert_eq!(opened[0].1["props"], json!({}));
+}
+
+#[test]
+fn a_draft_card_sends_what_the_chat_drafted_so_a_lost_ticket_is_bound_again() {
+    let drafted = json!({"title": "Quarterly plan", "start": at(2, 10, 0), "end": at(2, 11, 0)});
+    let (mut app, fake) = card(
+        json!({"draft": "tk1", "origin": {"tool": "gws_event_draft", "args": drafted}}),
+        |f| {
+            *f.draft_lost.lock().unwrap() = true;
+            *f.draft.lock().unwrap() = a_draft(0);
+        },
+        420.0,
+        420.0,
+    );
+    app.wait_for_within("label:Keep draft", WAIT)
+        .expect("the card shows");
+    assert_eq!(
+        last(&fake, "gws_event_draft_read"),
+        json!({"ticket": "tk1", "fields": drafted})
+    );
+    assert!(app.screen().shows("Quarterly plan"));
+    assert!(!app.screen().shows(LINK_LOST));
+}
+
+#[test]
+fn a_lost_draft_card_that_knows_its_event_can_try_again() {
+    let drafted = json!({"title": "Quarterly plan", "start": at(2, 10, 0), "end": at(2, 11, 0)});
+    let (mut app, fake) = card(
+        // a search's call is not this card's
+        json!({"draft": "tk1", "origin": {"tool": "gws_search_events", "args": drafted}}),
+        |f| *f.draft_lost.lock().unwrap() = true,
+        420.0,
+        420.0,
+    );
+    app.wait_for_within(&format!("text:{LINK_LOST}"), WAIT)
+        .expect("it says what happened");
+    assert_eq!(
+        last(&fake, "gws_event_draft_read"),
+        json!({"ticket": "tk1"})
+    );
+
+    let (mut app, fake) = card(
+        json!({"draft": "tk1", "origin": {"tool": "gws_event_draft", "args": drafted}}),
+        // a plugin from before tickets were kept takes no fields
+        |f| {
+            *f.draft.lock().unwrap() =
+                json!({"refused": "not_found", "message": "This card is out of date."})
+        },
+        420.0,
+        420.0,
+    );
+    app.wait_for_within(&format!("text:{LINK_LOST}"), WAIT)
+        .expect("it says what happened");
+    assert!(!app.screen().shows("This card is out of date."));
+    *fake.draft.lock().unwrap() = a_draft(0);
+    press(&mut app, "label:Try again");
+    app.wait_for_within("label:Keep draft", WAIT)
+        .expect("the card shows");
 }
 
 #[test]

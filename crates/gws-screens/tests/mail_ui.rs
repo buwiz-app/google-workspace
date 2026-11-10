@@ -97,6 +97,13 @@ struct Fake {
     nothing_saved: Mutex<bool>,
     /// What a mail card reads.
     card: Mutex<Value>,
+    /// A card's ticket stands for nothing: `new` is a plugin that binds it
+    /// again to a query sent along, `old` one from before tickets were kept.
+    card_lost: Mutex<Option<&'static str>>,
+    /// The same for a draft's card, which nothing can bind again.
+    draft_lost: Mutex<bool>,
+    /// What the screens asked the Bot to open.
+    opened: Mutex<Vec<Value>>,
     /// Google's sign-in went: lists fail as the plugin says so.
     signed_out: Mutex<bool>,
     /// In place of an attachment opening.
@@ -206,6 +213,9 @@ impl Host for Fake {
     fn post(&self, _: &str, _: Value) {}
 
     fn call(&self, method: &str, data: Value, done: Done) {
+        if method == "buwiz.open" {
+            self.opened.lock().unwrap().push(data.clone());
+        }
         if method != "buwiz.call" {
             return done(Err(BuwizError::new(
                 "invalid",
@@ -267,6 +277,21 @@ impl Host for Fake {
                 args["label"].as_str().unwrap_or_default().to_owned(),
                 json!({"threads": [], "more": false, "saved": true}),
             ),
+            "gws_mail_card" | "gws_mail_draft_read"
+                if match (tool, *self.card_lost.lock().unwrap()) {
+                    ("gws_mail_draft_read", _) => *self.draft_lost.lock().unwrap(),
+                    (_, Some("old")) => true,
+                    (_, Some(_)) => !args["query"].is_string(),
+                    (_, None) => false,
+                } =>
+            {
+                let old = *self.card_lost.lock().unwrap() == Some("old");
+                return done(Err(if old {
+                    BuwizError::new("not_found", false, "This card is out of date.")
+                } else {
+                    BuwizError::new("ticket_lost", false, LINK_LOST)
+                }));
+            }
             "gws_mail_card" => (String::new(), self.card.lock().unwrap().clone()),
             "gws_mail_list" => {
                 let mut answer = list(args);
@@ -2208,6 +2233,127 @@ fn a_person_with_no_labels_of_their_own_is_told_so() {
 fn press_row(app: &mut Headless) {
     app.press("text:Subject 2").expect("the row presses");
     settle(app);
+}
+
+const LINK_LOST: &str = "This card lost its link when the plugin restarted.";
+
+fn some_card() -> Value {
+    json!({"rows": [{"sender": "Ana Reyes", "subject": "Roof quote", "at": 1_700_000_000_000i64, "unread": false, "ticket": "tkt_row"}], "more": false, "saved": false})
+}
+
+/// A search card that came with the chat's tool call, as the Bot hands it over.
+fn card_with_origin(fake: Arc<Fake>, tool: &str) -> (Headless, Filter) {
+    *fake.inline.lock().unwrap() = true;
+    *fake.props.lock().unwrap() = json!({"search": "tk1", "origin": {"tool": tool, "args": {"query": " from:ana ", "limit": 10}}});
+    audited(&fake, 420.0, 400.0)
+}
+
+#[test]
+fn a_card_sends_the_chats_search_with_its_ticket_so_a_lost_one_is_bound_again() {
+    let fake = Arc::new(Fake::default());
+    *fake.card.lock().unwrap() = some_card();
+    *fake.card_lost.lock().unwrap() = Some("new");
+    let (mut app, _) = card_with_origin(fake.clone(), "gws_search_mail");
+    app.wait_for_within("text:Roof quote", WAIT)
+        .expect("its mail shows");
+    assert_eq!(
+        fake.called("gws_mail_card")[0],
+        json!({"ticket": "tk1", "query": "from:ana"})
+    );
+    assert!(!app.screen().shows(LINK_LOST));
+    assert!(
+        fake.called("gws_mail_list").is_empty(),
+        "the card's own read did"
+    );
+}
+
+#[test]
+fn with_a_plugin_that_kept_no_tickets_the_card_runs_the_chats_search_itself() {
+    let fake = Arc::new(Fake::default());
+    *fake.card_lost.lock().unwrap() = Some("old");
+    let (mut app, _) = card_with_origin(fake.clone(), "gws_search_mail");
+    app.wait_for_within("text:Subject 2", WAIT)
+        .expect("the search's mail shows");
+    assert_eq!(
+        fake.called("gws_mail_list")[0],
+        json!({"query": "from:ana"})
+    );
+    assert!(!app.screen().shows("This card is out of date."));
+    assert!(!app.screen().shows("Subject 5"), "a card's five rows");
+    app.press("text:Subject 2").expect("a row presses");
+    settle(&mut app);
+    let opened = fake.opened.lock().unwrap().clone();
+    assert_eq!(opened[0]["app"], "mail");
+    assert_eq!(opened[0]["props"], json!({"thread": "t2"}));
+}
+
+#[test]
+fn a_lost_card_with_nothing_to_go_on_says_so_and_opens_mail() {
+    for lost in ["new", "old"] {
+        let fake = Arc::new(Fake::default());
+        *fake.card_lost.lock().unwrap() = Some(lost);
+        let (mut app, _) = card_of(fake.clone());
+        app.wait_for_within(&format!("text:{LINK_LOST}"), WAIT)
+            .expect("it says what happened");
+        assert!(!app.screen().shows("This card is out of date."), "{lost}");
+        assert_eq!(fake.called("gws_mail_card")[0], json!({"ticket": "tk1"}));
+        assert!(!app.screen().matches("label:Run the search again").unwrap());
+        app.press("label:Open Mail").expect("the press is there");
+        settle(&mut app);
+        let opened = fake.opened.lock().unwrap().clone();
+        assert_eq!(
+            (&opened[0]["app"], &opened[0]["props"]),
+            (&json!("mail"), &json!({}))
+        );
+    }
+}
+
+#[test]
+fn another_tools_call_is_not_this_cards_search() {
+    let fake = Arc::new(Fake::default());
+    *fake.card_lost.lock().unwrap() = Some("new");
+    let (mut app, _) = card_with_origin(fake.clone(), "gws_search_drive");
+    app.wait_for_within(&format!("text:{LINK_LOST}"), WAIT)
+        .expect("it says what happened");
+    assert_eq!(fake.called("gws_mail_card")[0], json!({"ticket": "tk1"}));
+    assert!(fake.called("gws_mail_list").is_empty());
+}
+
+#[test]
+fn a_search_that_cant_run_yet_can_be_run_again_from_the_card() {
+    let fake = Arc::new(Fake::default());
+    *fake.card.lock().unwrap() = some_card();
+    *fake.card_lost.lock().unwrap() = Some("old");
+    *fake.signed_out.lock().unwrap() = true;
+    let (mut app, _) = card_with_origin(fake.clone(), "gws_search_mail");
+    app.wait_for_within(&format!("text:{LINK_LOST}"), WAIT)
+        .expect("it says what happened");
+    // the plugin was updated since: it binds the ticket now
+    *fake.card_lost.lock().unwrap() = Some("new");
+    app.press("label:Run the search again")
+        .expect("the press is there");
+    app.wait_for_within("text:Roof quote", WAIT)
+        .expect("its mail shows");
+    assert!(!app.screen().shows(LINK_LOST));
+}
+
+#[test]
+fn a_draft_card_whose_ticket_is_lost_says_so_and_opens_drafts() {
+    let fake = Arc::new(Fake::default());
+    *fake.inline.lock().unwrap() = true;
+    *fake.props.lock().unwrap() = json!({"draft": "tk1"});
+    *fake.draft_lost.lock().unwrap() = true;
+    let (mut app, _) = audited(&fake, 420.0, 400.0);
+    app.wait_for_within(&format!("text:{LINK_LOST}"), WAIT)
+        .expect("it says what happened");
+    assert!(
+        !app.screen().matches("label:Send").unwrap(),
+        "nothing to send"
+    );
+    app.press("label:Open Mail").expect("the press is there");
+    settle(&mut app);
+    let opened = fake.opened.lock().unwrap().clone();
+    assert_eq!(opened[0]["props"], json!({"view": "DRAFT"}));
 }
 
 fn card_of(fake: Arc<Fake>) -> (Headless, Filter) {

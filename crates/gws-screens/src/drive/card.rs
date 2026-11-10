@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use super::file::{Row, rows_in};
 use super::{refused, value};
 use crate::compose::press_text;
-use crate::shell::{DIM, INK, LINE, MUTE, PANEL, read};
+use crate::shell::{DIM, INK, LINE, MUTE, PANEL, RUN_AGAIN, link_lost, lost_card, origin, read};
 
 /// The most files a card shows, however many the answer holds.
 const ROWS: usize = 5;
@@ -54,13 +54,39 @@ fn row(b: &Bridge, ticket: &str, r: &Row) -> View {
         )
 }
 
-pub(super) fn files(b: Bridge) -> View {
-    #[derive(Clone, PartialEq)]
-    enum State {
-        Loading,
-        Rows(Vec<Row>, bool),
-        Line(String),
+#[derive(Clone, PartialEq)]
+enum State {
+    Loading,
+    Rows(Vec<Row>, bool),
+    Line(String),
+    /// Its ticket stands for nothing.
+    Lost,
+}
+
+/// Reads the card by its ticket. `query` is the search the chat made it with:
+/// it goes along, so a plugin that kept no tickets past a restart binds the
+/// ticket again.
+async fn read_card(b: &Bridge, ticket: &str, query: Option<&str>) -> State {
+    let mut args = json!({"ticket": ticket});
+    if let Some(query) = query {
+        args["query"] = json!(query);
     }
+    match read(b, "gws_drive_card", args).await {
+        Ok(v) => match refused(&v) {
+            Some(why) if link_lost(&why) => State::Lost,
+            Some(why) => State::Line(why),
+            None => {
+                let mut rows = rows_in(&v, "rows");
+                rows.truncate(ROWS);
+                State::Rows(rows, v.get("saved") == Some(&Value::Bool(true)))
+            }
+        },
+        Err(e) if e == "sign-in" => State::Line("Sign in to Google first.".to_owned()),
+        Err(e) => State::Line(e),
+    }
+}
+
+pub(super) fn files(b: Bridge) -> View {
     let state = signal(State::Loading);
     let ticket = b
         .props()
@@ -68,27 +94,24 @@ pub(super) fn files(b: Bridge) -> View {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let (reader, asked) = (b.clone(), ticket.clone());
-    b.spawn(async move {
-        match read(&reader, "gws_drive_card", json!({"ticket": asked})).await {
-            Ok(v) => match refused(&v) {
-                Some(why) => state.set(State::Line(why)),
-                None => {
-                    let mut rows = rows_in(&v, "rows");
-                    rows.truncate(ROWS);
-                    state.set(State::Rows(
-                        rows,
-                        v.get("saved") == Some(&Value::Bool(true)),
-                    ));
-                }
-            },
-            Err(e) if e == "sign-in" => {
-                state.set(State::Line("Sign in to Google first.".to_owned()));
-            }
-            Err(e) => state.set(State::Line(e)),
+    let query = origin(&b, "gws_search_drive")
+        .and_then(|args| Some(args.get("query")?.as_str()?.trim().to_owned()))
+        .filter(|q| !q.is_empty());
+    // a read asked for by a press outlives the press's own part of the card
+    let (reads, waiting) = tokio::sync::mpsc::unbounded_channel::<crate::shell::Job>();
+    b.spawn(crate::compose::work(waiting));
+    let load = {
+        let (b, ticket, query) = (b.clone(), ticket.clone(), query.clone());
+        move || {
+            let (reader, ticket, query) = (b.clone(), ticket.clone(), query.clone());
+            state.set(State::Loading);
+            drop(reads.send(Box::pin(async move {
+                state.set(read_card(&reader, &ticket, query.as_deref()).await);
+                reader.ready();
+            })));
         }
-        reader.ready();
-    });
+    };
+    load();
     let (fit, press) = (b.clone(), b);
     view()
         .app_class(Some(PANEL.into()))
@@ -100,6 +123,15 @@ pub(super) fn files(b: Bridge) -> View {
         .child(dynamic(move || match state.get() {
             State::Loading => plain("Looking…".to_owned()),
             State::Line(line) => plain(line),
+            State::Lost if query.is_some() => lost_card(RUN_AGAIN, load.clone()),
+            // nothing says what the search was: Drive is where to make it again
+            State::Lost => {
+                let b = press.clone();
+                lost_card("Open Drive", move || {
+                    let open = b.open("drive", json!({}));
+                    b.spawn(async move { drop(open.await) });
+                })
+            }
             State::Rows(rows, _) if rows.is_empty() => plain("No files match.".to_owned()),
             State::Rows(rows, saved) => {
                 let list = rows

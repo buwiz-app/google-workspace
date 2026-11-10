@@ -595,9 +595,13 @@ fn rows_covered(m: Drive) -> bool {
 
 fn keys(b: Bridge, m: Drive) {
     // never while typing in a field, where these keys are the field's own
+    // Buwiz Bot's newer nsh adds fields to KeyOptions; this plugin's own
+    // nsh pin has none left over. Drop the allow when the pin moves up.
+    #[allow(clippy::needless_update)]
     let options = KeyOptions {
         when: When::NotEditing,
         repeat: true,
+        ..Default::default()
     };
     let free = move || {
         matches!(
@@ -650,9 +654,13 @@ fn keys(b: Bridge, m: Drive) {
             m.search_box.focus();
         }
     });
+    // Buwiz Bot's newer nsh adds fields to KeyOptions; this plugin's own
+    // nsh pin has none left over. Drop the allow when the pin moves up.
+    #[allow(clippy::needless_update)]
     let once = KeyOptions {
         when: When::NotEditing,
         repeat: false,
+        ..Default::default()
     };
     on_key_with("f2", once, move |_| {
         if free() {

@@ -1,6 +1,6 @@
 [package]
 name = "buwiz-gws"
-version = "1.4.0"
+version = "1.5.0"
 description = "The first-party Google Workspace plugin (app.buwiz.google-workspace): Gmail, Calendar and Drive with the Google account Buwiz Bot signs in to"
 edition.workspace = true
 license.workspace = true

@@ -2404,13 +2404,40 @@ fn offline_a_card_keeps_its_mail_says_from_when_and_retry_reads_again() {
 }
 
 #[test]
-fn signed_out_a_card_keeps_its_mail_and_shows_the_way_to_sign_in() {
+fn offline_with_nothing_kept_a_card_says_so_with_retry_not_that_nothing_matches() {
     let fake = Arc::new(Fake::default());
-    *fake.card.lock().unwrap() = kept_card(Some("signed_out"), Some(now_ms()));
+    let mut card = kept_card(Some("offline"), None);
+    card["rows"] = json!([]);
+    *fake.card.lock().unwrap() = card;
+    let (mut app, _) = card_of(fake.clone());
+    app.wait_for_within("text:Offline · saved emails ·", WAIT)
+        .expect("it says why");
+    assert!(
+        app.screen()
+            .shows("Nothing of this card was saved on this Mac.")
+    );
+    assert!(!app.screen().shows("No mail matches this now."));
+    assert!(app.screen().matches("label:Retry").unwrap());
+}
+
+#[test]
+fn signed_out_a_card_keeps_its_mail_and_shows_the_way_to_sign_in() {
+    use chrono::TimeZone as _;
+    let at = now_ms();
+    let clock = chrono::Local
+        .timestamp_millis_opt(at)
+        .unwrap()
+        .format("%H:%M")
+        .to_string();
+    let fake = Arc::new(Fake::default());
+    *fake.card.lock().unwrap() = kept_card(Some("signed_out"), Some(at));
     let (mut app, _) = card_of(fake.clone());
     app.wait_for_within("text:Roof quote", WAIT)
         .expect("the kept mail shows");
-    assert!(app.screen().shows("Signed out ·"));
+    assert!(
+        app.screen()
+            .shows(&format!("Signed out · emails from {clock} ·"))
+    );
     assert!(!app.screen().matches("label:Retry").unwrap());
     app.press("label:Sign in to refresh").expect("it presses");
     settle(&mut app);

@@ -150,7 +150,11 @@ impl Kept {
     /// What the footer says before its press. `what` is "emails" or "files".
     fn line(&self, what: &str, now: i64) -> String {
         match (self.signed_out, self.at) {
-            (true, _) => "Signed out ·".to_owned(),
+            (true, Some(at)) => format!(
+                "Signed out · {what} from {} ·",
+                crate::mail::short_time(at, now)
+            ),
+            (true, None) => "Signed out ·".to_owned(),
             (false, Some(at)) => format!(
                 "Offline · {what} from {} ·",
                 crate::mail::short_time(at, now)
@@ -186,6 +190,9 @@ pub(crate) fn kept_footer(
         line.child(press("Retry", Box::new(retry)))
     }
 }
+
+/// What a card says above its footer when nothing of it was kept to show.
+pub(crate) const NOTHING_KEPT: &str = "Nothing of this card was saved on this Mac.";
 
 /// What a lost card's press reads when it can run the chat's search again.
 pub(crate) const RUN_AGAIN: &str = "Run the search again";

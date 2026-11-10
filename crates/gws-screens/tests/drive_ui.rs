@@ -2660,9 +2660,38 @@ fn offline_a_card_keeps_its_files_says_from_when_and_retry_reads_again() {
 }
 
 #[test]
+fn offline_with_nothing_kept_a_card_says_so_with_retry_not_that_nothing_matches() {
+    let fake = Arc::new(Fake::default());
+    *fake.inline.lock().unwrap() = true;
+    *fake.props.lock().unwrap() = json!({"search": "tkt1"});
+    let mut answer = a_card();
+    answer["saved"] = json!(true);
+    answer["why"] = json!("offline");
+    answer["rows"] = json!([]);
+    *fake.card.lock().unwrap() = Some(answer);
+    let (mut app, _) = open_app(fake.clone(), 420.0, 400.0);
+    app.wait_for_within("text:Offline · saved files ·", WAIT)
+        .expect("it says why");
+    assert!(
+        app.screen()
+            .shows("Nothing of this card was saved on this Mac.")
+    );
+    assert!(!app.screen().shows("No files match."));
+    assert!(app.screen().matches("label:Retry").unwrap());
+}
+
+#[test]
 fn signed_out_a_card_keeps_its_files_and_shows_the_way_to_sign_in() {
-    let (mut app, fake) = kept_card_app(Some("signed_out"), Some(now_ms()));
-    app.wait_for_within("text:Signed out ·", WAIT)
+    use chrono::TimeZone as _;
+    let at = now_ms();
+    let clock = chrono::Local
+        .timestamp_millis_opt(at)
+        .unwrap()
+        .format("%H:%M")
+        .to_string();
+    let (mut app, fake) = kept_card_app(Some("signed_out"), Some(at));
+    // from when, as offline says it
+    app.wait_for_within(&format!("text:Signed out · files from {clock} ·"), WAIT)
         .expect("it says so");
     assert!(app.screen().shows("Card file 0"));
     assert!(!app.screen().matches("label:Retry").unwrap());

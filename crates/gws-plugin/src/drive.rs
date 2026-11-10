@@ -463,9 +463,9 @@ fn gone() -> Value {
     refusal("not_found", "That's gone from Google Drive.")
 }
 
-/// A card's or its search's ticket that stands for nothing.
-fn lost() -> Value {
-    refusal("ticket_lost", crate::mail::TICKET_LOST)
+/// A card's or its search's ticket that stands for nothing here, and why.
+fn lost(core: &Core, ticket: &str) -> Value {
+    refusal("ticket_lost", crate::mail::lost_words(core, ticket))
 }
 
 fn no_access() -> Value {
@@ -862,7 +862,7 @@ fn list_search(
     skip: i64,
 ) -> Result<Value, Failure> {
     let Some(words) = searched(core, ticket) else {
-        return Ok(lost());
+        return Ok(lost(core, ticket));
     };
     let (files, saved) = find(core, auth, account, &words, PAGE)?;
     let page = files.get(skip as usize..).unwrap_or_default();
@@ -912,6 +912,7 @@ pub(crate) fn card_lines(core: &Core, account: &str, ticket: &str) -> Option<(i6
         }
         Ok(lines)
     })
+    .inspect_err(|e| eprintln!("buwiz-gws: a files card's rows couldn't be read: {e:?}"))
     .ok()?;
     Some((at, lines))
 }
@@ -931,7 +932,7 @@ fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
         bound.then_some(words)
     });
     let Some(words) = words else {
-        return Ok(lost());
+        return Ok(lost(core, &ticket));
     };
     let found = match &auth {
         Some(auth) => find(core, auth, &account, &words, CARD_ROWS as i64 + 1),

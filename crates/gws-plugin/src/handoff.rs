@@ -344,13 +344,50 @@ impl Kind {
 /// Excel often is, never goes to the Bot's view: it goes to the Mac's app,
 /// which reads either, or is only saved. A UTF-8 mark is still UTF-8.
 pub(crate) fn way_of(docs: &Documents, kind: &Kind, bytes: &[u8]) -> Way {
+    way_for(docs, kind, std::str::from_utf8(bytes).is_ok())
+}
+
+/// [`way_of`] once it's known whether the text is UTF-8.
+pub(crate) fn way_for(docs: &Documents, kind: &Kind, utf8: bool) -> Way {
     let way = way(docs, kind);
-    if way != Way::Viewer || !kind.utf8 || std::str::from_utf8(bytes).is_ok() {
+    if way != Way::Viewer || !kind.utf8 || utf8 {
         way
     } else if kind.system && docs.can(OPEN_WITH) {
         Way::System
     } else {
         Way::SaveOnly
+    }
+}
+
+/// How much of a file is read at a time to see that it's UTF-8.
+const UTF8_CHUNK: usize = 64 * 1024;
+
+/// Whether all of `reader` is UTF-8, read a chunk at a time: a large text
+/// file is never held whole for it. One that can't be read isn't.
+pub(crate) fn reads_as_utf8(mut reader: impl std::io::Read) -> bool {
+    let mut buf = vec![0; UTF8_CHUNK];
+    // the start of a character the last chunk cut, at most 3 bytes
+    let mut kept = 0;
+    loop {
+        let n = match reader.read(&mut buf[kept..]) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        };
+        let filled = kept + n;
+        if n == 0 {
+            return kept == 0;
+        }
+        match std::str::from_utf8(&buf[..filled]) {
+            Ok(_) => kept = 0,
+            // cut mid-character: carried into the next read
+            Err(e) if e.error_len().is_none() => {
+                let good = e.valid_up_to();
+                buf.copy_within(good..filled, 0);
+                kept = filled - good;
+            }
+            Err(_) => return false,
+        }
     }
 }
 
@@ -366,6 +403,34 @@ mod tests {
             &json!({"params": {"capabilities": {"experimental": {"buwiz/documents": list}}}}),
         );
         docs
+    }
+
+    /// Hands out `step` bytes a read, to cut characters anywhere.
+    struct Drip<'a>(&'a [u8], usize);
+
+    impl std::io::Read for Drip<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.1.min(self.0.len()).min(buf.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn utf8_is_checked_a_chunk_at_a_time_across_cut_characters() {
+        let mut long = "é€😀,".repeat(40_000).into_bytes();
+        assert!(long.len() > 2 * UTF8_CHUNK);
+        for step in [1, 2, 3, 5, UTF8_CHUNK - 1, UTF8_CHUNK, usize::MAX] {
+            assert!(reads_as_utf8(Drip(&long, step)), "step {step}");
+        }
+        assert!(reads_as_utf8(&b""[..]));
+        // a Latin-1 byte past the first chunk still counts
+        long.extend_from_slice(b"Pe\xf1a");
+        assert!(!reads_as_utf8(Drip(&long, 4096)));
+        // cut off mid-character at the end
+        assert!(!reads_as_utf8(&"€".as_bytes()[..2]));
+        assert!(!reads_as_utf8(&[0xff, 0xfe, b'N', 0][..]), "UTF-16");
     }
 
     #[test]

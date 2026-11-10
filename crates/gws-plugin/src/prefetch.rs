@@ -422,6 +422,11 @@ fn attachments(
             if bytes.len() as i64 >= ATTACHMENT_MAX {
                 continue;
             }
+            // its type said it opens; its bytes may not (text that isn't
+            // UTF-8, with no Mac app to hand it to)
+            if !crate::files::attachment_bytes_open(core, mime, name, &bytes) {
+                continue;
+            }
             let saved = Saved {
                 thread: thread.clone(),
                 at,
@@ -725,6 +730,48 @@ mod tests {
 
     fn has_file(core: &Core, n: u64) -> bool {
         with_store(core, |s| s.has_attachment(FAKE_EMAIL, &id(n), "1")).unwrap()
+    }
+
+    fn with_csv(n: u64, days_ago: i64, bytes: &[u8]) -> Mail {
+        let mut m = mail(n, days_ago);
+        m.attachments = vec![(
+            "prices.csv".to_owned(),
+            "text/csv".to_owned(),
+            bytes.to_vec(),
+        )];
+        m
+    }
+
+    fn csv_round(name: &str, docs: Value) -> (bool, bool) {
+        let google = FakeGoogle::start(Seed {
+            mails: vec![
+                with_csv(1, 1, b"Name\nPe\xf1a\n"),
+                with_csv(2, 2, "Name\nPe\u{f1}a\n".as_bytes()),
+            ],
+            ..Seed::default()
+        });
+        let core = synced(&google, name);
+        core.documents.heard(
+            &json!({"params": {"capabilities": {"experimental": {"buwiz/documents": docs}}}}),
+        );
+        round(&core, NOW).unwrap();
+        (has_file(&core, 1), has_file(&core, 2))
+    }
+
+    #[test]
+    fn text_that_could_only_be_saved_isnt_kept_ahead() {
+        let (latin1, utf8) = csv_round("csv-save-only", json!(["sheet", "save"]));
+        assert!(
+            !latin1,
+            "Latin-1 with no Mac app to hand it to: an open only saves it"
+        );
+        assert!(utf8, "UTF-8 opens in the Bot's sheet");
+    }
+
+    #[test]
+    fn text_the_macs_app_takes_is_kept_ahead() {
+        let (latin1, utf8) = csv_round("csv-open-with", json!(["sheet", "open_with", "save"]));
+        assert!(latin1 && utf8);
     }
 
     #[test]

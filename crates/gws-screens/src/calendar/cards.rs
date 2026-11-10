@@ -196,8 +196,19 @@ pub(super) fn decide(b: Bridge, ticket: String) -> View {
     let jobs = signal_with(jobs, SignalEquals::Never);
     b.spawn(compose::work(waiting));
     // what the chat drafted the event with: it goes along, so a plugin that
-    // kept no tickets past a restart binds the ticket again
-    let fields = origin(&b, "gws_event_draft");
+    // kept no tickets past a restart binds the ticket again, to the account
+    // the card says it was drafted on and no other
+    let account = b
+        .props()
+        .get("account")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let fields = origin(&b, "gws_event_draft").map(|mut fields| {
+        if let Some(account) = account {
+            fields["as_account"] = json!(account);
+        }
+        fields
+    });
     let retries = fields.is_some();
     let load = {
         let (b, name) = (b.clone(), ticket.clone());

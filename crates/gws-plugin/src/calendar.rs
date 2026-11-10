@@ -1867,21 +1867,31 @@ fn draft_read(core: &Core, args: &Value) -> Value {
 }
 
 /// Offers the `decide` card with a chat's event draft. Nothing of the event
-/// goes in it: props hold a ticket, and the card reads the fields itself. The
-/// chat keeps the card, so from here the ticket is kept for good.
+/// goes in it: props hold a ticket and the account it was drafted on, and the
+/// card reads the fields itself. The chat keeps the card, so from here the
+/// ticket is kept for good; were it lost, the account in props is the one the
+/// chat's fields may bind it to again.
 pub fn offer_card(core: &Core, tool: &str, result: &mut Value) {
     if tool != EVENT_DRAFT {
         return;
     }
     let ticket = result.pointer("/structuredContent/ticket").cloned();
     if let Some(ticket) = ticket {
+        let mut props = json!({"draft": ticket});
         if let Some(subject) = ticket
             .as_str()
             .and_then(|t| crate::mail::subject_of(core, t))
         {
+            if let crate::mail::Subject::EventDraft(fields) = &subject
+                && let Some(account) = serde_json::from_str::<Value>(fields)
+                    .ok()
+                    .and_then(|f| f["as_account"].as_str().map(str::to_owned))
+            {
+                props["account"] = json!(account);
+            }
             crate::mail::issue_card(core, &subject);
         }
-        result["_meta"] = json!({"buwiz/open": {"app": "calendar", "props": {"draft": ticket}, "title": "Calendar", "placement": "inline"}});
+        result["_meta"] = json!({"buwiz/open": {"app": "calendar", "props": props, "title": "Calendar", "placement": "inline"}});
     }
 }
 

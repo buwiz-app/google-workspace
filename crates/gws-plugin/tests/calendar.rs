@@ -331,7 +331,7 @@ mod attendee_changes {
         let ticket = data(answer.clone())["ticket"].as_str().unwrap().to_owned();
         assert_eq!(
             answer["_meta"]["buwiz/open"],
-            json!({"app": "calendar", "props": {"draft": ticket}, "title": "Calendar", "placement": "inline"})
+            json!({"app": "calendar", "props": {"draft": ticket, "account": FAKE_EMAIL}, "title": "Calendar", "placement": "inline"})
         );
         assert!(
             !answer["_meta"].to_string().contains("ana@example.com"),

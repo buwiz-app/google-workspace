@@ -1758,6 +1758,30 @@ fn a_draft_card_sends_what_the_chat_drafted_so_a_lost_ticket_is_bound_again() {
     assert!(!app.screen().shows(LINK_LOST));
 }
 
+/// The card says the account it was drafted on: the fields go with it, so
+/// the plugin binds the ticket to that account and no other.
+#[test]
+fn a_draft_card_sends_the_account_it_was_drafted_on_with_the_chats_fields() {
+    let drafted = json!({"title": "Quarterly plan", "start": at(2, 10, 0), "end": at(2, 11, 0)});
+    let (mut app, fake) = card(
+        json!({"draft": "tk1", "account": "me@example.com", "origin": {"tool": "gws_event_draft", "args": drafted}}),
+        |f| {
+            *f.draft_lost.lock().unwrap() = true;
+            *f.draft.lock().unwrap() = a_draft(0);
+        },
+        420.0,
+        420.0,
+    );
+    app.wait_for_within("label:Keep draft", WAIT)
+        .expect("the card shows");
+    let mut sent = drafted.clone();
+    sent["as_account"] = json!("me@example.com");
+    assert_eq!(
+        last(&fake, "gws_event_draft_read"),
+        json!({"ticket": "tk1", "fields": sent})
+    );
+}
+
 #[test]
 fn a_lost_draft_card_that_knows_its_event_can_try_again() {
     let drafted = json!({"title": "Quarterly plan", "start": at(2, 10, 0), "end": at(2, 11, 0)});

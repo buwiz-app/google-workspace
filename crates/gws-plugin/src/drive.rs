@@ -871,25 +871,97 @@ fn list_search(
     ))
 }
 
-/// A card's rows, by its ticket.
+/// The files a card shows while Google can't be asked: what it last showed,
+/// as it's kept now, and from when. A card that never showed any gets the kept
+/// files its search's words are in.
+fn kept_card(
+    core: &Core,
+    account: &str,
+    ticket: &str,
+    words: &str,
+) -> Result<(Vec<File>, Option<i64>), Failure> {
+    if let Some((at, ids)) = crate::mail::last_shown(core, account, ticket) {
+        let files = with_store(core, |store| {
+            let mut files = Vec::with_capacity(ids.len());
+            for id in &ids {
+                files.extend(store.drive_file(account, id)?);
+            }
+            Ok(files)
+        })?;
+        return Ok((files, Some(at)));
+    }
+    let files = with_store(core, |store| {
+        store.search_files(account, words, CARD_ROWS as i64 + 1)
+    })?;
+    Ok((files, None))
+}
+
+/// What a files card last showed, as plain lines, and when: the store's alone.
+pub(crate) fn card_lines(core: &Core, account: &str, ticket: &str) -> Option<(i64, Vec<String>)> {
+    let (at, ids) = crate::mail::last_shown(core, account, ticket)?;
+    let lines = with_store(core, |store| {
+        let mut lines = Vec::with_capacity(ids.len());
+        for id in &ids {
+            if let Some(f) = store.drive_file(account, id)? {
+                lines.push(if f.owner.is_empty() {
+                    f.name
+                } else {
+                    format!("{} — {}", f.name, f.owner)
+                });
+            }
+        }
+        Ok(lines)
+    })
+    .ok()?;
+    Some((at, lines))
+}
+
+/// A card's rows, by its ticket. When Google can't be asked they're the ones
+/// it last showed, and the answer says from when and why: `offline`, or
+/// `signed_out` when Google no longer takes the sign-in.
 fn card(core: &Core, args: &Value) -> Result<Value, Failure> {
-    let (auth, account) = signed_in(core)?;
+    // a lapsed token is still their sign-in, and what's kept is theirs to read
+    let (auth, account) = crate::mail::reader(core)?;
     let ticket = js::string_or_empty(args.get("ticket"));
     // a card from before tickets were kept comes with the search that made it
     let words = searched(core, &ticket).or_else(|| {
         let words = js::trim(&js::string_or_empty(args.get("query"))).to_owned();
         let bound = !words.is_empty()
-            && crate::mail::subject_of(core, &ticket).is_none()
             && crate::mail::bind(core, &ticket, &Subject::DriveSearch(words.clone()));
         bound.then_some(words)
     });
     let Some(words) = words else {
         return Ok(lost());
     };
-    let (files, saved) = find(core, &auth, &account, &words, CARD_ROWS as i64 + 1)?;
+    let found = match &auth {
+        Some(auth) => find(core, auth, &account, &words, CARD_ROWS as i64 + 1),
+        None => Err(crate::mail::unreached()),
+    };
+    let (files, kept) = match found {
+        Ok((files, false)) => (files, None),
+        Ok((_, true)) | Err(Failure::Offline(_)) => {
+            let (files, at) = kept_card(core, &account, &ticket, &words)?;
+            (files, Some((at, "offline")))
+        }
+        Err(Failure::AccountRequired) => {
+            let (files, at) = kept_card(core, &account, &ticket, &words)?;
+            // nothing kept is nothing to show: the card asks for the sign-in
+            if files.is_empty() {
+                return Err(Failure::AccountRequired);
+            }
+            (files, Some((at, "signed_out")))
+        }
+        Err(e) => return Err(e),
+    };
     let shown = &files[..files.len().min(CARD_ROWS)];
-    Ok(ok(
-        json!({"rows": rows(shown), "more": files.len() > CARD_ROWS, "saved": saved}),
+    if kept.is_none() {
+        let ids: Vec<&str> = shown.iter().map(|f| f.id.as_str()).collect();
+        crate::mail::note_shown(core, &account, &ticket, &ids);
+    }
+    Ok(crate::mail::card_answer(
+        rows(shown),
+        files.len() > CARD_ROWS,
+        kept,
     ))
 }
 

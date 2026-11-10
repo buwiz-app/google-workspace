@@ -1,6 +1,6 @@
 {
   "name": "google-workspace",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Your Gmail, Calendar and Drive in Buwiz Bot, with the Google account you sign in to.",
   "author": { "name": "Buwiz" },
   "homepage": "https://github.com/buwiz-app/google-workspace",
@@ -15,7 +15,7 @@
     "protocol": "1.0.0",
     "id": "app.buwiz.google-workspace",
     "short": "gws",
-    "version": "1.5.0",
+    "version": "1.6.0",
     "server": "gws",
     "accounts": [
       {

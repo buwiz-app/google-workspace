@@ -64,6 +64,7 @@ pub const MAIL_LIST: &str = "gws_mail_list";
 pub const MAIL_THREAD: &str = "gws_mail_thread";
 pub const MAIL_CHANGES: &str = "gws_mail_changes";
 pub const MAIL_CARD: &str = "gws_mail_card";
+pub const CARD_TEXT: &str = "gws_card_text";
 pub const MAIL_MARK: &str = "gws_mail_mark";
 pub const MAIL_LABEL: &str = "gws_mail_label";
 pub const MAIL_ARCHIVE: &str = "gws_mail_archive";
@@ -220,6 +221,14 @@ pub fn defs() -> Vec<Def> {
             read_only: true,
             audience: APP_ONLY,
             open_world: true,
+        },
+        Def {
+            name: CARD_TEXT,
+            description: "What a card last showed, as plain lines, by its ticket: only what is kept on this Mac.",
+            input_schema: json!({"type": "object", "properties": {"ticket": {"type": "string"}}, "required": ["ticket"]}),
+            read_only: true,
+            audience: APP_ONLY,
+            open_world: false,
         },
         write(
             MAIL_MARK,

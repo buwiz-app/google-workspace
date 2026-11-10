@@ -2613,16 +2613,77 @@ fn a_lost_card_that_knows_its_search_can_run_it_again_and_another_tools_is_not_i
     assert_eq!(last_of(&fake, "gws_drive_card"), json!({"ticket": "tkt1"}));
 }
 
-#[test]
-fn a_saved_card_says_so() {
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+fn kept_card_app(why: Option<&str>, at: Option<i64>) -> (Headless, Arc<Fake>) {
     let fake = Arc::new(Fake::default());
     *fake.inline.lock().unwrap() = true;
+    *fake.props.lock().unwrap() = json!({"search": "tkt1"});
     let mut answer = a_card();
     answer["saved"] = json!(true);
+    if let Some(why) = why {
+        answer["why"] = json!(why);
+    }
+    if let Some(at) = at {
+        answer["saved_at"] = json!(at);
+    }
     *fake.card.lock().unwrap() = Some(answer);
-    let (mut app, _) = open_app(fake, 420.0, 400.0);
-    app.wait_for_within("text:Saved files, offline", WAIT)
+    let (app, _) = open_app(fake.clone(), 420.0, 400.0);
+    (app, fake)
+}
+
+#[test]
+fn offline_a_card_keeps_its_files_says_from_when_and_retry_reads_again() {
+    use chrono::TimeZone as _;
+    let at = now_ms();
+    let clock = chrono::Local
+        .timestamp_millis_opt(at)
+        .unwrap()
+        .format("%H:%M")
+        .to_string();
+    let (mut app, fake) = kept_card_app(Some("offline"), Some(at));
+    let line = format!("Offline · files from {clock} ·");
+    app.wait_for_within(&format!("text:{line}"), WAIT)
         .expect("it says so");
+    assert!(app.screen().shows("Card file 0"), "the kept files show");
+    // back on line
+    *fake.card.lock().unwrap() = None;
+    press(&mut app, "label:Retry");
+    assert_eq!(fake.called("gws_drive_card").len(), 2);
+    assert!(app.screen().shows("Card file 0"));
+    assert!(!app.screen().shows(&line), "live again");
+}
+
+#[test]
+fn signed_out_a_card_keeps_its_files_and_shows_the_way_to_sign_in() {
+    let (mut app, fake) = kept_card_app(Some("signed_out"), Some(now_ms()));
+    app.wait_for_within("text:Signed out ·", WAIT)
+        .expect("it says so");
+    assert!(app.screen().shows("Card file 0"));
+    assert!(!app.screen().matches("label:Retry").unwrap());
+    press(&mut app, "label:Sign in to refresh");
+    let opened = fake.host.lock().unwrap().clone();
+    let (_, data) = opened
+        .iter()
+        .find(|(m, _)| m == "buwiz.open")
+        .expect("it opens");
+    assert_eq!(
+        (&data["app"], &data["props"]),
+        (&json!("drive"), &json!({}))
+    );
+}
+
+#[test]
+fn a_kept_card_from_a_plugin_that_says_no_more_still_says_offline() {
+    let (mut app, _) = kept_card_app(None, None);
+    app.wait_for_within("text:Offline · saved files ·", WAIT)
+        .expect("it says so");
+    assert!(app.screen().matches("label:Retry").unwrap());
 }
 
 #[test]

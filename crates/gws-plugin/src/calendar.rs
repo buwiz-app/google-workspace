@@ -1761,6 +1761,41 @@ fn draft(core: &Core, args: &Value) -> Value {
     ok(json!({"ticket": ticket}))
 }
 
+/// A draft's fields as plain lines, for the account it was drafted on: what
+/// it's called, when, where, who's invited, and its notes. Nobody else's.
+pub(crate) fn draft_lines(fields: &str, account: &str) -> Vec<String> {
+    let Ok(fields) = serde_json::from_str::<Value>(fields) else {
+        return Vec::new();
+    };
+    if fields["as_account"]
+        .as_str()
+        .is_some_and(|who| who != account)
+    {
+        return Vec::new();
+    }
+    let text = |key: &str| fields[key].as_str().unwrap_or_default().to_owned();
+    let guests: Vec<&str> = fields["guests"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let when = match (text("start"), text("end")) {
+        (start, end) if start.is_empty() || end.is_empty() => start + &end,
+        (start, end) => format!("{start} to {end}"),
+    };
+    [
+        text("title"),
+        when,
+        text("where"),
+        guests.join(", "),
+        text("notes"),
+    ]
+    .into_iter()
+    .filter(|line| !line.is_empty())
+    .collect()
+}
+
 /// A draft card's ticket that stands for nothing.
 fn lost() -> Value {
     refusal("ticket_lost", crate::mail::TICKET_LOST)

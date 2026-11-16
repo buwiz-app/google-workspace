@@ -21,7 +21,7 @@ pub fn ok(structured: Value) -> Value {
     json!({"content": [{"type": "text", "text": structured.to_string()}], "structuredContent": structured})
 }
 
-/// A failed tool call with a `{code, message}` for Rox.
+/// A failed tool call with a `{code, message}` for the Bot.
 pub fn fail(code: &str, message: &str) -> Value {
     json!({"content": [{"type": "text", "text": message}], "structuredContent": {"code": code, "message": message}, "isError": true})
 }

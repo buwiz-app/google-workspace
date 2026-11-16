@@ -26,7 +26,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # a series keeps its wall clock, and only a zone's rules say what that is
 chrono-tz = { version = "0.10", default-features = false }
 # the SDK's server: provision, session certificates, tickets, caller checks
-buwiz-plugin = { git = "https://github.com/buwiz-app/buwiz-sdk", rev = "317bae64f85947c94ce6d2efb7f2d9bdedc387a0" }
+buwiz-plugin = { git = "https://github.com/buwiz-app/buwiz-sdk", rev = "e1de9c4487de6a9b6509e53ed1e990d699cad454" }
 gws-store = { path = "../gws-store" }
 # Gmail's base64url bodies
 base64 = "0.22"

@@ -250,7 +250,7 @@ pub fn unsigned(key_id: &str) -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "title": TITLE,
         "description": "Your Gmail, Calendar and Drive in Buwiz Bot, with the Google account you sign in to.",
-        "publisher": { "id": "app.buwiz", "key_id": key_id, "name": "Goldcoders" },
+        "publisher": { "id": "app.buwiz", "key_id": key_id, "name": "Buwiz" },
         "commands": [
             { "name": "gws", "description": "Open Mail, Calendar or Drive", "args": "[mail, calendar or drive]", "resolve": tools::RESOLVE },
             { "name": "mail", "description": "Open Mail", "args": "[inbox, unread, drafts, sent, important or starred]", "resolve": tools::RESOLVE },

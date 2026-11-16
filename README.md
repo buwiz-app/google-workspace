@@ -37,11 +37,7 @@ person's own press.
    Google. If a routine or the agent reads mail before you sign in, a
    "Sign in to Google" card shows up in the chat.
 
-A Buwiz Bot on protocol 1.0 is needed. Earlier Bots ran pre-release
-numbers of the protocol: on a 2.1 Bot install 1.2.0
-(`https://github.com/buwiz-app/google-workspace/releases/tag/v1.2.0`), on a
-2.0 Bot 1.1.0
-(`https://github.com/buwiz-app/google-workspace/releases/tag/v1.1.0`).
+A Buwiz Bot on protocol 1.0 is needed.
 
 ## Commands
 
@@ -57,10 +53,26 @@ The plugin serves the signed manifest named by `BUWIZ_PLUGIN_MANIFEST`
 
 ```sh
 cargo test --locked
-tools/bot/conformance.sh        # the Bot's conformance runner, under a throwaway key
+tools/check-all.sh              # fmt, clippy, tests, then the SDK's conformance runner
+tools/conformance.sh            # the conformance runner alone, under a throwaway key
 tools/bot/live.sh up            # a real test Bot against the stub Google, on workspace 3
 tools/bot/live.sh down
 ```
+
+The conformance runner comes from the SDK
+([buwiz-app/buwiz-sdk](https://github.com/buwiz-app/buwiz-sdk)) at the revision
+this repo pins in `crates/gws-plugin/Cargo.toml`. Check it out, install its
+dependencies, and name it in `BUWIZ_SDK_DIR`:
+
+```sh
+git clone https://github.com/buwiz-app/buwiz-sdk
+git -C buwiz-sdk checkout 317bae64f85947c94ce6d2efb7f2d9bdedc387a0
+(cd buwiz-sdk && bun install)
+BUWIZ_SDK_DIR=$PWD/buwiz-sdk tools/check-all.sh
+```
+
+`tools/bot/live.sh` needs a Buwiz Bot checkout built on this machine
+(`BUWIZ_BOT_DIR`); nothing else here does.
 
 Tests use fake data and the stub. The `stub` feature is what lets a build talk
 to the stub (`GWS_STUB_BASE`, loopback only). A release is built without it, and
@@ -70,8 +82,8 @@ then the variable does nothing.
 
 `package/plugin.json` is the package's source: `mcpServers.gws` runs
 `${PLUGIN_ROOT}/bin/buwiz-gws mcp`, and its `buwiz` block names the mini
-app (id, short, version, protocol 1.0.0), its `google` account and the
-publisher key `gc-2026-01`. The release script fills in `buwiz.files` (the
+app (id, short, version, protocol 1.0.0), its `google` account and
+Buwiz's release key as the publisher key. The release script fills in `buwiz.files` (the
 signed served manifest) and `buwiz.binaries` (one per platform), each with
 its sha256, and signs the block. Keep its versions equal to
 `crates/gws-plugin/Cargo.toml` (`cargo test` checks).
@@ -90,7 +102,7 @@ BUWIZ_BROKER_BIN=<buwiz-bot>/broker/target/release/buwiz-broker tools/release/pu
 
 It builds this machine's binary, signs the served manifest with
 `buwiz-broker sign-manifest`, writes `plugin.json` and signs its `buwiz`
-block (`sign-manifest --block buwiz`), both with `gc-2026-01` from the
+block (`sign-manifest --block buwiz`), both with Buwiz's release key from the
 login Keychain: two Keychain prompts. `--trust <trust.json>` also checks
 the result as the Bot does (`buwiz-broker manifest verify` and
 `manifest package`). For a local check without the real key, sign with a

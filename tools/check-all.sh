@@ -6,8 +6,16 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# the last gate needs the SDK checkout: say so now, not after minutes of tests
+[ -n "${BUWIZ_SDK_DIR:-}" ] && [ -d "$BUWIZ_SDK_DIR" ] || [ "${SKIP_CONFORMANCE:-0}" = 1 ] || {
+  echo "check-all: set BUWIZ_SDK_DIR to a buwiz-sdk checkout (git clone https://github.com/buwiz-app/buwiz-sdk; cd buwiz-sdk; bun install)" >&2
+  exit 2
+}
+
 step() { printf '\n== %s\n' "$*"; }
 
+step "every buwiz-sdk pin is one revision"
+tools/sdk-pin.sh
 step "cargo fmt --check"
 cargo fmt --all --check
 step "cargo clippy"
@@ -18,8 +26,7 @@ step "cargo test with the stub"
 cargo test -p buwiz-gws --features stub --locked --quiet
 
 step "SDK doc links follow the pin"
-PIN="$(sed -n 's/^buwiz-plugin = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' crates/gws-plugin/Cargo.toml)"
-[ -n "$PIN" ] || { echo "no pinned buwiz-sdk revision in crates/gws-plugin/Cargo.toml" >&2; exit 1; }
+PIN="$(tools/sdk-pin.sh)"
 STALE="$(grep -rhoE 'buwiz-sdk/blob/[^/)]+|checkout [0-9a-f]{40}' README.md | grep -vE "blob/$PIN\$|checkout $PIN\$" || true)"
 [ -z "$STALE" ] || { printf 'SDK links name a revision other than the pinned %s:\n%s\n' "$PIN" "$STALE" >&2; exit 1; }
 

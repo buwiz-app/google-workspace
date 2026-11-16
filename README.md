@@ -83,8 +83,8 @@ then the variable does nothing.
 `package/plugin.json` is the package's source: `mcpServers.gws` runs
 `${PLUGIN_ROOT}/bin/buwiz-gws mcp`, and its `buwiz` block names the mini
 app (id, short, version, protocol 1.0.0), its `google` account and
-Buwiz's release key as the publisher key. The release script fills in `buwiz.files` (the
-signed served manifest) and `buwiz.binaries` (one per platform), each with
+the release key id as the publisher key (`buwiz.publisher.key_id`).
+The release script fills in `buwiz.files` (the signed served manifest) and `buwiz.binaries` (one per platform), each with
 its sha256, and signs the block. Keep its versions equal to
 `crates/gws-plugin/Cargo.toml` (`cargo test` checks).
 
@@ -102,8 +102,10 @@ BUWIZ_BROKER_BIN=<buwiz-bot>/broker/target/release/buwiz-broker tools/release/pu
 
 It builds this machine's binary, signs the served manifest with
 `buwiz-broker sign-manifest`, writes `plugin.json` and signs its `buwiz`
-block (`sign-manifest --block buwiz`), both with Buwiz's release key from the
-login Keychain: two Keychain prompts. `--trust <trust.json>` also checks
+block (`sign-manifest --block buwiz`), both with the key the release key id in `package/plugin.json`
+names, from the login Keychain (the script takes the id from the binary's
+manifest, which matches `package/plugin.json`; `KEY_ID=<id>` selects another
+key when you hold more than one): two Keychain prompts. `--trust <trust.json>` also checks
 the result as the Bot does (`buwiz-broker manifest verify` and
 `manifest package`). For a local check without the real key, sign with a
 throwaway seed file and a trust store that names its public key:

@@ -8,7 +8,7 @@ publish.workspace = true
 
 [dependencies]
 # the Bot pins these two: move them together, or `ScreenDef` is two types
-buwiz-app = { git = "https://github.com/buwiz-app/buwiz-sdk", rev = "e1de9c4487de6a9b6509e53ed1e990d699cad454" }
+buwiz-app.workspace = true
 nsh-core = { git = "https://github.com/hexuria/nsh", rev = "c66f78cb4fa67825c51db55909ef5e1ea24f1658" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # a time typed for another zone means that zone

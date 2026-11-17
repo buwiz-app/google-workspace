@@ -109,6 +109,8 @@ fn audience_allows(name: &str, origin: Origin) -> bool {
         // a routine's turn is the model's
         Origin::Agent | Origin::Routine => names("agent"),
         Origin::Resolve => name == tools::RESOLVE,
+        // no tool of this plugin is offered to generated widgets
+        Origin::Widget => false,
         Origin::Unknown => false,
     }
 }
@@ -424,6 +426,7 @@ mod tests {
             assert!(audience_allows(name, Origin::App), "{name}");
             assert!(!audience_allows(name, Origin::Agent), "{name}");
             assert!(!audience_allows(name, Origin::Routine), "{name}");
+            assert!(!audience_allows(name, Origin::Widget), "{name}");
             assert!(!audience_allows(name, Origin::Unknown), "{name}");
         }
     }
@@ -498,6 +501,13 @@ mod tests {
             !audience_allows(tools::STATUS, Origin::Resolve),
             "a resolve reaches the resolve tool"
         );
+    }
+
+    #[test]
+    fn a_widget_reaches_no_tool_of_this_plugin() {
+        for def in tools::defs() {
+            assert!(!audience_allows(def.name, Origin::Widget), "{}", def.name);
+        }
     }
 
     #[test]

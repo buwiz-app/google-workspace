@@ -1,32 +1,44 @@
 #!/usr/bin/env bash
-# tools/sdk-pin.sh: print the buwiz-sdk revision this repo pins, the one place
-# that reads it. Every buwiz-sdk git revision named in any Cargo.toml of the
-# workspace and in Cargo.lock must be the same one; otherwise this lists them
-# and fails.
+# tools/sdk-pin.sh: print the buwiz-sdk revision this repo pins. The one place
+# that reads it.
+#
+# It asks Cargo, not the text of a manifest: `cargo metadata --locked` fails
+# when Cargo.lock no longer matches the manifests, and its answer names the
+# revision every buwiz-sdk crate was resolved at, however the dependency is
+# written. Every buwiz-sdk crate must come from one revision, asked for in
+# full (rev = "<40 hex>"): a branch, a tag or a short revision is refused.
+# Only the root Cargo.toml may name the SDK's repository, so a manifest
+# outside the workspace cannot carry a pin of its own.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO"
-SDK_URL='github.com/buwiz-app/buwiz-sdk'
-FOUND="$(
-  {
-    # Cargo.toml: a dependency on the SDK must carry a full revision
-    find . -name Cargo.toml -not -path './target/*' -not -path './.git/*' | sort | while read -r f; do
-      grep -F "$SDK_URL" "$f" | while read -r line; do
-        rev="$(printf '%s\n' "$line" | sed -n 's/.*rev *= *"\([0-9a-f]\{40\}\)".*/\1/p')"
-        printf '%s %s\n' "${rev:-NONE}" "${f#./}"
-      done
-    done
-    # Cargo.lock: the requested rev and the resolved commit
-    if [ -f Cargo.lock ]; then
-      grep -F "git+https://$SDK_URL" Cargo.lock | sed -n 's/.*?rev=\([0-9a-f]\{40\}\)#\([0-9a-f]\{40\}\).*/\1 Cargo.lock\n\2 Cargo.lock/p'
-    fi
-  } | sort -u
-)"
-[ -n "$FOUND" ] || { echo "sdk-pin: no buwiz-sdk revision found in any Cargo.toml" >&2; exit 1; }
-REVS="$(printf '%s\n' "$FOUND" | cut -d' ' -f1 | sort -u)"
-if [ "$(printf '%s\n' "$REVS" | wc -l)" -ne 1 ] || [ "$REVS" = NONE ]; then
-  echo "sdk-pin: the buwiz-sdk pins disagree (or one has no full revision):" >&2
+command -v cargo >/dev/null 2>&1 || { echo "sdk-pin: cargo is not on PATH" >&2; exit 1; }
+ERR="$(mktemp)"
+trap 'rm -f "$ERR"' EXIT
+META="$(cargo metadata --locked --format-version 1 --manifest-path "$REPO/Cargo.toml" 2>"$ERR")" || {
+  echo "sdk-pin: cargo could not read the workspace with its lockfile as it is:" >&2
+  tail -5 "$ERR" | sed 's/^/  /' >&2
+  exit 1
+}
+# each buwiz-sdk crate's source, whatever the URL's scheme: git+...buwiz-app/buwiz-sdk...#<resolved>
+FOUND="$(printf '%s' "$META" | grep -oiE 'git\+[^"]*github\.com[:/]buwiz-app/buwiz-sdk[^"]*#[0-9a-f]{40}' | sort -u || true)"
+[ -n "$FOUND" ] || { echo "sdk-pin: this workspace depends on no buwiz-sdk crate by git revision" >&2; exit 1; }
+REVS="$(printf '%s\n' "$FOUND" | sed -E 's/.*#([0-9a-f]{40})$/\1/' | sort -u)"
+# a source is good when it asks, by rev, for the full revision it resolved to
+BAD="$(printf '%s\n' "$FOUND" | awk '{
+  resolved = $0; sub(/.*#/, "", resolved)
+  asked = ""
+  if (match($0, /[?&]rev=[0-9a-f]+/)) { asked = substr($0, RSTART, RLENGTH); sub(/^[?&]rev=/, "", asked) }
+  if (asked != resolved) print
+}')"
+if [ "$(printf '%s\n' "$REVS" | wc -l | tr -d ' ')" != 1 ] || [ -n "$BAD" ]; then
+  echo "sdk-pin: every buwiz-sdk crate must be pinned to one revision, written in full (rev = \"<40 hex>\"); found:" >&2
   printf '%s\n' "$FOUND" | sed 's/^/  /' >&2
   exit 1
 fi
-echo "$REVS"
+STRAY="$(cd "$REPO" && find . -name Cargo.toml -not -path ./Cargo.toml -not -path '*/target/*' -not -path '*/node_modules/*' -exec grep -liE 'buwiz-app/buwiz-sdk' {} + 2>/dev/null || true)"
+if [ -n "$STRAY" ]; then
+  echo "sdk-pin: only the root Cargo.toml may name the buwiz-sdk repository (members inherit it with workspace = true); also named in:" >&2
+  printf '%s\n' "$STRAY" | sed 's/^/  /' >&2
+  exit 1
+fi
+printf '%s\n' "$REVS"

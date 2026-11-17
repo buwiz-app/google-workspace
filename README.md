@@ -66,7 +66,7 @@ dependencies, and name it in `BUWIZ_SDK_DIR`:
 
 ```sh
 git clone https://github.com/buwiz-app/buwiz-sdk
-git -C buwiz-sdk checkout e1de9c4487de6a9b6509e53ed1e990d699cad454
+git -C buwiz-sdk checkout 8f95537270815e75d0a23488ca12d175138c6d91
 (cd buwiz-sdk && bun install)
 BUWIZ_SDK_DIR=$PWD/buwiz-sdk tools/check-all.sh
 ```

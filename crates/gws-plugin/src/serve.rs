@@ -504,10 +504,16 @@ mod tests {
     }
 
     #[test]
+    fn a_widget_reaches_no_tool_of_this_plugin() {
+        for def in tools::defs() {
+            assert!(!audience_allows(def.name, Origin::Widget), "{}", def.name);
+        }
+    }
+
+    #[test]
     fn a_caller_it_cant_name_reaches_nothing() {
         for def in tools::defs() {
             assert!(!audience_allows(def.name, Origin::Unknown), "{}", def.name);
-            assert!(!audience_allows(def.name, Origin::Widget), "{}", def.name);
         }
     }
 

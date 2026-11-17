@@ -7,7 +7,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-# the Bot pins these two: move them together, or `ScreenDef` is two types
+# the Bot pins these two (buwiz-app's rev is in the root Cargo.toml): move them
+# together, or `ScreenDef` is two types
 buwiz-app.workspace = true
 nsh-core = { git = "https://github.com/hexuria/nsh", rev = "c66f78cb4fa67825c51db55909ef5e1ea24f1658" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

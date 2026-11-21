@@ -504,7 +504,16 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
         v
     };
     let call = |ask: &mut dyn FnMut(&str, Value) -> Value, name: &str, args: Value| {
-        ask("tools/call", json!({"name": name, "arguments": args, "_meta": {"buwiz/caller": {"origin": "agent"}}}))["result"].clone()
+        let caller = if name.starts_with("buwiz.") {
+            Value::Null
+        } else {
+            json!({"origin": "agent"})
+        };
+        ask(
+            "tools/call",
+            json!({"name": name, "arguments": args, "_meta": {"buwiz/caller": caller}}),
+        )["result"]
+            .clone()
     };
 
     ask(
@@ -730,7 +739,6 @@ fn accounts_are_pushed_held_and_cleared_without_the_token_ever_showing() {
         "invalid_args"
     );
 
-    drop(ask);
     drop(stdin);
     let status = child.wait().unwrap();
     let mut stderr = String::new();
@@ -853,12 +861,12 @@ fn a_chats_drive_search_offers_the_files_card_through_the_real_server() {
     ask(
         "buwiz.provision",
         provision["params"]["arguments"].clone(),
-        json!({}),
+        Value::Null,
     );
     ask(
         "buwiz.account.set",
         json!({"account": "google", "label": "default", "subject": FAKE_SUBJECT, "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}),
-        json!({}),
+        Value::Null,
     );
 
     let agent = json!({"origin": "agent"});
@@ -941,12 +949,12 @@ fn every_routine_finds_its_items_and_its_turn_can_only_read() {
     ask(
         "buwiz.provision",
         provision["params"]["arguments"].clone(),
-        json!({}),
+        Value::Null,
     );
     ask(
         "buwiz.account.set",
         json!({"account": "google", "label": "default", "subject": FAKE_SUBJECT, "scopes": ["https://www.googleapis.com/auth/gmail.modify", "https://www.googleapis.com/auth/calendar.events", "https://www.googleapis.com/auth/drive"], "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}),
-        json!({}),
+        Value::Null,
     );
 
     // words the fake holds, as a person's settings would give them
@@ -1069,7 +1077,7 @@ fn pushes_one_at_a_time_leave_the_accounts_not_pushed_yet() {
         writeln!(stdin, "{provision}").unwrap();
         stdout.read_line(&mut line).unwrap();
         for (at, account) in who.iter().enumerate() {
-            let push = json!({"jsonrpc": "2.0", "id": at + 2, "method": "tools/call", "params": {"name": "buwiz.account.set", "arguments": {"account": "google", "label": account, "provider": "google", "subject": account, "scopes": [], "access_token": "fake-access-1", "token_type": "Bearer", "expires_at": 4_000_000_000u64}, "_meta": {"buwiz/caller": {"origin": "agent"}}}});
+            let push = json!({"jsonrpc": "2.0", "id": at + 2, "method": "tools/call", "params": {"name": "buwiz.account.set", "arguments": {"account": "google", "label": account, "provider": "google", "subject": account, "scopes": [], "access_token": "fake-access-1", "token_type": "Bearer", "expires_at": 4_000_000_000u64}, "_meta": {"buwiz/caller": null}}});
             writeln!(stdin, "{push}").unwrap();
             line.clear();
             stdout.read_line(&mut line).unwrap();
@@ -1136,12 +1144,12 @@ fn a_press_gets_its_document_through_the_real_server_and_the_model_gets_nothing(
     ask(
         "buwiz.provision",
         provision["params"]["arguments"].clone(),
-        json!({}),
+        Value::Null,
     );
     ask(
         "buwiz.account.set",
         json!({"account": "google", "label": "default", "subject": FAKE_SUBJECT, "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}),
-        json!({}),
+        Value::Null,
     );
     let certified = |ask: &mut dyn FnMut(&str, Value, Value) -> Value, app: &str, open_id: &str| {
         let plan = gws::manifest::unsigned(gws::manifest::RELEASE_KEY_ID);
@@ -1318,12 +1326,12 @@ fn the_bots_word_at_initialize_opens_a_photo_and_saves_it_and_the_model_gets_not
     ask(
         "buwiz.provision",
         provision["params"]["arguments"].clone(),
-        json!({}),
+        Value::Null,
     );
     ask(
         "buwiz.account.set",
         json!({"account": "google", "label": "default", "subject": FAKE_SUBJECT, "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}),
-        json!({}),
+        Value::Null,
     );
     let plan = gws::manifest::unsigned(gws::manifest::RELEASE_KEY_ID);
     let entry = buwiz_plugin::manifest::app(&plan, "mail").unwrap();
@@ -1437,12 +1445,12 @@ fn the_model_and_a_routine_are_refused_every_drive_write_and_a_person_is_not() {
     ask(
         "buwiz.provision",
         provision["params"]["arguments"].clone(),
-        json!({}),
+        Value::Null,
     );
     ask(
         "buwiz.account.set",
         json!({"account": "google", "label": "default", "subject": FAKE_SUBJECT, "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}),
-        json!({}),
+        Value::Null,
     );
 
     let writes = [
@@ -1594,12 +1602,12 @@ fn a_test_run_shares_with_nobody_but_its_own_address() {
     ask(
         "buwiz.provision",
         provision["params"]["arguments"].clone(),
-        json!({}),
+        Value::Null,
     );
     ask(
         "buwiz.account.set",
         json!({"account": "google", "label": "default", "subject": FAKE_SUBJECT, "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}),
-        json!({}),
+        Value::Null,
     );
     let plan = gws::manifest::unsigned(gws::manifest::RELEASE_KEY_ID);
     let entry = buwiz_plugin::manifest::app(&plan, "drive").unwrap();
@@ -1701,12 +1709,12 @@ fn the_model_can_never_fetch_a_mails_pictures() {
     ask(
         "buwiz.provision",
         provision["params"]["arguments"].clone(),
-        json!({}),
+        Value::Null,
     );
     ask(
         "buwiz.account.set",
         json!({"account": "google", "label": "default", "subject": FAKE_SUBJECT, "access_token": "fake-access-1", "expires_at": 4_000_000_000u64}),
-        json!({}),
+        Value::Null,
     );
     for caller in [
         json!({"origin": "agent"}),

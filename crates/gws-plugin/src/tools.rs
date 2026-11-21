@@ -652,6 +652,7 @@ pub fn list() -> Vec<Tool> {
             description: d.description,
             input_schema: d.input_schema,
             read_only: d.read_only,
+            meta: None,
         })
         .collect()
 }

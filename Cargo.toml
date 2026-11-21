@@ -11,8 +11,8 @@ repository = "https://github.com/buwiz-app/google-workspace"
 [workspace.dependencies]
 # The SDK, pinned by commit, each crate once here and inherited by the members
 # (`workspace = true`); tools/sdk-pin.sh reads it.
-buwiz-plugin = { git = "https://github.com/buwiz-app/buwiz-sdk", rev = "8f95537270815e75d0a23488ca12d175138c6d91" }
-buwiz-app = { git = "https://github.com/buwiz-app/buwiz-sdk", rev = "8f95537270815e75d0a23488ca12d175138c6d91" }
+buwiz-plugin = { git = "https://github.com/buwiz-app/buwiz-sdk", rev = "f63038d5cdbb05a20d9f329be3a85a8a6f3e8f8d" }
+buwiz-app = { git = "https://github.com/buwiz-app/buwiz-sdk", rev = "f63038d5cdbb05a20d9f329be3a85a8a6f3e8f8d" }
 # plain: gws-screens is compiled into the Bot, and a feature here would change
 # serde_json for the whole app. The plugin turns on preserve_order for itself.
 serde_json = "1"
